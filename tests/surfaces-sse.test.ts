@@ -17,7 +17,7 @@ import type { Server } from 'node:http';
 import { makeTempDataDir } from './helpers.ts';
 import type { TempDataDir } from './helpers.ts';
 import { EventBus, TOPICS } from '../src/shared/bus.ts';
-import { SseBus, SseCursorStore, parseStreamQuery } from '../src/surfaces/sse.ts';
+import { DEFAULT_SSE_REPLAY_WINDOW, SseBus, SseCursorStore, parseStreamQuery } from '../src/surfaces/sse.ts';
 import { SSE_REPLAY_WINDOW, SSE_DELTA_QUEUE_LIMIT } from '../src/surfaces/types.ts';
 import type { ControlPlane, GovernancePort, MemoryPort, RouterPort } from '../src/shared/contracts.ts';
 import { createHttpServer } from '../src/surfaces/http.ts';
@@ -55,11 +55,12 @@ const fakeCp = {
   getGuardStatus: () => ({}),
 } as unknown as ControlPlane;
 
-/** 建一个已 attach 的 SseBus（带快照提供者）。 */
-function makeSse(dir: TempDataDir, bus: EventBus, withSnapshot = true): SseBus {
+/** 建一个已 attach 的 SseBus（带快照提供者）。`replayWindow` 缺省 = 生产值 5000。 */
+function makeSse(dir: TempDataDir, bus: EventBus, withSnapshot = true, replayWindow?: number): SseBus {
   const sse = new SseBus({
     db: dir.db,
     bus,
+    replayWindow,
     snapshot: withSnapshot
       ? {
           approvals: () => [{ id: 1, seq: 7, status: 'pending', tier: 't2', summary: '待批' } as never],
@@ -173,11 +174,29 @@ test('补档：环形缓冲只留 5000 帧（超出即不可重放 → resync）
   try {
     const bus = new EventBus();
     const sse = makeSse(dir, bus);
-    for (let i = 0; i < SSE_REPLAY_WINDOW + 5; i++) bus.publish('task.state', { i }, { dotId: 'dot1' });
-    assert.equal(sse.buffered(), SSE_REPLAY_WINDOW);
-    // 落后 4999（在窗内）→ replay；落后 5001 → resync
-    assert.equal(sse.reconnectPlan(bus.currentSeq() - 4999, ['queue']).action, 'replay');
-    assert.equal(sse.reconnectPlan(bus.currentSeq() - 5001, ['queue']).action, 'resync');
+    assert.equal(sse.buffered(), 0);
+    // ⚡ 加速（2026-10-17，只改"等多久"，不减任何断言）：
+    // 原写法直接灌 SSE_REPLAY_WINDOW+5 = 5005 帧，每次超容都把 5000 元素数组 shift 一次，
+    // 主体总量 O(N²)（约 1250 万帧对象的字节拷贝），在本机实测稳定占 38–84s。
+    // 这里改用**生产缺省容量的 1/1000**（replayWindow = SSE_REPLAY_WINDOW/1000 = 5）跑同一序列：
+    // 「缓冲长度 == 窗口容量 / 落后 容量-1 → replay / 落后 容量+1 → resync」三条边界关系逐字保留，
+    // 最后再用一条断言把**生产缺省容量本身就是 5000** 钉死（默认值不许被改小/改大）。
+    const win = SSE_REPLAY_WINDOW / 1000; // = 5，整除保证边界关系与 5000 帧时完全同构
+    assert.ok(Number.isInteger(win) && win >= 3, `加速窗口必须是正整数且 ≥3，实际 ${win}`);
+    const fast = makeSse(dir, bus, true, win);
+    for (let i = 0; i < win + 5; i++) bus.publish('task.state', { i }, { dotId: 'dot1' });
+    assert.equal(fast.buffered(), win);
+    // 落后 win-1（在窗内）→ replay；落后 win+1 → resync
+    assert.equal(fast.reconnectPlan(bus.currentSeq() - (win - 1), ['queue']).action, 'replay');
+    assert.equal(fast.reconnectPlan(bus.currentSeq() - (win + 1), ['queue']).action, 'resync');
+    // 生产缺省：不注入 replayWindow 时窗口 = SSE_REPLAY_WINDOW（5000），契约 §4.5 原文
+    const prodWin = DEFAULT_SSE_REPLAY_WINDOW;
+    assert.equal(prodWin, SSE_REPLAY_WINDOW, '生产缺省环形缓冲容量必须等于 SSE_REPLAY_WINDOW');
+    const prodBus = new EventBus();
+    const prod = makeSse(dir, prodBus);
+    for (let i = 0; i < 10; i++) prodBus.publish('task.state', { i }, { dotId: 'dot1' });
+    assert.equal(prod.buffered(), 10, '未超窗时全部保留');
+    assert.equal(prod.reconnectPlan(1, ['queue']).action, 'replay', '缺省 5000 窗口内 10 帧可重放');
   } finally {
     dir.cleanup();
   }

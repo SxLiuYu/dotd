@@ -485,8 +485,22 @@ export class DotRunner {
    */
   async start(signal?: AbortSignal): Promise<void> {
     this.running = true;
+    // 常驻协程的生存纪律（审码 finding B）：`maxRunning=1` 下这个 while 是**唯一**的消费者。
+    // 任何一轮意外抛错都必须被吞掉并退避重试——否则协程直接退出，队列从此永久静止，
+    // 而 daemon 进程还活着、HTTP 还回 200，是"进程半死"最难排查的形态。
+    let backoff = this.idlePollMs;
     while (this.running && signal?.aborted !== true) {
-      const out = await this.runNext();
+      let out: TaskRunOutcome;
+      try {
+        out = await this.runNext();
+      } catch (err) {
+        // 这里能收到的只剩"连收口都失败"的错误（pop 抛错已在 runNext 内兜住）。
+        this.log(`runner: 循环轮次异常（${errText(err)}），${Math.min(backoff, START_MAX_BACKOFF_MS)}ms 后重试`);
+        await this.idleWait(signal, backoff);
+        backoff = Math.min(backoff * 2, START_MAX_BACKOFF_MS);
+        continue;
+      }
+      backoff = this.idlePollMs;
       if (out.status === 'none') {
         await this.idleWait(signal);
       }
@@ -499,13 +513,13 @@ export class DotRunner {
   }
 
   /** CP §2.1 空转等待：等 idlePollMs 或提前被唤醒（装配层可调 wakeNow）。 */
-  private idleWait(signal?: AbortSignal): Promise<void> {
+  private idleWait(signal?: AbortSignal, delayMs?: number): Promise<void> {
     return new Promise<void>((resolve) => {
       if (signal?.aborted === true) {
         resolve();
         return;
       }
-      const t = setTimeout(resolve, this.idlePollMs);
+      const t = setTimeout(resolve, delayMs ?? this.idlePollMs);
       if (typeof t.unref === 'function') t.unref();
       signal?.addEventListener('abort', () => {
         clearTimeout(t);
@@ -521,7 +535,16 @@ export class DotRunner {
    * 返回 'none' = 队列空（pop 返回 null）。
    */
   async runNext(): Promise<TaskRunOutcome> {
-    const task = this.cp.pop(this.dotId);
+    // 审码 finding B：pop 原本在 try 之外。cp.pop 走的是 SQLite（`DatabaseSync`，
+    // 同步抛错），库忙/库损坏/库被另一个进程锁住时它直接抛，异常会穿过 start() 的
+    // while 让常驻协程退出。这里把它兜成 'none'：本轮让位，下一轮再 pop。
+    let task: Task | null;
+    try {
+      task = this.cp.pop(this.dotId);
+    } catch (err) {
+      this.log(`runner: pop 异常（${errText(err)}），本轮让位`);
+      return { taskId: '', epoch: 0, status: 'none' };
+    }
     if (task === null) return { taskId: '', epoch: 0, status: 'none' };
     try {
       return await this.runTask(task);
@@ -1052,10 +1075,22 @@ export class DotRunner {
   private async onFatal(task: Task, err: unknown): Promise<TaskRunOutcome> {
     const msg = errText(err);
     this.log(`runner: 任务 ${task.id} 主循环异常：${msg}`);
+    let finished = false;
     try {
       this.cp.finish(task.id, task.runEpoch, { ok: false, summary: `runner:${msg}` });
-    } catch {
-      // 围栏拒绝等：交给看门狗 reclaim
+      finished = true;
+    } catch (finishErr) {
+      // 围栏拒绝（epoch 已变 / 任务已被取消）是正常竞态，交给看门狗或下一任 Runner。
+      this.log(`runner: finish 收口失败（${errText(finishErr)}），改走 failTask`);
+    }
+    if (!finished) {
+      // 审码 finding C：收口失败若只记日志，任务会**停在 running 白占 maxRunning=1**
+      // 直到看门狗 180s 回收。补一次 failTask（CP §5.4 通道，不经 attempt 重试）。
+      try {
+        this.failTask(task, task.runEpoch, `runner:${msg}`);
+      } catch (failErr) {
+        this.log(`runner: failTask 也失败（${errText(failErr)}），交看门狗回收 ${task.id}`);
+      }
     }
     await this.seal(task, 'failed', msg);
     return { taskId: task.id, epoch: task.runEpoch, status: 'failed', summary: msg };
@@ -1090,6 +1125,13 @@ export class DotRunner {
 }
 
 // ── 4. 自由函数 ──────────────────────────────────────────────────────────
+
+/**
+ * 常驻循环单轮异常后的退避上限（审码 finding B）。
+ * 60s 与 CP 的心跳超时同量级：退避到顶时仍远小于"运维会误判为卡死"的时长，
+ * 又足以让 SQLITE_BUSY 这类瞬时故障自愈而不打爆日志。
+ */
+const START_MAX_BACKOFF_MS = 60_000;
 
 /** 容器 home 根（EX §7 护栏；与 exec/protocol.ts:393 同值，跨模块不 import 实现）。 */
 const CONTAINER_HOME_ROOT = '/dot/home';

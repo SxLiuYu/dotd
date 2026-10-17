@@ -41,8 +41,10 @@ import type { GovDefaults } from '../src/governance/config.ts';
 import { AllEndpointsDownError } from '../src/shared/errors.ts';
 import type {
   ChatMessage,
+  ControlPlane,
   ExecToolCall,
   ExecToolResult,
+  GovernanceApi,
   HomeRelPath,
   MemoryServiceApi,
   MemoryWriteResult,
@@ -850,4 +852,242 @@ test('WRITE-SEAL：sealTask 抛错不得登记去重键（后续同键收口仍�
 
   const sealed = (runner as unknown as { sealed: Set<string> }).sealed;
   assert.equal(sealed.size, 0, '两次都失败 → 键一个都不登记');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 常驻协程生存纪律（审码 finding B / C）
+//
+// 背景：maxRunning=1 下 start() 的 while 是**唯一**的消费者。它一旦因异常退出，
+// 队列从此永久静止，而 daemon 进程还活着、HTTP 还回 200 —— "进程半死"。
+//
+// 写法约定：这两条要求轮询，**不能用 node --test 的内置超时**（内置超时不会打断
+// 被测的同步循环，卡住时只会永久挂起）。每个断言都被 Promise.race 包住，
+// 超时即失败退出；循环同时挂在 abort 上，测试失败也不会留下后台协程。
+// ═══════════════════════════════════════════════════════════════════
+
+/** 在 ms 内等条件成立；超时抛错（而不是挂死）。 */
+async function until(cond: () => boolean, ms: number, what: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`等待超时（${ms}ms）：${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** 让 promise 最多跑 ms；超时抛错并 abort 掉协程。 */
+async function within<T>(p: Promise<T>, ac: AbortController, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ac.abort();
+      reject(new Error(`协程在 ${ms}ms 内没有让出时间片：${what}`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** 只测调度行为的最小依赖面：pop/finish/failTask 都换成可编程桩。 */
+function loopHarness(opts: { pop: () => unknown }): {
+  cp: ControlPlane;
+  runner: DotRunner;
+  log: string[];
+  calls: { pop: number; finish: number; failTask: number };
+} {
+  const log: string[] = [];
+  const calls = { pop: 0, finish: 0, failTask: 0 };
+  const noop = async (): Promise<never> => {
+    throw new Error('不该被调用');
+  };
+  const cp = {
+    pop: () => {
+      calls.pop += 1;
+      return opts.pop();
+    },
+    finish: () => {
+      calls.finish += 1;
+    },
+    failTask: () => {
+      calls.failTask += 1;
+    },
+    journal: { tail: () => [] },
+  } as unknown as ControlPlane;
+  const runner = new DotRunner(
+    {
+      cp,
+      router: { complete: noop } as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+      exec: {
+        runTool: noop,
+        getCapabilities: async () => [],
+        reconcileCall: async () => 'unknown',
+        getCallResult: async () => null,
+        cancelTool: async () => {},
+      },
+      memory: {
+        openThread: noop,
+        appendMessage: noop,
+        appendSystemMessage: noop,
+        buildContextBundle: noop,
+        buildSessionReplay: async () => [],
+        beforeWrite: async () => ({ ok: true }),
+        sealTask: async () => {},
+      } as unknown as MemoryServiceApi,
+      governance: {
+        evaluate: async () => ({ kind: 'deny', decisionId: 'd', reason: 'x' }),
+        claim: async () => ({ ok: false }),
+        forceApproval: async () => ({ approvalId: 0 }),
+      } as unknown as GovernanceApi,
+    },
+    { idlePollMs: 5, log: (m) => log.push(m) },
+  );
+  return { cp, runner, log, calls };
+}
+
+/** 等循环转够圈数（用 pop 计数当进度条，不信固定 sleep；超时即失败）。 */
+async function waitPops(h: { calls: { pop: number } }, atLeast: number, ms = 3_000): Promise<void> {
+  await until(() => h.calls.pop >= atLeast, ms, `pop 只转了 ${h.calls.pop}/${atLeast} 圈`);
+}
+
+test('B：cp.pop 抛错不得让常驻协程退出（库忙/库损坏也只能让位一轮）', async () => {
+  let throwTimes = 3;
+  const h = loopHarness({
+    pop: () => {
+      if (throwTimes > 0) {
+        throwTimes -= 1;
+        throw new Error('SQLITE_BUSY: database is locked');
+      }
+      return null;
+    },
+  });
+  const ac = new AbortController();
+  try {
+    const loop = h.runner.start(ac.signal);
+    await waitPops(h, 6);
+    const popsAfterErrors = h.calls.pop;
+    assert.ok(popsAfterErrors >= 6, `pop 抛了 3 次后协程必须继续转（实际 pop ${popsAfterErrors} 次）`);
+    assert.ok(
+      h.log.some((m) => m.includes('pop 异常')),
+      '必须留下可排查的日志，而不是静默吞掉',
+    );
+    // 协程还活着：再让一轮
+    await waitPops(h, popsAfterErrors + 3, 1_000);
+    assert.ok(h.calls.pop > popsAfterErrors, '协程仍在推进');
+    ac.abort();
+    await within(loop, ac, 2_000, 'start() 收到 abort 后应退出');
+  } finally {
+    ac.abort();
+  }
+});
+
+test('B2：收口通道全断时每轮仍要回到循环（onFatal 不得把异常抛回 while）', async () => {
+  // 构造：只喂 3 个任务就返回 null——**不能每轮都喂**，否则协程以 idlePollMs
+  // 为周期热转，在负载机上会被饿死成随机红（测试缺陷，不是产品缺陷）。
+  // 喂满 3 个后走 idle 等待，既保留"收口通道全断仍回到循环"的语义，又不烧 CPU。
+  let rounds = 0;
+  const h = loopHarness({
+    pop: () => {
+      if (rounds >= 3) return null;
+      rounds += 1;
+      return {
+        id: `tk_${rounds}`,
+        dotId: 'dot1',
+        runEpoch: 1,
+        threadId: 'th',
+        title: 't',
+        goal: 'g',
+        budgetTokens: 1000,
+        resumeFromSeq: null,
+      };
+    },
+  });
+  (h.cp as unknown as { finish: () => never }).finish = () => {
+    throw new Error('finish boom');
+  };
+  (h.cp as unknown as { failTask: () => never }).failTask = () => {
+    throw new Error('failTask boom');
+  };
+  const ac = new AbortController();
+  try {
+    const loop = h.runner.start(ac.signal);
+    // 完成信号用日志（"尽力而为"，不依赖墙钟轮数）；断言只看是否真的转满 3 圈。
+    await until(() => h.log.some((m) => m.includes('failTask 也失败')), 20_000, '收口通道全断的日志');
+    assert.ok(h.calls.pop >= 3, `收口通道全断时每轮仍要回到循环（实际 ${h.calls.pop} 轮）`);
+    assert.ok(
+      h.log.some((m) => m.includes('failTask 也失败')),
+      '两条收口通道都失败时要有明确日志（交看门狗回收）',
+    );
+    // 3 个任务跑完后必须进入 idle（pop 返回 null）而不是继续热转：
+    // 这是"协程仍活着且不再有任务"的正确形态。
+    await until(() => h.calls.pop >= 4, 5_000, '任务喂完后应再转一圈进入 idle');
+    ac.abort();
+    await within(loop, ac, 5_000, 'start() 收到 abort 后应退出');
+  } finally {
+    ac.abort();
+  }
+});
+
+test('C：onFatal 里 finish 失败必须补 failTask，任务不能停在 running 白占 maxRunning=1', async () => {
+  const calls = { finish: 0, failTask: 0 };
+  const cp = {
+    pop: () => null,
+    finish: () => {
+      calls.finish += 1;
+      throw new Error('stale_writer');
+    },
+    failTask: () => {
+      calls.failTask += 1;
+    },
+    journal: { tail: () => [] },
+  } as unknown as ControlPlane;
+  const runner = new DotRunner(
+    {
+      cp,
+      router: {
+        complete: async () => {
+          throw new Error('model boom');
+        },
+      } as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+      exec: {
+        runTool: async () => ({ call_id: '', status: 'ok', result: null }),
+        getCapabilities: async () => [],
+        reconcileCall: async () => 'unknown',
+        getCallResult: async () => null,
+        cancelTool: async () => {},
+      },
+      memory: {
+        openThread: async () => 'th',
+        appendMessage: async () => {},
+        appendSystemMessage: async () => {},
+        buildContextBundle: async () => ({ memoryMd: '', manualExcerpts: [], summary: null }),
+        buildSessionReplay: async () => [],
+        beforeWrite: async () => ({ ok: true }),
+        sealTask: async () => {},
+      } as unknown as MemoryServiceApi,
+      governance: {
+        evaluate: async () => ({ kind: 'deny', decisionId: 'd', reason: 'x' }),
+        claim: async () => ({ ok: false }),
+        forceApproval: async () => ({ approvalId: 0 }),
+      } as unknown as GovernanceApi,
+    },
+    { idlePollMs: 5, log: () => {} },
+  );
+  const task = {
+    id: 'tk_c',
+    dotId: 'dot1',
+    runEpoch: 1,
+    threadId: 'th',
+    title: 't',
+    goal: 'g',
+    budgetTokens: 1000,
+    resumeFromSeq: null,
+  };
+  const out = await (runner as unknown as {
+    onFatal: (t: typeof task, e: unknown) => Promise<{ status: string }>;
+  }).onFatal(task, new Error('boom'));
+  assert.equal(out.status, 'failed');
+  assert.equal(calls.finish, 1, '先试 finish');
+  assert.equal(calls.failTask, 1, 'finish 失败后必须走 failTask，否则任务停在 running');
 });

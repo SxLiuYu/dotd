@@ -54,6 +54,17 @@ export interface SseFrame {
   data: string;
 }
 
+/**
+ * §4.5 重放环形缓冲的缺省容量（= SSE_REPLAY_WINDOW，5000 帧）。
+ *
+ * 为什么单独列一个常量：`SseBusOptions.replayWindow` 是**测试专用注入口**——
+ * 「环形缓冲只留 N 帧，超出即不可重放」这条用例如果按生产值 5000 跑，需要 push 5005 帧
+ * 并每次 `Array.prototype.shift()` 一个 5000 元素数组（主体序列化是 O(5000²) 字节拷贝，
+ * 实测单条用例 ~40–80s）。生产路径永远用本常量（见 `SseBus.replayWindow` 的类字段初始化），
+ * 只有测试显式传参时才变小；**默认值未变**。
+ */
+export const DEFAULT_SSE_REPLAY_WINDOW = SSE_REPLAY_WINDOW;
+
 export interface SseBusOptions {
   db: DatabaseSync;
   bus: EventBus;
@@ -61,6 +72,11 @@ export interface SseBusOptions {
   now?(): Date;
   /** 游标落盘节流：每 N 次 publish 落一次（0 = 每次 publish 都落）。默认 0（实时续读）。 */
   persistEvery?: number;
+  /**
+   * 环形缓冲容量（帧）。**缺省 = DEFAULT_SSE_REPLAY_WINDOW（= SSE_REPLAY_WINDOW = 5000）**，
+   * 与契约 §4.5 的「只保留 5000 帧」一致；只有测试为了不跑 O(N²) 时显式传小值。
+   */
+  replayWindow?: number;
 }
 
 /** 单个 SSE 订阅者的登记项。 */
@@ -112,6 +128,11 @@ export class SseBus {
   private readonly snapshot: SseSnapshotProvider | undefined;
   private readonly now: () => Date;
   private readonly persistEvery: number;
+  /**
+   * 环形缓冲容量。**生产缺省 = DEFAULT_SSE_REPLAY_WINDOW（= SSE_REPLAY_WINDOW，5000）**；
+   * 测试可经 `SseBusOptions.replayWindow` 注入更小值以避免 O(N²) 的 shift 拷贝。
+   */
+  private readonly replayWindow: number;
   private readonly ring: SseFrame[] = [];
   private readonly subscribers = new Map<number, Subscriber>();
   private detachFns: Array<() => void> = [];
@@ -123,6 +144,7 @@ export class SseBus {
     this.snapshot = opts.snapshot;
     this.now = opts.now ?? (() => new Date());
     this.persistEvery = opts.persistEvery ?? 0;
+    this.replayWindow = opts.replayWindow ?? DEFAULT_SSE_REPLAY_WINDOW;
   }
 
   /** 当前游标（= 最后一次 publish 的 seq）。 */
@@ -160,7 +182,8 @@ export class SseBus {
   /** 事件入环形缓冲 + 落盘游标（§4.5：重启续读）。 */
   private record(ev: BusEvent<unknown>): void {
     this.ring.push({ id: ev.seq, channel: ev.channel, kind: ev.kind, data: JSON.stringify(ev) });
-    if (this.ring.length > SSE_REPLAY_WINDOW) this.ring.shift();
+    // 容量缺省即 SSE_REPLAY_WINDOW（5000），行为与原实现逐字一致（只留最近 N 帧）。
+    if (this.ring.length > this.replayWindow) this.ring.shift();
   }
 
   private maybePersist(): void {
@@ -207,7 +230,7 @@ export class SseBus {
     if (lastEventId === null || lastEventId >= head) return { action: 'live' };
 
     const lag = head - lastEventId;
-    if (lag > SSE_REPLAY_WINDOW) return { action: 'resync', frame: this.resyncFrame('lag', lag) };
+    if (lag > this.replayWindow) return { action: 'resync', frame: this.resyncFrame('lag', lag) };
 
     const wanted =
       channels.length === 0 ? [...REPLAYABLE_CHANNELS] : channels.filter((c) => REPLAYABLE_CHANNELS.includes(c));

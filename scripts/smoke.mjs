@@ -22,6 +22,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash, createHmac } from 'node:crypto';
+import { createServer } from 'node:http';
 import {
   mkdtempSync,
   mkdirSync,
@@ -47,6 +48,16 @@ const POLL_MS = 250;
 const HOOK_SOURCE = 'smoke';
 const MASTER_TOKEN = 'smoke-master-token';
 const HOOK_SECRET = 'smoke-hook-secret';
+/**
+ * 非 stub 模型传输分支的独立开关（默认关闭，原 11 条断言路径逐字不变）。
+ *
+ * 开 = 模型链路走 **真 HttpTransport**（DOTD_MODEL_TRANSPORT 不设 stub），
+ * 但上游是一个本脚本在 127.0.0.1:0 起的**假 OpenAI 兼容服务**——零外网、零凭据。
+ * 这样证明的是 `daemon → ModelRouter → HttpTransport → 真 TCP → 上游` 整条链，
+ * 而不是 StubTransport 在内存里自说自话。stub 分支仍然保留：它是"路由/编排逻辑"
+ * 的证明，假上游分支是"出网编解码"的证明，两者互不替代（CONVENTIONS §7）。
+ */
+const FAKE_UPSTREAM = process.env.DOTD_SMOKE_FAKE_UPSTREAM === '1';
 
 // ── 断言记录 ──────────────────────────────────────────────────────────
 
@@ -157,6 +168,143 @@ const env = {
   // 宿主真实 ~/.dotd 绝不被读：db/config/outbox 都已显式覆盖
   HOME: homedir(),
 };
+
+// ── 假 OpenAI 兼容上游（仅 DOTD_SMOKE_FAKE_UPSTREAM=1 时启用）───────
+//
+// 一个真监听在 127.0.0.1:0 的 http 服务：按顺序把上面同一份 modelScript 里的
+// content / toolCalls 编成**真 OpenAI 线格式**回给 daemon。daemon 那边不知道它是假的，
+// 走的是真 HttpTransport（真 TCP、真 JSON 编解码、真 SSE 路径不涉及——本分支用非流式）。
+//
+// 为什么要复用 modelScript 而不是另写一份：这保证"stub 分支能跑通的编排"在真传输上
+// 也跑通同样的编排，差异只在传输层这一个变量上，对照才有意义。
+
+/** 按端点/轨/模型命中 modelScript，模拟 StubTransport 的 take() 语义（顺序消费）。 */
+function makeFakeUpstreamScript(items) {
+  const queue = items.map((it) => ({ ...it, used: false }));
+  return function take(track, model) {
+    for (const it of queue) {
+      if (it.used) continue;
+      if (it.track !== undefined && it.track !== track) continue;
+      if (it.model !== undefined && it.model !== model) continue;
+      it.used = true;
+      return it;
+    }
+    return null;
+  };
+}
+
+/** 把一条脚本项编成 OpenAI chat.completion 线格式。 */
+function toWireCompletion(item, model) {
+  const toolCalls = (item.toolCalls ?? []).map((tc) => ({
+    id: tc.id,
+    type: 'function',
+    // 上游看到的是消毒后的名字，且**按线上名字回显**——顺带验证 transport 的还原表
+    function: { name: String(tc.name).replace(/[^a-zA-Z0-9_-]/g, '_'), arguments: tc.arguments },
+  }));
+  return {
+    id: `chatcmpl-smoke-${Date.now()}`,
+    object: 'chat.completion',
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: item.content ?? '',
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        },
+        finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 20,
+      total_tokens: 120,
+      prompt_tokens_details: { cached_tokens: 0 },
+    },
+  };
+}
+
+/** 起假上游；返回 { baseUrl, requests, close }。 */
+async function startFakeUpstream(scriptItems) {
+  const take = makeFakeUpstreamScript(scriptItems);
+  const requests = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => {
+      body += c;
+    });
+    req.on('end', () => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        parsed = null;
+      }
+      requests.push({ path: req.url, body: parsed, auth: req.headers.authorization ?? null });
+      // 判定轨道：本冒烟里 light 轨只出现在事件分流，primary 轨是任务对话。
+      // 上游无法直接看到 track，按 system prompt 兜底识别（见 buildMessages）。
+      const msgs = Array.isArray(parsed?.messages) ? parsed.messages : [];
+      const sys = msgs.find((m) => m.role === 'system');
+      const track = /分流|classify|事件匹配/i.test(String(sys?.content ?? '')) ? 'light' : 'primary';
+      const model = String(parsed?.model ?? '');
+      const item = take(track, model) ?? take('primary', model);
+      if (item === null) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ id: 'x', choices: [], usage: { prompt_tokens: 1, completion_tokens: 0 } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(toWireCompletion(item, model)));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  return {
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    requests,
+    close: () =>
+      new Promise((r) => {
+        server.closeAllConnections?.();
+        server.close(() => r());
+      }),
+  };
+}
+
+let fakeUpstream = null;
+let fakeCfgDir = null;
+if (FAKE_UPSTREAM) {
+  fakeUpstream = await startFakeUpstream(JSON.parse(modelScript));
+  // 独立的 config 目录：只覆盖 models.yml（其余 yml 仍指仓库 config/，
+  // 靠 DOTD_CONFIG_DIR 指向临时目录 + 把需要的文件复制过来）。
+  fakeCfgDir = join(tmp, 'config-fake');
+  mkdirSync(fakeCfgDir, { recursive: true });
+  for (const f of ['dotd.yml', 'event-rules.yml', 'free-models.yml', 'rules.yml', 'tools.yml']) {
+    const src = join(REPO_ROOT, 'config', f);
+    if (existsSync(src)) writeFileSync(join(fakeCfgDir, f), readFileSync(src));
+  }
+  // 把真 config/models.yml 的 base_url 换成本地假上游；端点 id / 模型名 / 超时全部保留，
+  // 这样路由层看到的配置与生产同形，唯一的变量是"网络那头是谁"。
+  const modelsYml = readFileSync(join(REPO_ROOT, 'config', 'models.yml'), 'utf8');
+  const rewritten = modelsYml.replace(
+    /^(\s*base_url:\s*)http:\/\/127\.0\.0\.1:7863\/v1\s*$/m,
+    `$1${fakeUpstream.baseUrl}`,
+  );
+  if (rewritten === modelsYml) {
+    process.stderr.write('[smoke] 假上游分支：没能在 models.yml 里找到 tier1 base_url，配置改写失败\n');
+    await fakeUpstream.close();
+    process.exit(2);
+  }
+  writeFileSync(join(fakeCfgDir, 'models.yml'), rewritten, 'utf8');
+
+  // 切到假上游分支：不设 DOTD_MODEL_TRANSPORT=stub（= 真实路径），config 指向临时目录
+  env.DOTD_MODEL_TRANSPORT = '';
+  delete env.DOTD_MODEL_STUB_SCRIPT;
+  env.DOTD_CONFIG_DIR = fakeCfgDir;
+  // 假上游不校验鉴权，但仍给出一个假 key：证明 apiKeyEnv 真的被读并上送
+  env.WB2API_KEY = 'smoke-fake-key';
+}
 
 const daemon = spawn(process.execPath, ['--import', 'tsx', join(REPO_ROOT, 'src', 'daemon.ts')], {
   cwd: REPO_ROOT,
@@ -387,6 +535,69 @@ try {
   const outboxText = existsSync(join(dataDir, 'OUTBOX.md')) ? readFileSync(join(dataDir, 'OUTBOX.md'), 'utf8') : '';
   check('OUTBOX.md 有优雅退出留痕', outboxText.includes('优雅退出'), `bytes=${outboxText.length}`);
 
+  // ⑨【仅假上游分支】真 HttpTransport 链路的独立证据。
+  //
+  // 前 8 条断言（①–⑧ 原 11 个 check）在两种分支下逐字相同——它们只回答"编排对不对"。
+  // 这一条回答另一个问题，只有走真传输时才有意义：
+  //   daemon 里的 ModelRouter 是否**真的通过 TCP** 打到了上游、发的是不是合法
+  //   OpenAI 线格式（stream:false + tools 带 type:function + 真 Authorization），
+  //   以及上游回显的消毒工具名是否被还原成契约名（fs_write → fs.write）。
+  // 没有这一条，"冒烟全绿"就只是证明了 stub 在内存里自洽。
+  if (FAKE_UPSTREAM) {
+    const reqs = fakeUpstream.requests;
+    check(
+      '假上游分支：daemon 真的通过 TCP 打到了上游（请求数 > 0）',
+      reqs.length > 0,
+      `收到 ${reqs.length} 个 /chat/completions 请求`,
+    );
+
+    const chatReqs = reqs.filter((r) => String(r.path).endsWith('/chat/completions'));
+    check(
+      '假上游分支：全部请求走 POST /v1/chat/completions',
+      chatReqs.length === reqs.length && reqs.length > 0,
+      `paths=${[...new Set(reqs.map((r) => r.path))].join(',')}`,
+    );
+
+    // 线格式：tools 必须是 {type:'function',function:{name,parameters}}，名字已消毒
+    const withTools = chatReqs.filter((r) => Array.isArray(r.body?.tools) && r.body.tools.length > 0);
+    const wireOk =
+      withTools.length > 0 &&
+      withTools.every(
+        (r) =>
+          r.body.tools.every(
+            (t) =>
+              t.type === 'function' &&
+              typeof t.function?.name === 'string' &&
+              /^[a-zA-Z0-9_-]+$/.test(t.function.name) &&
+              typeof t.function?.parameters === 'object',
+          ) &&
+          r.body.stream === false,
+      );
+    check(
+      '假上游分支：tools 线格式合法（type=function / 名字已消毒 / stream:false）',
+      wireOk,
+      withTools.length === 0
+        ? '没有带 tools 的请求'
+        : `带工具请求 ${withTools.length} 个，示例=${JSON.stringify(withTools[0].body.tools.map((t) => t.function.name))}`,
+    );
+
+    // 鉴权头：apiKeyEnv 指向的 WB2API_KEY 必须真的上送
+    const authOk = chatReqs.length > 0 && chatReqs.every((r) => r.auth === 'Bearer smoke-fake-key');
+    check(
+      '假上游分支：Authorization 头按 api_key_env 真的上送',
+      authOk,
+      `示例=${JSON.stringify(chatReqs[0]?.auth ?? null)}`,
+    );
+
+    // 消毒名还原：journal 里记的必须是契约名 fs.write，不是 fs_write
+    const journalOk = toolStep !== null && toolStep.tool_name === 'fs.write';
+    check(
+      '假上游分支：上游回显的消毒工具名已还原为契约名（fs_write → fs.write）',
+      journalOk,
+      `journal tool_name=${toolStep?.tool_name ?? 'n/a'}`,
+    );
+  }
+
   failed = checks.some((c) => !c.ok);
   exitCode = failed ? 1 : 0;
 } catch (cause) {
@@ -397,6 +608,13 @@ try {
 } finally {
   if (daemon.exitCode === null) {
     daemon.kill('SIGKILL');
+  }
+  if (fakeUpstream !== null) {
+    try {
+      await fakeUpstream.close();
+    } catch {
+      // 已关
+    }
   }
   // Windows 上文件句柄释放有延迟（WAL/SHM），删不掉只留警告，不影响判定
   for (let i = 0; i < 10; i++) {
