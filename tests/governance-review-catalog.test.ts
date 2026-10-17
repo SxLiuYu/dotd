@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { registerTempPath, sweepTempPaths } from './helpers.ts';
 import { makeGovFixture, ctxOf, auditRows } from './governance-support.ts';
 import type { GovFixture } from './governance-support.ts';
 import { evaluate, decide, claim, resolveExecution } from '../src/governance/gate.ts';
@@ -46,6 +47,10 @@ import {
 import { govDefaults } from '../src/governance/config.ts';
 import type { ToolCall } from '../src/governance/types.ts';
 
+// 兜底回收临时目录：治理用例大量走 makeGovFixture()（真库 + 临时 config），
+// 个别用例忘了 cleanup 时不让目录留在 TEMP 里（tests/helpers.ts 的登记表 + 自检）。
+test.after(() => { sweepTempPaths(); });
+
 const fixtures: GovFixture[] = [];
 function fixture(opts: Parameters<typeof makeGovFixture>[0] = {}): GovFixture {
   const f = makeGovFixture(opts);
@@ -56,6 +61,7 @@ function fixture(opts: Parameters<typeof makeGovFixture>[0] = {}): GovFixture {
 /** 建一个临时 yml 文件并加载。 */
 function tmpYml(name: string, text: string): string {
   const dir = mkdtempSync(join(tmpdir(), 'dotd-gov-yml-'));
+  registerTempPath(dir); // 登记进 helpers 临时路径表：test.after(sweepTempPaths) 兜底回收
   const p = join(dir, name);
   writeFileSync(p, text, 'utf8');
   return p;
@@ -992,6 +998,7 @@ test('§5.1.2 batch_ref：同任务 5 分钟内第 2 张 browser 审批单继承
 
 test('loadCatalog：tools+rules 一并加载，告警合并', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dotd-gov-both-'));
+  registerTempPath(dir); // 登记：test.after(sweepTempPaths) 兜底回收（此处不手工删，保持原用例结构）
   const tp = join(dir, 'tools.yml');
   const rp = join(dir, 'rules.yml');
   writeFileSync(

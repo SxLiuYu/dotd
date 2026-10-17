@@ -59,7 +59,7 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `node node_modules/typescript/bin/tsc --noEmit -p .` | exit **0**，0 错误 |
-| 测试套件 | `npm test` | `tests 1004 / pass 1004 / fail 0`，exit **0**（48 个 `.test.ts` 文件，92 个 suite） |
+| 测试套件 | `npm test`（并行 4） | `tests 1138 / pass 1138 / fail 0`，exit **0**（56 个 `.test.ts` 文件，110 个 suite；串行同值，见「已知限制」） |
 | 端到端冒烟 | `node scripts/smoke.mjs` | **11/11 通过**，exit **0** |
 
 > 测试总数是**流动的**（`tests/` 目录在活跃迭代中：套件总数从 873 经 879、935、976 变成 1004，中间只隔了几小时）。上面的数字是 2026-10-17 多次实跑的结果（末次 19:12）；跑之前自己数一遍更稳妥：
@@ -69,15 +69,14 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 
 ### 测试数字必须说清的一件事
 
-上面的 `1004/1004` 是**在 `dotd/` 目录下**跑出来的（`npm test` 的 cwd 就是仓库根）。但门禁记录过一次 11 个失败（`pass 862 / fail 11`，exit 1）——那次跑的时候套件总数是 879。这 11 个失败**全部集中在同一类测试**：三个按 `process.cwd()` 拼仓库内文件路径的测试文件——
+~~上面的 `1004/1004` 是**在 `dotd/` 目录下**跑出来的…三个按 `process.cwd()` 拼仓库内文件路径的测试文件~~ —— **2026-10-17 已修**：那三个文件（`router-config` / `surfaces-channels-web-config` / `surfaces-cli`）已改为用 `import.meta.url` 推导仓库根，现在 `npm test` 在**任意 cwd** 下都绿。
 
-- `tests/router-config.test.ts:34` — `join(process.cwd(), 'config', 'models.yml')`，解析真实 `models.yml` 的续行写法
-- `tests/surfaces-channels-web-config.test.ts:432` — `join(process.cwd(), 'config', 'dotd.yml')`，读仓库真实 `dotd.yml` 全七节
-- `tests/surfaces-cli.test.ts:370` — `join(process.cwd(), 'src', 'surfaces', 'cli.ts')`，读源码断言 CLI 不 import SQLite
+- `tests/router-config.test.ts` — `REAL_MODELS_YML = join(dirname(fileURLToPath(import.meta.url)), '..', 'config', 'models.yml')`
+- `tests/surfaces-channels-web-config.test.ts` — `REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')` → `join(REPO_ROOT, 'config', 'dotd.yml')`
+- `tests/surfaces-cli.test.ts` — 同上，`join(REPO_ROOT, 'src', 'surfaces', 'cli.ts')`
 
-我从 `dotd/tests/` 目录单独跑这三个文件，复现出了完全相同的失败集合（`ENOENT`，因为 cwd 下没有 `config/` 和 `src/`）。也就是说：**这不是产品缺陷，是测试套件的 cwd 脆弱性**——换任何非仓库根的目录启动，这 11 个就红。仓库里其余 42 个测试文件都用 `import.meta.url` 推导路径，不受影响。
+实测：从 `dotd/tests/` 目录单独跑这三个文件，改动前是 ENOENT 红，改动后 `22/22`、`32/32`、`28/28` 全绿。以后新增测试若要去仓库根，**一律用 `import.meta.url`**，不要用 `process.cwd()`。
 
-所以「测试全绿」这句话必须带限定词：**从 `dotd/` 目录跑 `npm test` 才是 1004/1004**。别在别的目录跑，也别据此认为有 11 个真实失败。
 
 ### 哪些是真验证过的
 
@@ -268,7 +267,9 @@ token 三顺位：`--token` > `DOTD_MASTER_TOKEN` > `~/.dotd/cli_token`（`src/s
 
 ```bash
 npm run typecheck                  # tsc --noEmit -p .
-npm test                           # 1004 个用例；务必在 dotd/ 目录下跑
+npm test                           # 1138 个用例；并行 4，任意 cwd 都可（约 60–90s）
+npm run test:serial                # 同上但不并行（约 5 分钟；排查并行相关假红时用）
+npm run test:fast                  # 日常快检（同并行 4）
 node scripts/smoke.mjs             # 11/11 端到端冒烟（自建临时数据目录，不碰 ~/.dotd）
 npm run build:web                  # web-ui：tsc --noEmit + vite build
 ```
@@ -343,8 +344,8 @@ tier1 → tier2 → tier3 → tier4 **单向**，失败永远向前降级，绝�
 ### 高
 
 - **真实链路一次都没验证过。** 全部 1004 测试与 11/11 冒烟都在 `DOTD_MODEL_TRANSPORT=stub` + `DOTD_FLEET=stub` 下通过。tier1 代理 hy3（`:7863`）的 tool_calls、breaker open→half_open 探活、真实容器 boot/recreate、`/fs/ops` 桥、netguard iptables 实装，全只在上层 stub 上验过。
-- **`npm test` 曾是个假绿（2026-10-17 已修）。** 原脚本写成 `--test "tests/*.test.ts"`，引号让 glob 不展开，`--test` 拿到一个字面量文件名、找不到文件也不报错——`tests 0 / pass 0 / fail 0`、exit **0**。也就是说修好之前 `npm test` 对任何人（含 CI）都是"全绿"。现已改成无引号，并固定 `--test-concurrency=1`（并行跑时有 3 个假红，见下条）。
-- **并行跑测试有 3 个假红（2026-10-17 已修，非代码缺陷）。** `node --test` 默认按文件并行，并行全量时 `tests/router-health.test.ts` 有 3 个 429 冷却评分用例稳定失败（`cooldownRemainingMs` 读到 0、期望 7500）。单独跑该文件 25/25 过，串行跑全量也过，独立探针在全新 db 上复刻同样 settle 序列得到 `remaining = 7500 / factor = 0.5`（完全符合断言）——是 runner 并发的共享状态污染，不是 `Breaker`/`HealthTracker` 的错。`npm test` 已固定为串行。
+- **`npm test` 曾是个假绿（2026-10-17 已修）。** 原脚本写成 `--test "tests/*.test.ts"`，引号让 glob 不展开，`--test` 拿到一个字面量文件名、找不到文件也不报错——`tests 0 / pass 0 / fail 0`、exit **0**。也就是说修好之前 `npm test` 对任何人（含 CI）都是"全绿"。现已改成无引号。
+- ~~**并行跑测试有 3 个假红**（`tests/router-health.test.ts` 的 3 个 429 冷却评分用例）；`npm test` 固定为串行。~~ **2026-10-17 已恢复并行（测试套件加速任务）。** 当时的根因判定（"runner 并发的共享状态污染"）没有复现；把测试里的真实等待砍掉之后实测 **`--test-concurrency=4` 连跑 3 次全量 1138/1138、0 失败**（90.4s / 112.5s / 61.7s），`router-health` 并行下 25/25。现在 `npm test` = 并行 4；要复现旧行为用 `npm run test:serial`，日常快检用 `npm run test:fast`（同并行 4）。**注意**：并行时任何"靠真定时器/墙钟等待推进"的用例都会在负载机上被饿死（本机还跑着 6 个 node 测试进程时有实例），所以新测试一律用可注入的假时钟或事件驱动等待，别写 `sleep`。
 - **CLI 入口守卫在中文路径下恒假（2026-10-17 已修）。** 原判据拿 `import.meta.url` 和手拼的 `file://${argv[1]}` 比，而 `import.meta.url` 会把非 ASCII 路径段百分号编码（`%E7%A0%94%E7%A9%B6` = "研究"），手拼的不编码，两者永不相等 → 守卫恒假 → `node src/surfaces/cli.ts status` 静默退出、exit 0、零输出。**README 里每一条 `npm run dotd -- xxx` 示例因此都曾是空操作。** 已改为与 `src/daemon.ts` 同一手法（比对解析后的绝对路径），修复后 `--help` 正常列出 15 个子命令。
 - **第二个 daemon 实例不消费队列。** 用 `DOTD_CONFIG` 指向另一份配置换个端口（如 `:7799`）起 daemon，`/api/status` 正常、能提交任务，但任务永远停在 `queued`——exec 层启动即把 dot1 标 `quarantined`（日志 `[exec] boot 告警：dot1 进入 quarantined`），没有消费者。看到"任务不动"先查这条。
 - **tier1 的 `WB2API_KEY` 在全机没有持久来源（真缺口，非文档疏漏）。** 搭建方法已写进 [`docs/tier1-endpoint.md`](docs/tier1-endpoint.md)，但 2026-10-17 排查发现这个 key 不在 `~/.dotd/tokens.env`（逐行看过），也不在 Windows 用户/机器环境变量（`HKCU:\Environment` 与 Machine 作用域均无）——它只存在于当前跑着的 daemon 进程环境里（`/proc/<pid>/environ` 实测有值），即启动它的 shell 临时 export 的。后果：用 `scripts/daemon-launch.sh` 重启 daemon 就会丢 key（该脚本只 `source tokens.env`），重启即 tier1 全灭，且现象是"daemon 正常起、任务全部不干活"。修法：把 `export WB2API_KEY=...` 补进 `~/.dotd/tokens.env`。

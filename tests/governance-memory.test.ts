@@ -8,6 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { sweepTempPaths } from './helpers.ts';
 import { makeGovFixture, ctxOf, auditRows } from './governance-support.ts';
 import type { GovFixture } from './governance-support.ts';
 import { evaluate, decide } from '../src/governance/gate.ts';
@@ -22,6 +23,10 @@ import {
   enforceTierCap,
 } from '../src/governance/memory-rules.ts';
 import { govDefaults } from '../src/governance/config.ts';
+
+// 兜底回收临时目录：治理用例大量走 makeGovFixture()（真库 + 临时 config），
+// 个别用例忘了 cleanup 时不让目录留在 TEMP 里（tests/helpers.ts 的登记表 + 自检）。
+test.after(() => { sweepTempPaths(); });
 
 const fixtures: GovFixture[] = [];
 function fixture(opts: Parameters<typeof makeGovFixture>[0] = {}): GovFixture {

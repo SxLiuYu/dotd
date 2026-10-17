@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { EventBus } from '../src/shared/bus.ts';
-import { makeTempDataDir } from './helpers.ts';
+import { makeTempDataDir, registerTempPath } from './helpers.ts';
 import type { TempDataDir } from './helpers.ts';
 import { createGovernance, initGovernance } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
@@ -119,6 +119,9 @@ export function makeGovFixture(
 ): GovFixture {
   const tmp = makeTempDataDir();
   const root = mkdtempSync(join(tmpdir(), 'dotd-gov-cfg-'));
+  // 登记进 helpers 的临时路径表：即使调用方忘了 cleanup()，`sweepTempPaths()` 也会回收
+  // （此前这里每个 fixture 泄漏一个目录，TEMP 里积了数百个 dotd-gov-cfg-*）。
+  registerTempPath(root);
   const toolsPath = join(root, 'tools.yml');
   const rulesPath = join(root, 'rules.yml');
   writeFileSync(

@@ -15,12 +15,13 @@
  * 两变量由 daemon.ts 装配层在启动时读取；测试直接调本文件的工厂，不经装配层。
  */
 
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb } from '../db/conn.ts';
 import { migrate } from '../db/migrate.ts';
+import { openMigratedTemplateDb, acquirePooledDb, releasePooledDb } from '../db/template.ts';
 import { EventBus } from '../src/shared/bus.ts';
 import type {
   ExecToolCall,
@@ -31,6 +32,16 @@ import type {
 } from '../src/shared/contracts.ts';
 
 // ── 1. 临时数据目录 ────────────────────────────────────────────────
+
+/**
+ * 按需建库文件（池模式下用）：池库是内存库，`dir.dbPath` 只在真有独立连接/子进程要用时
+ * 才需要存在。建出来的文件与池库同结构（同一模板），且同样是 user_version=100。
+ */
+function ensureOwnDbFile(dbPath: string): void {
+  if (existsSync(dbPath)) return;
+  const own = openMigratedTemplateDb(dbPath);
+  own.close();
+}
 
 export interface TempDataDir {
   /** 临时根目录（已创建）。 */
@@ -53,8 +64,21 @@ export interface TempDataDir {
  *
  * 契约 D1 的库路径解析（db/conn.ts resolveDbPath）优先显式参数 > DOTD_DB_PATH，
  * 因此这里显式传 dbPath，不受宿主真实 ~/.dotd 影响。
+ *
+ * ⚡ 加速（2026-10-17，测试套件加速任务）：建库走 `db/template.ts` 的空库模板
+ * （进程内首次仍完整跑一次真 `migrate()`，之后按"初始 CREATE TABLE + ALTER 回放"重建），
+ * 实测单次建库（磁盘库）~110ms → ~60ms；`{pool:true}` 再省掉重复建表（~15ms → ~2ms）。
+ *
+ * 门禁口径不变：**列定义 / 索引 / `user_version` 与真迁移逐字等价**由
+ * `tests/db-template.test.ts` 钉死（逐库比对 `sqlite_master` + `pragma_table_info`）。
+ * 需要"真跑一遍迁移"的用例（迁移 runner 自身）请直接用 `migrate()`，不要用本工厂。
+ *
+ * @param opts.pool 从**空库池**借库（`db/template.ts` 的 acquire/release）：每用例仍拿到
+ *   "空表 + user_version=100"，但复用已建好的表结构。要求：该用例**不自带库文件路径假设**
+ *   （默认全满足）；`dir.dbPath` 指向的子进程会用**独立的新库文件**（池库是内存库，
+ *   无法给子进程用），仅 `{pool:true}` 时成立。
  */
-export function makeTempDataDir(): TempDataDir {
+export function makeTempDataDir(opts: { pool?: boolean } = {}): TempDataDir {
   const root = mkdtempSync(join(tmpdir(), 'dotd-test-'));
   const dbPath = join(root, 'dotd.db');
   const outboxPath = join(root, 'OUTBOX.md');
@@ -62,12 +86,19 @@ export function makeTempDataDir(): TempDataDir {
   mkdirSync(blobDir, { recursive: true });
   writeFileSync(outboxPath, '', 'utf8');
 
-  const db = openDb(dbPath);
-  migrate(db); // 推到 user_version=100，测试直接面对终态 schema
+  let db: DatabaseSync;
+  if (opts.pool === true) {
+    db = acquirePooledDb();
+    // 子进程/独立连接要用的库文件：按需建一份（与池库表结构相同），仅当有人真的去开它。
+    ensureOwnDbFile(dbPath);
+  } else {
+    db = openMigratedTemplateDb(dbPath); // 终态 schema = user_version 100（与旧 openDb+migrate 相同）
+  }
 
   const bus = new EventBus();
 
   let cleaned = false;
+  registerTempPath(root);
   return {
     root,
     dbPath,
@@ -78,14 +109,106 @@ export function makeTempDataDir(): TempDataDir {
     cleanup(): void {
       if (cleaned) return;
       cleaned = true;
-      try {
-        db.close();
-      } catch {
-        // 已关
+      if (opts.pool === true) {
+        releasePooledDb(db); // 清空数据后归池（不 close）
+      } else {
+        try {
+          db.close();
+        } catch {
+          // 已关
+        }
       }
-      rmSync(root, { recursive: true, force: true });
+      // 必须先关库再删目录：SQLite 的 db-wal/db-shm 句柄没释放时 rmSync 会 EBUSY/EPERM。
+      removeTempPath(root);
     },
   };
+}
+
+// ── 1b. 临时路径登记表（防泄漏 + 自检）─────────────────────────────
+//
+// 背景（2026-10-17 实测）：TEMP 里积了 4600+ 个 `dotd-test-*` 目录。逐个排查后**不是**
+// `cleanup()` 删不掉（实测：先 `db.close()` 再 `rmSync`，30/30 干净），而是**有些测试根本
+// 没调 cleanup**——典型是 `tests/governance-support.ts:makeGovFixture()` 额外 mkdtemp 的
+// `dotd-gov-cfg-*`（它从来没人删）。所以这里做两件事：
+//   1. 所有经本文件的 temp 路径登记在案，`cleanup()` 时**自检目录确实消失**（删不掉重试并报警）；
+//   2. 提供 `sweepTempPaths()`：测试文件用 `t.after(sweepTempPaths)` 兜底回收，
+//      用例忘了 cleanup 也不会把目录丢在 TEMP 里。
+
+/** 已登记、尚未删除的临时路径（进程内）。 */
+const liveTempPaths = new Set<string>();
+
+/** 删除失败时的重试次数（Windows 上杀毒/索引器偶发持有句柄）。 */
+const RM_RETRIES = 5;
+
+/** 登记一个临时路径（`cleanup()` 与 `sweepTempPaths()` 都会处理它）；**返回原路径**以便内联使用。 */
+export function registerTempPath<T extends string>(p: T): T {
+  liveTempPaths.add(p);
+  return p;
+}
+
+/**
+ * 删掉一个临时路径：最多重试 `RM_RETRIES` 次（每次 20ms），成功后从登记表移除。
+ * @returns 删除后目录是否确实不存在（`false` = 删不掉，调用方应报警）。
+ */
+export function removeTempPath(p: string): boolean {
+  for (let i = 0; i < RM_RETRIES; i++) {
+    try {
+      rmSync(p, { recursive: true, force: true, maxRetries: 2, retryDelay: 10 });
+    } catch {
+      // 句柄还没放：下一轮再来
+    }
+    if (!existsSync(p)) {
+      liveTempPaths.delete(p);
+      return true;
+    }
+    // 同步自旋等 20ms（cleanup 是同步 API；不引入异步等待以免改变测试时序）
+    const until = Date.now() + 20;
+    while (Date.now() < until) {
+      // busy-wait：20ms 级别的等待，避免 rm 的“关库尚未完成 → EBUSY”竞态
+    }
+  }
+  return !existsSync(p);
+}
+
+/**
+ * 兜底清理：把本文件登记过、仍存在的临时路径全部删掉。
+ * 测试文件可写 `test.after(sweepTempPaths)` 一行兜底（忘了 cleanup 也不泄漏）。
+ *
+ * 注意：sweep 只能删**没人再持有连接**的目录。库连接还开着时 Windows 上删不掉
+ * （WAL/SHM 句柄）——这是设计上的安全边界，不是缺陷；用例写完数据后仍应自己 `cleanup()`。
+ * @returns 仍删不掉的路径（正常情况下应为空）。
+ */
+export function sweepTempPaths(): string[] {
+  const left: string[] = [];
+  for (const p of [...liveTempPaths]) {
+    if (!removeTempPath(p)) left.push(p);
+  }
+  return left;
+}
+
+/**
+ * 强制回收一个临时目录（供**忘调 cleanup 的用例**兜底）：若路径登记过且其库连接仍开着，
+ * 由调用方显式关库（`closeOwner`）后再删。
+ * @returns 目录是否已不存在。
+ */
+export function forceRemoveTempPath(p: string, closeOwner?: () => void): boolean {
+  if (!existsSync(p)) {
+    liveTempPaths.delete(p);
+    return true;
+  }
+  if (closeOwner !== undefined) {
+    try {
+      closeOwner();
+    } catch {
+      // 已关
+    }
+  }
+  return removeTempPath(p);
+}
+
+/** 当前登记但未删除的临时路径数量（诊断/自检用）。 */
+export function liveTempPathCount(): number {
+  return liveTempPaths.size;
 }
 
 // ── 2. stub 模型 transport（DOTD_MODEL_TRANSPORT=stub）──────────────

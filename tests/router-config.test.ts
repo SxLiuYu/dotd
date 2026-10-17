@@ -20,7 +20,8 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { makeTempDataDir, type TempDataDir } from './helpers.ts';
 import { loadModelsConfig, parseModelsYaml } from '../src/router/config.ts';
@@ -36,8 +37,8 @@ afterEach(() => {
   tmp.cleanup();
 });
 
-/** 仓库真实 models.yml 的绝对路径（cwd = dotd/）。 */
-const REAL_MODELS_YML = join(process.cwd(), 'config', 'models.yml');
+/** 仓库真实 models.yml 的绝对路径（由本文件位置推导，不依赖 cwd）。 */
+const REAL_MODELS_YML = join(dirname(fileURLToPath(import.meta.url)), '..', 'config', 'models.yml');
 
 // ═══════════════════════════════════════════════════════════════════
 // 1. 真实配置：续行 models 映射（阻塞级回归）

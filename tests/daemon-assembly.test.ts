@@ -118,7 +118,10 @@ async function boot(): Promise<{ daemon: Awaited<ReturnType<typeof assembleDaemo
       stubTransport: true,
       dotIds: ['dot1'],
       shutdownGraceMs: 5_000,
-      idlePollMs: 1_000,
+      // ⚡ Runner 空转轮询 1000ms → 5ms：6 条用例各自的 daemon 起停里，
+      //    shutdown 前的空转轮询纯是墙钟等待（生产默认仍由 loadDaemonConfig 的 1_000 决定，
+      //    src/daemon.ts:169；这里只是测试注入，语义/断言不变）。
+      idlePollMs: 5,
     },
   });
   const close = async (): Promise<void> => {

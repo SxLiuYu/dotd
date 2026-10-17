@@ -7,7 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeTempDataDir } from './helpers.ts';
+import { makeTempDataDir, sweepTempPaths } from './helpers.ts';
 import type { TempDataDir } from './helpers.ts';
 import { makeGovFixture, ctxOf, approvalRow, auditRows } from './governance-support.ts';
 import type { GovFixture } from './governance-support.ts';
@@ -15,6 +15,10 @@ import { evaluate, decide, claim, resolveExecution, revoke } from '../src/govern
 import { isLegalTransition, TRANSITIONS } from '../src/governance/status.ts';
 import { forceApproval } from '../src/governance/gate.ts';
 import type { ApprovalStatus } from '../src/shared/contracts.ts';
+
+// 兜底回收临时目录：治理用例大量走 makeGovFixture()（真库 + 临时 config），
+// 个别用例忘了 cleanup 时不让目录留在 TEMP 里（tests/helpers.ts 的登记表 + 自检）。
+test.after(() => { sweepTempPaths(); });
 
 const fixtures: GovFixture[] = [];
 const tmps: TempDataDir[] = [];

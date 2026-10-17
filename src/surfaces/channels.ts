@@ -137,6 +137,12 @@ export interface NotificationChannelsDeps {
   /** 飞书出站目标 chat_id（oc_ / open_id）。缺省 → deliver('feishu') 如实报未配置。 */
   feishuChatId?: string;
   now?(): number;
+  /**
+   * §5.7「3 次快重试、2s 间隔」的**间隔毫秒数**。缺省 = TG_RETRY_DELAY_MS（2000）。
+   * 测试专用注入口：验"重试 3 次后如实失败"只需快重试的**次数与最终结果**，
+   * 不必真的等满 4s 墙钟；生产路径不传该字段 → 仍由下方常量决定，默认值未变。
+   */
+  retryDelayMs?: number;
 }
 
 /** MR §4.5：telegram 可用性 = bot token 已配且最近 5min getMe 成功。 */
@@ -153,10 +159,13 @@ const TG_RETRY_DELAY_MS = 2_000;
 export class SurfacesNotificationChannels implements NotificationChannels {
   private readonly file: FileChannel;
   private readonly now: () => number;
+  /** §5.7 快重试间隔（缺省 TG_RETRY_DELAY_MS = 2000；测试可注入更小值）。 */
+  private readonly retryDelayMs: number;
 
   constructor(private readonly deps: NotificationChannelsDeps) {
     this.file = new FileChannel(deps.filePath);
     this.now = deps.now ?? (() => Date.now());
+    this.retryDelayMs = deps.retryDelayMs ?? TG_RETRY_DELAY_MS;
   }
 
   available(channel: 'telegram' | 'feishu' | 'email'): boolean {
@@ -187,7 +196,7 @@ export class SurfacesNotificationChannels implements NotificationChannels {
       for (let i = 0; i < TG_FAST_RETRIES; i++) {
         last = await this.deliverTelegram(text);
         if (last.ok) return last;
-        if (i < TG_FAST_RETRIES - 1) await sleep(TG_RETRY_DELAY_MS);
+        if (i < TG_FAST_RETRIES - 1) await sleep(this.retryDelayMs);
       }
       return last;
     }
@@ -198,7 +207,7 @@ export class SurfacesNotificationChannels implements NotificationChannels {
       for (let i = 0; i < TG_FAST_RETRIES; i++) {
         last = await this.deliverFeishu(text);
         if (last.ok) return last;
-        if (i < TG_FAST_RETRIES - 1) await sleep(TG_RETRY_DELAY_MS);
+        if (i < TG_FAST_RETRIES - 1) await sleep(this.retryDelayMs);
       }
       return last;
     }

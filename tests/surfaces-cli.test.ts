@@ -14,9 +14,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DEFAULT_BASE_URL, EXIT_UNREACHABLE, buildCli, resolveBaseUrl, resolveToken } from '../src/surfaces/cli.ts';
 import type { CliOptions } from '../src/surfaces/cli.ts';
+
+/**
+ * 仓库根（dotd/）绝对路径——由本文件位置推导，**不依赖 `process.cwd()`**。
+ * 依据 README「测试数字必须说清的一件事」：用 cwd 拼仓库内路径会让测试在非仓库根
+ * 目录启动时 ENOENT（例如从 dotd/tests/ 跑）。
+ */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // ── 测试辅助：捕获输出与退码，stub fetch ─────────────────────────────
 
@@ -367,7 +375,7 @@ test('resolveToken 顺位 3：~/.dotd/cli_token（临时 HOME 隔离，不碰真
 
 test('CLI 不依赖 SQLite（全部经 HTTP；无 db 导入即证明）', async () => {
   // 直接读源码断言：cli.ts 不得 import node:sqlite / db/ 层（§5.6：CLI 不直写库）
-  const src = readFileSync(join(process.cwd(), 'src', 'surfaces', 'cli.ts'), 'utf8');
+  const src = readFileSync(join(REPO_ROOT, 'src', 'surfaces', 'cli.ts'), 'utf8');
   assert.ok(!/node:sqlite/.test(src), 'CLI 不得 import node:sqlite');
   assert.ok(!/from '\.\.\/db\//.test(src), 'CLI 不得 import db 层');
   assert.ok(!/openDb|migrate\(/.test(src), 'CLI 不得开库/迁移');

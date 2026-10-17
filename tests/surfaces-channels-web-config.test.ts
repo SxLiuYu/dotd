@@ -7,7 +7,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createServer, type Server } from 'node:http';
 import { Writable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -33,6 +34,16 @@ import { expandEnv, expandHome, loadSurfacesConfig, parseSurfacesSection } from 
 import { ConfigError } from '../src/shared/errors.ts';
 import { assertHttpConfig } from '../src/surfaces/http.ts';
 import type { SurfacesConfig } from '../src/surfaces/types.ts';
+import { registerTempPath, sweepTempPaths } from './helpers.ts';
+
+test.after(() => { sweepTempPaths(); });
+
+/**
+ * 仓库根（dotd/）绝对路径——由本文件位置推导，**不依赖 `process.cwd()`**。
+ * 依据 README「测试数字必须说清的一件事」：用 cwd 拼仓库内路径会让测试在非仓库根
+ * 目录启动时 ENOENT（例如从 dotd/tests/ 跑）。
+ */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 // ═══════════════════════════════════════════════════════════════════
 // 一、出站通道（§5.7）
@@ -77,7 +88,9 @@ test('NULL_FEISHU_GATEWAY：未配 App ID/Secret 时 available 恒 false、deliv
   const ch = new SurfacesNotificationChannels({
     telegram: NULL_TELEGRAM_GATEWAY,
     feishu: NULL_FEISHU_GATEWAY,
-    filePath: join(mkdtempSync(join(tmpdir(), 'dotd-chan-')), 'notifications.log'),
+    filePath: join(registerTempPath(mkdtempSync(join(tmpdir(), 'dotd-chan-'))), 'notifications.log'),
+    // ⚡ 只压缩"等多久"（§5.7 的 2s → 1ms），重试次数与全部断言不变。
+    retryDelayMs: 1,
   });
   assert.equal(ch.available('feishu'), false);
   // 有 chat id 也发不出去（真 App ID/Secret 为空 → token 接口必然失败）
@@ -124,7 +137,7 @@ test('FeishuGateway：拿到 tenant_access_token 即置位可用性（不靠先�
     const ch = new SurfacesNotificationChannels({
       telegram: NULL_TELEGRAM_GATEWAY,
       feishu: gw,
-      filePath: join(mkdtempSync(join(tmpdir(), 'dotd-warm-')), 'notifications.log'),
+      filePath: join(registerTempPath(mkdtempSync(join(tmpdir(), 'dotd-warm-'))), 'notifications.log'),
       feishuChatId: 'oc_owner',
     });
     assert.equal(ch.available('feishu'), true, '凭证有效即视为可用（求救才进得了飞书）');
@@ -142,7 +155,7 @@ test('FeishuGateway.warm()：token 接口失败 → 返回 false、不置位、�
     const ch = new SurfacesNotificationChannels({
       telegram: NULL_TELEGRAM_GATEWAY,
       feishu: gw,
-      filePath: join(mkdtempSync(join(tmpdir(), 'dotd-warm-')), 'notifications.log'),
+      filePath: join(registerTempPath(mkdtempSync(join(tmpdir(), 'dotd-warm-'))), 'notifications.log'),
       feishuChatId: 'oc_owner',
     });
     assert.equal(ch.available('feishu'), false);
@@ -241,7 +254,7 @@ test('SurfacesNotificationChannels：email 配了 SMTP_URL 也 available=false�
   try {
     const ch = new SurfacesNotificationChannels({
       telegram: NULL_TELEGRAM_GATEWAY,
-      filePath: join(mkdtempSync(join(tmpdir(), 'dotd-nc-')), 'notifications.log'),
+      filePath: join(registerTempPath(mkdtempSync(join(tmpdir(), 'dotd-nc-'))), 'notifications.log'),
     });
     assert.equal(ch.available('email'), false);
   } finally {
@@ -274,10 +287,12 @@ test('SurfacesNotificationChannels：TG chatId 来自 defaultChatId；缺 → �
     assert.deepEqual(sent, [{ chatId: 777, text: 'x' }]);
 
     // ③ 两者都缺 → 一次都不发，如实 {ok:false}（绝不静默投 chat_id=0）
+    // ⚡ retryDelayMs=1：本用例里 3 次重试也走 §5.7 的 2s 间隔（合计 4s 纯等待），
+    //    而这里断言的是 attempts === 0 / ok=false，等待长度不在被验语义内。
     sent.length = 0;
     let attempts = 0;
     const gw3: TelegramGateway = { ...gw, sendMessage: (chatId, text) => { attempts++; sent.push({ chatId, text }); return Promise.resolve({ ok: true }); } };
-    const ch3 = new SurfacesNotificationChannels({ telegram: gw3, filePath: join(root, 'n.log'), now: () => 0 });
+    const ch3 = new SurfacesNotificationChannels({ telegram: gw3, filePath: join(root, 'n.log'), now: () => 0, retryDelayMs: 1 });
     const r3 = await ch3.deliver('telegram', 'x');
     assert.equal(r3.ok, false);
     assert.match(r3.error ?? '', /chat id 未配置/);
@@ -302,6 +317,8 @@ test('SurfacesNotificationChannels：telegram 未装配 → 3 次快重试后如
       filePath: join(root, 'n.log'),
       now: () => 0,
       defaultChatId: 1, // chat 目标已定 → 才能走到"发送失败重试"这条路径
+      // ⚡ 只压缩"等多久"（§5.7 的 2s → 1ms）；断言 attempts === 3 与结果不变。
+      retryDelayMs: 1,
     });
     const r = await ch.deliver('telegram', 'x');
     assert.equal(r.ok, false);
@@ -498,7 +515,7 @@ test('loadSurfacesConfig：读仓库 config/dotd.yml 全部 surfaces 节（含 $
   process.env['DOTD_RO_TOKEN'] = 'test-readonly';
   process.env['HOOK_GRAFANA'] = 'test-secret';
   try {
-    const cfg = loadSurfacesConfig(join(process.cwd(), 'config', 'dotd.yml'));
+    const cfg = loadSurfacesConfig(join(REPO_ROOT, 'config', 'dotd.yml'));
     assert.equal(cfg.http.host, '127.0.0.1');
     assert.equal(cfg.http.port, 7788); // 契约 H2 唯一监听端口
     assert.equal(cfg.http.masterToken, 'test-master');

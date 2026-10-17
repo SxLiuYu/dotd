@@ -16,7 +16,9 @@
     "doctor": "node scripts/doctor.mjs",
     "serve": "node --import tsx src/daemon.ts",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test": "node --import tsx --test --test-concurrency=4 tests/*.test.ts",
+    "test:serial": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:fast": "node --import tsx --test --test-concurrency=4 tests/*.test.ts",
     "build:web": "npm --prefix web-ui run build"
   },
   "dependencies": {
