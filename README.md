@@ -54,18 +54,18 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 在这一批优化里被真测试证明过（详见 [`docs/optimization-2026-10-17.md`](docs/optimization-2026-10-17.md)）。
 **仍然没验证的**：真模型往返（环境无凭据）、真 Docker 容器（本机无 dockerd）、真实飞书链路。
 
-### 门禁实测（2026-10-17 本批结束时实跑，Node v24.13.0 / npm 11.9.0，原生 Windows）
+### 门禁实测（三轮优化结束时实跑，Node v24.13.0 / npm 11.9.0，原生 Windows）
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `node node_modules/typescript/bin/tsc --noEmit -p .` | exit **0**，0 错误（约 9s） |
-| 测试套件 | `npm test`（并行 4） | `tests 1390 / pass 1390 / fail 0`，exit **0**（61 个 `.test.ts` 量级，128 suite） |
-| 测试套件（串行） | `npm run test:serial` | 同样 `1390/1390`、0 失败（约 5 分钟，排查并行问题时用） |
+| 测试套件 | `npm test`（并行 4） | `tests 1394 / pass 1394 / fail 0`，exit **0**（134 suite） |
+| 测试套件（串行） | `npm run test:serial` | 同样 `1394/1394`、0 失败（约 5 分钟，排查并行问题时用） |
 | 端到端冒烟 | `node scripts/smoke.mjs` | **11/11 通过**，exit **0** |
 | 冒烟（真 HTTP 模型链路） | `DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` | **16/16 通过**，exit **0**（daemon → ModelRouter → 真 HttpTransport → 真 TCP → 假上游） |
-| 上线前体检 | `npm run doctor` | 10 项检查，每项给「结论 + 下一步命令」；本机当前 2 项 fail（缺 `WB2API_KEY`、严格占位符未展开） |
+| 上线前体检 | `npm run doctor` | 11 项检查（含 MCP server 检查），每项给「结论 + 下一步命令」；本机当前 2 项 fail（缺 `WB2API_KEY`、严格占位符未展开） |
 
-> 耗时是同一批改动的直接成果：全量从 **278s（改前，1032 用例）** 降到 **61–107s（1231 用例）/ 91s（1302 用例，随机器负载波动）**，路径是
+> 耗时是同一批改动的直接成果：全量从 **278s（改前，1032 用例）** 降到 **70–135s（1394 用例，随机器负载波动）**，路径是
 > 消掉测试里的真实等待（SSE 环形缓冲 O(N²)、每用例重跑迁移、TG 重试 2s×3）、修 cwd 脆弱性、并恢复并行。
 > 测试总数是**流动的**，跑之前自己数一遍更稳妥：
 > `grep -hcE "^[[:space:]]*(test|it)\(" tests/*.test.ts | awk '{s+=$1} END {print s}'`。
@@ -89,7 +89,7 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 ### 哪些是真验证过的
 
 - 类型系统：全量 `tsc --noEmit` 干净。
-- 模块行为：1231 个用例，覆盖控制面队列/journal/恢复/事件匹配/调度、模型路由降级与熔断状态机、治理审批八态与工具目录、执行面幂等 ledger 与网络收敛、记忆注入/封写/保留、surfaces HTTP/HMAC/SSE/ingress/飞书入站出站、Runner 主循环、Runner 工具说明书与 system prompt、`dotd doctor`。
+- 模块行为：1394 个用例，覆盖控制面队列/journal/恢复/事件匹配/调度、模型路由降级与熔断状态机、治理审批八态与工具目录、执行面幂等 ledger 与网络收敛、记忆注入/封写/保留、surfaces HTTP/HMAC/SSE/ingress/飞书入站出站、Runner 主循环、Runner 工具说明书与 system prompt、`dotd doctor`。
 - 容器内协议一致性：`tests/agent-runtime-protocol.test.ts` 双向断言 `agent-runtime/protocol.ts`（容器侧权威）与 `src/exec/protocol.ts`（宿主侧）逐字同形——40 个用例，含 11 名工具词表逐个比对、`args_hash`/`identity_hash` 同值、fs 错误码名同码。
 - **真实 HTTP 模型传输**（2026-10-17 新增）：`tests/router-http-transport.test.ts` 34 条，用真 `node:http` 假上游跑真 `HttpTransport`——非流式/SSE 流式解析、auth/rate_limit/quota/server_error 分类、**三档超时各自生效**、空壳判据、脏 JSON、断流、以及真 ModelRouter 接真 transport 的集成路由。
 - **daemon 全链路（含真 HTTP 模型）**：`DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` 16/16，daemon 真的通过 TCP 打到上游并跑出任务终态。
@@ -291,7 +291,7 @@ token 三顺位：`--token` > `DOTD_MASTER_TOKEN` > `~/.dotd/cli_token`（`src/s
 
 ```bash
 npm run typecheck                  # tsc --noEmit -p .
-npm test                           # 1231 个用例；并行 4，任意 cwd 都可
+npm test                           # 1394 个用例；并行 4，任意 cwd 都可
 npm run test:serial                # 同上但不并行（约 5 分钟；排查并行相关假红时用）
 npm run test:fast                  # 日常快检（同并行 4）
 node scripts/smoke.mjs             # 11/11 端到端冒烟（自建临时数据目录，不碰 ~/.dotd）
