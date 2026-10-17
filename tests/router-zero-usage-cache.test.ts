@@ -29,6 +29,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { makeTempDataDir, type TempDataDir } from './helpers.ts';
+import { Breaker } from '../src/router/breaker.ts';
 import { ModelRouter } from '../src/router/ModelRouter.ts';
 import { CacheTracker, explainCacheRate } from '../src/router/cache.ts';
 import { classifyError, isModelScopedKind } from '../src/router/candidates.ts';
@@ -55,6 +56,64 @@ afterEach(() => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
+// 0. 测试基建：Usage 的唯一构造入口（防"字段不全的强转"复发）
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 构造 `Usage`，**显式给出每个字段**，不做 `as Usage` 强转。
+ *
+ * 为什么单开一个 helper：此前本文件用 `{ promptTokens, completionTokens } as Usage`
+ * 糊过 tsc，于是"provider 到底报没报缓存"这个信号被**静默省略**——
+ * StubTransport 把 `usage` 原样当响应 usage 返回（src/router/transport.ts:268），
+ * ModelRouter.logCall 再把 `cachedPromptTokens ?? null` 落库（ModelRouter.ts:1035），
+ * 所以"不报"永远是 NULL（= 无缓存数据），而不是"报了但没命中"（= 0）。
+ * 两个语义在缓存命中率上是不同的数（cache.ts:107）。这个 helper 让"报了几个字段"
+ * 在调用点上肉眼可见；`tests/router-usage-shape.guard.test.ts` 静态挡住 as 强转复发。
+ */
+function usageOf(promptTokens: number, completionTokens: number, cachedPromptTokens?: number): Usage {
+  return {
+    promptTokens,
+    completionTokens,
+    ...(cachedPromptTokens === undefined ? {} : { cachedPromptTokens }),
+  };
+}
+
+/**
+ * 经 `breaker.settle()` 灌健康样本（同 tests/router-health.test.ts:96 的纪律：
+ * **不要**直接 INSERT breaker_sample，否则 breaker 的内存镜像不更新）。
+ *
+ * 排序用例必须靠它先把排序**钉在确定状态**，而不是让空库的"未置位"状态
+ * 碰巧等于声明顺序——见下面「排序键」一节的失败复现记录。
+ */
+function seedHealth(endpointId: string, samples: Array<{ ok: boolean; latencyMs: number }>): void {
+  const breaker = new Breaker({ db: tmp.db, now: Date.now, cfg: BREAKER_CFG });
+  for (const s of samples) {
+    breaker.settle({
+      endpointId,
+      track: 'primary',
+      ok: s.ok,
+      ...(s.ok ? {} : { kind: 'server_error' as const }),
+      latencyMs: s.latencyMs,
+    });
+  }
+}
+
+/** 与「排序键」用例里 models.yml 的 breaker: 段**同值**（window_ms 决定样本会不会过期）。 */
+const BREAKER_CFG = {
+  window_size: 20,
+  window_ms: 300_000,
+  min_samples: 5,
+  failure_ratio: 0.5,
+  consec_failures: 3,
+  backoff_initial_ms: 60_000,
+  backoff_max_ms: 3_600_000,
+  half_open_success_needed: 2,
+  half_open_max_concurrency: 1,
+  throttle_max_ms: 120_000,
+  busy_consec_limit: 3,
+};
+
+// ═══════════════════════════════════════════════════════════════════
 // 1. 纯函数：空壳判据（三条同时满足才算，故意保守）
 // ═══════════════════════════════════════════════════════════════════
 
@@ -63,7 +122,7 @@ describe('isEmptyShellResponse：三条同时满足才算空壳', () => {
     content,
     ...(toolCalls !== undefined ? { toolCalls } : {}),
   });
-  const u = (completionTokens: number): Usage => ({ promptTokens: 100, completionTokens });
+  const u = (completionTokens: number): Usage => usageOf(100, completionTokens);
 
   it('无正文 + 无工具调用 + completion_tokens=0 → 空壳', () => {
     assert.equal(isEmptyShellResponse(resp(''), undefined), true, 'usage 缺失也算');
@@ -341,7 +400,8 @@ recon:
     endpointId,
     model,
     content: '',
-    usage: { promptTokens: 100, completionTokens: 0 } as Usage,
+    usage: usageOf(100, 0),
+    // 故意不给 cachedPromptTokens：零用量空壳的 provider 不会报缓存命中数。
   });
   const good = (endpointId: string, model: string, content = '真答案') => ({
     endpointId,
@@ -436,7 +496,7 @@ recon:
         endpointId: 'cloud-main',
         model: PRIMARY_CHAIN[0],
         content: 'ok',
-        usage: { promptTokens: 100, completionTokens: 7, cachedPromptTokens: 64 },
+        usage: usageOf(100, 7, 64),
       },
       good('local-llm', 'olmoe-1b'),
     ]);
@@ -451,23 +511,49 @@ recon:
 // 6. 排序键合成：缓存只在健康度有分时做同一档内的微调
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * 本节的小结（修复前 3 个用例在此全红，见各用例注释里的实测记录）：
+ *
+ * 1. **用例状态的构造必须确定**。旧写法靠"发 12 次 complete 循环、让两端各攒够样本"，
+ *    而 12 次里请求打到哪端取决于排序自己 —— 这就是自我指涉的循环构造，最脆。
+ *    现在改为：健康样本用 `seedHealth()` 经 breaker.settle 直接灌、缓存样本用
+ *    `logCache()` 直接插 model_call_log，两者都是**生产写路径**、且各自独立于排序；
+ *    每个用例最后只发**一次** complete，只断言"这一次选了谁"。
+ *
+ * 2. **不能按端点写 StubTransport 脚本**。它的脚本是每端点一个独立 FIFO
+ *    （transport.ts:161 Map / 入队 :210-213 / 消费 :256 / 耗尽 :259 抛错），
+ *    而排序会把请求集中到排第一的端点 → 另一端预置永不消费 → 先耗尽的一端被记成
+ *    network 失败、连开熔断（实测连续三次 tried:[cache-hot:false,cache-cold:true]，
+ *    第 12 次循环直接 AllEndpointsDownError）。本节的 stub 只用 `fallback`
+ *    （全局队列、不分桶；take() 先查端点键、查不到才走 fallback，:248-258）。
+ */
 describe('排序键：缓存不能单独决定排序', () => {
-  /** 两个同 tier 端点：cache-hot 声明在前，cache-cold 声明在后。 */
-  function twoEndpointRouter(): ModelRouter {
+  type Order = readonly ['cache-hot', 'cache-cold'] | readonly ['cache-cold', 'cache-hot'];
+
+  /**
+   * 两个同 tier 端点的配置模板。@param order 决定声明顺序
+   * （声明顺序 = 同分时的最终裁决，candidates.ts:127）。
+   * 只写配置、不造 router——造 router 走 `routerWith()`，顺带消掉了原先
+   * "先 new 一个 router 再 dispose、然后重建"的死代码。
+   */
+  function writeTwoEndpointConfig(order: Order = ['cache-hot', 'cache-cold']): void {
+    const blocks: Record<string, string> = {
+      'cache-hot': `  - id: cache-hot
+    tier: 1
+    base_url: https://a.example/v1
+    models: { primary: m-a, light: m-a }
+    timeouts: { connect_ms: 100, idle_ms: 1000, total_ms: 2000 }`,
+      'cache-cold': `  - id: cache-cold
+    tier: 1
+    base_url: https://b.example/v1
+    models: { primary: m-b, light: m-b }
+    timeouts: { connect_ms: 100, idle_ms: 1000, total_ms: 2000 }`,
+    };
     writeFileSync(
       join(cfgDir, 'models.yml'),
       `version: 1
 endpoints:
-  - id: cache-hot
-    tier: 1
-    base_url: https://a.example/v1
-    models: { primary: m-a, light: m-a }
-    timeouts: { connect_ms: 100, idle_ms: 1000, total_ms: 2000 }
-  - id: cache-cold
-    tier: 1
-    base_url: https://b.example/v1
-    models: { primary: m-b, light: m-b }
-    timeouts: { connect_ms: 100, idle_ms: 1000, total_ms: 2000 }
+${order.map((id) => blocks[id]).join('\n')}
 routing:
   default_track: primary
 breaker:
@@ -497,21 +583,77 @@ recon:
       'utf8',
     );
     writeFileSync(join(cfgDir, 'free-models.yml'), 'version: 1\nupdated_at: null\nmodels: []\n', 'utf8');
+  }
+
+  /**
+   * 造 router。脚本一律走 `fallback`（全局队列），端点自己的脚本为空，
+   * 这样"哪端承载"不会决定"会不会耗尽"——见本节小结第 2 条。
+   */
+  function routerWith(
+    responses: Array<{ content?: string; usage?: Usage }> = [{}],
+    order?: Order,
+  ): ModelRouter {
+    const stub = new StubTransport({
+      script: [],
+      fallback: responses.map((r) => ({
+        content: r.content ?? 'ok',
+        usage: r.usage ?? usageOf(100, 7),
+      })),
+    });
+    writeTwoEndpointConfig(order);
     return ModelRouter.load({
       db: tmp.db,
       configDir: cfgDir,
       scheduler: { registerInternalJob: () => {} },
       channels: null,
       bus: tmp.bus,
-      transport: new StubTransport({ script: [] }),
+      transport: stub,
     });
+  }
+
+  /** 一次 complete。本节每个用例只用一次——不靠循环攒状态。 */
+  const ask = (router: ModelRouter, attemptId: string) =>
+    router.complete({
+      track: 'primary',
+      messages: [{ role: 'user', content: 'hi' }],
+      attemptId,
+    });
+
+  /**
+   * 灌"健康度**逐位相等**"的样本：两端都是 6 样本 0 失败、成功延迟全 10ms。
+   *
+   * 为什么必须显式灌：空库不是"打平"，是"两端都没分"。`pickCandidates` 在任一侧
+   * rankKey 为 null 时**整段跳过缓存项、直接落回声明顺序**（candidates.ts:122-127）。
+   * 若不灌，用例会在缓存一行都没被读过的情况下变绿——什么都没验。
+   *
+   * 为什么延迟写死 10ms 才能逐位相等：score = 0.6*成功率 + 0.4*clamp01(1-(p95-1000)/14000)
+   * （health.ts:47-53/142/146），延迟由 breaker_sample 的**成功样本**算 p95
+   * （health.ts:195-202）。两端成功率、样本数、p95 全相同 → 分数同一串浮点运算 → 完全相等。
+   */
+  function seedTiedHealth(): void {
+    seedHealth(
+      'cache-hot',
+      Array.from({ length: 6 }, () => ({ ok: true, latencyMs: 10 })),
+    );
+    seedHealth(
+      'cache-cold',
+      Array.from({ length: 6 }, () => ({ ok: true, latencyMs: 10 })),
+    );
   }
 
   /**
    * 直接插 model_call_log 行（缓存统计只读这张表，与 breaker_sample 无关）。
-   * 时间戳用真实 now——CacheTracker 的窗口是 30min，写死常量会落到窗口外。
+   *
+   * `ts` 默认真实 now：CacheTracker 只统计 ts >= now-30min 的行（cache.ts:97，
+   * 实测"窗口外补行凑数"无效：5 行里窗口外 4 行 samples 仍计 0），所以必须是窗口内。
+   * 窗口内行不影响健康度——健康度读 breaker_sample，两张表互不相干。
    */
-  function logCache(endpointId: string, cached: number | null): void {
+  function logCache(
+    endpointId: string,
+    cached: number | null,
+    ts: number = Date.now(),
+    attemptSeq = 1,
+  ): void {
     tmp.db
       .prepare(
         `INSERT INTO model_call_log
@@ -521,7 +663,7 @@ recon:
       )
       .run(
         `nonj:C${Math.random().toString(36).slice(2, 8)}`,
-        1,
+        attemptSeq,
         null,
         'primary',
         endpointId,
@@ -533,184 +675,133 @@ recon:
         100,
         5,
         cached,
-        Date.now(),
+        ts,
       );
   }
 
-  it('健康度打平 → 缓存热的那端被优先选中（平局打破者）', async () => {
-    const router = twoEndpointRouter();
-    // 两端都没有 breaker 样本 → 健康度都没分 → 排序退化为声明顺序。
-    // 这时缓存也不该说话（见下一个测试），所以先各灌 6 条 ok 的健康样本。
-    const stub = new StubTransport({
-      script: [
-        ...Array.from({ length: 6 }, () => ({ endpointId: 'cache-hot', content: 'ok' })),
-        ...Array.from({ length: 6 }, () => ({ endpointId: 'cache-cold', content: 'ok' })),
-      ],
-    });
-    // stub 已构造进 router，改用运行时追加脚本的方式灌样本
-    void stub;
-    router.dispose();
+  /**
+   * 灌满 5 条（= min_samples）窗口内缓存样本：
+   *   cache-hot  5/5 命中 → hitRate 1
+   *   cache-cold 0/5 命中 → hitRate 0（"报了但没命中" = 0，不是 NULL）
+   * 少于 5 条时 hitRate 是 null、微调项退化为 0（cache.ts:38/113/121），用例就什么都没验。
+   */
+  function seedCacheSamples(): void {
+    for (let i = 0; i < 5; i++) logCache('cache-hot', 100, Date.now(), i + 1);
+    for (let i = 0; i < 5; i++) logCache('cache-cold', 0, Date.now(), i + 1);
+  }
 
-    // 重新造一个，脚本可控
-    const r2 = ModelRouter.load({
-      db: tmp.db,
-      configDir: cfgDir,
-      scheduler: { registerInternalJob: () => {} },
-      channels: null,
-      bus: tmp.bus,
-      transport: new StubTransport({
-        script: [
-          ...Array.from({ length: 6 }, () => ({
-            endpointId: 'cache-hot',
-            content: 'ok',
-            usage: { promptTokens: 100, completionTokens: 7, cachedPromptTokens: 100 },
-          })),
-          ...Array.from({ length: 6 }, () => ({
-            endpointId: 'cache-cold',
-            content: 'ok',
-            usage: { promptTokens: 100, completionTokens: 7, cachedPromptTokens: 0 },
-          })),
-        ],
-      }),
-    });
-    // 交替发请求，让两端都攒够健康样本（pickCandidates 会按排序挑，顺序不固定也行）
-    for (let i = 0; i < 12; i++) {
-      await r2.complete({
-        track: 'primary',
-        messages: [{ role: 'user', content: 'hi' }],
-        attemptId: `nonj:ZUC${String(i).padStart(4, '0')}`,
-      });
-    }
-    const hot = r2.endpointHealth('cache-hot', 'primary');
-    const cold = r2.endpointHealth('cache-cold', 'primary');
-    assert.ok(hot.score !== null && cold.score !== null, '两端都攒够了样本');
-    assert.equal(
-      r2.endpointCacheRate('cache-hot', 'primary')?.hitRate,
-      1,
-      'cache-hot 全命中',
-    );
-    assert.equal(
-      r2.endpointCacheRate('cache-cold', 'primary')?.hitRate,
-      0,
-      'cache-cold 全 miss',
-    );
-    // 两端成功率相同、延迟都极小 → 健康度打平，缓存是唯一的区分信号
-    const final = await r2.complete({
-      track: 'primary',
-      messages: [{ role: 'user', content: 'hi' }],
-      attemptId: 'nonj:ZUCFFFF',
-    });
+  it('健康度打平 → 缓存热的那端被优先选中（平局打破者）', async () => {
+    seedTiedHealth();
+    seedCacheSamples();
+    const router = routerWith();
+
+    // 三个前提先自检：任一不成立，这条用例验的就是别的命题
+    const hot = router.endpointHealth('cache-hot', 'primary');
+    const cold = router.endpointHealth('cache-cold', 'primary');
+    assert.ok(hot.score !== null && cold.score !== null, '两端都必须有分（否则不进缓存微调分支）');
+    assert.equal(hot.score, cold.score, '前提①：健康度逐位相等（显式构造，不靠运气）');
+    assert.equal(router.endpointCacheRate('cache-hot', 'primary')?.hitRate, 1, '前提②：cache-hot 全命中');
+    assert.equal(router.endpointCacheRate('cache-cold', 'primary')?.hitRate, 0, '前提③：cache-cold 全 miss');
+
+    // 健康度相等 + 缓存 1 vs 0 → 排序键相差 CACHE_RANK_WEIGHT*1 = 0.05
+    // （ModelRouter.ts:102/1392），cache-hot 必须翻过"声明顺序"赢下来。
+    const final = await ask(router, 'nonj:ZUC0001');
     assert.equal(
       final.meta.endpointId,
       'cache-hot',
       '健康度打平时缓存热的那端赢——这正是 cache-aware 要打断的冷启动环',
     );
-    r2.dispose();
+    router.dispose();
+  });
+
+  it('健康度打平 + 缓存冷的那端声明在前 → 缓存热的那端仍被优先选中（证明是缓存而非声明顺序）', async () => {
+    // 上一条里"cache-hot 胜出"与"它声明在前"同向，单独看排除不了"其实只是按声明顺序选的"。
+    // 把声明顺序反过来：若缓存不参与排序 → 打平落回声明顺序 → 会选 cache-cold；
+    // 只有缓存项真的进了排序键，cache-hot 才能翻过声明顺序赢。
+    seedTiedHealth();
+    seedCacheSamples();
+    const router = routerWith([{}], ['cache-cold', 'cache-hot']);
+
+    const hot = router.endpointHealth('cache-hot', 'primary');
+    const cold = router.endpointHealth('cache-cold', 'primary');
+    assert.equal(hot.score, cold.score, '前提：健康度逐位相等');
+    assert.equal(router.endpointCacheRate('cache-hot', 'primary')?.hitRate, 1, 'cache-hot 全命中');
+    assert.equal(router.endpointCacheRate('cache-cold', 'primary')?.hitRate, 0, 'cache-cold 全 miss');
+
+    const final = await ask(router, 'nonj:ZUC0002');
+    assert.equal(
+      final.meta.endpointId,
+      'cache-hot',
+      '声明顺序与缓存偏好相反时仍选缓存热的——否则这条性质只是"按声明顺序"的假象',
+    );
+    router.dispose();
   });
 
   it('缓存热但健康度差 → 健康度赢（省算力不能换成功率）', async () => {
-    const router = twoEndpointRouter();
-    router.dispose();
-    const r = ModelRouter.load({
-      db: tmp.db,
-      configDir: cfgDir,
-      scheduler: { registerInternalJob: () => {} },
-      channels: null,
-      bus: tmp.bus,
-      transport: new StubTransport({
-        script: [
-          // cache-hot：缓存全命中，但 6 次里挂 3 次（成功率 0.5）
-          ...Array.from({ length: 3 }, () => ({
-            endpointId: 'cache-hot',
-            content: 'ok',
-            usage: { promptTokens: 100, completionTokens: 7, cachedPromptTokens: 100 },
-          })),
-          ...Array.from({ length: 3 }, () => ({
-            endpointId: 'cache-hot',
-            content: '',
-            usage: { promptTokens: 100, completionTokens: 0 },
-            fail: Object.assign(new Error('boom'), { status: 500 }),
-          })),
-          // cache-cold：缓存全 miss，但 6 次全成
-          ...Array.from({ length: 6 }, () => ({
-            endpointId: 'cache-cold',
-            content: 'ok',
-            usage: { promptTokens: 100, completionTokens: 7, cachedPromptTokens: 0 },
-          })),
-        ],
-      }),
-    });
-    for (let i = 0; i < 12; i++) {
-      await r.complete({
-        track: 'primary',
-        messages: [{ role: 'user', content: 'hi' }],
-        attemptId: `nonj:ZUW${String(i).padStart(4, '0')}`,
-      });
-    }
-    assert.equal(r.endpointCacheRate('cache-hot', 'primary')?.hitRate, 1, '缓存确实更热');
-    assert.ok(
-      (r.endpointHealth('cache-hot', 'primary').score ?? 0) <
-        (r.endpointHealth('cache-cold', 'primary').score ?? 0),
-      '但健康度明显更差',
+    // 健康样本灌成"cache-hot 差、cache-cold 好"，两端都过 min_samples：
+    //   cache-hot  6 样本 1 失败、成功延迟全 10ms → 0.6*(5/6) + 0.4*1 = 0.9
+    //   cache-cold 6 样本 0 失败、成功延迟全 10ms → 0.6*(6/6) + 0.4*1 = 1.0
+    // 缓存项最多贡献 0.05（CACHE_RANK_WEIGHT），0.1 的健康差翻不过去
+    // —— 这正是 ModelRouter.ts:1378-1382 写明的设计意图。
+    seedHealth('cache-hot', [
+      { ok: true, latencyMs: 10 },
+      { ok: true, latencyMs: 10 },
+      { ok: true, latencyMs: 10 },
+      { ok: true, latencyMs: 10 },
+      { ok: false, latencyMs: 10 },
+      { ok: true, latencyMs: 10 },
+    ]);
+    seedHealth(
+      'cache-cold',
+      Array.from({ length: 6 }, () => ({ ok: true, latencyMs: 10 })),
     );
-    const final = await r.complete({
-      track: 'primary',
-      messages: [{ role: 'user', content: 'hi' }],
-      attemptId: 'nonj:ZUWFFFF',
-    });
+    seedCacheSamples();
+    // 即便 cache-hot 声明在前（对它最有利），也必须被健康度压回去
+    const router = routerWith([{}], ['cache-hot', 'cache-cold']);
+
+    assert.equal(router.endpointCacheRate('cache-hot', 'primary')?.hitRate, 1, '前提：缓存确实更热');
+    assert.ok(
+      (router.endpointHealth('cache-hot', 'primary').score ?? 0) <
+        (router.endpointHealth('cache-cold', 'primary').score ?? 0),
+      '前提：健康度确实更差',
+    );
+
+    const final = await ask(router, 'nonj:ZUW0001');
     assert.equal(
       final.meta.endpointId,
       'cache-cold',
       '为了省算力把请求送给更可能失败的端点，这个交易不划算',
     );
-    r.dispose();
+    router.dispose();
   });
 
   it('没有缓存数据 → 排序与只有健康度时逐字一致（声明顺序）', async () => {
-    const router = twoEndpointRouter();
-    router.dispose();
-    const r = ModelRouter.load({
-      db: tmp.db,
-      configDir: cfgDir,
-      scheduler: { registerInternalJob: () => {} },
-      channels: null,
-      bus: tmp.bus,
-      transport: new StubTransport({
-        script: [
-          ...Array.from({ length: 6 }, () => ({ endpointId: 'cache-hot', content: 'ok' })),
-          ...Array.from({ length: 6 }, () => ({ endpointId: 'cache-cold', content: 'ok' })),
-        ],
-      }),
-    });
-    for (let i = 0; i < 12; i++) {
-      await r.complete({
-        track: 'primary',
-        messages: [{ role: 'user', content: 'hi' }],
-        attemptId: `nonj:ZUX${String(i).padStart(4, '0')}`,
-      });
-    }
-    // 两家都不报缓存命中数（stub 默认 usage 没有 cachedPromptTokens）
-    assert.equal(r.endpointCacheRate('cache-hot', 'primary')?.samples, 0);
-    assert.equal(r.endpointCacheRate('cache-cold', 'primary')?.samples, 0);
-    // 健康度打平 → 落回声明顺序，声明在前者先
-    const final = await r.complete({
-      track: 'primary',
-      messages: [{ role: 'user', content: 'hi' }],
-      attemptId: 'nonj:ZUXFFFF',
-    });
+    seedTiedHealth();
+    // 一次真调用落库，但 usage 不带 cachedPromptTokens → logCall 落 NULL
+    // （ModelRouter.ts:1035 `usage?.cachedPromptTokens ?? null`），NULL 样本被排除在
+    // 分子分母之外（cache.ts:107）→ samples 0 → 微调项恒为 0。
+    const router = routerWith([{}]);
+    assert.equal(router.endpointCacheRate('cache-hot', 'primary')?.samples, 0);
+    assert.equal(router.endpointCacheRate('cache-cold', 'primary')?.samples, 0);
+
+    const hot = router.endpointHealth('cache-hot', 'primary');
+    const cold = router.endpointHealth('cache-cold', 'primary');
+    assert.equal(hot.score, cold.score, '前提：健康度逐位相等 → 只剩声明顺序可决定');
+
+    const final = await ask(router, 'nonj:ZUX0001');
     assert.equal(
       final.meta.endpointId,
       'cache-hot',
       '没有缓存数据时不为一个尚无数据的信号改变现有行为',
     );
-    r.dispose();
+    router.dispose();
   });
 
   it('有缓存数据但没有任何健康样本 → 缓存也不能把端点提到前面', () => {
     // 构造状态：model_call_log 有缓存行，breaker_sample 一行没有。
     // （只插 model_call_log 是安全的——缓存统计只读这张表；健康度读的是另一张。）
     for (let i = 0; i < 6; i++) logCache('cache-cold', 100);
-    const router = twoEndpointRouter();
+    const router = routerWith([]);
     assert.equal(router.endpointCacheRate('cache-cold', 'primary')?.hitRate, 1, '缓存数据在');
     assert.equal(
       router.endpointHealth('cache-cold', 'primary').score,

@@ -752,6 +752,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       `审批续跑 ${recovery.approvalsResumed.length} / 心跳补投 ${recovery.heartbeatsCaughtUp} / ` +
       `事件重放 ${recovery.eventsReplayed}`,
   );
+  // 对账失败的任务不得静默（recovery.ts 已兜底归位为 queued，这里让它见光）
+  for (const f of recovery.inFlightFailed) {
+    log(`[recovery] 在途对账失败 task=${f.taskId}（已兜底回 queued）：${f.error}`);
+  }
 
   // ⑩b CP §7.1 步骤 7：scheduler.start（registerInternalJob 全部就位后起 tick）。
   //     recoverOnStartup 只做恢复动作、不起定时器（recovery.ts:170-203），起 tick

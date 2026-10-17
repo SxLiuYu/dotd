@@ -49,6 +49,8 @@ export interface RecoveryDeps {
 export interface RecoveryReport {
   /** 步骤 3：从 running 回 queued 的任务。 */
   inFlightRecovered: string[];
+  /** 步骤 3：对账失败但已兜底归位（queued）的任务——必须可观测，不许静默跳过。 */
+  inFlightFailed: Array<{ taskId: string; epoch: number; error: string }>;
   /** 步骤 3：处置过的孤儿 started 步。 */
   openStepsResolved: Array<{ taskId: string; seq: number; outcome: string }>;
   /** 步骤 4：停机期间已落定的审批续跑。 */
@@ -88,6 +90,13 @@ function lastShutdownGraceful(db: DatabaseSync): boolean {
  * 再对 started 孤儿步 resolveOpenStep（§5.3 同一函数），最后任务 → queued、
  * attempt+1、priority=min(priority,2)、last_heartbeat_at=NULL；run_epoch **保持**
  * （下次 pop 再 +1）。
+ *
+ * 隔离语义（审码 finding，任务永久卡死）：对账要经执行面（exec.reconcileCall /
+ * getCallResult），那是**网络调用**——容器没起来、docker socket 不通、执行面半装配
+ * 都会抛。旧实现没有 per-task try，一条任务对账抛错会让整个 recoverInFlight 抛 →
+ * cp.recover() 抛 → assembleDaemon 抛 → **daemon 根本起不来**。
+ * 现在：单条任务失败只记账 + 把该任务放回 queued（任务本身不丢，下一轮看门狗/
+ * 重启还能再收口），其余任务照常恢复。
  */
 async function recoverInFlight(deps: RecoveryDeps, report: RecoveryReport): Promise<void> {
   const running = deps.db
@@ -96,13 +105,32 @@ async function recoverInFlight(deps: RecoveryDeps, report: RecoveryReport): Prom
     )
     .all() as Array<{ id: string; epoch: number }>;
   for (const t of running) {
-    for (const s of deps.journal.tail(t.id, 2_000)) {
-      if (s.status !== 'started') continue;
-      const outcome = await deps.journal.reconcileAndResolve(t.id, s.seq);
-      report.openStepsResolved.push({ taskId: t.id, seq: s.seq, outcome });
+    try {
+      for (const s of deps.journal.tail(t.id, 2_000)) {
+        if (s.status !== 'started') continue;
+        const outcome = await deps.journal.reconcileAndResolve(t.id, s.seq);
+        report.openStepsResolved.push({ taskId: t.id, seq: s.seq, outcome });
+      }
+      deps.queue.reclaimInFlight(t.id, t.epoch, 'recovery');
+      report.inFlightRecovered.push(t.id);
+    } catch (err) {
+      // 可观测且不静默：记 resource_event + 进报告的 failed 列表（CLI/日志可读）。
+      const message = err instanceof Error ? err.message : String(err);
+      report.inFlightFailed.push({ taskId: t.id, epoch: t.epoch, error: message });
+      deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({ taskId: t.id, epoch: t.epoch, what: 'recovery_failed', error: message }),
+      );
+      // 兜底归位：孤儿步没对账完，但任务不能停在 running（会白占 maxRunning 额度、
+      // 且没有任何协程持有它 → 永久卡死）。queued 是无损的：已 succeeded 步仍会被
+      // Runner 从尾部重建跳过（§5.3 硬保证 1），started 孤儿步下次仍走对账。
+      try {
+        deps.queue.reclaimInFlight(t.id, t.epoch, 'recovery_degraded');
+      } catch {
+        // 连归位都失败（库级故障）：保持 running 交看门狗心跳超时兜底。
+      }
     }
-    deps.queue.reclaimInFlight(t.id, t.epoch, 'recovery');
-    report.inFlightRecovered.push(t.id);
   }
 }
 
@@ -174,6 +202,7 @@ export async function recoverOnStartup(
 ): Promise<RecoveryReport> {
   const report: RecoveryReport = {
     inFlightRecovered: [],
+    inFlightFailed: [],
     openStepsResolved: [],
     approvalsResumed: [],
     heartbeatsCaughtUp: 0,

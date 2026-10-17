@@ -279,9 +279,11 @@ export class Journal {
    * daemon 重启（§7.1 步骤 3）、Runner abort 后重领（§7.4）都走它。
    *
    * 返回：
-   * - 'replayed'    ：llm 或 safe/replayable（或 exec 确认 aborted）→ 标 interrupted，Runner 重放；
+   * - 'replayed'    ：llm 或 safe/replayable → 标 interrupted，Runner 重放；
    * - 'took_result' ：exec 确认 done → 补记结果，不重放也不白花；
-   * - 'deferred'    ：仍未知 → 标 interrupted + 注入提示 +（treatUnknownAsRisk）转审批。
+   * - 'deferred'    ：unknown 副作用（含 exec 报 'aborted' 的情形）→ 标 interrupted +
+   *                   注入提示 +（treatUnknownAsRisk）转审批。**绝不返回 replayed**，
+   *                   这是「绝不重复执行」的最后一道闸（见下方 'aborted' 分支注释）。
    */
   async reconcileAndResolve(
     taskId: string,
@@ -302,26 +304,46 @@ export class Journal {
     }
 
     // unknown：先向执行面对账该 call_id 的真实结局（issue #6）
-    const outcome =
-      s.call_id !== null && this.deps.exec !== undefined
-        ? await this.deps.exec.reconcileCall(s.call_id)
-        : 'unknown_host';
+    const outcome = await this.reconcileOutcome(s);
     if (outcome === 'done') {
-      const r = s.call_id !== null ? await this.deps.exec!.getCallResult(s.call_id) : null;
+      const r = s.call_id !== null ? await this.callResultOrNull(s.call_id) : null;
       this.finalizeStepAsSucceeded(taskId, seq, r?.resultJson ?? null);
       return 'took_result'; // 补记，不重放
-    }
-    if (outcome === 'aborted') {
-      // 工具体未跑或已回滚 → 按 replayable 安全重放
-      this.markInterrupted(taskId, seq);
-      this.injectRecoveryNote(taskId, seq, s);
-      return 'replayed';
     }
     // unknown / unknown_host：无法判定，宁可让 agent 重观测
     this.markInterrupted(taskId, seq);
     this.injectRecoveryNote(taskId, seq, s);
+    // 'aborted' 与 unknown 同路（2026-10-17 修，重复执行风险）：
+    // 执行面的 'aborted' 并不是"保证未落地"——daemon.ts:485-490 把 ExecService 的
+    // 'interrupted' 全部映射成 'aborted'，而 fleet.ts:843-862/895-897/930-932 里
+    // 'interrupted' 有三个来源（container_lost / aborted / not_found），其中
+    // container_lost 恰恰发生在「容器被 pause 或丢失、真实结局不明」时。
+    // 尤其 guard 在 throttled/halted 会 pause 容器（guard.ts:224-244）→ 容器状态
+    // suspended → canAcceptCalls=false（exec/types.ts:71-73）→ 之后任何对账都报
+    // interrupted → 已执行过的 rm/net.post 会被判为可安全重放。
+    // 因此只有 side_effect ∈ {safe,replayable} 才走上面的直接重放分支（:299-302）；
+    // 走到这里的必然是 'unknown'，一律转审批，绝不重放。
     if (this.deps.treatUnknownAsRisk !== false && this.deps.governance !== undefined) {
-      const ap = await this.deps.governance.requestApproval({
+      await this.requestUnknownSideEffectApproval(taskId, seq, s, outcome);
+    }
+    return 'deferred';
+  }
+
+  /**
+   * 造 unknown 副作用孤儿步的审批单并回写 approval_id（幂等：同一 callId 因
+   * uniq_open_step / subject_key='unk:'+callId 命中同一单）。
+   * 治理不可用/抛错时降级为"只注入提示"（不炸恢复流程），但记 watchdog。
+   */
+  private async requestUnknownSideEffectApproval(
+    taskId: string,
+    seq: number,
+    s: StepRow,
+    outcome: 'aborted' | 'unknown' | 'unknown_host',
+  ): Promise<void> {
+    const governance = this.deps.governance;
+    if (governance === undefined) return;
+    try {
+      const ap = await governance.requestApproval({
         taskId,
         kind: 'side_effect_unknown',
         subject: {
@@ -329,14 +351,62 @@ export class Journal {
           tool: s.tool_name ?? '',
           params: s.args_json ?? '',
         },
-        reason: `孤儿步 ${taskId}#${seq} 副作用未知，需主人确认`,
+        reason: `孤儿步 ${taskId}#${seq} 副作用未知（exec=${outcome}），需主人确认`,
       });
-      // 幂等：同一 callId 因 uniq_open_step / subject_key='unk:'+callId 命中同一单。
       this.db
         .prepare('UPDATE steps SET approval_id=? WHERE task_id=? AND seq=?')
         .run(ap.approvalId, taskId, seq);
+    } catch (err) {
+      // 恢复流程不得因治理侧故障整体失败（一条任务失败不阻其余任务恢复）
+      this.deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({
+          taskId,
+          seq,
+          what: 'recovery_approval_failed',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
     }
-    return 'deferred';
+  }
+
+  /** 执行面对账（异常降级为 unknown_host：对账本身失败 ≠ 确认未落地）。 */
+  private async reconcileOutcome(s: StepRow): Promise<'done' | 'aborted' | 'unknown' | 'unknown_host'> {
+    if (s.call_id === null || this.deps.exec === undefined) return 'unknown_host';
+    try {
+      return await this.deps.exec.reconcileCall(s.call_id);
+    } catch (err) {
+      this.deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({
+          callId: s.call_id,
+          what: 'reconcile_failed',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return 'unknown_host';
+    }
+  }
+
+  /** 取执行面结果（异常降级为 null：取不到结果不影响"不重放"决策）。 */
+  private async callResultOrNull(callId: string): Promise<{ resultJson: string } | null> {
+    if (this.deps.exec === undefined) return null;
+    try {
+      return await this.deps.exec.getCallResult(callId);
+    } catch (err) {
+      this.deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({
+          callId,
+          what: 'getCallResult_failed',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return null;
+    }
   }
 
   /**

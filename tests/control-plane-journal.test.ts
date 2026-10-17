@@ -182,20 +182,32 @@ test('getStepByCallId / stepExists 反查（契约 J1/治理重入核对）', ()
 
 // ── §7.2 崩溃矩阵：第 1 行 beginTool 后执行中 ───────────────────────
 
-test('§7.2 beginTool 提交后执行中：unknown 孤儿 → exec 确认 aborted → interrupted + 重放', async () => {
+test('§7.2 beginTool 提交后执行中：unknown 孤儿 → exec 确认 aborted → interrupted + 不重放（转审批）', async () => {
+  // 2026-10-17 健壮性审计修正：执行面的 'aborted' 不保证"未落地"——daemon.ts:485-490
+  // 把 ExecService 的 interrupted（container_lost / aborted / not_found 三来源）
+  // 全映射成 'aborted'，其中 container_lost 恰恰是"容器被 pause/丢失、结局不明"。
+  // 因此 unknown 副作用步一律走 deferred（转审批），只有 safe/replayable 才重放。
+  // 回归用例见 tests/control-plane-robustness.test.ts 的 A3/A10。
   const f = fixture({
     exec: {
       reconcileCall: async () => 'aborted',
       getCallResult: async () => null,
     },
   });
+  (f.journal as unknown as { deps: { governance?: unknown } }).deps.governance = {
+    async requestApproval() {
+      return { approvalId: 41 };
+    },
+  };
   const { seq, callId } = startOrphan(f, 'unknown');
   const outcome = await f.journal.reconcileAndResolve(f.taskId, seq);
-  assert.equal(outcome, 'replayed', '工具体未跑/已回滚 → 安全重放');
-  const row = f.tmp.db.prepare('SELECT status FROM steps WHERE call_id=?').get(callId) as {
+  assert.equal(outcome, 'deferred', 'unknown 副作用步不赌"其实没执行"，转审批');
+  const row = f.tmp.db.prepare('SELECT status, approval_id FROM steps WHERE call_id=?').get(callId) as {
     status: string;
+    approval_id: number | null;
   };
   assert.equal(row.status, 'interrupted', '孤儿步转 interrupted 不删（审计闭环）');
+  assert.equal(row.approval_id, 41, '必须落审批单');
   // 注记步已注入（供 Runner 下一步 messages 首条）
   const note = f.tmp.db
     .prepare("SELECT COUNT(*) AS n FROM steps WHERE task_id=? AND tool_name='system.note'")
@@ -358,11 +370,13 @@ test('幂等：同一 callId 重复 reconcile 命中同一审批单（不重复�
 
 // ── §7.4 onExecInterrupted（exec.interrupted 回报驱动） ────────────
 
-test('onExecInterrupted 定位 started 步走同一分流；replayed 时 Runner 原地继续', async () => {
+test('onExecInterrupted 定位 started 步走同一分流；replayed（无副作用步）时 Runner 原地继续', async () => {
+  // 用 safe 步表达"replayed → 原地继续、不外抛 queued"这条编排语义；
+  // unknown 步在同一函数里走 deferred（见 robustness 测试 A3/A10）。
   const f = fixture({
     exec: { reconcileCall: async () => 'aborted', getCallResult: async () => null },
   });
-  const { seq, callId } = startOrphan(f, 'unknown');
+  const { seq, callId } = startOrphan(f, 'safe');
   const r = await f.journal.onExecInterrupted(callId);
   assert.ok(r !== null);
   assert.equal(r!.taskId, f.taskId);
@@ -370,6 +384,21 @@ test('onExecInterrupted 定位 started 步走同一分流；replayed 时 Runner 
   assert.equal(r!.outcome, 'replayed');
   // 任务仍在 running（replayed → 原地继续，不外抛 queued）
   assert.equal(f.queue.getTask(f.taskId)!.status, 'running');
+});
+
+test('onExecInterrupted：unknown 副作用步返回 deferred（不重放，交审批）', async () => {
+  const f = fixture({
+    exec: { reconcileCall: async () => 'aborted', getCallResult: async () => null },
+  });
+  (f.journal as unknown as { deps: { governance?: unknown } }).deps.governance = {
+    async requestApproval() {
+      return { approvalId: 42 };
+    },
+  };
+  const { callId } = startOrphan(f, 'unknown');
+  const r = await f.journal.onExecInterrupted(callId);
+  assert.ok(r !== null);
+  assert.equal(r!.outcome, 'deferred', 'unknown 步不得判 replayed（重复执行风险）');
 });
 
 test('onExecInterrupted 对非 started 步返回 null', async () => {

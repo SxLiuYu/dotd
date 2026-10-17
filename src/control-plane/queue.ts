@@ -355,7 +355,11 @@ export class Queue {
         'finish',
       );
       if (ok) {
-        this.writeResult(taskId, r.summary, true);
+        // 状态已落库之后的一切都是「附带动作」，失败不得抛给调用方：
+        // 抛出去会让 Runner 走 onFatal → 再 finish 一次 → 因 status≠running 记 stale_writer，
+        // 用户看到的是「任务 done 但 task_results 读不到」+ 一条莫名的 stale_writer。
+        // 权威 = tasks.status；结果行可后补（queue.gc/诊断），故这里只记账不抛。
+        this.writeResultSafely(taskId, r.summary, true, epoch);
         this.seal(taskId, 'done', r.summary);
         this.deps.bus.publish('task.state', { taskId, from: 'running', to: 'done', epoch });
       }
@@ -390,7 +394,7 @@ export class Queue {
       'finish',
     );
     if (ok) {
-      this.writeResult(taskId, r.summary, false);
+      this.writeResultSafely(taskId, r.summary, false, epoch);
       this.seal(taskId, 'failed', r.summary);
       this.deps.bus.publish('task.state', { taskId, from: 'running', to: 'failed', epoch });
     }
@@ -609,6 +613,32 @@ export class Queue {
   }
 
   /**
+   * 终态收口路径专用的 writeResult：**永不抛出**。
+   *
+   * 背景（审码 finding，静默失败）：finish()/markFailed() 都先 fenceUpdate 改状态、
+   * 再 writeResult 写结果行。状态是权威，结果行是附属。若 writeResult 抛错（表被锁、
+   * 磁盘满、schema 漂移），旧实现会把异常抛回调用方——Runner 的 onFatal 再 finish 一次，
+   * 因 status≠running 记 stale_writer，于是用户看到「任务显示 done 但没有结果」
+   * 外加一条误导性的 stale_writer。这里降级为记账，状态转移语义不受影响。
+   */
+  private writeResultSafely(taskId: string, summary: string, ok: boolean, epoch: number): void {
+    try {
+      this.writeResult(taskId, summary, ok);
+    } catch (err) {
+      this.deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({
+          taskId,
+          epoch,
+          what: 'writeResult_failed',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+
+  /**
    * 契约 M3（S2'）：控制面在 finish()（done 正常）、finish 失败路径（attempt≥max→failed）、
    * 看门狗 reclaim 判 failed、背压 kill、queue_evict 淘汰（cancelled）、优雅关停落账
    * ——每个终态收口点都必须调 memory.sealTask(task, outcome, stopReason)。
@@ -634,7 +664,7 @@ export class Queue {
       'watchdog',
     );
     if (ok) {
-      this.writeResult(taskId, reason, false);
+      this.writeResultSafely(taskId, reason, false, epoch);
       this.seal(taskId, 'failed', reason);
       this.deps.bus.publish('task.state', { taskId, to: 'failed', epoch, reason });
     }
