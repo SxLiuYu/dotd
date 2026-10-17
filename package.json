@@ -13,6 +13,7 @@
   "scripts": {
     "dotd": "node --import tsx src/surfaces/cli.ts",
     "init-config": "node scripts/init-config.mjs",
+    "doctor": "node scripts/doctor.mjs",
     "serve": "node --import tsx src/daemon.ts",
     "typecheck": "tsc --noEmit -p .",
     "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",

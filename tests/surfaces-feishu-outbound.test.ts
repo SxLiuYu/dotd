@@ -9,7 +9,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeTempDataDir } from './helpers.ts';
 
-import { startFeishuOutbound, feishuChatIdForThread, lastAssistantText } from '../src/surfaces/feishu-outbound.ts';
+import {
+  formatExpiry,
+  renderApprovalCard,
+  startFeishuOutbound,
+  feishuChatIdForThread,
+  lastAssistantText,
+} from '../src/surfaces/feishu-outbound.ts';
+import type { ApprovalView } from '../src/shared/contracts.ts';
 
 const CHAT = 'oc_testchat0000000000000000000000';
 
@@ -89,7 +96,7 @@ test('done + feishu 来源 → 外发最后 assistant 正文；重复状态事�
       dir.bus.publish('task.state', { taskId: 'tk_out1', from: 'running', to: 'done', epoch: 1 });
       await settle();
       assert.equal(gw.calls.length, 1);
-      assert.ok(logs.some((l) => l.includes('已回复 tk_out1')));
+      assert.ok(logs.some((l) => l.includes('已发送 tk_out1')));
     } finally {
       stop();
     }
@@ -184,7 +191,7 @@ test('sendText 失败：只落日志、不记录幂等，下轮同态可再发',
       dir.bus.publish('task.state', { taskId: 'tk_out1', from: 'running', to: 'done', epoch: 1 });
       await settle();
       assert.equal(n, 2);
-      assert.ok(logs.some((l) => l.includes('已回复')));
+      assert.ok(logs.some((l) => l.includes('已发送')));
     } finally {
       stop();
     }
@@ -207,4 +214,136 @@ test('stop() 解订：之后的事件不再触发动作', async () => {
   } finally {
     dir.cleanup();
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 审批推送：任务卡在审批时，主人必须在手机上看到，而不是 24h 后作废
+//
+// 背景：approval TTL 24h，任务在 awaiting_approval 时 Runner 让位、整个任务停着；
+// 而原出站只订阅 task.state 的 done/failed —— 飞书完全静默。
+// ═══════════════════════════════════════════════════════════════════
+
+function approvalView(over: Partial<ApprovalView> = {}): ApprovalView {
+  return {
+    id: 42,
+    seq: 7,
+    kind: 'tool_call',
+    tier: 'dangerous',
+    status: 'pending',
+    summary: 'shell.run: rm -rf /dot/home/notes/old',
+    fullParams: { cmd: 'rm -rf /dot/home/notes/old' },
+    reason: '危险命令命中规则',
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    taskRef: { taskId: 'tk_out1', journalStepId: 'st_1' },
+    ...over,
+  };
+}
+
+test('approval:created → 推一张能看懂的审批卡片（说清要批什么/批了会怎样/怎么回）', async () => {
+  const dir = makeTempDataDir();
+  const gw = fakeGw();
+  const logs: string[] = [];
+  try {
+    seed(dir, 'feishu');
+    const stop = startFeishuOutbound({ db: dir.db, bus: dir.bus, gateway: gw, log: (m) => logs.push(m) });
+    try {
+      dir.bus.publish('approval:created', approvalView(), { dotId: 'dot1' });
+      await settle();
+      assert.equal(gw.calls.length, 1, '必须推一条');
+      const text = gw.calls[0]!.text;
+      assert.equal(gw.calls[0]!.chatId, CHAT, '发回主人原会话');
+      assert.match(text, /需要你批准/, '第一行就说清要你决定什么');
+      assert.match(text, /rm -rf/, '要写清具体操作（summary）');
+      assert.match(text, /dangerous/, '要带风险档位');
+      assert.match(text, /危险命令命中规则/, '要带拦下原因');
+      assert.match(text, /批准 42/, '要给出可以直接照做的回复指令');
+      assert.match(text, /拒绝 42/);
+      assert.match(text, /还有约/, '要说清还有多久过期');
+      assert.ok(logs.some((l) => l.includes('已发送 approval:42')));
+    } finally {
+      stop();
+    }
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('同一条审批重复 publish 不重复推（防重投刷屏）', async () => {
+  const dir = makeTempDataDir();
+  const gw = fakeGw();
+  try {
+    seed(dir, 'feishu');
+    const stop = startFeishuOutbound({ db: dir.db, bus: dir.bus, gateway: gw, log: () => {} });
+    try {
+      dir.bus.publish('approval:created', approvalView(), { dotId: 'dot1' });
+      dir.bus.publish('approval:created', approvalView(), { dotId: 'dot1' });
+      await settle();
+      assert.equal(gw.calls.length, 1);
+    } finally {
+      stop();
+    }
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('非飞书来源任务的审批不外发（主人在电脑前，Web UI 已经亮了）', async () => {
+  const dir = makeTempDataDir();
+  const gw = fakeGw();
+  try {
+    seed(dir, 'web');
+    const stop = startFeishuOutbound({ db: dir.db, bus: dir.bus, gateway: gw, log: () => {} });
+    try {
+      dir.bus.publish('approval:created', approvalView(), { dotId: 'dot1' });
+      await settle();
+      assert.equal(gw.calls.length, 0);
+    } finally {
+      stop();
+    }
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('审批推送失败只落日志，不影响同一时刻的任务完成回复', async () => {
+  const dir = makeTempDataDir();
+  let n = 0;
+  const calls: Sent[] = [];
+  const gw = {
+    sendText: async (chatId: string, text: string): Promise<{ ok: boolean; error?: string }> => {
+      n += 1;
+      if (n === 1) return { ok: false, error: '审批卡片超时' };
+      calls.push({ chatId, text });
+      return { ok: true };
+    },
+  };
+  const logs: string[] = [];
+  try {
+    seed(dir, 'feishu');
+    putMessage(dir, 2, 'assistant', '干完了');
+    const stop = startFeishuOutbound({ db: dir.db, bus: dir.bus, gateway: gw, log: (m) => logs.push(m) });
+    try {
+      dir.bus.publish('approval:created', approvalView(), { dotId: 'dot1' });
+      await settle();
+      dir.bus.publish('task.state', { taskId: 'tk_out1', from: 'running', to: 'done', epoch: 1 });
+      await settle();
+      assert.ok(logs.some((l) => l.includes('approval:42') && l.includes('失败')), '失败要留痕');
+      assert.deepEqual(calls, [{ chatId: CHAT, text: '干完了' }], '后续回复照常发出');
+    } finally {
+      stop();
+    }
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('renderApprovalCard：无 summary 时不出现空白；过期的说"已过期"', () => {
+  const text = renderApprovalCard(
+    approvalView({ summary: '', expiresAt: new Date(Date.now() - 1000).toISOString(), tier: null, reason: '' }),
+    null,
+  );
+  assert.ok(!text.includes('要做的操作：\n'), '不能留空行占位');
+  assert.match(text, /已过期/);
+  assert.match(text, /tool_call/, '缺 summary 时退回 kind，不出现 undefined');
+  assert.ok(!text.includes('undefined'));
 });
