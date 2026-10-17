@@ -50,22 +50,30 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 
 ## 当前状态
 
-**阶段一 MVP。** 能跑通一条完整链路，但跑通的方式是 stub。
+**阶段一 MVP，但不再只是 stub 演示。** 真实的 HTTP 模型传输、daemon 全链路、以及四个会丢数据/丢任务的缺陷，
+在这一批优化里被真测试证明过（详见 [`docs/optimization-2026-10-17.md`](docs/optimization-2026-10-17.md)）。
+**仍然没验证的**：真模型往返（环境无凭据）、真 Docker 容器（本机无 dockerd）、真实飞书链路。
 
-### 门禁实测（2026-10-17，Node v24.13.0 / npm 11.9.0，原生 Windows）
-
-我在本次会话里实跑了三条，命令与结果如下：
+### 门禁实测（2026-10-17 本批结束时实跑，Node v24.13.0 / npm 11.9.0，原生 Windows）
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 类型检查 | `node node_modules/typescript/bin/tsc --noEmit -p .` | exit **0**，0 错误 |
-| 测试套件 | `npm test`（并行 4） | `tests 1138 / pass 1138 / fail 0`，exit **0**（56 个 `.test.ts` 文件，110 个 suite；串行同值，见「已知限制」） |
+| 类型检查 | `node node_modules/typescript/bin/tsc --noEmit -p .` | exit **0**，0 错误（约 9s） |
+| 测试套件 | `npm test`（并行 4） | `tests 1138 / pass 1138 / fail 0`，exit **0**，**75s**（56 个 `.test.ts`，110 suite） |
+| 测试套件（串行） | `npm run test:serial` | 同样 `1138/1138`、0 失败（约 5 分钟，排查并行问题时用） |
 | 端到端冒烟 | `node scripts/smoke.mjs` | **11/11 通过**，exit **0** |
+| 冒烟（真 HTTP 模型链路） | `DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` | **16/16 通过**，exit **0**（daemon → ModelRouter → 真 HttpTransport → 真 TCP → 假上游） |
+| 上线前体检 | `npm run doctor` | 10 项检查，每项给「结论 + 下一步命令」；本机当前 2 项 fail（缺 `WB2API_KEY`、严格占位符未展开） |
 
-> 测试总数是**流动的**（`tests/` 目录在活跃迭代中：套件总数从 873 经 879、935、976 变成 1004，中间只隔了几小时）。上面的数字是 2026-10-17 多次实跑的结果（末次 19:12）；跑之前自己数一遍更稳妥：
-> `grep -hcE "^[[:space:]]*(test|it)\(" tests/*.test.ts | awk '{s+=$1} END {print s}'`（静态数与运行数一致，无动态注册）。
+> 耗时是同一批改动的直接成果：全量从 **278s（改前，1032 用例）** 降到 **75s（1138 用例）**，路径是
+> 消掉测试里的真实等待（SSE 环形缓冲 O(N²)、每用例重跑迁移、TG 重试 2s×3）、修 cwd 脆弱性、并恢复并行。
+> 测试总数是**流动的**，跑之前自己数一遍更稳妥：
+> `grep -hcE "^[[:space:]]*(test|it)\(" tests/*.test.ts | awk '{s+=$1} END {print s}'`。
 
 冒烟脚本做了什么：自建临时数据目录 + 临时 `config.yml`，以 stub 模型 / stub fleet 起 daemon 子进程 → `GET /api/status` 200 → `POST /hooks/smoke` 202 → 事件匹配建任务 `tk_ev_1` 并跑到终态 `done` → journal 里有一次 `fs.write succeeded` → IPC 触发优雅退出 exitCode=0 → `shutdown_marker` 落库 → `OUTBOX.md` 留痕（`scripts/smoke.mjs:1-20` 头注）。
+`DOTD_SMOKE_FAKE_UPSTREAM=1` 时额外起一个真 `node:http` 假 OpenAI 上游、把 tier1 `base_url` 指过去、
+不设 `DOTD_MODEL_TRANSPORT=stub`，于是走**真 HttpTransport**；多出的 5 条断言证明请求真的过 TCP、
+`tools` 线格式合法、`Authorization` 按 `api_key_env` 上送、上游回显的工具名被正确还原。
 
 ### 测试数字必须说清的一件事
 
@@ -81,21 +89,24 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 ### 哪些是真验证过的
 
 - 类型系统：全量 `tsc --noEmit` 干净。
-- 模块行为：1004 个用例，覆盖控制面队列/journal/恢复/事件匹配/调度、模型路由降级与熔断状态机、治理审批八态与工具目录、执行面幂等 ledger 与网络收敛、记忆注入/封写/保留、surfaces HTTP/HMAC/SSE/ingress/飞书入站出站、Runner 主循环。
+- 模块行为：1138 个用例，覆盖控制面队列/journal/恢复/事件匹配/调度、模型路由降级与熔断状态机、治理审批八态与工具目录、执行面幂等 ledger 与网络收敛、记忆注入/封写/保留、surfaces HTTP/HMAC/SSE/ingress/飞书入站出站、Runner 主循环、Runner 工具说明书与 system prompt、`dotd doctor`。
 - 容器内协议一致性：`tests/agent-runtime-protocol.test.ts` 双向断言 `agent-runtime/protocol.ts`（容器侧权威）与 `src/exec/protocol.ts`（宿主侧）逐字同形——40 个用例，含 11 名工具词表逐个比对、`args_hash`/`identity_hash` 同值、fs 错误码名同码。
+- **真实 HTTP 模型传输**（2026-10-17 新增）：`tests/router-http-transport.test.ts` 34 条，用真 `node:http` 假上游跑真 `HttpTransport`——非流式/SSE 流式解析、auth/rate_limit/quota/server_error 分类、**三档超时各自生效**、空壳判据、脏 JSON、断流、以及真 ModelRouter 接真 transport 的集成路由。
+- **daemon 全链路（含真 HTTP 模型）**：`DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` 16/16，daemon 真的通过 TCP 打到上游并跑出任务终态。
 - 冒烟：daemon 真起真停，事件到任务到终态，journal 有真工具步。
 
 ### 哪些是 stub，别当成已验证
 
 | 项 | 状态 |
 |---|---|
-| 模型调用 | **全部 stub。** 测试用 `tests/helpers.ts:120` 的 `makeStubTransport()`，冒烟用 `DOTD_MODEL_TRANSPORT=stub`（`scripts/smoke.mjs:154`）。本机零网络模型请求，`config/models.yml` 里没有任何端点被拨测过。 |
-| Docker 执行面 | **全部 stub。** `DOTD_FLEET=stub`（`scripts/smoke.mjs:156`），`tests/helpers.ts` 的 `makeStubFleet()`。stub 运行时的 `browser.*` 只做结构仿真不起 chromium，`shell.run` 返回固定假 stdout（`src/exec/stub-runtime.ts:12-15,382-397`）。 |
-| 真实飞书链路 | **未验证。** 仓库无 appId/appSecret，本次未连接开放平台。WS 长连接拨通与出站 `sendText` 真实往返都没测。 |
+| 模型调用（真实模型） | **真实模型一次都没跑过。** 默认测试与冒烟仍用 `DOTD_MODEL_TRANSPORT=stub`；真 HTTP 代码路径已被 `tests/router-http-transport.test.ts` 与假上游冒烟证明，但**没有任何一次真实模型往返**——本机 `127.0.0.1:7863` 端口通、`GET /v1/models` 返回 **401**，环境里没有 `WB2API_KEY`。`node scripts/probe-live-model.mjs` 在有 key 时随时可跑，`npm run doctor` 会把这条判成 fail。 |
+| Docker 执行面 | **全部 stub。** `DOTD_FLEET=stub`（`scripts/smoke.mjs`），`tests/helpers.ts` 的 `makeStubFleet()`。stub 运行时的 `browser.*` 只做结构仿真不起 chromium，`shell.run` 返回固定假 stdout（`src/exec/stub-runtime.ts`）。**真实容器从未 boot 过**（本机无 dockerd）。 |
+| 真实飞书链路 | **未验证。** 仓库无 appId/appSecret。WS 长连接拨通与出站 `sendText` 真实往返都没测（审批卡片的推送逻辑只在 fake gateway 上验证过）。 |
 | Web UI 完整构建 | **未跑** `npm run build:web`。仓库内 `web-ui/dist/` 是既有产物，冒烟里 `GET /` 与静态资源均 200。 |
-| CLI 对运行中 daemon | 14 个功能子命令（外加 commander 自动的 `help`）的清单与选项来自读 `src/surfaces/cli.ts:155-438`，没有逐个对活 daemon 端到端调用过。 |
+| CLI 对运行中 daemon | 功能子命令的清单与选项来自读 `src/surfaces/cli.ts`，没有逐个对活 daemon 端到端调用过。 |
 
-一句话：**门禁全绿是在 stub 模型 + stub fleet 下取得的，对真实模型和真实容器零证明力。** 第一次真跑时会撞到什么，没有人知道。
+一句话：**门禁全绿证明的是"逻辑正确 + 真实 HTTP 线格式正确"，不证明"真模型 + 真容器能干活"。**
+那需要一份模型凭据和一台有 docker 的 Linux/WSL 机器，缺的是环境，不是代码。
 
 ---
 
@@ -206,7 +217,7 @@ npm run dotd -- watch                      # 实时事件流
 
 模型那张是信息量最大的：`GET /api/models/rank` 的返回直接画成了表——每个端点的 tier、是否参与准入、primary 与 light 两条 track 各自的熔断状态（`closed` = 正常）、下次探测时间；下面「排序」是 `pickCandidates` 按健康度重排后的真实结果。**端点名字和地址来自本地 `config/dotd.yml`，换你自己的配置就会换一批。**
 
-**stub 模式下任务会跑完并留下 journal 步骤**（冒烟脚本断言了 `fs.write succeeded`），但模型回答和容器执行都是假的。要真模型、真容器、真飞书回复，往下看 §前置条件 与下面「5. WSL 真容器路径」。完整细节、每个开关的坑、CLI 全量子命令，见下面各节。
+**stub 模式下任务会跑完并留下 journal 步骤**（冒烟脚本断言了 `fs.write succeeded`），但模型回答和容器执行都是假的。要真模型、真容器、真飞书回复，往下看 §前置条件 与下面「6. WSL 真容器路径」，**并且先跑一遍 `npm run doctor`**。完整细节、每个开关的坑、CLI 全量子命令，见下面各节。
 
 ---
 ### 0. 检查 Node
@@ -267,14 +278,40 @@ token 三顺位：`--token` > `DOTD_MASTER_TOKEN` > `~/.dotd/cli_token`（`src/s
 
 ```bash
 npm run typecheck                  # tsc --noEmit -p .
-npm test                           # 1138 个用例；并行 4，任意 cwd 都可（约 60–90s）
+npm test                           # 1138 个用例；并行 4，任意 cwd 都可（约 75s）
 npm run test:serial                # 同上但不并行（约 5 分钟；排查并行相关假红时用）
 npm run test:fast                  # 日常快检（同并行 4）
 node scripts/smoke.mjs             # 11/11 端到端冒烟（自建临时数据目录，不碰 ~/.dotd）
+DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs   # 16/16：真 HTTP 模型链路（本地假上游，零外网）
 npm run build:web                  # web-ui：tsc --noEmit + vite build
 ```
 
-### 5. WSL 真容器路径（可选）
+### 5. 上线前体检（强烈建议：起 daemon 之前先跑这个）
+
+```bash
+npm run doctor                     # 10 项只读检查；有 fail 时退出码 1
+npm run doctor -- --json           # 机器可读（CI / 远程排查用）
+```
+
+它专抓**静默失败**——那种"daemon 起来了、看起来在跑、其实什么也没干"的情况：
+`DOTD_FLEET` 拼错（`Docker`/`DOCKER` 会**静默**回落 stub，所有工具执行都是假的）、
+`DOTD_MODEL_TRANSPORT` 的缺省其实是**真 HTTP**（与 fleet 的缺省正好相反）、
+tier1 端点连不上、**tier1 的 key 不在环境里**（这是"daemon 正常起、交互任务全挂起"的根因）、
+严格占位符没展开（`ConfigError` 拒启动）、库的 `user_version` 落后于 `db/migrations` 的期望版本。
+每项都给人话结论 + 下一步命令，不打印任何密钥的值。
+
+实跑示例（本机 2026-10-17，故意暴露两个真实缺口）：
+
+```
+❌ 环境里没有 WB2API_KEY
+     缺 key 不是启动期错误，但运行期请求会失败并计入熔断；tier1 是唯一能承载 primary 的端点
+     → 下一步：把 export WB2API_KEY=... 写进 ~/.dotd/tokens.env，这样 daemon 重启后不会丢
+⚠️  user_version=90，期望 100
+     落后：daemon 启动时会自动迁移（会先写 OUTBOX）
+结论：2 项会让 daemon 起不来或干了假活，先按上面的「下一步」修。
+```
+
+### 6. WSL 真容器路径（可选）
 
 ```bash
 # 在 WSL Ubuntu-24.04 里：
@@ -343,12 +380,12 @@ tier1 → tier2 → tier3 → tier4 **单向**，失败永远向前降级，绝�
 
 ### 高
 
-- **真实链路一次都没验证过。** 全部 1004 测试与 11/11 冒烟都在 `DOTD_MODEL_TRANSPORT=stub` + `DOTD_FLEET=stub` 下通过。tier1 代理 hy3（`:7863`）的 tool_calls、breaker open→half_open 探活、真实容器 boot/recreate、`/fs/ops` 桥、netguard iptables 实装，全只在上层 stub 上验过。
+- ~~**真实链路一次都没验证过。**~~ **2026-10-17 部分消除**：真实 HTTP 模型传输已由 `tests/router-http-transport.test.ts`（34 条，真 TCP）与假上游冒烟（16/16）证明；**真模型往返、真 Docker 容器、真实飞书仍是零验证**（见「哪些是 stub」）。另外三条在本批被修掉的真实缺陷值得记下来当教训：① `rawHttp` 的三档超时全建在响应回调里，而上游"接了连接回了头再卡住"时该回调永不调用——**超时一个都不生效、调用方永久钉死**；② 崩溃恢复把执行面报的 `aborted`（含 `container_lost`）当成"未落地"，导致已执行的 `rm`/`net.post` 被判可重放；③ `runNext()` 里 `cp.pop()` 在 try 外面，一次 `SQLITE_BUSY` 就能让唯一的常驻协程退出、队列永久静止而进程还活着。三条的改法见 [`docs/optimization-2026-10-17.md`](docs/optimization-2026-10-17.md)。
 - **`npm test` 曾是个假绿（2026-10-17 已修）。** 原脚本写成 `--test "tests/*.test.ts"`，引号让 glob 不展开，`--test` 拿到一个字面量文件名、找不到文件也不报错——`tests 0 / pass 0 / fail 0`、exit **0**。也就是说修好之前 `npm test` 对任何人（含 CI）都是"全绿"。现已改成无引号。
 - ~~**并行跑测试有 3 个假红**（`tests/router-health.test.ts` 的 3 个 429 冷却评分用例）；`npm test` 固定为串行。~~ **2026-10-17 已恢复并行（测试套件加速任务）。** 当时的根因判定（"runner 并发的共享状态污染"）没有复现；把测试里的真实等待砍掉之后实测 **`--test-concurrency=4` 连跑 3 次全量 1138/1138、0 失败**（90.4s / 112.5s / 61.7s），`router-health` 并行下 25/25。现在 `npm test` = 并行 4；要复现旧行为用 `npm run test:serial`，日常快检用 `npm run test:fast`（同并行 4）。**注意**：并行时任何"靠真定时器/墙钟等待推进"的用例都会在负载机上被饿死（本机还跑着 6 个 node 测试进程时有实例），所以新测试一律用可注入的假时钟或事件驱动等待，别写 `sleep`。
 - **CLI 入口守卫在中文路径下恒假（2026-10-17 已修）。** 原判据拿 `import.meta.url` 和手拼的 `file://${argv[1]}` 比，而 `import.meta.url` 会把非 ASCII 路径段百分号编码（`%E7%A0%94%E7%A9%B6` = "研究"），手拼的不编码，两者永不相等 → 守卫恒假 → `node src/surfaces/cli.ts status` 静默退出、exit 0、零输出。**README 里每一条 `npm run dotd -- xxx` 示例因此都曾是空操作。** 已改为与 `src/daemon.ts` 同一手法（比对解析后的绝对路径），修复后 `--help` 正常列出 15 个子命令。
 - **第二个 daemon 实例不消费队列。** 用 `DOTD_CONFIG` 指向另一份配置换个端口（如 `:7799`）起 daemon，`/api/status` 正常、能提交任务，但任务永远停在 `queued`——exec 层启动即把 dot1 标 `quarantined`（日志 `[exec] boot 告警：dot1 进入 quarantined`），没有消费者。看到"任务不动"先查这条。
-- **tier1 的 `WB2API_KEY` 在全机没有持久来源（真缺口，非文档疏漏）。** 搭建方法已写进 [`docs/tier1-endpoint.md`](docs/tier1-endpoint.md)，但 2026-10-17 排查发现这个 key 不在 `~/.dotd/tokens.env`（逐行看过），也不在 Windows 用户/机器环境变量（`HKCU:\Environment` 与 Machine 作用域均无）——它只存在于当前跑着的 daemon 进程环境里（`/proc/<pid>/environ` 实测有值），即启动它的 shell 临时 export 的。后果：用 `scripts/daemon-launch.sh` 重启 daemon 就会丢 key（该脚本只 `source tokens.env`），重启即 tier1 全灭，且现象是"daemon 正常起、任务全部不干活"。修法：把 `export WB2API_KEY=...` 补进 `~/.dotd/tokens.env`。
+- **tier1 的 `WB2API_KEY` 在全机没有持久来源（真缺口，非文档疏漏）。** 搭建方法已写进 [`docs/tier1-endpoint.md`](docs/tier1-endpoint.md)，但 2026-10-17 排查发现这个 key 不在 `~/.dotd/tokens.env`（逐行看过），也不在 Windows 用户/机器环境变量（`HKCU:\Environment` 与 Machine 作用域均无）——它只存在于当前跑着的 daemon 进程环境里，即启动它的 shell 临时 export 的。后果：用 `scripts/daemon-launch.sh` 重启 daemon 就会丢 key（该脚本只 `source tokens.env`），重启即 tier1 全灭，且现象是"daemon 正常起、任务全部不干活"。修法：把 `export WB2API_KEY=...` 补进 `~/.dotd/tokens.env`。**`npm run doctor` 现在会把这一条直接判 fail 并给出这句修法**——这是本批加它最主要的动机之一。
 - **`.env.example` 与 `scripts/setup-dev-env.sh` 会互相覆盖，且它不覆盖全部变量。** 代码确实不读 `.env`，环境变量只能 export 进 shell；仓库现有 `.env.example` 清单（11402 字节，见「环境变量与配置文件」），但三个坑：① 它建议 `cp .env.example ~/.dotd/tokens.env`，而 `scripts/setup-dev-env.sh` 在 tokens.env 已存在时直接跳过——照快速启动先生成过真 token 的用户再 cp 一遍，真 token 就被 `__REPLACE_ME_*__` 占位符覆盖，下次启动报 `ConfigError「环境变量 DOTD_MASTER_TOKEN 未设置」`（`src/surfaces/config.ts:204-211`，未设/空即拒），且看不出是覆盖导致的；② 它没登记 `DOTD_HOOK_SECRET_SMOKE`（CLI `hook smoke` 需要，而 daemon 侧根本没登记 smoke 源，详见快速开始注记）；③ 快速启动实际用到的变量其余都在里面。**跨平台的替代入口是 `npm run init-config`**（`scripts/init-config.mjs`）：生成 `~/.dotd/config.yml` + 补齐 `tokens.env` 缺键，幂等且绝不覆盖已有行。
 - **原生 Windows / WSL 两条权威说法对立。** `CONVENTIONS.md:12` 说「不在 WSL」，`docs/design/CONTEXT.md:34` 说「控制面 daemon 跑 WSL 内」（该文件现在**在库内**了，见「相关文档」）。按 CONVENTIONS 自己的仲裁规则（冲突时以 `docs/design/` 原文为准）又该照后者，而代码的实际约束也偏向后者（`src/exec/types.ts:154` 硬编码 Unix socket）。在原生 Windows 上跑真实 fleet 只会得到 `docker 不可用 —— degraded 启动`，此后每个容器动作被拒。
 - **首次人工登录通道完全未设计。** 容器内无显示转发路径、surfaces 无身份/登录页。想让它用你的账号干活，得先手工把宿主已登录的 Chrome profile 复制进 docker 卷。
