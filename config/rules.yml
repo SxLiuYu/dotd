@@ -1,0 +1,25 @@
+# rules.yml —— 人工收紧规则（GOV §2.6）
+#
+# 语义（GOV §2.6 逐字）：
+#   一次调用命中多个条目取最高档；upgrade 解析：把 JSON.stringify(call.params) 作小写
+#   字符串，whenContains 任一子串命中 ⇒ 档位提至 upgrade.tier；tierHint 只可提档。
+#   rules.yml 自定义规则只能收紧：allow→approve 之类降档在加载时被拒绝并告警。
+#
+# 即：本文件是主人的白名单外"加密"层——只允许把某类调用提到更严的裁决（allow→approve），
+#   任何试图放宽（approve→allow）的条目在加载时拒绝并告警。
+#
+# 匹配字段（GOV §2.6 示例形状）：tool、urlHost（browser/net 类）。其余谓词字段由治理
+#   模块的 rules 加载器定义；阶段一默认空列表（不预设任何收紧规则，未登记工具一律 deny）。
+
+rules: []
+
+# ── 条目形状（GOV §2.6 示例，逐字抄录）──────────────────────────────────────
+# rules:
+#   - match: { tool: "net.post", urlHost: "*.github.com" }
+#     decision: approve          # allow→approve 之类降档在加载时被拒绝并告警
+#     reason: "对外仓库写入需人看"
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 与记忆化授权（GOV §4，approve_remember 派生 approval_rules 表）的关系：
+#   本文件 = 主人手改的静态收紧，永远压过记忆（设计方案:230：人工收紧 rules.yml 永远压过记忆）。
+#   记忆派生的是 DB 里的 approval_rules 行，不写本文件。

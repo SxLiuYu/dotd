@@ -1,0 +1,163 @@
+# models.yml —— 模型路由配置（MR §2.1，逐字抄录；仅按接缝契约 T3 修订一处）
+#
+# 修订点（唯一改动，契约 T3 明确裁决）：
+#   alerts.outbox_path: /dot/state/OUTBOX.md  →  ~/.dotd/OUTBOX.md
+#   （原稿指向容器路径；契约 T3 定 outbox 在 daemon 侧状态目录，§9.1 目录树注释亦如此记载）
+# 追加（契约/§4.3 要求）：routing.light_events 须含 event.match（设计方案:202 点名）与 memory.*
+#   前缀（契约 M7 记忆事件同样走 light 轨）——原稿缺 event.match，已补。
+# 2026-10-17 追加：端点级 `fallback_models`（自 PilotDeck runFallbackChain 迁移的模型级
+#   fallback 链）。语义、写法和"为什么"见下方 openrouter-main 处的说明块；
+#   回归测试 tests/router-model-fallback.test.ts。
+# 其余一字未改。
+
+# 端点定义。tier: 1|2。tier3 来自 free_models_file，tier4 来自 recon_candidate 表。
+version: 1
+reload_debounce_ms: 1500
+
+endpoints:
+  - id: openrouter-main
+    tier: 1
+    # 2026-10-16 主人指定：tier1 走本机 Agent2API/workbuddy 代理的 hy3。
+    # 2026-10-17 修正：原写 :3065，该端口在本机已无监听（Agent2API 那一版已停），
+    # 现役代理是 workbuddy2api 容器（0.0.0.0:7863 → 容器 :7863，4 账号池，healthy）。
+    # 密钥同源不同值：config.json 的 api_key（wb2a… 37 位）≠ tokens.env 里旧的 sk-a…，
+    # 故新增 WB2API_KEY 而不是复用 HY3_API_KEY（旧的留着，代理回来即可回退）。
+    # 换供应商仍只改这一行 + key_env（契约 T3 的 base_url 可换性由 transport 层编解码保证）。
+    base_url: http://127.0.0.1:7863/v1
+    api_key_env: WB2API_KEY
+    models:
+      # 2026-10-16 实测：hy3 支持 tool_calls（finish_reason=tool_calls，arguments 合法 JSON），
+      # 带 reasoning_content；light 同模型（hy3 一套三个别名，见 /v1/models）。
+      primary: hy3
+      light:   hy3
+    # 2026-10-17：模型级 fallback 链（迁移自 PilotDeck runFallbackChain / RouterFallbackConfig）。
+    #
+    # 是什么：同一端点内再分一层——models[track] 先试，失败且故障是"模型级"
+    #   （429 / 配额 / 5xx / 超时 / 网络 / 协议错误）时，按 fallback_models[track] 的
+    #   顺序换下一个模型重试；**端点不换、熔断不结算**。端点与凭据都是好的，
+    #   坏的只是这一个模型，把样本记到端点窗口上是连坐。
+    #   端点级故障（401/403 鉴权、引擎不可用、池无资格）或整条链试完，才换下一个端点。
+    # 为什么必须有：primary 轨只有一个候选（就是本端点）。没有这条链，hy3 一次限流
+    #   就把唯一候选拖进 consec_failures=3 的熔断，之后每个交互任务都直接失败——
+    #   模型链是它唯一的自救手段。链上限 5 个备份（同 PilotDeck
+    #   LITELLM_ROUTER_MAX_FALLBACKS）；再多通常已是供应商整体故障，该换端点解决。
+    # 怎么写：**只支持行内数组**。`fallback_models: { primary: [a, b], light: [c] }`。
+    #   YAML 块列表（`- a` 逐行）在本仓库的极简解析器里会被静默丢弃——写成块列表
+    #   等于没配，且不报错。给某轨配备份，则该轨必须先有 models[track]，否则
+    #   daemon 拒启动（fail-loud，见 config.ts validateModelsConfig）。
+    # 这里先注释掉：要把 /v1/models 里 hy3 的几个别名按"实测最稳的放前面"排进来。
+    #   没实测过别名稳定性之前不填——填错的名字只是多烧一次链上尝试。
+    # fallback_models: { primary: [hy3-alias-2, hy3-alias-3], light: [hy3] }
+    style: openai
+    timeouts: { connect_ms: 2000, idle_ms: 60000, total_ms: 180000 }
+    emergency_eligible: true                  # 应急模式下仍可用（付费自有通道）。执行语义见 §4.2：应急档位下承载 primary 的硬门槛
+
+  # 2026-10-16：OpenRouter 免费路由在本机的实测结论是 ~40% 返回 200 无 choices 的空壳
+  # （Nvidia 免费池过载），且付费模型区域封锁 403。已从 tier1 撤下，作为 tier2 备胎保留。
+  # 主人要恢复随时把 enabled 改回 true（热加载生效）。
+  - id: openrouter-fallback
+    tier: 2
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    models:
+      light: poolside/laguna-s-2.1:free
+    style: openai
+    timeouts: { connect_ms: 5000, idle_ms: 60000, total_ms: 180000 }
+    enabled: false
+    local:                                    # tier2 校验要求 health_url 必填（config.ts:634）
+      health_url: https://openrouter.ai/api/v1/models
+
+  - id: backup-openai-compatible
+    tier: 1
+    base_url: https://api.xxx.example/v1
+    api_key_env: BACKUP_API_KEY
+    models: { primary: some/model, light: some/model-mini }
+    # 模型级 fallback 链示例（行内数组；语义见 openrouter-main 处的说明块）。
+    # 同一家的不同规格：主模型限流/降级时换小的，比整个换端点更省一次握手。
+    fallback_models: { primary: [some/model-mini, some/model-old], light: [some/model-mini-old] }
+    style: openai
+    enabled: false                            # 备胎默认关，主人启用即热生效
+    emergency_eligible: true
+
+  - id: colibri-olmoe
+    tier: 2
+    # 2026-10-17 修（全方位测试高危"tier2 双断点"之网络层）：Colibrì 只绑 Windows
+    # 127.0.0.1:8001，WSL 里 daemon 自己的 127.0.0.1:8001 是另一个命名空间，直连必拒。
+    # 通路 = WSL 默认网关 + Windows 侧 win-relay.mts（0.0.0.0:18001 → 127.0.0.1:8001，
+    # 带 Host 重写）。网关 IP 会随 WSL 重启漂移，故留 DOTD_TIER2_HOST 环境变量口子
+    # （setup-dev-env.sh 自动算当前网关写进 tokens.env；未设则用下面的默认值）。
+    base_url: ${DOTD_TIER2_HOST:-http://172.17.48.1:18001}/v1
+    models: { light: olmoe-colibri }          # 2026-10-16 实测：coli serve --model-id olmoe-colibri（原稿 olmoe-1b-7b-instruct 会 404）。7B 无（已证实的）工具调用能力，默认只挂 light；主人显式加 primary 行即授权降格（§4.3）
+    style: openai
+    timeouts: { connect_ms: 1000, idle_ms: 15000, total_ms: 45000 }
+    local:                                    # queue_reject_ms 等参数一律挂在端点.local 下；调用方不得覆盖（§4.2）
+      health_url: ${DOTD_TIER2_HOST:-http://172.17.48.1:18001}/health
+      # 2026-10-17 修（同一次测试的判据层）：Colibrì /profile 把 expert_disk_s 嵌在
+      # turns[] 里（{"seq":8,"turns":[{…,"expert_disk_s":10.01},…]}），且冷启动序列是
+      # 10.0/1.0/0.9/0.47… 驻留后跌到 0.02 以下——故判据写"末条 turn 不超过 0.1s"：
+      # 既避开 == 0 被采样噪声反复打穿，又在冷启动窗口稳稳判负（实测冷值最小 0.471）。
+      # turns 还是空数组（引擎刚起、一条没跑）时判过：无磁盘 I/O 样本即无违背，
+      # 否则永远等不到第一条 turn，闸门会把 tier2 永久锁死。
+      warm_check:
+        url: ${DOTD_TIER2_HOST:-http://172.17.48.1:18001}/profile
+        json_max: { 'turns.last.expert_disk_s': 0.1 }
+      warm_grace_ms: 150000                   # /health 通过≠全量驻留，宽限期外不判 warm
+      max_concurrency: 1                      # 无 batching 实测结论：并发只排队，超 1 直接快速失败
+      queue_reject_ms: 8000                   # 槽位被占超 8s → 本请求放弃该端点（是否入窗见 §4.1 busy 规则）
+  # 2026-10-16 关掉：本机没装 ollama（:11434 拒连）。开着会让 light 轨每次降级都先
+  # 撞一次 ECONNREFUSED，白白多耗一个探针周期。主人装了随时 enabled: true。
+  - id: ollama
+    tier: 2
+    base_url: http://127.0.0.1:11434/v1
+    models: { light: qwen2.5:7b }
+    style: openai
+    timeouts: { connect_ms: 1000, idle_ms: 15000, total_ms: 45000 }
+    enabled: false
+    local: { health_url: http://127.0.0.1:11434/api/tags, max_concurrency: 2, queue_reject_ms: 8000 }
+
+free_models_file: config/free-models.yml
+
+routing:
+  default_track: primary
+  light_events:                               # 事件类型 → light 轨（前缀匹配）
+    - event.classify
+    - event.route
+    - event.match               # 事件→目标匹配的置信度打分（设计方案:202 点名必须）
+    - memory.summarize
+    - heartbeat.triage
+    - queue.dedupe
+    - digest
+
+breaker:
+  window_size: 20          # 滑动窗口样本数
+  window_ms: 300000        # 窗口时限 5min
+  min_samples: 5           # 判失败率所需最少样本
+  failure_ratio: 0.5       # open 阈值
+  consec_failures: 3       # 连续失败直接 open（不等窗口）
+  backoff_initial_ms: 60000
+  backoff_max_ms: 3600000
+  half_open_success_needed: 2
+  half_open_max_concurrency: 1
+  throttle_max_ms: 120000  # 429 Retry-After 软冷却上限，超过则按 open 处理
+  busy_consec_limit: 3     # Tier2 槽位连续 queue_reject 达到该数 → 按 engine_unavailable 入窗（§4.1）
+
+alerts:
+  dedup_window_ms: 86400000          # 同一签名 24h 只求救一次
+  outbox_path: ~/.dotd/OUTBOX.md     # 兜底通道（daemon 侧状态目录，非容器卷；契约 T3 修订）
+  # 2026-10-17 修（全方位测试高危"SOS 未接飞书"）：feishu 提到首位——主人 2026-10-16
+  # 拍板飞书机器人取代 Telegram。telegram/email 未装配或未实现时 available=false，
+  # 会自动落到下一级；outbox 恒为最后一级兜底（validateModelsConfig 强制含它）。
+  channel_order: [feishu, telegram, email, outbox]
+  channel_timeout_ms: 10000          # 单通道投递超时即换下一通道
+
+recon:
+  interval_ms: 21600000              # 非 NORMAL 时每 6h 侦察一次
+  max_candidates_per_scan: 10
+  sources:
+    - type: openrouter_models        # GET https://openrouter.ai/api/v1/models（元数据，非推理）
+      filter: ":free"
+    - type: github_curated           # 经 api.github.com contents/ 取策展清单更新（github.com 直连被墙）
+      api_url: https://api.github.com/repos/{owner}/{repo}/contents/free-models.yml
+      raw_via: base64
+  candidate_ttl_ms: 604800000        # 提案 7 天无人理会 → expired；再次扫到按 §4.6 复活规则处理
+  rejected_cooldown_ms: 2592000000   # 被拒候选 30 天内不再重复提案

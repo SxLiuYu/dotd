@@ -1,0 +1,416 @@
+#!/usr/bin/env node
+/**
+ * scripts/smoke.mjs —— dotd 端到端冒烟（stub 全链路）。
+ *
+ * 目标（任务书原文）：
+ *   cwd 无关；流程 = 临时数据目录 + stub 模型 / stub fleet 起 daemon 子进程 →
+ *   GET /api/status → POST 一条测试事件 → 轮询直至任务 done（含至少一次工具步
+ *   入 journal）→ SIGTERM 优雅退出 → 断言全中则 exit 0。
+ *
+ * 环境约束（CONVENTIONS.md §7 + 本机现状）：
+ *   - 本机无 docker、无 OpenRouter key → 全链路走 DOTD_FLEET=stub +
+ *     DOTD_MODEL_TRANSPORT=stub（零网络请求、零容器）。
+ *   - 数据目录、库、OUTBOX、journal-blobs、exec-tokens 全部指到本脚本自建的
+ *     临时目录；绝不碰宿主真实 ~/.dotd。
+ *   - HTTP 配置来自自写的临时 config.yml（surfaces 六节缺一不可，SF 加载器
+ *     fail-closed），master token 与 hook secret 由本脚本生成。
+ *
+ * cwd 无关：一切路径从本文件位置（repo 根 / dotd）推导，不读 process.cwd()。
+ *
+ * 退出码：0 = 全部断言通过；1 = 断言失败；2 = 环境/装配错误（含 daemon 起不来）。
+ */
+
+import { spawn } from 'node:child_process';
+import { createHash, createHmac } from 'node:crypto';
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// ── 路径（cwd 无关）───────────────────────────────────────────────────
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(HERE, '..');
+
+// ── 可调参数 ──────────────────────────────────────────────────────────
+
+const STEP_TIMEOUT_MS = Number(process.env.SMOKE_TIMEOUT_MS ?? 60_000);
+const POLL_MS = 250;
+/** 事件源（config.yml hooks 里登记的 source；HMAC 用它做 secret）。 */
+const HOOK_SOURCE = 'smoke';
+const MASTER_TOKEN = 'smoke-master-token';
+const HOOK_SECRET = 'smoke-hook-secret';
+
+// ── 断言记录 ──────────────────────────────────────────────────────────
+
+const checks = [];
+function check(name, ok, detail = '') {
+  checks.push({ name, ok, detail });
+  const tag = ok ? 'PASS' : 'FAIL';
+  process.stdout.write(`[${tag}] ${name}${detail ? ` — ${detail}` : ''}\n`);
+  return ok;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── 临时数据目录 ──────────────────────────────────────────────────────
+
+const tmp = mkdtempSync(join(tmpdir(), 'dotd-smoke-'));
+const dataDir = join(tmp, 'data');
+const dbPath = join(dataDir, 'dotd.db');
+mkdirSync(dataDir, { recursive: true });
+
+const configPath = join(tmp, 'config.yml');
+writeFileSync(
+  configPath,
+  [
+    'version: 1',
+    '',
+    'surfaces:',
+    '  http:',
+    '    host: 127.0.0.1',
+    '    port: 7788',
+    `    master_token: "${MASTER_TOKEN}"`,
+    '    readonly_tokens: []',
+    '    allowed_origins: ["http://localhost:7788", "http://127.0.0.1:7788"]',
+    '  hooks:',
+    `    - source: ${HOOK_SOURCE}`,
+    `      secret: "${HOOK_SECRET}"`,
+    '      dot_id: dot1',
+    '      rate_limit_per_min: 600',
+    '  jsonl_watch: []',
+    '  heartbeat:',
+    '    tick_interval_s: 15',
+    '  telegram:',
+    '    bot_token: ""',
+    '    allowlist: []',
+    '    edit_throttle_ms: 1200',
+    '  ui:',
+    '    stream_deltas: true',
+    '',
+  ].join('\n'),
+  'utf8',
+);
+
+// ── 起 daemon 子进程 ──────────────────────────────────────────────────
+
+// 脚本按「端点 id × 轨道」回放，耗尽即抛错（router/transport.ts:213）。
+// 事件分流器走 light 轨（control-plane/match.ts:251），任务对话走 primary 轨，两者都要预置。
+const modelScript = JSON.stringify([
+  // ① light 轨：事件分流器的 LLM 层（matchByLlm，严格 JSON 解析一次）
+  {
+    endpointId: 'openrouter-main',
+    track: 'light',
+    content: JSON.stringify({
+      action: 'run_new',
+      confidence: 1,
+      reason: '冒烟事件：规则层未命中，LLM 层直接建任务',
+      title: '冒烟测试事件',
+      goal: '把冒烟笔记写进 notes/2026-10-15-smoke.md，然后收口。',
+      priority: 5,
+    }),
+  },
+  // ② primary 轨：任务第一步——工具调用（fs.write 入 journal）
+  {
+    endpointId: 'openrouter-main',
+    track: 'primary',
+    content: '先把冒烟笔记写进 home。',
+    toolCalls: [
+      {
+        id: 'smoke-call-1',
+        name: 'fs.write',
+        arguments: JSON.stringify({
+          // §3.2 记忆规范：模型给 home 相对路径 + note 命名 YYYY-MM-DD-<slug>.md
+          // （limits.ts:93）；容器绝对路径由 Runner 在 toolCall() 里拼接（dot.ts
+          //  withHomeRootArgs，memory.md:237），模型侧绝不出现 /dot/home。
+          path: 'notes/2026-10-15-smoke.md',
+          content: '# dotd 冒烟\nstub 全链路写入。\n',
+        }),
+      },
+    ],
+  },
+  // ③ primary 轨：收口轮
+  {
+    endpointId: 'openrouter-main',
+    track: 'primary',
+    content: '冒烟任务完成：已写入 notes/2026-10-15-smoke.md。',
+  },
+]);
+
+const env = {
+  ...process.env,
+  DOTD_DB_PATH: dbPath,
+  DOTD_HOME: dataDir,
+  DOTD_CONFIG: configPath,
+  DOTD_CONFIG_DIR: join(REPO_ROOT, 'config'),
+  DOTD_WEB_ROOT: join(REPO_ROOT, 'web-ui', 'dist'),
+  DOTD_MODEL_TRANSPORT: 'stub',
+  DOTD_MODEL_STUB_SCRIPT: modelScript,
+  DOTD_FLEET: 'stub',
+  // 宿主真实 ~/.dotd 绝不被读：db/config/outbox 都已显式覆盖
+  HOME: homedir(),
+};
+
+const daemon = spawn(process.execPath, ['--import', 'tsx', join(REPO_ROOT, 'src', 'daemon.ts')], {
+  cwd: REPO_ROOT,
+  env,
+  stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+});
+
+let daemonOut = '';
+let daemonErr = '';
+daemon.stdout.on('data', (b) => {
+  daemonOut += b.toString();
+});
+daemon.stderr.on('data', (b) => {
+  daemonErr += b.toString();
+});
+
+// ── HTTP 小客户端（原生 fetch）─────────────────────────────────────────
+
+const BASE = 'http://127.0.0.1:7788';
+
+async function api(method, path, body, headers = {}) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: {
+      authorization: `Bearer ${MASTER_TOKEN}`,
+      'content-type': 'application/json',
+      origin: 'http://127.0.0.1:7788',
+      ...headers,
+    },
+    // body 已是字符串（HMAC 按原文签名，绝不能二次 stringify）；对象才序列化。
+    body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* 非 JSON（静态托管等） */
+  }
+  return { status: res.status, json, text };
+}
+
+/** §5.2 hooks HMAC：`sha256=hex(hmac(secret, ts\n nonce\n body))`（http.ts:160 hmacSignature）。 */
+function hookHeaders(bodyText) {
+  const ts = String(Math.floor(Date.now() / 1000));
+  const nonce = `smoke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sig = createHmac('sha256', HOOK_SECRET).update(`${ts}\n${nonce}\n${bodyText}`, 'utf8').digest('hex');
+  return {
+    'x-dotd-timestamp': ts,
+    'x-dotd-nonce': nonce,
+    'x-dotd-signature': `sha256=${sig}`,
+  };
+}
+
+// ── 主流程 ────────────────────────────────────────────────────────────
+
+let failed = false;
+let exitCode = 2;
+
+try {
+  // ① 等 daemon 就绪（HTTP 起来 + 迁移完成）
+  const deadline = Date.now() + STEP_TIMEOUT_MS;
+  let up = false;
+  while (Date.now() < deadline) {
+    if (daemon.exitCode !== null) break;
+    try {
+      const r = await api('GET', '/api/health');
+      if (r.status === 200) {
+        up = true;
+        break;
+      }
+    } catch {
+      /* 还没起来 */
+    }
+    await sleep(POLL_MS);
+  }
+  check('daemon 子进程存活并完成启动', up, daemon.exitCode !== null ? `子进程已退出 code=${daemon.exitCode}` : '');
+  if (daemon.exitCode !== null) {
+    process.stderr.write(daemonErr.slice(-4000) + '\n');
+    throw new Error('daemon 提前退出');
+  }
+
+  // ② GET /api/status（健康探针）
+  const status = await api('GET', '/api/status');
+  check('GET /api/status → 200 且含 service 字段', status.status === 200 && status.json?.service === 'dotd', `status=${status.status} body=${status.text.slice(0, 200)}`);
+
+  // ②b web-ui 产物被 daemon 静态托管（SF web.ts；dist 未构建时不拒启动、只返回说明页）。
+  //     dist 存在时 index.html 与其引用的 JS/CSS 都必须 200——这是"六视图构建产物真的
+  //    能被服务"的唯一端到端证据（http.ts 的 static 路由）。
+  const distDir = join(REPO_ROOT, 'web-ui', 'dist');
+  if (existsSync(join(distDir, 'index.html'))) {
+    const html = await api('GET', '/');
+    const assetRefs = [...String(html.text).matchAll(/(?:src|href)="\/(assets\/[^"]+)"/g)].map((m) => m[1]);
+    check('GET / → 200 且是 UI index.html', html.status === 200 && html.text.includes('<div id="root">'), `status=${html.status} bytes=${html.text.length}`);
+    let allAssets = assetRefs.length > 0;
+    const details = [];
+    for (const ref of assetRefs) {
+      const a = await api('GET', `/${ref}`);
+      if (a.status !== 200) allAssets = false;
+      details.push(`${ref}=${a.status}`);
+    }
+    check('UI 静态资源（JS/CSS）全部 200', allAssets, details.join(' ') || 'index.html 无 assets 引用');
+  } else {
+    check('GET / → 200 且是 UI index.html', false, `web-ui/dist 不存在（未构建）：${distDir}`);
+  }
+
+  // ③ POST 一条测试事件（hooks ingest，HMAC）
+  const payload = {
+    source: HOOK_SOURCE,
+    title: '冒烟测试事件',
+    goal: '把冒烟笔记写进 notes/2026-10-15-smoke.md，然后收口。',
+    priority: 5,
+  };
+  const bodyText = JSON.stringify(payload);
+  const posted = await api('POST', `/hooks/${HOOK_SOURCE}`, bodyText, {
+    'content-type': 'application/json',
+    ...hookHeaders(bodyText),
+  });
+  check(
+    'POST /hooks/smoke → 202 {eventId}',
+    posted.status === 202 && typeof posted.json?.eventId === 'number',
+    `status=${posted.status} body=${posted.text.slice(0, 300)}`,
+  );
+  const eventId = posted.json?.eventId;
+
+  // ④ 轮询：事件被匹配（event.match 走 light 轨 → run_new 建任务）
+  let taskId = null;
+  {
+    const dl = Date.now() + STEP_TIMEOUT_MS;
+    while (Date.now() < dl && taskId === null) {
+      const r = await api('GET', '/api/queue?status=queued,running,awaiting_approval,paused,done,failed,cancelled&limit=200');
+      const row = (r.json?.queue ?? []).find((t) => t.id === `tk_ev_${eventId}` || t.title.includes('冒烟测试事件'));
+      if (row !== undefined) taskId = row.id;
+      else await sleep(POLL_MS);
+    }
+  }
+  check('事件匹配建任务（tk_ev_<eventId>）', taskId !== null, `eventId=${eventId} taskId=${taskId}`);
+
+  // ⑤ 轮询任务终态：done（含 journal 工具步）
+  let finalRow = null;
+  {
+    const dl = Date.now() + STEP_TIMEOUT_MS;
+    while (Date.now() < dl) {
+      const r = await api('GET', '/api/queue?status=done,failed,cancelled&limit=200');
+      const row = (r.json?.queue ?? []).find((t) => t.id === taskId);
+      if (row !== undefined) {
+        finalRow = row;
+        break;
+      }
+      await sleep(POLL_MS);
+    }
+  }
+  check('任务到达终态 done', finalRow !== undefined && finalRow.status === 'done', `taskId=${taskId} status=${finalRow?.status ?? 'n/a'}`);
+
+  // ⑥ journal 至少一次工具步入账（直接读库：冒烟进程与 daemon 同机，只读一次）
+  let toolStep = null;
+  if (taskId !== null) {
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const rows = db
+        .prepare(`SELECT call_id, tool_name, status, result_json FROM steps WHERE task_id = ? AND kind = 'tool' ORDER BY seq ASC`)
+        .all(taskId);
+      toolStep = rows[0] ?? null;
+    } finally {
+      db.close();
+    }
+  }
+  check(
+    'journal 含至少一次工具步（fs.write 且 succeeded）',
+    toolStep !== null && toolStep.tool_name === 'fs.write' && toolStep.status === 'succeeded',
+    toolStep === null
+      ? 'steps 无 tool 行'
+      : `${toolStep.tool_name} status=${toolStep.status}${toolStep.result_json ? ` result=${String(toolStep.result_json).slice(0, 200)}` : ''}`,
+  );
+
+  // ⑦ 优雅退出（退出码 0 + 优雅标记 + OUTBOX 留痕）
+  //
+  // 平台分层（本机实测，Node v24.13.0 / 原生 Windows）：
+  //   Windows 下 spawn 出的子进程，跨进程 kill(SIGTERM/SIGINT/SIGBREAK)、cmd.exe 包装、
+  //   进程组 kill 一律被 OS 直接终止，子进程 handler **不执行**（12–25ms 即死、无留痕）。
+  //   唯一能触发 handler 的通道是进程内 process.emit(sig)。因此：
+  //   - Linux/WSL：直接 daemon.kill('SIGTERM')（生产形态，control-plane.md:60 契约）。
+  //   - Windows：经 IPC 让 daemon 自投递 SIGTERM，走**完全相同**的 shutdown() 路径
+  //     （停投递 → AbortSignal → 落 journal → markGracefulShutdown → OUTBOX → exit 0），
+  //     只是触发源从 OS 信号换成 IPC 消息（src/daemon.ts 的 message 监听）。
+  const onWindows = process.platform === 'win32';
+  const exitSignal = onWindows ? 'SIGTERM（IPC 触发，Windows 跨进程信号不可达）' : 'SIGTERM';
+  const beforeExit = Date.now();
+  if (onWindows) {
+    daemon.send({ type: 'shutdown' });
+  } else {
+    daemon.kill('SIGTERM');
+  }
+  const exited = await Promise.race([
+    new Promise((r) => daemon.once('exit', (code, signal) => r({ code, signal }))),
+    sleep(35_000).then(() => null),
+  ]);
+  const exitMs = Date.now() - beforeExit;
+  check(
+    `${exitSignal} 后 daemon 优雅退出（exitCode=0）`,
+    exited !== null && exited.code === 0,
+    exited === null
+      ? '35s 内未退出'
+      : `code=${exited.code} signal=${exited.signal} 用时 ${exitMs}ms${onWindows ? '（Windows 经 IPC 触发同一 shutdown 路径）' : ''}`,
+  );
+
+  // ⑧ 优雅退出落痕：resource_events 的 shutdown_marker + OUTBOX.md 追加
+  //   落点口径（control-plane/recovery.ts:69-72）：不建 meta 表（契约 D3），
+  //   用 resource_events 一行 kind='watchdog' + detail 含 "shutdown_marker" 记录；
+  //   cp.shutdown()（control-plane/index.ts:355-359）与 markGracefulShutdown 同口径。
+  if (taskId !== null && existsSync(dbPath)) {
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(dbPath, { readOnly: true });
+    let marker = null;
+    try {
+      marker =
+        db
+          .prepare(
+            `SELECT kind, detail FROM resource_events WHERE kind = 'watchdog' AND detail LIKE '%shutdown_marker%' ORDER BY id DESC LIMIT 1`,
+          )
+          .get() ?? null;
+    } finally {
+      db.close();
+    }
+    check('优雅停机标记落库（shutdown_marker）', marker !== null, JSON.stringify(marker?.detail ?? null).slice(0, 120));
+  }
+  const outboxText = existsSync(join(dataDir, 'OUTBOX.md')) ? readFileSync(join(dataDir, 'OUTBOX.md'), 'utf8') : '';
+  check('OUTBOX.md 有优雅退出留痕', outboxText.includes('优雅退出'), `bytes=${outboxText.length}`);
+
+  failed = checks.some((c) => !c.ok);
+  exitCode = failed ? 1 : 0;
+} catch (cause) {
+  process.stderr.write(`[smoke] 异常：${cause instanceof Error ? cause.stack : String(cause)}\n`);
+  process.stderr.write('--- daemon stdout ---\n' + daemonOut.slice(-4000) + '\n');
+  process.stderr.write('--- daemon stderr ---\n' + daemonErr.slice(-6000) + '\n');
+  exitCode = 2;
+} finally {
+  if (daemon.exitCode === null) {
+    daemon.kill('SIGKILL');
+  }
+  // Windows 上文件句柄释放有延迟（WAL/SHM），删不掉只留警告，不影响判定
+  for (let i = 0; i < 10; i++) {
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+      break;
+    } catch {
+      await sleep(200);
+    }
+  }
+}
+
+// ── 汇总 ──────────────────────────────────────────────────────────────
+
+const passed = checks.filter((c) => c.ok).length;
+process.stdout.write(`\n冒烟结果：${passed}/${checks.length} 通过，退出码 ${exitCode}\n`);
+process.exit(exitCode);

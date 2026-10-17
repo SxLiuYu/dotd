@@ -1,0 +1,29 @@
+# free-models.yml —— Tier 3 策展免费池（MR §2.2）
+#
+# §9.1 定位：阶段一收录为空/占位，结构定型。因此：
+#   models: []                      ← 池空（阶段一"池空但代码结构在位"，设计方案:364）
+#   条目字段形状以注释完整保留        ← 结构定型，后续阶段往 models: 下加条目即可
+#
+# 语义要点（MR §2.2 说明段，逐字保留）：
+# > 池内条目的 capabilities.tool_calling 允许写 unknown——首次被选为 primary 候选前，
+# > 路由按需现测（见 MR §4.4），测过才可用。这是"策展"与"实时性"的折中：
+# > 不信任清单上的静态声明。
+
+version: 1
+updated_at: null          # 阶段一未收录；主人首次维护时填 ISO8601
+
+models: []                # 阶段一池空；条目形状见下方注释
+
+# ── 条目形状（结构定型，抄录 MR §2.2 示例，勿删）──────────────────────────────
+# models:
+#   - id: groq-llama-free
+#     base_url: https://api.groq.com/openai/v1
+#     api_key_env: GROQ_API_KEY          # none/无 env 名 = 免鉴权端点
+#     models: [llama-3.3-70b-versatile]
+#     style: openai
+#     capabilities: { tool_calling: unknown, context: 128000 }
+#     rate: { rpm: 30, rpd: 1000 }
+#     last_verified: null                # 微型工具调用往返测试通过时间；null=从未通过
+#     verify_staleness_ms: 86400000      # 通过结果 24h 过期，需复测
+#     emergency_eligible: true           # 池内条目默认 true——池本身就是应急档
+# ─────────────────────────────────────────────────────────────────────────────

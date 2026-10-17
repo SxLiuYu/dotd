@@ -1,0 +1,55 @@
+# event-rules.yml —— 事件→目标匹配规则层（CP §6.1）
+#
+# 定位（设计方案:123 / CP §6.1 逐字）：
+#   消费 events 未决策行，规则层（event-rules.yml，via=rule 置信 1.0）优先，
+#   模型层走 complete({track:'light', deadlineMs:15000, attemptId:'nonj:…'})。
+#   规则命中恒 confidence=1.0、零成本可解释（CP §6.2 分档表第一行）。
+#   规则未中才走模型层；两条都无产出 → 落 inbox 等主人（via 待 manual）。
+#
+# 置信度分档（CP §6.2，规则命中即 1.0 走"直接执行"）：
+#   | 规则命中  | 恒 1.0 |
+#   | ≥ 0.85    | 直接执行 decision |
+#   | 0.55–0.85 | 执行 + 推通知"已自动处理…可撤销" |
+#   | < 0.55    | 不建/不并，event_decisions(action='ignore')，surfaces 收件箱高亮等 retryMatch |
+#
+# action 取值（event_decisions.action CHECK）：run_new / merge / ignore
+#   其中 merge 目标仅 queued/running/paused 非终态任务；目标已终态则退化 run_new（CP §6.2）。
+#   run_new 的任务主键 = 'tk_ev_'+events.id 确定性派生（CP §6.1，幂等核心）。
+#
+# 阶段一默认空（不预设任何自动规则，全部事件走模型层/inbox）：
+#   规则是"零成本可解释"的自动决策，写错即误建任务，故默认不放规则，由主人逐步加。
+
+version: 1
+rules: []
+
+# ── 条目形状（按 CP §6.1/§6.2 语义定型；字段名以治理模块加载器为准）──────────
+# 匹配对象 = events 行：source（http/file/heartbeat/telegram/email）、actor、payload(JSON 文本)。
+# 产出 = 一条 event_decisions（PK=events.id，天然幂等，重放撞 PK 回滚）。
+#
+# rules:
+#   - id: heartbeat-quiet-hours
+#     match:
+#       source: heartbeat
+#       actor: dot1
+#       payloadContains: "quiet"        # payload JSON 文本子串（大小写不敏感，按加载器实现）
+#     action: ignore
+#     reason: "静默时段心跳不入队"
+#
+#   - id: grafana-alert-to-task
+#     match:
+#       source: http
+#       payloadContains: "grafana"
+#     action: run_new
+#     task:
+#       title: "告警：{payload.alertname}"    # 占位符由加载器从 payload JSON 取值
+#       goal: "排查并处置告警"
+#       priority: 2
+#     reason: "Grafana 告警一律建任务"
+#
+#   - id: repeat-into-live-task
+#     match:
+#       source: file
+#       payloadContains: "sync"
+#     action: merge                        # 并入 queued/running/paused 的非终态任务
+#     reason: "同类文件同步事件并入在途任务"
+# ─────────────────────────────────────────────────────────────────────────────

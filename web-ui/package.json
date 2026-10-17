@@ -1,0 +1,24 @@
+{
+  "name": "dotd-web-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "dotd Web UI 占位骨架（真内容由 surfaces 模块后续填充）",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p . && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4"
+  }
+}

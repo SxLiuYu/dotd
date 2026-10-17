@@ -1,0 +1,1 @@
+# 控制面 CP：types.ts queue.ts journal.ts scheduler.ts guard.ts match.ts recovery.ts evict.ts（§9.1）。属主见 CONVENTIONS.md §4。

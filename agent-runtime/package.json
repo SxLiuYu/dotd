@@ -1,0 +1,25 @@
+{
+  "name": "dotd-agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "dotd 容器内 agent-runtime（EX §5.2 端点表，监听 0.0.0.0:9223）。镜像构建见 dotd/exec-image/。",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc --noEmit -p .",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "playwright": "1.49.1",
+    "playwright-extra": "4.3.6",
+    "puppeteer-extra-plugin-stealth": "2.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^5.9.3"
+  }
+}

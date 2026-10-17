@@ -1,0 +1,859 @@
+/**
+ * src/daemon.ts —— dotd 装配层（`dotd serve` 的唯一真入口）。
+ *
+ * 职责边界（CONVENTIONS.md §4「模块边界」铁律）：
+ *   - 本文件是**唯一**知道全部八个模块的地方：openDb → migrate → 模块 init
+ *     （顺序 CP→MR→GOV→EX→MEM→SF）→ HTTP listen → Runner 常驻循环 → 优雅退出。
+ *   - 模块内部不知道装配细节；跨模块依赖一律走 src/shared/contracts.ts 的接口面。
+ *   - 本文件不做业务判断，只做"把谁的哪个实现递给谁"。
+ *
+ * 启动序列逐条落地（control-plane.md §7.1）：
+ *   1 openDb + migrate（失败 → MigrationError → 拒启动 + 追加 OUTBOX.md）
+ *   2 优雅标记（CP §7.1 步骤 2）：退出时调 recovery.markGracefulShutdown(db)，
+ *     无标记 = 崩溃。CP 不建 meta 表（契约 D3），标记落在 resource_events。
+ *   3–6 recoverInFlight / recoverAwaiting / catchUpHeartbeats / replayUndecidedEvents：
+ *     全部在 cp.recover() 内（见 control-plane/index.ts:334），治理 approvals 只读
+ *     探针由本装配层注入（ApprovalsReader.listForTask）。
+ *   7 guard.calibrateOrUseFallback（recover 内）+ scheduler.start（recover 内）
+ *     + http.listen（本文件）。
+ *
+ * 优雅退出（CP §2.1-4）：
+ *   SIGTERM/SIGINT → ①停 pop 与心跳投递 ②向在跑 Runner 协程传 AbortSignal，
+ *   Runner 在当前步边界落 journal 后自然退出，上限 shutdownGraceMs=30s
+ *   ③超时不 SIGSTOP（协程模型无此原语），直接 process.exit()，由 CP §7 恢复兜底。
+ *
+ * 环境变量（CONVENTIONS §7）：
+ *   - DOTD_MODEL_TRANSPORT=stub → 模型走内存 stub（零网络请求）
+ *   - DOTD_FLEET=stub → fleet 走内存 stub（不起容器）
+ *   - DOTD_DB_PATH → 覆盖唯一库文件路径（契约 D1；测试/冒烟必设）
+ *   - DOTD_CONFIG → config.yml 路径（surfaces 节加载）
+ *   - DOTD_HOME → 数据目录根；缺省 ~/.dotd。OUTBOX/journal-blobs/exec-tokens/
+ *     通知留痕都在它下面，冒烟脚本用它把整棵状态树指到临时目录。
+ */
+
+import type { Server } from 'node:http';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { DatabaseSync } from 'node:sqlite';
+
+import { openDb, resolveDbPath } from '../db/conn.ts';
+import { migrate } from '../db/migrate.ts';
+
+import { EventBus } from './shared/bus.ts';
+import { MigrationError } from './shared/errors.ts';
+import type {
+  ApprovalView,
+  ControlPlane,
+  ExecServiceApi,
+  GovernanceApi,
+  GovernancePort,
+  MemoryPort,
+  MemoryServiceApi,
+  ModelRouterApi,
+  NotificationChannels,
+  RouterPort,
+  Task,
+} from './shared/contracts.ts';
+
+import { createControlPlane } from './control-plane/index.ts';
+import type { ControlPlaneInstance } from './control-plane/index.ts';
+import type { ApprovalsReader, RecoveryReport } from './control-plane/recovery.ts';
+import { markGracefulShutdown } from './control-plane/recovery.ts';
+import type { EventRule, LowBrain } from './control-plane/match.ts';
+import type { ExecPorts, GuardDeps } from './control-plane/guard.ts';
+import type { ExecReconciler, GovernanceForcer } from './control-plane/journal.ts';
+import { ModelRouter } from './router/ModelRouter.ts';
+import {
+  initGovernance,
+  initSeq,
+  loadCatalog,
+  watchEmergency,
+} from './governance/index.ts';
+import {
+  claim as govClaim,
+  decide as govDecide,
+  evaluate as govEvaluate,
+  forceApproval as govForceApproval,
+  getApproval as govGetApproval,
+  listPending as govListPending,
+} from './governance/gate.ts';
+import type { GovDeps } from './governance/types.ts';
+import { ExecServiceImpl } from './exec/ExecService.ts';
+import { execConfigFromEnv } from './exec/types.ts';
+import { toHomeAbs } from './exec/protocol.ts';
+import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
+import { createMemoryService } from './memory/MemoryService.ts';
+import type { MemoryServiceImpl } from './memory/MemoryService.ts';
+import { assertHttpConfig, startHttpServer } from './surfaces/http.ts';
+import { loadSurfacesConfig } from './surfaces/config.ts';
+import { SseBus } from './surfaces/sse.ts';
+import {
+  NULL_TELEGRAM_GATEWAY,
+  NULL_FEISHU_GATEWAY,
+  FeishuGateway,
+  SurfacesNotificationChannels,
+} from './surfaces/channels.ts';
+import { startFeishuWs } from './surfaces/feishu-ws.ts';
+import { startFeishuOutbound } from './surfaces/feishu-outbound.ts';
+import { DotRunner } from './runner/dot.ts';
+import { loadEventRules } from './event-rules.ts';
+
+// ── 路径解析（cwd 无关：一切以本文件位置或 DOTD_HOME 为基准）─────────────────
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(HERE, '..');
+
+/** `~/x` → HOME 展开（config/dotd.yml「路径支持 ~ 展开为 daemon 用户 HOME」）。 */
+function expandHome(p: string): string {
+  if (p === '~') return homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return homedir() + p.slice(1);
+  return p;
+}
+
+/** 数据目录根：DOTD_HOME > 默认 ~/.dotd。 */
+export function resolveDataDir(): string {
+  const env = process.env.DOTD_HOME;
+  if (env !== undefined && env.length > 0) return resolve(expandHome(env));
+  return join(homedir(), '.dotd');
+}
+
+/** 仓库 config/ 目录（MR models.yml / free-models.yml；GOV tools.yml / rules.yml；CP event-rules.yml）。 */
+export function resolveConfigDir(): string {
+  const env = process.env.DOTD_CONFIG_DIR;
+  if (env !== undefined && env.length > 0) return resolve(expandHome(env));
+  return join(REPO_ROOT, 'config');
+}
+
+/** web-ui 构建产物目录（SF web.ts 静态托管；缺 dist 时静态请求 404，不拒启动）。 */
+export function resolveWebRoot(): string {
+  const env = process.env.DOTD_WEB_ROOT;
+  if (env !== undefined && env.length > 0) return resolve(expandHome(env));
+  return join(REPO_ROOT, 'web-ui', 'dist');
+}
+
+// ── 配置 ────────────────────────────────────────────────────────────────────
+
+export interface DaemonConfig {
+  dataDir: string;
+  dbPath: string;
+  configDir: string;
+  webRoot: string;
+  /** config.yml 路径（SF surfaces 节；DOTD_CONFIG 覆盖）。 */
+  configPath: string | undefined;
+  /** stub 模式（CONVENTIONS §7）。 */
+  stubTransport: boolean;
+  /** 阶段一恒 ['dot1']（契约 §9：无 dots 表）。 */
+  dotIds: string[];
+  /** 优雅退出宽限（CP §2.1-4：shutdownGraceMs）。 */
+  shutdownGraceMs: number;
+  /** Runner 空转轮询间隔。 */
+  idlePollMs: number;
+}
+
+const DEFAULT_SHUTDOWN_GRACE_MS = 30_000;
+
+export function loadDaemonConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig {
+  const envConfigPath = process.env.DOTD_CONFIG;
+  return {
+    dataDir: resolveDataDir(),
+    dbPath: resolveDbPath(),
+    configDir: resolveConfigDir(),
+    webRoot: resolveWebRoot(),
+    configPath:
+      envConfigPath !== undefined && envConfigPath.length > 0 ? envConfigPath : undefined,
+    stubTransport: process.env.DOTD_MODEL_TRANSPORT === 'stub',
+    dotIds: ['dot1'],
+    shutdownGraceMs: DEFAULT_SHUTDOWN_GRACE_MS,
+    idlePollMs: 1_000,
+    ...overrides,
+  };
+}
+
+// ── OUTBOX 追加（CP §7.1 步骤 1：迁移失败 → 拒启动 + 追加）──────────────────
+
+/**
+ * 契约 T3：OUTBOX.md 的块格式归 MR；**装配层只负责"追加"这个动作**，不自造格式
+ * （CONVENTIONS.md §5 原文）。故这里只写一行时间戳+错误摘要，无 HELP 头。
+ */
+export function appendOutbox(dataDir: string, line: string): void {
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    appendFileSync(join(dataDir, 'OUTBOX.md'), `[${new Date().toISOString()}] ${line}\n`, 'utf8');
+  } catch {
+    // OUTBOX 本身写不动时只能让原始错误继续上抛（拒启动）
+  }
+}
+
+/**
+ * 水位预留（MB）读取：DOTD_RESERVE_MB 环境变量优先，其次 ~/.dotd/config.yml 顶层
+ * `dotdReserveMb:` 键（只按行匹配这一个标量，不引 YAML 库），都没有则返回 null 用默认。
+ * 背景：装配层此前不读 dotd.yml 的 dotdReserveMb（接线缺口），本机内存紧张时无法调档。
+ */
+export function cpReserveMbFromEnvOrConfig(cfg: DaemonConfig): number | null {
+  const envV = process.env.DOTD_RESERVE_MB;
+  if (envV !== undefined && envV.length > 0) {
+    const n = Number(envV);
+    if (Number.isFinite(n) && n >= 0) return Math.round(n);
+    throw new Error(`DOTD_RESERVE_MB 非法：${envV}`);
+  }
+  try {
+    const txt = readFileSync(join(cfg.dataDir, 'config.yml'), 'utf8');
+    const g = txt.match(/^dotdReserveMb:\s*([0-9_]+)\s*(?:#.*)?$/m)?.[1];
+    if (g !== undefined) return Number(g.replace(/_/g, ''));
+  } catch {
+    // 配置文件缺失/不可读 → 回落默认（fail-open 只对本键，其余仍走各自 fail-closed）
+  }
+  return null;
+}
+
+// ── 治理面（模块单例已 initGovernance；此处只做端口投影）─────────────────────
+/** GOV 的 router 依赖（契约 G4/T1：统一走 complete({track:'light'})）。 */
+function govRouterOf(router: ModelRouter): GovDeps['router'] {
+  return {
+    async complete(req) {
+      const r = await router.complete({
+        track: 'light',
+        // GOV 只发 system/user 两色（review.ts:114 precheckMessages）；CP 侧
+        // 的 matchByLlm 也只发 system/user。assistant/tool 角色在此面不存在，
+        // 但 contracts.ChatMessage 是四色——降级映射保证任何上游形状都能过类型。
+        messages: req.messages.map((m) => ({
+          role: m.role === 'system' || m.role === 'user' ? m.role : 'user',
+          content: m.content,
+        })),
+        attemptId: req.attemptId,
+        deadlineMs: req.deadlineMs,
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
+      });
+      // RouteResult.response 是 ChatResponse | AsyncIterable<ChatChunk> 联合；
+      // GOV 只取非流式文本，流式迭代器没有 .content，收敛为空串。
+      const resp: unknown = r.response;
+      const content =
+        typeof resp === 'object' &&
+        resp !== null &&
+        'content' in resp &&
+        typeof resp.content === 'string'
+          ? resp.content
+          : '';
+      return { response: { content } };
+    },
+  };
+}
+
+/**
+ * CP 的 lowBrain 端口（契约 T1 / CP §6.1：事件→目标匹配的模型层分流）。
+ *
+ * 与 govRouterOf 的分工：两者都把调用打到 `router.complete({track:'light'})`，
+ * 但入参词表不同——CP 的 LowBrain 允许 assistant 角色（match.ts:51），GOV 的
+ * router 端口只收 system/user（governance/types.ts:144）。统一收敛到
+ * system/user（assistant → user）后再出网，两个端口各取所需。
+ */
+function lowBrainOf(router: ModelRouter): LowBrain {
+  return {
+    async complete(req) {
+      const r = await router.complete({
+        track: 'light',
+        messages: req.messages.map((m) => ({
+          role: m.role === 'system' || m.role === 'user' ? m.role : 'user',
+          content: m.content,
+        })),
+        attemptId: req.attemptId,
+        deadlineMs: req.deadlineMs,
+      });
+      const resp: unknown = r.response;
+      const content =
+        typeof resp === 'object' &&
+        resp !== null &&
+        'content' in resp &&
+        typeof resp.content === 'string'
+          ? resp.content
+          : '';
+      return { response: { content } };
+    },
+  };
+}
+
+/** CP 的治理 forceApproval 端口（unknown 孤儿步转审批，CP §5.3 / journal.ts:41）。 */
+function govForcerOf(): GovernanceForcer {
+  return {
+    requestApproval: (req) =>
+      govForceApproval(req.taskId, {
+        kind: req.kind,
+        subject: req.subject as unknown as Record<string, unknown>,
+        reason: req.reason,
+      }),
+  };
+}
+
+/** SF 的治理端口（契约 S-2：唯一裁决写路径在 GOV decide()）。 */
+function govPortOf(): GovernancePort {
+  return {
+    decide: (approvalId, channel, verdict, actor, note) =>
+      govDecide(approvalId, channel, verdict, actor, note),
+    listPending: (limit) => govListPending(limit) as ApprovalView[],
+    getApproval: (idOrSeq) => govGetApproval(idOrSeq),
+  };
+}
+
+/** Runner 的治理面（接缝 §8 ⑧/⑨：evaluate/claim/forceApproval）。 */
+function govApiOf(): GovernanceApi {
+  return {
+    evaluate: (ctx, call, opts) => govEvaluate(ctx, call, opts ?? {}),
+    claim: (approvalId) => govClaim(approvalId),
+    forceApproval: (taskId, req) => govForceApproval(taskId, req),
+  };
+}
+
+/** SF 的记忆端口（契约 S-1：会话历史属主 = MEM）。 */
+function memPortOf(memory: MemoryServiceImpl): MemoryPort {
+  return {
+    openThread: (dotId, channel, o) => memory.openThread(dotId, channel, o),
+    appendMessage: (threadId, msg) => memory.appendMessage(threadId, msg),
+    listThreads: async (dotId, o) => {
+      // contracts.ts §7 ThreadSummary（最小投影）与 MEM §8 ThreadSummary（整行投影）
+      // 字段名不同：MEM 用 lastActiveAt，契约用 updatedAt。装配层做形状适配——
+      // SF 只消费契约投影（http.ts:520 只把它透传给前端）。
+      const rows = await memory.listThreads(dotId, o);
+      return rows.map((t) => ({
+        id: t.id,
+        title: t.title,
+        channel: t.channel,
+        status: t.status,
+        createdAt: t.lastActiveAt,
+        updatedAt: t.lastActiveAt,
+      }));
+    },
+    listMessages: (threadId, o) => memory.listMessages(threadId, o),
+  };
+}
+
+/** Runner 的执行面（contracts.ts §9 ExecServiceApi）。 */
+function execApiOf(exec: ExecServiceImpl): ExecServiceApi {
+  return {
+    runTool: (call) => exec.runTool(call),
+    getCapabilities: (dotId) => exec.getCapabilities(dotId),
+    // 词表适配：契约 §9 的 ExecReconciler 用 'done'|'aborted'|'unknown'|'unknown_host'，
+    // 而 ExecServiceImpl.reconcileCall 返回 ReconcileEntry{outcome:'done'|'doing'|
+    // 'interrupted'|'skipped'}（EX §5.3 三分流）。Runner 主循环不调它（⑫ 对账归
+    // CP/Journal.reconcileAndResolve），此处只做形状适配（tests/runner-main.test.ts 同款）。
+    reconcileCall: async (callId) => {
+      const entry = await exec.reconcileCall(callId);
+      return entry.outcome === 'done' ? 'done' : 'unknown';
+    },
+    getCallResult: (callId) => exec.getCallResult(callId),
+    cancelTool: (callId, reason) => exec.cancelTool(callId, reason),
+  };
+}
+
+/** Runner 的记忆面（契约 M3/M1：sealTask 全覆盖 + buildSessionReplay 唯一重建入口）。 */
+function memApiOf(memory: MemoryServiceImpl): MemoryServiceApi {
+  return {
+    openThread: (dotId, channel, o) => memory.openThread(dotId, channel, o),
+    appendMessage: (threadId, msg) => memory.appendMessage(threadId, msg),
+    appendSystemMessage: (threadId, msg) => memory.appendSystemMessage(threadId, msg),
+    buildContextBundle: (dotId, taskText, budgetTokens, o) =>
+      memory.buildContextBundle(dotId, taskText, budgetTokens, o),
+    buildSessionReplay: (threadId, taskId, budgetTokens) =>
+      memory.buildSessionReplay(threadId, taskId, budgetTokens),
+    beforeWrite: (dotId, path, content) => memory.beforeWrite(dotId, path, content),
+    sealTask: (task, outcome, reason) => memory.sealTask(task, outcome, reason),
+  };
+}
+
+/** MR 的模型面（契约 T1：主循环 track:'primary'）。 */
+function routerApiOf(router: ModelRouter): ModelRouterApi {
+  return {
+    complete: (req) => router.complete(req),
+    stream: (req) => router.stream(req),
+    trackForEvent: (eventType) => router.trackForEvent(eventType),
+    trackForRequest: (req) => router.trackForRequest(req),
+    snapshot: () => router.snapshot(),
+    get emergencyActive(): boolean {
+      return router.emergencyActive;
+    },
+  };
+}
+
+// ── 装配 ────────────────────────────────────────────────────────────────────
+
+export interface Daemon {
+  cfg: DaemonConfig;
+  db: DatabaseSync;
+  bus: EventBus;
+  sse: SseBus;
+  cp: ControlPlaneInstance;
+  router: ModelRouter;
+  exec: ExecServiceImpl;
+  memory: MemoryServiceImpl;
+  runner: DotRunner;
+  server: Server;
+  /** 启动恢复报告（CP §7.1 步骤 3–6）。 */
+  recovery: RecoveryReport;
+  /** 优雅退出（幂等）。 */
+  shutdown(reason: string): Promise<void>;
+}
+
+/**
+ * 装配 daemon（含 listen 与恢复，但**不**自动起 Runner 循环以外的常驻）——
+ * 供 `dotd serve` 与后续集成测试复用。
+ *
+ * 顺序（CONVENTIONS §4）：CP → MR → GOV → EX → MEM → SF。
+ * CP 先建：GOV/EX 的回调要写回 CP（setAwaitingApproval/onApprovalSettled），
+ * 而 CP 的 recover 又要读治理 approvals 与执行面对账结果。环用"先建后注"打破：
+ * 建 CP → 建 MR → 建 GOV（cp 钩子回填到真 CP）→ 建 EX → 把 exec 补注进 CP 的
+ * journal/recovery deps → 建 MEM → 建 SF → recover → Runner 循环。
+ */
+export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise<Daemon> {
+  const cfg = opts.cfg ?? loadDaemonConfig();
+  const log = (m: string): void => {
+    process.stdout.write(`[dotd] ${m}\n`);
+  };
+
+  // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
+  const db = openDb(cfg.dbPath);
+  try {
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 100）。
+    // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
+    // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
+    const res = migrate(db, { expectedVersion: 100 });
+    if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
+    else log(`库已是最新（user_version=${res.to}）`);
+  } catch (cause) {
+    db.close();
+    appendOutbox(cfg.dataDir, `启动失败：${String(cause)}`);
+    throw cause instanceof MigrationError ? cause : new MigrationError(String(cause), null, { cause });
+  }
+
+  const blobDir = join(cfg.dataDir, 'journal-blobs');
+  mkdirSync(blobDir, { recursive: true });
+  const outboxPath = join(cfg.dataDir, 'OUTBOX.md');
+
+  // ② EventBus + SSE 总线（bus_seq 从 surf_sse_cursor 续读，SF §4.5）
+  const cursorProbe = new SseBus({ db, bus: new EventBus() });
+  const persistedSeq = cursorProbe.persistedSeq();
+  const bus = new EventBus({ startSeq: persistedSeq });
+  // SF §4.5 重放快照数据源（approval/queue 两通道可重建）。CP 与 GOV 在本步之后才
+  // init，故与下面的 execHolder/memHolder 同模式用惰性 holder：SseBus 构造期只收
+  // 闭包，运行期（首个订阅者接入 / 断线补档）才真读。缺省（holder 为空）时
+  // SseBus.snapshotFrames 返回 []，只发 resync 帧——不因装配顺序把总线降级。
+  const cpHolder: { cp: ControlPlaneInstance | null } = { cp: null };
+  const govHolderForSse: { listPending: (() => ApprovalView[]) | null } = { listPending: null };
+  const sseBus = new SseBus({
+    db,
+    bus,
+    snapshot: {
+      approvals: () => govHolderForSse.listPending?.() ?? [],
+      queue: () =>
+        (cpHolder.cp?.list({ status: ['queued', 'running'] }) ?? []).map((t) => ({
+          id: t.id,
+          title: t.title,
+          status: t.status,
+          priority: t.priority,
+          dotId: t.dotId,
+        })),
+    },
+  });
+  sseBus.attach();
+
+  // ③ CP（先建：其余模块的回调都指向它）。sealTask 钩子经 holder 惰性取 MEM
+  //    （契约 M3：MEM 在 CP 之后 init，但 Queue.finish 运行期才调钩子）；
+  //    exec/governance 同理经 holder 惰性取（EX/GOV 在 CP 之后 init，
+  //    而 CP 的 journal/guard/recovery 只在运行期读它们）。
+  const rules: EventRule[] = loadEventRules(join(cfg.configDir, 'event-rules.yml'));
+  if (rules.length > 0) log(`事件规则层载入 ${rules.length} 条`);
+  const memHolder: { svc: MemoryServiceImpl | null } = { svc: null };
+  const execHolder: { svc: ExecServiceImpl | null } = { svc: null };
+  const govHolder: { forcer: GovernanceForcer | null } = { forcer: null };
+  const routerHolder: { r: ModelRouter | null } = { r: null };
+
+  const execPortsOf = (): ExecPorts & ExecReconciler => {
+    const svc = execHolder.svc;
+    if (svc === null) {
+      throw new Error('exec 尚未装配（CP 的 exec 端口在运行期才被读取，不应提前触发）');
+    }
+    // 词表适配：契约 journal.ts 的 ExecReconciler.reconcileCall 返回
+    // 'done'|'unknown'|'aborted'|'unknown_host'，而 ExecServiceImpl.reconcileCall
+    // 返回 ReconcileEntry{outcome:'done'|'doing'|'interrupted'|'skipped'}（EX §5.3
+    // 三分流）。CP 的 journal.reconcileAndResolve 只判 'done' 与否，故映射：
+    // done→done；doing/interrupted→aborted（重试可再入）；skipped→unknown。
+    return {
+      pauseContainer: (dotId) => svc.pauseContainer(dotId),
+      unpauseContainer: (dotId) => svc.unpauseContainer(dotId),
+      destroyDotContainer: (dotId, opts) => svc.destroyDotContainer(dotId, opts),
+      getContainerStats: (dotId) => svc.getContainerStats(dotId),
+      reconcileCall: async (callId) => {
+        const entry = await svc.reconcileCall(callId);
+        if (entry.outcome === 'done') return 'done';
+        if (entry.outcome === 'doing' || entry.outcome === 'interrupted') return 'aborted';
+        return 'unknown';
+      },
+      // 词表适配：ExecServiceImpl.getCallResult 回 unknown（容器终态 ToolResult 或
+      // {result_hash}）；契约面只要 {resultJson}。取不到明文时回落 null
+      // （CP 按「无结果」走 unknown 路径，与 EX §5.4「明文由容器 ledger 持有」一致）。
+      getCallResult: async (callId) => {
+        const r: unknown = await svc.getCallResult(callId);
+        if (r === null || typeof r !== 'object') return null;
+        const o = r as { result?: unknown; result_hash?: unknown };
+        if (o.result !== undefined) return { resultJson: JSON.stringify(o.result) };
+        if (typeof o.result_hash === 'string') return { resultJson: JSON.stringify({ result_hash: o.result_hash }) };
+        return { resultJson: JSON.stringify(r) };
+      },
+    };
+  };
+
+  // CP §6.3 水位预留：dotd.yml 声明了 dotdReserveMb 但装配层此前未读（接线缺口）。
+  // 优先级：DOTD_RESERVE_MB（调试覆盖）> ~/.dotd/config.yml 顶层键 > DEFAULT_CP_CONFIG。
+  const reserveMbOverride = cpReserveMbFromEnvOrConfig(cfg);
+
+  const cp = createControlPlane({
+    db,
+    bus,
+    rules,
+    dotIds: cfg.dotIds,
+    blobDirAbs: blobDir,
+    ...(reserveMbOverride === null ? {} : { cfg: { dotdReserveMb: reserveMbOverride } }),
+    // 模型层（契约 T1 / CP §6.1）：事件→目标匹配的 LLM 分流走 light 轨。
+    // MR 在 CP 之后 init（它要 cp 的 taskImpact/registerInternalJob），故经 holder
+    // 惰性取——matcher 只在事件匹配运行期调 lowBrain.complete。
+    lowBrain: {
+      complete: (req) => {
+        const r = routerHolder.r;
+        if (r === null) {
+          throw new Error('router 尚未装配（CP 的 lowBrain 在运行期才被读取，不应提前触发）');
+        }
+        return lowBrainOf(r).complete(req);
+      },
+    },
+    // 惰性门面：EX/GOV 在 CP 之后 init，CP 只在运行期（guard 容器指令 /
+    // journal 对账 / unknown 孤儿步转审批）才经这两个闭包读它们。
+    exec: {
+      pauseContainer: (dotId) => execPortsOf().pauseContainer(dotId),
+      unpauseContainer: (dotId) => execPortsOf().unpauseContainer(dotId),
+      destroyDotContainer: (dotId, opts) => execPortsOf().destroyDotContainer(dotId, opts),
+      getContainerStats: (dotId) => execPortsOf().getContainerStats(dotId),
+      reconcileCall: (callId) => execPortsOf().reconcileCall(callId),
+      getCallResult: (callId) => execPortsOf().getCallResult(callId),
+    },
+    governance: {
+      requestApproval: (req) => {
+        const forcer = govHolder.forcer;
+        if (forcer === null) {
+          throw new Error('governance 尚未装配（GOV 在 CP 之后 init，不应提前触发）');
+        }
+        return forcer.requestApproval(req);
+      },
+    },
+    sealTask: (task: Task, outcome, reason) => {
+      const svc = memHolder.svc;
+      // MEM 未就绪时不封（装配顺序保证 SF/MEM 先于任何任务终态）
+      return svc === null ? Promise.resolve() : svc.sealTask(task, outcome, reason);
+    },
+  });
+
+  // ④ 前置：求救通知通道。原在 ⑧ 才装配，MR 只能收到 null → 求救永远落 OUTBOX.md，
+  // 飞书机器人（主人 2026-10-16 指定通道）一条都收不到。SF 配置是纯读取，提前无副作用。
+  const surfCfg = loadSurfacesConfig(cfg.configPath);
+  assertHttpConfig(surfCfg);
+  // 飞书：App ID + App Secret 都配了才装配真网关，否则 NULL 占位（available 恒 false）
+  const feishuGw =
+    surfCfg.feishu.appId.length > 0 && surfCfg.feishu.appSecret.length > 0
+      ? new FeishuGateway(surfCfg.feishu)
+      : NULL_FEISHU_GATEWAY;
+  const channels: NotificationChannels = new SurfacesNotificationChannels({
+    telegram: NULL_TELEGRAM_GATEWAY,
+    feishu: feishuGw,
+    filePath: join(cfg.dataDir, 'notifications.log'),
+    defaultChatId: surfCfg.telegram.ownerChatId ?? surfCfg.telegram.allowlist[0],
+    // owner_chat_id 允许逗号分隔多会话（入站闸门放行全部）；出站通知发第一个。
+    feishuChatId: surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0],
+  });
+  // 飞书可用性预热：拿到 token 即置位。否则 daemon 刚起来时 available('feishu') 恒 false
+  // （只在 sendText 成功后才置位），第一封求救——常是重启后两轨齐挂那一刻——会白白
+  // 绕过飞书落进 OUTBOX.md。fire-and-forget：失败不阻启动，可用性保持 false，求救
+  // 照旧走 OUTBOX 兜底。
+  if (feishuGw !== NULL_FEISHU_GATEWAY) {
+    void feishuGw.warm().then((ok) => {
+      if (ok) log('[surfaces] 飞书凭证校验通过（求救可走飞书）');
+      else log('[surfaces] 飞书凭证预热失败（求救暂落 OUTBOX，待后续成功发送置位）');
+    });
+  }
+
+  // ④ MR（TaskImpact 由 CP 提供，契约 T2；channels = 上面的 SF 适配器）
+  const router = ModelRouter.load({
+    db,
+    configDir: cfg.configDir,
+    scheduler: cp,
+    channels,
+    bus,
+    taskImpact: () => cp.taskImpact(),
+  });
+  routerHolder.r = router; // 回填：CP 的 lowBrain 从此刻起可读
+  cpHolder.cp = cp; // 回填：SSE queue 通道快照从此刻起可读
+
+  // ⑤ GOV（cp 钩子回填到真 CP；模块单例 initGovernance）
+  const { catalog, warnings } = loadCatalog(
+    join(cfg.configDir, 'tools.yml'),
+    join(cfg.configDir, 'rules.yml'),
+  );
+  for (const w of warnings) log(`[governance] 目录告警：${w.kind} ${w.detail}`);
+  const govDeps: GovDeps = {
+    controlPlane: {
+      setAwaitingApproval: (taskId, epoch, approvalId) =>
+        cp.setAwaitingApproval(taskId, epoch, approvalId),
+      onApprovalSettled: (taskId, approvalId, ok, meta) =>
+        cp.onApprovalSettled(taskId, approvalId, ok, meta),
+      resumeDotQueue: (dotId) => cp.resumeDotQueue(dotId),
+    },
+    journal: {
+      // GOV §1.2：治理绝不写 journal，只读核对
+      stepExists: (callId) => cp.journal.getStepByCallId(callId) !== null,
+    },
+    router: govRouterOf(router),
+    bus: {
+      publish: (topic, payload, o) => bus.publish(topic, payload, o),
+      on: (topic, handler) => bus.on(topic, handler),
+    },
+  };
+  initSeq(db);
+  const govRt = initGovernance(db, catalog, govDeps);
+  // 契约 S5：订阅 router.mode_changed，路由进/出 EMERGENCY 时写 emergency_on/off
+  // 审计并清审查熔断窗口。这个 watcher 此前全库没有调用方——紧急切换既不审计也不
+  // 清窗口，旧策略的失败样本会一直压着审查熔断（2026-10-17 接线）。
+  const emergencyWatch = watchEmergency(govRt, bus);
+
+  // ⑥ EX（fleet 的唯一开关是 DOTD_FLEET，经 execConfigFromEnv 落到 ExecConfig.fleet；
+  //     未设时 DEFAULT_EXEC_CONFIG.fleet='stub'。真 fleet 要求 daemon 跑在 WSL 里：
+  //     dockerSocketPath 硬编码 /var/run/docker.sock，HttpRuntime 又走容器 IP:9223。）
+  const exec = new ExecServiceImpl({
+    db,
+    bus,
+    cfg: { ...execConfigFromEnv(), tokenDir: process.env.DOTD_TOKEN_DIR ?? join(cfg.dataDir, 'exec-tokens') },
+  });
+  const bootReport = await exec.boot(cfg.dotIds);
+  for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);
+  // failed/orphans 必须见光：阶段一只打 warnings+degraded，占名 409 曾静默瘫痪整个 fleet。
+  for (const f of bootReport.failed) log(`[exec] boot 失败 dot=${f.dotId}：${f.reason}`);
+  for (const o of bootReport.orphans) log(`[exec] boot 未托管容器（保留不擅杀）：${o.slice(0, 12)}`);
+  if (bootReport.created.length > 0) log(`[exec] boot 新建容器：${bootReport.created.join(', ')}`);
+  if (bootReport.adopted.length > 0) log(`[exec] boot 接管容器：${bootReport.adopted.join(', ')}`);
+  if (!bootReport.dockerAvailable) {
+    log('[exec] docker 不可用 —— degraded 启动（真实 fleet 下容器动作将被拒）');
+  }
+
+  // ⑥b 把 EX/GOV 补注进 CP 的惰性 holder（建 CP 时它们还不存在；CP 内部只在
+  //     运行期经 execPortsOf / governance.requestApproval 读它们）
+  execHolder.svc = exec;
+  govHolder.forcer = govForcerOf();
+  // 回填：SSE approval 通道快照（GOV listPending，与 GET /api/approvals 同源）
+  govHolderForSse.listPending = () => govListPending(200) as ApprovalView[];
+  const approvalsReader: ApprovalsReader = {
+    listForTask: (taskId) => {
+      const rows = db
+        .prepare(
+          `SELECT id, status FROM approvals WHERE task_id = ? AND status IN ('pending','approved','executing')`,
+        )
+        .all(taskId) as Array<{ id: number; status: string }>;
+      return rows;
+    },
+  };
+
+  // ⑦ MEM（bridge = exec.fsOps 包一层，契约 S4'/M4；journal 探针供 §4.3 wroteMemory 判据）。
+  // 路径口径与失败降级都在 makeExecFsOpsBridge 里收口，见该函数注释。
+  const memory = createMemoryService({
+    db,
+    outboxPath,
+    taskStatusProbe: (taskId) => cp.getTask(taskId)?.status ?? null,
+    journalMemoryProbe: (taskId, sinceMs) =>
+      cp
+        .getJournal(taskId)
+        .filter((s) => s.startedAt >= sinceMs)
+        .map((s) => `${s.toolName ?? s.kind}:${s.callId ?? s.seq}`),
+    bridge: makeExecFsOpsBridge(exec),
+    // §4.2 骨架补建落盘：经工具层 fs.write（FsOpsBridge 只读，无 write 原语）。
+    // task_id 用 dotId 派生——这不是任务调用，是装配期一次性补建；exec_calls
+    // 只按 call_id 幂等，不与真实任务流水冲突。
+    homeWriter: async (dotId, path, content) => {
+      const callId = `memseed_${dotId}_${path.replace(/[^a-zA-Z0-9]+/g, '_')}`;
+      const res = await exec.runTool({
+        call_id: callId,
+        task_id: `memseed_${dotId}`,
+        dot_id: dotId,
+        tool: 'fs.write',
+        args: { path: toHomeAbs(path), content },
+        deadline_ms: 30_000,
+        issued_at: new Date().toISOString(),
+      });
+      return res.status === 'ok';
+    },
+    onCorruption: (error) => {
+      appendOutbox(cfg.dataDir, `记忆库完整性检查失败：${error.message}`);
+    },
+  });
+  memHolder.svc = memory;
+
+  // ⑧ SF：HTTP（listen 在此；契约 H2 唯一监听）。surfCfg/channels/feishuGw 已在
+  // ④ 前置段装配（MR 要注入 channels），这里只起服务。
+  const server = await startHttpServer({
+    db,
+    bus,
+    cp: cp as unknown as ControlPlane,
+    gov: govPortOf(),
+    mem: memPortOf(memory),
+    router: router as unknown as RouterPort,
+    channels,
+    sse: sseBus,
+    cfg: surfCfg,
+    webRoot: cfg.webRoot,
+    // §5.7 求救自检要真值：顺序/兜底文件直接从 router 的 alerts 配置取，
+    // 不让 /api/channels 与 `dotd sos-test` 拿编译期默认值猜（2026-10-17）。
+    alertsRoute: () => router.alertsRoute(),
+  });
+  log(`HTTP 监听 ${surfCfg.http.host}:${surfCfg.http.port}（契约 H2 默认 127.0.0.1:7788）`);
+
+  // ⑧b 飞书长连接入站（主人 2026-10-16 拍板：无公网回调，事件订阅走出站 WS）。
+  // App 凭据齐了就拨出去；owner_chat_id 为空时连接照建、消息全 403（fail-closed）。
+  const stopFeishuWs =
+    surfCfg.feishu.appId.length > 0 && surfCfg.feishu.appSecret.length > 0
+      ? startFeishuWs({
+          cp: cp as unknown as ControlPlane,
+          mem: memPortOf(memory),
+          db,
+          bus,
+          cfg: surfCfg.feishu,
+          log,
+        })
+      : null;
+
+  // ⑧c 飞书出站回路：feishu 来源任务终态（done/failed）→ 回复发回原会话。
+  // 订阅方永远排在发布方前（handler 同步入 emitter 数组，runner 的 cp.finish
+  // 触发 publish 时本订阅已就位）；发送失败只落日志，不影响任务落库。
+  const stopFeishuOutbound =
+    surfCfg.feishu.appId.length > 0 && surfCfg.feishu.appSecret.length > 0
+      ? startFeishuOutbound({ db, bus, gateway: feishuGw, log })
+      : null;
+
+  // ⑨ Runner 常驻协程（CP §12：pop 循环；AbortSignal 让位）
+  const runner = new DotRunner(
+    {
+      cp,
+      router: routerApiOf(router),
+      exec: execApiOf(exec),
+      memory: memApiOf(memory),
+      governance: govApiOf(),
+    },
+    { dotId: cfg.dotIds[0] ?? 'dot1', idlePollMs: cfg.idlePollMs, log },
+  );
+
+  // ⑩ 恢复（CP §7.1 步骤 3–6；在 Runner 起循环之前）
+  const recovery = await cp.recover(approvalsReader);
+  log(
+    `启动恢复：在途回队 ${recovery.inFlightRecovered.length} / 孤儿步 ${recovery.openStepsResolved.length} / ` +
+      `审批续跑 ${recovery.approvalsResumed.length} / 心跳补投 ${recovery.heartbeatsCaughtUp} / ` +
+      `事件重放 ${recovery.eventsReplayed}`,
+  );
+
+  // ⑩b CP §7.1 步骤 7：scheduler.start（registerInternalJob 全部就位后起 tick）。
+  //     recoverOnStartup 只做恢复动作、不起定时器（recovery.ts:170-203），起 tick
+  //     是装配层的活。心跳 tick / queue.gc / 看门狗 / memory guard 都靠它。
+  cp.scheduler.start();
+  log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard）');
+
+  // ⑪ Runner 循环（常驻）
+  const abort = new AbortController();
+  const runnerLoop = (async () => {
+    try {
+      await runner.start(abort.signal);
+    } catch (cause) {
+      log(`Runner 循环异常退出：${String(cause)}`);
+      appendOutbox(cfg.dataDir, `Runner 循环异常：${String(cause)}`);
+    }
+  })();
+
+  // ⑫ 优雅退出（CP §2.1-4）
+  let closing = false;
+  const shutdown = async (reason: string): Promise<void> => {
+    if (closing) return;
+    closing = true;
+    log(`收到 ${reason}，开始优雅退出（宽限 ${cfg.shutdownGraceMs}ms）…`);
+    // ⓪ 先断外来源：飞书长连接停止投递新事件（否则关停中还在建任务）
+    stopFeishuWs?.();
+    emergencyWatch.stop();
+    // ① 停 pop 与心跳投递（scheduler.stop 内部停全部 registerInternalJob）
+    cp.shutdown();
+    // ② 向在跑 Runner 协程传 AbortSignal，等它在当前步边界落 journal 后退出
+    abort.abort();
+    const grace = new Promise<void>((done) => setTimeout(done, cfg.shutdownGraceMs));
+    await Promise.race([runnerLoop.catch(() => {}), grace]);
+    // ②b 出站订阅此刻才解订：在跑任务若正好在宽限内 finish，回复仍发得出去
+    stopFeishuOutbound?.();
+    // ③ 关 HTTP（SSE 长连接会拖住 close；补一次强关）
+    await new Promise<void>((done) => {
+      server.close(() => done());
+      setTimeout(() => {
+        server.closeAllConnections?.();
+      }, 1_000).unref();
+    });
+    markGracefulShutdown(db);
+    try {
+      db.close();
+    } catch {
+      // 已关
+    }
+    appendOutbox(cfg.dataDir, `优雅退出（${reason}）`);
+    log('优雅退出完成');
+  };
+
+  const onSignal = (sig: NodeJS.Signals): void => {
+    void shutdown(sig).then(
+      () => process.exit(0),
+      (cause: unknown) => {
+        process.stderr.write(`[dotd] 退出异常：${String(cause)}\n`);
+        process.exit(1);
+      },
+    );
+  };
+  process.on('SIGTERM', onSignal);
+  process.on('SIGINT', onSignal);
+
+  // Windows 原生 node 下，跨进程 kill(SIGTERM/SIGINT/SIGBREAK)、cmd.exe 包装、进程组
+  // kill 一律被 OS 直接终止，子进程 handler **不执行**（本机实测四类通道均 12–25ms 即死、
+  // 无留痕；唯一能触发 handler 的是进程内 process.emit）。冒烟/CI 需要一条不依赖 OS 信号
+  // 投递的自停通道：父进程经 IPC 发 { type: 'shutdown' }，本进程再自投递 SIGTERM，
+  // 走与真信号**完全相同**的 shutdown() 路径（停投递 → AbortSignal → 落 journal →
+  // markGracefulShutdown → OUTBOX 留痕 → exit 0）。Linux/WSL 下此通道同样可用，
+  // 真 SIGTERM 路径不变。
+  process.on('message', (msg: unknown) => {
+    const t = typeof msg === 'object' && msg !== null && 'type' in msg ? String((msg as { type: unknown }).type) : '';
+    if (t !== 'shutdown') return;
+    log('收到 IPC shutdown 请求（Windows 跨进程信号不可达的等效通道）');
+    process.emit('SIGTERM');
+  });
+
+  return { cfg, db, bus, sse: sseBus, cp, router, exec, memory, runner, server, recovery, shutdown };
+}
+
+// ── 入口 ────────────────────────────────────────────────────────────────────
+
+/** 本文件被直接执行（node --import tsx src/daemon.ts）时为真。 */
+function isMainModule(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) return false;
+  return resolve(argv1) === resolve(HERE, 'daemon.ts');
+}
+
+async function main(): Promise<void> {
+  const daemon = await assembleDaemon();
+  process.stdout.write('[dotd] daemon 就绪（Ctrl-C / SIGTERM 退出）\n');
+  // 常驻：event loop 由 Runner 循环 + HTTP server + scheduler 定时器持有
+  await new Promise<void>(() => {});
+  void daemon;
+}
+
+if (isMainModule()) {
+  void main().catch((cause: unknown) => {
+    process.stderr.write(`[dotd] 启动失败：${String(cause)}\n`);
+    appendOutbox(resolveDataDir(), `启动失败：${String(cause)}`);
+    process.exit(1);
+  });
+}

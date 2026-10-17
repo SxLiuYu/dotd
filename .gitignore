@@ -1,0 +1,52 @@
+# 依赖
+node_modules/
+.pnp.*
+.yarn/
+
+# 构建产物
+dist/
+*.tsbuildinfo
+web-ui/dist/
+web-ui/.vite/
+
+# 运行期数据（唯一库文件 ~/.dotd/dotd.db 由 daemon 自己管，这里只挡误提交）
+*.db
+*.db-wal
+*.db-shm
+journal-blobs/
+
+# 本地环境/密钥（绝不入库）
+.env
+.env.*
+!.env.example
+# scripts/init-config.mjs 的产物。正常落在 ~/.dotd/ 不受仓库管，但 DOTD_HOME
+# 指到仓库内时它会带着三个随机密钥落在这里，一并挡掉。
+/tokens.env
+
+# 编辑/OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# 日志
+*.log
+npm-debug.log*
+OUTBOX.md
+
+# ── 一次性探针 / 临时调试脚本（2026-10-17 追加，上面规则一条未动）──────────
+# 这些是开发期的临时探针（写死内网 IP、WSL 绝对路径 /root/.dotd、任务 ID、
+# systemd unit 全文等运维细节），不属于项目源码，不入库。
+# 命名约定：以后新写的探针用 .tmp-*（任意目录）或 scripts/tmp-*，即自动被挡住。
+/tmp-feishu-chats.sh
+.tmp-*
+scripts/tmp-*
+
+# Windows 保留设备名误建文件（cmd 重定向 `> nul` 的产物，git add 会直接报错）
+/nul
+/nul.*
+
+# ZCode 会话数据（可视化产物等，非项目源码）。原先只靠 .zcode/ 内嵌 .gitignore
+# 的 `*` 挡着，那是脆的；这里补根级规则。
+/.zcode/

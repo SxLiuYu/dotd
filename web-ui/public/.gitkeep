@@ -1,0 +1,1 @@
+# web-ui/public：静态资源（favicon 等），vite 原样拷贝到 dist/。

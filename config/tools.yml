@@ -1,0 +1,64 @@
+# tools.yml —— 工具档位目录（GOV §2.2 语义 + 契约 M5/§9.1 的 11 名工具词表）
+#
+# 词表来源（§9.1 目录树注释点名，与接缝契约 M5、EX §5.3 ToolName 逐字一致）：
+#   fs.read / fs.write / fs.list / fs.stat / shell.run
+#   browser.open / browser.act / browser.snapshot / browser.close / net.get / net.post
+# 共 11 个。治理 tools.yml 登记这 11 个名字（契约 M5）。
+#
+# 与 GOV §2.2 原示例的差异（原示例已被下述裁决取代，不是漏抄）：
+#   1. 工具名按 §9.1/M5/EX §5.3 定稿：原稿的 browser.navigate→browser.open、
+#      browser.purchase→（取消，购物即 browser.act）、shell.exec→shell.run。
+#   2. **无 identityParam 字段**：接缝契约 G1 裁决，登录态谓词改顶层 ToolCall.identity，
+#      GOV §2.2/§2.3 的 identityParam 字段与 zod 必填校验作废（契约 G1 连锁修改）。
+#   3. browser.* 五档归类按 GOV 五档制 + §9.3 默认策略（browser→review）。
+#
+# 档位五档（GOV §2，§9.3 默认策略）：read / write_file / browser / spend / dangerous
+#   read/write_file→allow；browser→review（低智能前审放行，判危转人工）；
+#   spend→approve 一律人工；dangerous→approve+Web 勾选确认。
+#   upgrade.whenContains 子串命中提档；rules.yml 只能收紧不能放宽；未登记工具一律 deny。
+
+tools:
+  - name: fs.read
+    tier: read
+    # 限额分层（契约 M6）：EX 物理兜底 fs.read≤4MB；MEM 策略层更严者生效
+  - name: fs.write
+    tier: write_file
+    pathPrefixes: ["/dot/home/"]           # 写范围约束，执行面同享此契约（GOV §2.2/S2）
+    # 限额分层（契约 M6）：EX 物理兜底 fs.write≤8MB
+  - name: fs.list
+    tier: read
+    # EX §7：目录枚举/mtime/size，深度 ≤4
+  - name: fs.stat
+    tier: read
+    # EX §7：mtime/size
+  - name: shell.run
+    tier: write_file                        # 容器内 shell（EX §7：bash -c，cwd=/dot/home，超时必填）
+    upgrade:                                # 命中即提档（解析规则见 GOV §3.1）
+      tier: dangerous
+      whenContains: ["rm ", "sudo ", "docker ", "> /dev/"]
+  - name: browser.open
+    tier: read                              # 只导航不交互
+  - name: browser.act                       # click/type/submit 合并为一个动作工具
+    tier: browser                           # §9.3：browser→review
+    # 登录态判定不在此声明（契约 G1 作废 identityParam）：
+    # isLoginSensitive(call) = call.tool.startsWith('browser.')
+    #                          && call.identity != null && call.identity !== 'anon'
+  - name: browser.snapshot
+    tier: read                              # 读取当前页面结构，无副作用
+  - name: browser.close
+    tier: read                              # 关 context，profile 留卷上（EX §5.5）
+  - name: net.get
+    tier: read
+  - name: net.post
+    tier: write_file                        # 对外 POST 有副作用：比 GET 高一档（GOV §2.2）
+
+# ── spend 档条目（结构定型，§9.3：花钱一律人工审批）──────────────────────────
+# GOV §2.3 校验细则：tier == "spend" 的条目必须带 spendParams（缺则加载失败）。
+# 阶段一工具词表（§9.1/M5）无 spend 档工具；购物走 browser.act 由 review 承接。
+# 阶段二接入支付/下单类工具时按此形状补条目（含 spendParams.required）：
+#
+#   - name: shop.checkout
+#     tier: spend
+#     spendParams:
+#       required: [amountCents, currency, category]
+# ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,109 @@
+# dotd.yml —— 全局配置（§9.1：数据目录、dotdReserveMb、maxQueued、.wslconfig 注记）
+#
+# 来源：
+# - docs/design/自主Dot系统设计方案.md §9.1 目录树注释（本文件承载的四个键）
+# - modules/control-plane.md:59（.wslconfig memory=32GB / processors=24，注记落在本文件）
+# - modules/control-plane.md:277（maxQueued=200，队列上限与淘汰）
+# - modules/control-plane.md:430（dotdReserveMb 默认 6GB，水位标定用相对基线）
+# - modules/surfaces.md §3（surfaces: 节，HTTP/hooks/jsonl_watch/heartbeat/telegram/ui）
+#
+# 加载约定（骨架定，具体实现归 surfaces 模块）：
+# - 环境变量占位（写法是美元号加花括号包住变量名）由加载器展开；未设置的变量 →
+#   daemon 拒绝启动（fail-closed），不静默回落空串（token/secret 类配置尤其如此）。
+# - 路径支持 `~` 展开为 daemon 用户 HOME。
+#
+# ⚠️ 本文件不是 daemon 的配置文件，是「配置模板」。daemon 只从
+#    `~/.dotd/config.yml`（或 DOTD_CONFIG 指定的路径）读，而且只读其中的
+#    `surfaces:` 一节（src/surfaces/config.ts:354）。其余键（data_dir /
+#    wslconfig_note / db 等）在本文件里只是设计注记，加载器一律不碰——
+#    真实覆盖走环境变量：DOTD_HOME（数据目录）、DOTD_DB_PATH（库文件）。
+#    所以直接 `cp config/dotd.yml ~/.dotd/config.yml` 是不够的：
+#    `${DOTD_MASTER_TOKEN}` / `${DOTD_RO_TOKEN}` / `${HOOK_GRAFANA}` 三个
+#    占位走严格展开，未设置即 ConfigError 拒启动（FEISHU_* 六个是非严格展开，
+#    未设置 → 空串 → 装配层落 NULL 占位，飞书不工作但不拒启动）。
+#    用 `node scripts/init-config.mjs` 生成一份能直接加载的（见该脚本头注）。
+
+version: 1
+
+# 数据目录：SQLite 库、OUTBOX、journal-blobs 等一切落盘状态都在这棵树下。
+# 契约 D1：唯一库文件 ~/.dotd/dotd.db。测试用 DOTD_DB_PATH 覆盖（见 db/conn.ts）。
+data_dir: ~/.dotd
+
+# 内存水位预留（MB）：标定模式取 MemAvailable p50=base 后，normal 档 = base + 本值。
+# CP §6.3：默认 6GB（6144MB）。base 本身低于本值时走"求救事实事件"而非静默 throttled（接缝 S8）。
+dotdReserveMb: 6144
+
+# 队列上限：submit/匹配 run_new 时 queued 数已达上限即触发淘汰（CP §4.4）。
+# 超限时 surfaces.ingest 把 HTTP 响应映射为 503 {"retryAfterMs":…}（surfaces.md:209）。
+maxQueued: 200
+
+# 宿主内存/CPU 规划注记（CP:59 —— 本文件只做注记，实际值在 WSL 侧 .wslconfig 手改）：
+#   .wslconfig: memory=32GB, processors=24
+#   推导：netfuzz 常驻 ~20GB 是基线噪声不假设被驱逐；32GB 下给 dotd 3 容器(6g)+daemon(1g) 留余量。
+#   旧稿 24GB 与 netfuzz 20GB 常驻矛盾，已按 CP 修订列表 #19 提至 32GB。
+wslconfig_note:
+  memory: 32GB
+  processors: 24
+  # daemon 自身 --max-old-space-size：surfaces.md:55 已定 1024MB，在启动脚本里给。
+
+# daemon 自身堆上限（surfaces.md:55 定值，node 启动参数 --max-old-space-size=1024）
+node_max_old_space_mb: 1024
+
+# 迁移与库（契约 D3）：CP db 层为唯一 runner，PRAGMA user_version 递增。
+db:
+  # 覆盖默认的 ~/.dotd/dotd.db（测试/多实例用；默认留空即用 data_dir 推导）
+  # ⚠️ 本节的 path / expected_user_version 都不被 surfaces 加载器读取（死键），
+  #    真正的库路径覆盖用环境变量 DOTD_DB_PATH；期望版本硬编码在 src/daemon.ts。
+  # path: ${DOTD_DB_PATH}
+  # 迁移后期望达到的 user_version = db/migrations 的最大 NNN。
+  # 2026-10-17 起为 090（080 alert_dispatch 加 feishu、090 endpoint_grants 加
+  # last_hit_at）；改完迁移包必须同步改 src/daemon.ts 的 expectedVersion，
+  # 两处不一致时 daemon 启动即拒（比留着旧值静默不迁好）。
+  expected_user_version: 90
+
+surfaces:
+  http:
+    host: 127.0.0.1
+    # 契约 H2 唯一监听端口。改它 = 制造漂移：CLI 的默认 base URL 写死 7788
+    # （src/surfaces/cli.ts:23），assertHttpConfig 也会告警，而 ~/.dotd/config.yml
+    # 一旦写成别的端口，`dotd status/ask` 不设 DOTD_URL 就连不上（2026-10-17
+    # 全方位测试实测：实况被写成 7789， CLI 默认 7788，两边互相够不着）。
+    port: 7788
+    master_token: "${DOTD_MASTER_TOKEN}"
+    readonly_tokens: ["${DOTD_RO_TOKEN}"]
+    # 白名单按**实际监听端口**配（防 DNS rebinding，src/surfaces/ingress.ts:146）。
+    # 浏览器从 http://localhost:7788 打开 Web UI 时，Origin 就是这两个之一；
+    # 少写一个 = 该来源的 /api 全部 403，而 curl/CLI（无 Origin）不受影响，
+    # 所以症状是"命令行好使、网页全 403"，很难一眼看穿。
+    allowed_origins: ["http://localhost:7788", "http://127.0.0.1:7788"]
+  hooks:
+    - source: grafana
+      secret: "${HOOK_GRAFANA}"
+      dot_id: dot1
+      rate_limit_per_min: 30
+  jsonl_watch:
+    - path: ~/dots/inbox/*.jsonl
+      dot_id: dot1
+      enabled: false          # 阶段一定型默认关（surfaces.md:81 分期）
+      idle_debounce_ms: 500
+  heartbeat:
+    tick_interval_s: 15       # 扫描 CP crontabs 表（CP:191-200）
+  # telegram: 节已退役（2026-10-16 主人拍板飞书机器人取代 Telegram，且明确不要
+  # Telegram）。surfaces 加载器对缺省的 telegram 段给空默认（config.ts:253），
+  # NotificationChannels.available('telegram') 恒 false，求救自动落到下一级；
+  # 因此这里不再放 bot_token/allowlist 占位——放着只会让人以为它还活着。
+  # 飞书段（下一节）是现役入站/出站通道。
+  # 2026-10-16 起飞书取代 Telegram 成为现役入站/出站通道（WS 长连接，无需公网 URL）。
+  # 密钥同源：app_id/app_secret 等与 http.master_token 一起落在 ~/.dotd/tokens.env，
+  # 由 scripts/setup-dev-env.sh 或 scripts/init-config.mjs 生成；expandEnv 非严格展开，
+  # 未设置 → 空串 → 装配层落 NULL 占位（不拒启动，但飞书不工作）。
+  feishu:
+    app_id: "${FEISHU_APP_ID}"
+    app_secret: "${FEISHU_APP_SECRET}"
+    verification_token: "${FEISHU_VERIFICATION_TOKEN}"
+    encrypt_key: "${FEISHU_ENCRYPT_KEY}"
+    # owner_chat_id 留空 = 只入站不出站；拿到群 id 后填这里（oc_ 开头）
+    owner_chat_id: "${FEISHU_OWNER_CHAT_ID}"
+    edit_throttle_ms: 1200
+  ui:
+    stream_deltas: true

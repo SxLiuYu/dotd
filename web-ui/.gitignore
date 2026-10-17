@@ -1,0 +1,5 @@
+# 构建产物由 surfaces 的 web.ts 静态托管（SF §5.2）；本目录不参与 dotd 主包构建。
+dist/
+node_modules/
+*.local
+.vite/
