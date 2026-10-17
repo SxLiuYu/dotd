@@ -59,13 +59,13 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `node node_modules/typescript/bin/tsc --noEmit -p .` | exit **0**，0 错误（约 9s） |
-| 测试套件 | `npm test`（并行 4） | `tests 1231 / pass 1231 / fail 0`，exit **0**（59 个 `.test.ts` 量级，118 suite） |
-| 测试套件（串行） | `npm run test:serial` | 同样 `1231/1231`、0 失败（约 5 分钟，排查并行问题时用） |
+| 测试套件 | `npm test`（并行 4） | `tests 1302 / pass 1302 / fail 0`，exit **0**（61 个 `.test.ts` 量级，128 suite） |
+| 测试套件（串行） | `npm run test:serial` | 同样 `1302/1302`、0 失败（约 5 分钟，排查并行问题时用） |
 | 端到端冒烟 | `node scripts/smoke.mjs` | **11/11 通过**，exit **0** |
 | 冒烟（真 HTTP 模型链路） | `DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` | **16/16 通过**，exit **0**（daemon → ModelRouter → 真 HttpTransport → 真 TCP → 假上游） |
 | 上线前体检 | `npm run doctor` | 10 项检查，每项给「结论 + 下一步命令」；本机当前 2 项 fail（缺 `WB2API_KEY`、严格占位符未展开） |
 
-> 耗时是同一批改动的直接成果：全量从 **278s（改前，1032 用例）** 降到 **61–107s（1231 用例，随机器负载波动）**，路径是
+> 耗时是同一批改动的直接成果：全量从 **278s（改前，1032 用例）** 降到 **61–107s（1231 用例）/ 91s（1302 用例，随机器负载波动）**，路径是
 > 消掉测试里的真实等待（SSE 环形缓冲 O(N²)、每用例重跑迁移、TG 重试 2s×3）、修 cwd 脆弱性、并恢复并行。
 > 测试总数是**流动的**，跑之前自己数一遍更稳妥：
 > `grep -hcE "^[[:space:]]*(test|it)\(" tests/*.test.ts | awk '{s+=$1} END {print s}'`。
@@ -330,6 +330,42 @@ WSL 部署时，Windows 侧的 loopback 模型服务需要 `scripts/win-relay.mt
 
 ---
 
+## 出网工具（`net.get` / `net.post`）：默认关闭
+
+dotd 的立身之本是**完全自托管，唯一允许的外部依赖是可换 base_url 的模型 API**。让 agent 主动出网会把主人问的内容发给第三方、也可能产生账单，所以这两个工具**默认是关的**（2026-10-18 之前更糟：容器侧直接返回 `not_implemented`，模型看得见、用了必失败）。
+
+| 开关 | 行为 |
+|---|---|
+| 不设 / `DOTD_NET_TOOLS=off` | `net.get`、`net.post` 都返回 `net_tools_disabled`（可预测的失败码，模型会读成"主人没开"而不是"工具坏了"） |
+| `DOTD_NET_TOOLS=get` | **只**放开 `net.get`。GET 无请求体，泄露面最小。`net.post` 返回 `net_post_disabled` |
+| `DOTD_NET_TOOLS=all` | get + post。post 对外有副作用，治理按 `config/tools.yml` 的 `write_file` 档审查，必要时请主人审批 |
+
+**拼错的值按 `off` 处理并打 warning**（例如 `ENABLED`）——绝不因为拼错意外放开出网。
+
+打开以后还有三道独立护栏（`agent-runtime/net.ts`）：
+
+1. **只允许 http/https**，URL 不得内嵌账号密码；
+2. **SSRF 防护**：拒绝 localhost、`*.local`、127/8、10/8、172.16/12、192.168/16、169.254/16（含云元数据 169.254.169.254）、IPv6 loopback/ULA/link-local，以及 `[::ffff:127.0.0.1]` 这类 IPv4 映射（实测 `new URL()` 会把它规范化成 `::ffff:7f00:1`，第一版防护就漏在这里，已修）；
+3. **不自动跟随重定向**（3xx 原样返回 `location`），响应体 **4MB 上限**（超出截断并标 `bodyTruncated`），单次超时 **30s**。
+   宿主侧 `src/exec/netguard.ts` 的 DOTD-OUT 链只放行容器出外网、显式 DROP 到宿主网关/loopback，与这三条是叠加关系。
+
+### 为什么没有内置 web 搜索
+
+**判断：不做内置搜索工具**（2026-10-18 本机实测依据）：
+
+| 端点 | 实测 |
+|---|---|
+| `html.duckduckgo.com/html/?q=…` | 连接超时 |
+| `api.duckduckgo.com/?q=…&format=json` | 连接超时 |
+| `www.google.com/search?q=…` | 连接超时 |
+| `www.bing.com/search?q=…` | HTTP 200，但 **5/5 次返回与查询无关的结果**（查 `dotd agent harness` → 返回 "DiskGenius 数据恢复软件"；结果来自 `cn.bing`、未登录态降级）、无验证码但不可用 |
+
+把这种结果当"搜索结果"喂给模型，**比没有搜索更糟**——模型会当真。要稳定就得接带 key 的付费搜索 API，那是新增外部依赖与账单，违反自托管的前提。
+
+因此搜索能力表达为 **`net.get` + 一份判据手册**（`src/runner/tool-catalog.ts` 的 `NET_SEARCH_GUIDE`）：优先直连权威数据源（官方 API/文档/RSS），不要去抓搜索引擎网页；主人若能提供自己的搜索端点（自建 SearxNG、内网检索、已付费 API），模型直接 `net.get` 那个端点即可，无需内置。手册同时明确禁止"用 shell curl 绕过 `net_tools_disabled`"——那是同一个出网行为，绕过治理。
+
+---
+
 ## 架构
 
 `src/` 下八个模块目录 + 两个装配层根文件（`src/daemon.ts` 装配层、`src/event-rules.ts` 侧加载器）。
@@ -403,7 +439,8 @@ tier1 → tier2 → tier3 → tier4 **单向**，失败永远向前降级，绝�
 - **`config/dotd.yml` 是个同名陷阱。** 它含 `dotdReserveMb`/`maxQueued` 与 surfaces 七节，但没有任何代码加载它；真正被读的是 `~/.dotd/config.yml`。两个同名文件并存、只有一个生效，改仓库那份不产生任何效果。
 - ~~**`config/dotd.yml` 缺 `feishu:` 节。**~~ **2026-10-17 已修**：模板补上了 `feishu:` 六字段（`app_id`/`app_secret`/`owner_chat_id`/`verification_token`/`encrypt_key`/`edit_throttle_ms`），由 `init-config` 一并填出。注意 `verification_token`/`encrypt_key` 只对 HTTP webhook 路径有意义，WS 长连接入站不校验它们。
 - **`config/dotd.yml` 五个顶层键没有代码读取**（`data_dir`/`maxQueued`/`node_max_old_space_mb`/`wslconfig_note`/`db.expected_user_version`），装配层只按行正则抓 `dotdReserveMb`。改了不生效，且无提示。
-- **三个 CLI 子命令自带「路由待补」塌陷。** `logs` 只能经 `/api/guard` 旁路（`src/surfaces/cli.ts:297-309`）、`task` 只能从 `/api/queue` 里 find，找不到就 `not_found` + note（`:311-322`）；HTTP 路由表确无 `/api/logs`、`/api/tasks/:id`（`src/surfaces/http.ts:95-135`）。
+- ~~**三个 CLI 子命令自带「路由待补」塌陷。**~~ **2026-10-18 已修**：`/api/logs` 与 `/api/tasks/:id` 两条路由已补齐（`src/surfaces/http.ts` 的 `logs` / `task_by_id`），`dotd logs` 直接读 `surf_ingress_rejects`、`dotd task <id>` 读 CP `getTask()+getJournal()`。`dotd task <id> --verbose` 新增「花了多少 / 卡在哪 / 每一步多久」三段视图（`src/surfaces/task-view.ts`；成本口径直接取 `model_call_log.prompt_tokens/completion_tokens`，按契约 J1 用 `attempt_id = llm 步 call_id` 关联，不重造）。
+- **`net.get`/`net.post` 已实现但默认关闭（2026-10-18）**：此前容器侧直接返回 `not_implemented`——模型在工具目录里看得见、调用必失败。现在见下方「出网工具」节。**没有内置 web 搜索**，理由与实测证据写在该节。
 - **背压设计依赖两个未实测环境事实**：WSL2 `docker pause` 可用性（cgroup-freezer），以及 netfuzz 负载的确切位置（文档假设在 WSL 内，与 `CONTEXT.md:35` 的表述存在相反可能）。若 netfuzz 在 WSL 之外，四档水位阈值全盘错误。
 - **阶段一求救只有 `~/.dotd/OUTBOX.md` 一条路**，且 daemon 崩溃时无处可写。深夜全灭时求救可能无人见。
 - **免费池 key 与主通道相关性故障。** OpenRouter 挂时 groq `:free` 也要同家 key，Tier3 对 tier1 故障失效——容灾链第三级可能名存实亡。

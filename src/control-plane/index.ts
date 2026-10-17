@@ -84,6 +84,32 @@ export interface ControlPlaneInstance extends ControlPlane {
   runQueueGcNow(): ReturnType<typeof runQueueGc>;
 }
 
+/**
+ * P1-1：抢占后的 journal 对账。
+ *
+ * 被抢占的任务退回 queued 时，journal 里可能还有 `started` 的孤儿步（当时正在等工具返回）。
+ * 不处理的话，"抢占"就等于"批量制造 unknowns"，与 P0-3 立下的"绝不重复执行"直接冲突。
+ *
+ * 做法：把该任务所有 `started` 步逐个交给 `journal.reconcileAndResolve`——
+ * 它就是 CP §5.3 的既有三分流（不要在这里另写一套判据）：
+ *   - llm / safe / replayable 步 → 标 interrupted，由重跑的 Runner 重新决策（不重放副作用）；
+ *   - unknown 副作用步 → 先向执行面按 call_id 对账真实结局（done 就补 succeeded，不重放）。
+ *
+ * 不抛：任何异常都吞掉（对账失败还能靠下轮 pop/看门狗/重启恢复兜底），
+ * 但会记一条 resource_event 便于复盘。
+ */
+async function reconcilePreempted(
+  holder: { j: Journal | null },
+  taskId: string,
+): Promise<void> {
+  const journal = holder.j;
+  if (journal === null) return;
+  for (const s of journal.tail(taskId, 200)) {
+    if (s.status !== 'started') continue;
+    await journal.reconcileAndResolve(taskId, s.seq);
+  }
+}
+
 export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance {
   const cfg: ControlPlaneConfig = { ...DEFAULT_CP_CONFIG, ...deps.cfg };
   const bus = deps.bus;
@@ -118,7 +144,15 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     guardLevel: () => guard.currentLevel(),
     record,
     sealTask: deps.sealTask,
+    // P1-1：抢占后对账（惰性取 journalImpl——它在 queue 之后构造）
+    reconcileAfterPreempt: (taskId) => {
+      void reconcilePreempted(journalHolder, taskId).catch(() => {
+        // 对账失败不炸队列：下轮 pop / 看门狗 / 重启恢复仍会兜底
+      });
+    },
   });
+  /** 惰性 holder：journalImpl 在建 queue 之后才存在。 */
+  const journalHolder: { j: Journal | null } = { j: null };
   // 补回 queue 引用（构造后再赋值；Guard 内只在运行期读）。
   (guard as unknown as { deps: GuardDeps }).deps.queue = queue;
 
@@ -131,6 +165,7 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     governance: deps.governance,
     treatUnknownAsRisk: deps.treatUnknownAsRisk,
   });
+  journalHolder.j = journalImpl;
 
   // scheduler 后建；matcher 的 wake 用惰性门面（构造顺序 matcher → scheduler）。
   const matcher: Matcher = new Matcher({

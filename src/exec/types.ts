@@ -131,6 +131,29 @@ export interface ExecConfig {
   logTailChars: number;
   /** 资源闸门（EX §4.3）。 */
   gate: { maxActiveContainers: number; maxMemBudgetTotalMb: number; minMemAvailableMb: number };
+  /**
+   * P1-1 容器内工具并发闸（按容器 × 工具档计）。
+   *
+   * 只在 `maxRunningTasks > 1` 时才有意义：单任务串行时 Runner 一次只派发一个工具，
+   * 闸永远不会触发。**默认全 0 = 不限 = 与改动前逐字一致**。
+   *
+   * 取值依据（Lead 批准的分档）：
+   *  - `browser`: 1 —— Playwright 的页面/上下文上限是硬约束，且浏览器实例本身串行；
+   *  - `shell`  : 2 —— CPU 竞争与吞吐的折中，再多就是互相拖慢（长命令本就不该并行）；
+   *  - `fs`     : 0（不限）—— 本地快操作，排队成本大于收益。
+   *
+   * 超限**排队**；排队超过 `queueMs` 才降级为 `container_busy`（可重试），**绝不直接拒**。
+   *
+   * 可选字段：缺省 = 全不限（读 DEFAULT_EXEC_CONFIG.containerJail）。
+   * 这样既有"手工构造完整 ExecConfig"的测试无需改动（新开关不强制填）。
+   */
+  containerJail?: {
+    browser: number;
+    shell: number;
+    fs: number;
+    /** 排队上限（毫秒）；超时才降级。0 = 不等待（立即 busy）。 */
+    queueMs: number;
+  };
   /** token bind 文件目录（EX §2.1-4：WSL 本地文件系统，非卷）。 */
   tokenDir: string;
   /** 镜像构建上下文根：exec-image/Dockerfile 与 agent-runtime/ 的父目录（§3.2 内存 tar）。 */
@@ -166,6 +189,8 @@ export const DEFAULT_EXEC_CONFIG: ExecConfig = {
   pollIntervalMs: 500,
   logTailChars: 4000,
   gate: { maxActiveContainers: 2, maxMemBudgetTotalMb: 4096, minMemAvailableMb: 4096 },
+  /** P1-1：默认全不限（= 与改动前逐字一致）。开并发时由装配层显式设值。 */
+  containerJail: { browser: 0, shell: 0, fs: 0, queueMs: 0 },
   tokenDir: '/var/lib/dotd/tokens',
   repoRoot: deriveRepoRoot(),
   profileHashChars: 16,

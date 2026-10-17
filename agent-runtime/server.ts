@@ -47,6 +47,14 @@ import { FsTools } from './fs.ts';
 import { ShellTools, type SpawnAdapter } from './shell.ts';
 import { BrowserHolder, MAX_PAGES_PER_CTX, identityHash, browserCrashed, isPersistentIdentity } from './browser.ts';
 import { XvfbManager, type XvfbSpawn } from './xvhfd.ts';
+import {
+  defaultFetch,
+  NET_TOOLS_DEFAULT_MODE,
+  parseNetToolsMode,
+  runNetCall,
+  type FetchLike,
+  type NetToolsMode,
+} from './net.ts';
 
 /** agent-runtime 版本（参与镜像 tag 计算；增删工具必须 bump，EX S2）。 */
 export const RUNTIME_VERSION = '0.1.0';
@@ -103,6 +111,13 @@ export interface RuntimeConfig {
   canSetUid?: () => boolean;
   browserFactory?: BrowserHolder extends never ? never : import('./browser.ts').ChromiumFactory;
   xvfbSpawn?: XvfbSpawn;
+  /**
+   * net.* 的出网策略。**缺省 = 读 `DOTD_NET_TOOLS`，未设即 off（默认关闭）**，
+   * 见 agent-runtime/net.ts 头注「默认策略」。显式传此字段优先于环境变量（测试用）。
+   */
+  netTools?: NetToolsMode;
+  /** fetch 打桩（测试直连假上游，真路径不 mock）。 */
+  fetchImpl?: FetchLike | null;
   /** 日志出口（默认 console；测试可捕获）。 */
   log?: (line: string) => void;
 }
@@ -128,6 +143,9 @@ export class AgentRuntime {
   readonly shell: ShellTools;
   readonly browser: BrowserHolder;
   readonly xvfb: XvfbManager;
+  /** net.* 生效策略（默认 off；拼错的值按 off 并打 warning，绝不意外放开）。 */
+  readonly netTools: NetToolsMode;
+  private readonly fetchImpl: FetchLike | null | undefined;
 
   private readonly cfg: Required<
     Pick<RuntimeConfig, 'port' | 'host' | 'stateDir'>
@@ -151,6 +169,18 @@ export class AgentRuntime {
     };
     this.log = cfg.log ?? ((line) => console.log(line));
     this.token = cfg.token ?? readToken(cfg.tokenPath ?? DEFAULT_TOKEN_PATH);
+
+    // net.* 出网策略：显式参数 > DOTD_NET_TOOLS > 默认 off。
+    const netParsed =
+      cfg.netTools !== undefined
+        ? { mode: cfg.netTools, warning: null }
+        : parseNetToolsMode(process.env['DOTD_NET_TOOLS']);
+    this.netTools = netParsed.mode ?? NET_TOOLS_DEFAULT_MODE;
+    if (netParsed.warning !== null) this.log(`[warn] ${netParsed.warning}`);
+    this.fetchImpl = cfg.fetchImpl;
+    if (this.netTools !== 'off') {
+      this.log(`[net] 出网工具已启用：mode=${this.netTools}（DOTD_NET_TOOLS；治理侧仍按 tools.yml 档位把关）`);
+    }
 
     const ledgerPath = cfg.ledgerPath ?? `${this.cfg.stateDir}/ledger.jsonl`;
     this.ledger = new Ledger({ filePath: ledgerPath });
@@ -608,8 +638,19 @@ export class AgentRuntime {
         return this.browserCall(call, key, jobId);
       case 'net.get':
       case 'net.post':
-        // 阶段二（§9.7 D6+）：词表已登记、能力目录已声明，容器内实现留位。
-        return errorResult(call.call_id, ERROR_CODES.not_implemented, `${call.tool} 阶段二实现`, false);
+        return runNetCall(
+          {
+            callId: call.call_id,
+            method: call.tool === 'net.get' ? 'GET' : 'POST',
+            url: typeof call.args.url === 'string' ? call.args.url : '',
+            ...(typeof call.args.headers === 'object' && call.args.headers !== null
+              ? { headers: call.args.headers as Record<string, unknown> }
+              : {}),
+            ...(typeof call.args.body === 'string' ? { body: call.args.body } : {}),
+            deadlineMs: call.deadline_ms,
+          },
+          { mode: this.netTools, fetchImpl: this.fetchImpl ?? defaultFetch() },
+        );
       default:
         return errorResult(call.call_id, ERROR_CODES.unknown_tool, `未知工具 ${String(call.tool)}`, false);
     }

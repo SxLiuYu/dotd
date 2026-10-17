@@ -188,6 +188,75 @@ export function appendOutbox(dataDir: string, line: string): void {
 }
 
 /**
+ * P1-1 并发配置读取：**只有显式声明才返回键**（返回空对象 = 全走 DEFAULT_CP_CONFIG）。
+ *
+ * 环境变量（前缀 DOTD_）：
+ *  - `DOTD_MAX_RUNNING`（int ≥1）：并发额度，默认仍是 1；
+ *  - `DOTD_INTERACTIVE_RESERVE`（int ≥0）：给主人对话预留的额外名额，默认 0；
+ *  - `DOTD_PREEMPTIBLE_PRIORITY`（int 0..10）：可被对话抢占的后台优先级阈值，默认 0=关闭。
+ *
+ * 为什么不全用 `truthyEnv`：并发额度必须能表达"3 个"，不是开关。
+ * 非法值**抛错拒启动**（与 DOTD_RESERVE_MB 同口径）：静默回落默认值会让
+ * "我明明设了 4 却还是串行"变成最难排查的那种坑。
+ */
+export function cpConcurrencyFromEnv(): Partial<{
+  maxRunningTasks: number;
+  interactiveReserve: number;
+  preemptiblePriority: number;
+}> {
+  const out: Partial<{
+    maxRunningTasks: number;
+    interactiveReserve: number;
+    preemptiblePriority: number;
+  }> = {};
+  const intOf = (name: string, min: number): number | null => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.length === 0) return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < min) {
+      throw new Error(`${name} 非法：${raw}（要求整数 ≥ ${min}）`);
+    }
+    return n;
+  };
+  const maxRunning = intOf('DOTD_MAX_RUNNING', 1);
+  if (maxRunning !== null) out.maxRunningTasks = maxRunning;
+  const reserve = intOf('DOTD_INTERACTIVE_RESERVE', 0);
+  if (reserve !== null) out.interactiveReserve = reserve;
+  const preemptible = intOf('DOTD_PREEMPTIBLE_PRIORITY', 0);
+  if (preemptible !== null) out.preemptiblePriority = preemptible;
+  return out;
+}
+
+/**
+ * P1-1 容器内工具并发闸的取值（**只在 `DOTD_MAX_RUNNING > 1` 时被调用**）。
+ *
+ * 分档依据（Lead 批准）：
+ *  - `browser.*` = 1：Playwright 的页面/上下文上限是硬约束，浏览器实例本身串行；
+ *  - `shell.run` = 2：CPU 竞争与吞吐的折中，再多只会互相拖慢；
+ *  - `fs.*` = 不限：本地快操作，排队成本大于收益。
+ *
+ * 三个键都可用环境变量覆盖（调优用）：`DOTD_JAIL_BROWSER` / `DOTD_JAIL_SHELL` /
+ * `DOTD_JAIL_QUEUE_MS`。**排队超时才降级**（`container_busy`，retryable），不直接拒。
+ */
+export function containerJailFromEnv(): { browser: number; shell: number; fs: number; queueMs: number } {
+  const num = (name: string, fallback: number, min: number): number => {
+    const raw = process.env[name];
+    if (raw === undefined || raw.length === 0) return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < min) {
+      throw new Error(`${name} 非法：${raw}（要求整数 ≥ ${min}）`);
+    }
+    return n;
+  };
+  return {
+    browser: num('DOTD_JAIL_BROWSER', 1, 0),
+    shell: num('DOTD_JAIL_SHELL', 2, 0),
+    fs: 0,
+    queueMs: num('DOTD_JAIL_QUEUE_MS', 30_000, 0),
+  };
+}
+
+/**
  * 水位预留（MB）读取：DOTD_RESERVE_MB 环境变量优先，其次 ~/.dotd/config.yml 顶层
  * `dotdReserveMb:` 键（只按行匹配这一个标量，不引 YAML 库），都没有则返回 null 用默认。
  * 背景：装配层此前不读 dotd.yml 的 dotdReserveMb（接线缺口），本机内存紧张时无法调档。
@@ -511,6 +580,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // 优先级：DOTD_RESERVE_MB（调试覆盖）> ~/.dotd/config.yml 顶层键 > DEFAULT_CP_CONFIG。
   const reserveMbOverride = cpReserveMbFromEnvOrConfig(cfg);
 
+  // P1-1 并发：**显式声明才开**（默认值纪律：默认 1 = 与既有行为逐字相同）。
+  const concurrencyCfg = cpConcurrencyFromEnv();
+
   const cp = createControlPlane({
     db,
     bus,
@@ -518,6 +590,8 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     dotIds: cfg.dotIds,
     blobDirAbs: blobDir,
     ...(reserveMbOverride === null ? {} : { cfg: { dotdReserveMb: reserveMbOverride } }),
+    // P1-1：并发相关键只在**显式声明**时覆盖（否则完全走 DEFAULT_CP_CONFIG，行为不变）。
+    ...(Object.keys(concurrencyCfg).length === 0 ? {} : { cfg: concurrencyCfg }),
     // 模型层（契约 T1 / CP §6.1）：事件→目标匹配的 LLM 分流走 light 轨。
     // MR 在 CP 之后 init（它要 cp 的 taskImpact/registerInternalJob），故经 holder
     // 惰性取——matcher 只在事件匹配运行期调 lowBrain.complete。
@@ -633,7 +707,16 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   const exec = new ExecServiceImpl({
     db,
     bus,
-    cfg: { ...execConfigFromEnv(), tokenDir: process.env.DOTD_TOKEN_DIR ?? join(cfg.dataDir, 'exec-tokens') },
+    cfg: {
+      ...execConfigFromEnv(),
+      tokenDir: process.env.DOTD_TOKEN_DIR ?? join(cfg.dataDir, 'exec-tokens'),
+      // P1-1 容器内工具并发闸：**只在开了并发时才生效**。
+      // maxRunningTasks=1（默认）时 Runner 一次只派发一个工具，闸永远不该触发 →
+      // 此时不传该键，走 ExecConfig 的默认"全不限"，保证默认行为与改动前逐字一致。
+      ...(concurrencyCfg.maxRunningTasks !== undefined && concurrencyCfg.maxRunningTasks > 1
+        ? { containerJail: containerJailFromEnv() }
+        : {}),
+    },
     // P0-3 在途心跳：工具在途期间由执行面轮询驱动心跳（CP 的 heartbeat 在此注入，
     // EX 不 import CP、不直写 tasks 表——CONVENTIONS §4 模块边界）。
     // 语义：每轮**成功**的 GET /jobs 续一次；getJob 抛错/容器判死/本地 deadline 都很

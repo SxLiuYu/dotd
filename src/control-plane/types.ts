@@ -142,8 +142,37 @@ export interface CrontabRow {
 // ── 2. 配置（config/dotd.yml 的 CP 侧投影）────────────────────────────────
 
 export interface ControlPlaneConfig {
-  /** 并发额度（CP §2.2：MVP maxRunningTasks=1；阶段三按 dotId 分桶）。 */
+  /**
+   * 并发额度（CP §2.2）。**默认 1 = 严格串行**，与既有行为逐字相同。
+   *
+   * P1-1：允许 >1，但必须由装配层显式声明（`config/dotd.yml` 或 `DOTD_MAX_RUNNING`），
+   * 不得改默认值——默认值突然变大会让所有人在没要求的情况下改变行为（多任务并行
+   * 意味着更多容器/端点压力、更难排查的交叉失败）。见 `truthyEnv` 与 daemon 装配。
+   */
   maxRunningTasks: number;
+  /**
+   * P1-1：为主人对话（priority=1，`dotd ask` / 飞书 / web 消息）**预留**的额外名额。
+   *
+   * 语义：额度满时，只要有 interactive 任务在排队，就允许它额外进入，最多超过
+   * `maxRunningTasks` 这么多条。**默认 0 = 不预留**（行为与改动前逐字相同）。
+   *
+   * 为什么需要它（而不是只靠优先级排序）：`pop()` 在额度满时会直接返回 null，
+   * **根本走不到"看队列里有没有 interactive"那一步**——优先级只在有空位时才有意义。
+   * 所以必须有一个"满额时仍可放行 interactive"的通道。
+   */
+  interactiveReserve: number;
+  /**
+   * P1-1：可被 interactive 抢占的优先级阈值（含）。
+   *
+   * 语义：额度满、且预留格已用完时，若队列里有 interactive 任务，且 running 中存在
+   * priority >= 本值的任务（默认 5 = heartbeat/hook 这类后台任务），就抢占**最晚开始**
+   * 的那一条：把它退回 queued（**attempt 不变、不记失败**），让出名额给对话。
+   * 填 0 = 关闭抢占（只靠 interactiveReserve）。
+   *
+   * 默认 5：与 `PRIORITY_MAP` 的后台档一致（interactive=1 / heartbeat·hook=5 / bulk=7）。
+   * bulk(7) 同样可被抢占；重任务不会被抢占（priority < 5 的按重要性处理）。
+   */
+  preemptiblePriority: number;
   /** 队列上限（CP §4.4：maxQueued=200）。 */
   maxQueued: number;
   /** 心跳超时（CP §4.1 看门狗：running 且 now-last_heartbeat_at > 该值即 reclaim）。 */
@@ -185,6 +214,9 @@ export interface ControlPlaneConfig {
 /** 默认值逐条对应 config/dotd.yml 的键与 CP 正文数值。 */
 export const DEFAULT_CP_CONFIG: ControlPlaneConfig = {
   maxRunningTasks: 1,
+  /** P1-1：默认不预留、不抢占——与既有行为逐字相同。 */
+  interactiveReserve: 0,
+  preemptiblePriority: 0,
   maxQueued: 200,
   heartbeatTimeoutMs: 180_000,
   shutdownGraceMs: 30_000,

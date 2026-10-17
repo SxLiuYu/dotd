@@ -214,31 +214,35 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     description:
       '发一个 HTTP GET 取数据，适合调 JSON API、抓静态页面源码、看某个 URL 的响应头。' +
       '能直接拿到数据的接口一律用它，比开浏览器快一个数量级；需要执行页面 JS、要携带登录 Cookie 的，才退回 browser.*。' +
-      '限制：只有 http/https；单次调用硬截止 60 秒；只准 GET，带副作用的请求用 net.post。',
+      '**注意：出网默认是关的**——主人没开时你会收到 net_tools_disabled，那就改用 shell / browser 或直接告诉主人"需要我联网查吗"。',
     params: {
       url: '完整的 http(s) 网址，查询参数直接写在 URL 上（如 ?q=x&limit=5）。',
-      headers: '可选，一个键值对象，如 {"accept":"application/json"}。值必须是字符串。',
+      headers: '可选，一个键值对象，如 {"accept":"application/json"}。只认 accept / accept-language / content-type / user-agent / cache-control 等无害头。',
     },
-    returns: '返回值是 JSON：url（请求地址）、status（HTTP 状态码）、body（响应体文本）。',
+    returns:
+      '返回值是 JSON：url、status（HTTP 状态码）、contentType、headers、body（响应体文本）、bodyTruncated（是否因超过 4MB 被截断）。' +
+      '3xx 不会自动跟随，会额外给 redirect 字段告诉你跳去哪。',
     failures:
-      'bad_args（url 不是字符串）、not_implemented（部分运行环境尚未实现网络工具，看到这个码就改用 shell/浏览器）、' +
-      'deadline_exceeded（超时）。4xx/5xx 也要看 status 与 body，不要当成"没结果"。',
+      'net_tools_disabled（主人没开联网，**别再重试**，换个办法或问主人）、net_post_disabled（只开了只读）、' +
+      'net_bad_url（不是 http/https 或内嵌账号密码）、net_blocked_host（目标是本机/内网/元数据地址，被拒）、' +
+      'net_timeout（超时，可重试）、net_network_error（DNS/连接失败）、net_too_large（响应过大）。' +
+      '4xx/5xx **不算失败**：那是对方的状态码，照常看 status 与 body。',
   },
   {
     name: 'net.post',
     description:
       '发一个 HTTP POST（JSON 或表单）到外部服务。' +
       '只在确实需要提交数据时用它：它对**外部世界有副作用**（可能下单、发帖、改远端数据），治理会按写操作级别审查，必要时会请主人审批。' +
-      '能读就别写；写之前想清楚参数，因为一旦提交，重试可能重复生效。',
+      '能读就别写；写之前想清楚参数，因为一旦提交，重试可能重复生效。默认只有 DOTD_NET_TOOLS=all 时才可用。',
     params: {
       url: '完整的 http(s) 网址。',
       body: '请求体字符串。发 JSON 就自己序列化成字符串，并配 Content-Type 头。',
       headers: '可选，一个键值对象。发 JSON 记得写 {"content-type":"application/json"}。',
     },
-    returns: '返回值是 JSON：url、status（HTTP 状态码）、body（响应体文本）。',
+    returns: '返回值是 JSON：url、status、contentType、headers、body、bodyTruncated（同 net.get）。',
     failures:
-      'bad_args（url 不是字符串）、not_implemented（环境未实现）、deadline_exceeded（超时）。' +
-      '提交成功但对方报错时看 status 与 body，不要盲目重发。',
+      'net_tools_disabled / net_post_disabled（主人只开了 GET；**不要绕道**用 shell curl）、net_bad_url、net_blocked_host、' +
+      'net_timeout、net_network_error。提交成功但对方报错时看 status 与 body，不要盲目重发。',
   },
 ];
 
@@ -339,6 +343,33 @@ const KNOWN_PARAM_WORDS = new Set([
 ]);
 
 /**
+ * 「要不要联网查 / 怎么查」的判据（B 项的落地形态：**不做搜索工具，给模型一份手册**）。
+ *
+ * 为什么不做内置 web_search 工具（2026-10-18 实测结论，写在这里让后来人不用重做）：
+ * - 本机实测 `html.duckduckgo.com`、`api.duckduckgo.com`、`google.com/search` **全部连接超时**；
+ *   只有 `www.bing.com/search` 返回 200，但同一查询连发 5 次拿到的是**与查询完全无关**的结果
+ *   （查 `dotd agent harness` → 返回 "DiskGenius 数据恢复软件"），且响应来自 `cn.bing`、
+ *   未登录态会降级。把这种结果当"搜索结果"喂给模型，比没有搜索更糟（模型会当真）。
+ * - 要稳定就得接付费/带 key 的搜索 API —— 那是**新增外部依赖与账单**，违反本项目
+ *   "唯一外部依赖是可换 base_url 的模型 API" 的立身之本。
+ * - 因此：搜索能力表达为 **net.get + 本手册**。主人若能提供自己的搜索端点（自建 SearxNG、
+ *   公司内网检索、已付费的 API），模型直接 `net.get <那个端点>?...` 即可，不需要我们内置。
+ */
+export const NET_SEARCH_GUIDE = `联网查资料的判据（没有内置搜索工具，用 net.get 自己拼 URL）：
+- 先问自己：这件事**必须**用今天的实时信息吗？代码/文档/本机文件里已有的，别联网。
+  联网会把主人问的问题发给外部服务——这是隐私代价，能省就省。
+- 出网默认关闭。若 net.get 返回 net_tools_disabled，说明主人没开；**不要**改用 shell curl 绕过去
+  （那是同一个出网行为，绕过治理），直接告诉主人"需要联网的话请设 DOTD_NET_TOOLS=get"。
+- 开了以后，优先直连**权威数据源**，而不是搜索引擎：
+  · 官方 API 的 JSON（如 https://api.github.com/repos/<owner>/<repo>/issues?state=open）
+  · 官方文档、RSS/Atom 订阅、sitemap、公开数据集
+  这些结果结构稳定、可解析、不会突然变成广告页。
+- 确实需要"搜索"时：主人若在 config 里给了搜索端点就用它；没有的话，**不要**去抓 google/bing
+  的网页（实测会被重定向到地区版、返回与查询无关的内容，还可能触发验证码），
+  而是直连你知道站点的 URL，或如实告诉主人"我查不到，需要你给一个搜索服务"。
+- 抓回来的 HTML 很长时：只读你需要的片段（fs.write 存档后 shell.run grep），别把整页塞进推理。`;
+
+/**
  * 工具清单里发给模型的整体引导段（放在 system prompt 之后、工具定义之前使用，
  * 也可直接拼进 system prompt）。讲清 11 个工具的分工与通用约束。
  */
@@ -347,13 +378,15 @@ export const TOOLS_GUIDE = `可用工具共 11 个，按"先便宜后昂贵"选�
 2. 写盘：fs.write（覆盖整篇，改文件前必须先 fs.read 出原文再整篇写回）。任务收尾写记忆用它。
 3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
 4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
-5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。
+5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
 通用约定：
 - 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
 - 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。
 - 结果是 JSON；失败时结构是 {"status":"error","error":{"code","message","retryable"}}。
   先读 code 和 message 再决定：retryable=true 可以重试，false 说明参数或路径错了，原样重发只会再失败一次。
-- 任何工具都可能被治理拦下：deny 时你会收到 {"denied":true,"reason":...}，这表示这条动作不被允许，请换一条路完成目标，而不是换个工具重试同一个动作。`;
+- 任何工具都可能被治理拦下：deny 时你会收到 {"denied":true,"reason":...}，这表示这条动作不被允许，请换一条路完成目标，而不是换个工具重试同一个动作。
+
+${NET_SEARCH_GUIDE}`;
 
 /**
  * 组装一份可直接上线的工具清单：schema 来自能力目录（逐字透传），

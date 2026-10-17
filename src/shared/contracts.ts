@@ -435,6 +435,18 @@ export interface EndpointDef {
   };
   capabilities?: { tool_calling: 'yes' | 'no' | 'unknown'; context: number };
   rate?: { rpm: number; rpd: number };
+  /**
+   * P1-1 生产请求并发上限（可选，远程端点用）。
+   *
+   * 语义：本端点**同时**最多允许多少个在途模型请求；超出的请求由 ModelRouter
+   * 的生产信号量**排队**（不是快速失败），排队超时才降级换端点。
+   *
+   * 为什么不复用 `local.max_concurrency`：那个字段挂在 `local:` 段下，而 `local:`
+   * 在本仓库的语义是「Tier2 本地引擎」（含 health_url / warm 探活），远程端点没有
+   * 也不该有那个段。远程端点要声明"我知道自己只支持 N 并发"（免费额度、单实例网关）
+   * 时用本字段。缺省 = 未声明 = 按 `DEFAULT_REMOTE_CONCURRENCY` 兜底（见 ModelRouter）。
+   */
+  maxConcurrency?: number;
   lastVerifiedAt?: number;
 }
 

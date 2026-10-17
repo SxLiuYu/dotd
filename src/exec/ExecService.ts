@@ -64,6 +64,91 @@ import type {
 import { DEFAULT_EXEC_CONFIG } from './types.ts';
 import type { StubRuntime, StubRuntimeOptions } from './stub-runtime.ts';
 
+/**
+ * 工具 → 容器闸档位（P1-1）。
+ *
+ * 返回 null = 不设闸（fs.* 这类本地快操作）。
+ * 分档依据见 `ExecConfig.containerJail` 的注释。
+ */
+export function containerJailLane(tool: string): 'browser' | 'shell' | null {
+  if (tool.startsWith('browser.')) return 'browser';
+  if (tool === 'shell.run') return 'shell';
+  return null;
+}
+
+/** 闸状态：按 (容器, 档位) 计数 + FIFO 等待队列。 */
+interface JailLane {
+  inFlight: number;
+  waiters: Array<() => void>;
+}
+
+/**
+ * 容器内工具并发闸（P1-1）：按 (dotId, 档位) 限制同时在途的工具调用数。
+ *
+ * 语义（与模型侧生产信号量同口径）：
+ *  - 有空位 → 立刻放行；
+ *  - 满额 → **排队**，等到有人释放；
+ *  - 排队超过 `queueMs` → 返回 null，调用方降级为 `container_busy`（retryable），
+ *    而不是把工具本身判失败。
+ *
+ * 设计上刻意**不碰** runTool 的幂等/ledger/心跳：闸只在"校验通过、尚未 call_sent"
+ * 的那一步生效（见 runTool 的第 ④ 步），排队期间 exec_calls 里没有这条记录，
+ * 因此重放/对账语义完全不变。
+ */
+export class ContainerJail {
+  private readonly lanes = new Map<string, JailLane>();
+
+  constructor(private readonly cfg: { browser: number; shell: number; fs: number; queueMs: number }) {}
+
+  private capOf(lane: 'browser' | 'shell'): number {
+    return lane === 'browser' ? this.cfg.browser : this.cfg.shell;
+  }
+
+  /** 取一个许可；返回 null = 排队超时（调用方降级）。cap<=0 = 不限，立即放行。 */
+  async acquire(dotId: string, lane: 'browser' | 'shell'): Promise<{ release(): void } | null> {
+    const cap = this.capOf(lane);
+    if (cap <= 0) return { release: () => undefined }; // 不限
+    const key = `${dotId}::${lane}`;
+    let st = this.lanes.get(key);
+    if (st === undefined) {
+      st = { inFlight: 0, waiters: [] };
+      this.lanes.set(key, st);
+    }
+    if (st.inFlight < cap) {
+      st.inFlight += 1;
+      return { release: () => this.release(key) };
+    }
+    // 满额：排队（超时降级）
+    const waited = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        const i = st!.waiters.indexOf(fn);
+        if (i >= 0) st!.waiters.splice(i, 1);
+        resolve(false);
+      }, this.cfg.queueMs);
+      const fn = (): void => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      st!.waiters.push(fn);
+    });
+    if (!waited) return null;
+    // 被唤醒 = 名额已经转交给它（计数不增不减）
+    return { release: () => this.release(key) };
+  }
+
+  private release(key: string): void {
+    const st = this.lanes.get(key);
+    if (st === undefined) return;
+    const next = st.waiters.shift();
+    if (next !== undefined) {
+      // 名额直接转交：inFlight 不变（避免"释放→别人抢走"的惊群）
+      next();
+      return;
+    }
+    st.inFlight = Math.max(0, st.inFlight - 1);
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // 在途心跳接缝（P0-3 看门狗误回收）
 // ═══════════════════════════════════════════════════════════════════
@@ -179,6 +264,10 @@ export class ExecServiceImpl implements ExecService {
   private inflight = new Map<string, number>();
   /** 在途心跳回调（P0-3：轮询驱动；只看"上游确实答了一次"）。 */
   private liveness: ExecLiveness | null;
+  /** P1-1：容器内工具并发闸（默认全 0 = 不限）。 */
+  private readonly jail: ContainerJail;
+  /** 闸的生效配置（用于错误消息里的上限数字）。 */
+  private readonly jailCfg: { browser: number; shell: number; fs: number; queueMs: number };
   /** 时钟（测试注入虚拟时间；生产恒 Date.now）。 */
   private readonly clock: () => number;
 
@@ -189,6 +278,11 @@ export class ExecServiceImpl implements ExecService {
     // 此处只做覆盖合并，不再维护第二份字面量（审码：双份定义会静默分叉）。
     const base: ExecConfig = { ...DEFAULT_EXEC_CONFIG, ...deps.cfg };
     this.cfg = base;
+    // P1-1：容器闸用合并后的配置（部分覆盖时其余键仍取默认）
+    this.jailCfg = {
+      ...(base.containerJail ?? { browser: 0, shell: 0, fs: 0, queueMs: 0 }),
+    };
+    this.jail = new ContainerJail(this.jailCfg);
 
     if (deps.backend !== undefined) {
       this.backend = deps.backend;
@@ -388,6 +482,31 @@ export class ExecServiceImpl implements ExecService {
       };
     }
 
+    // ④-pre P1-1 容器内并发闸：按 (容器, 工具档) 限流。
+    //
+    // 位置是刻意的：放在**校验通过、call_sent 之前**。
+    //  - 排队期间 exec_calls 里没有这条记录 → 幂等/ledger/对账语义完全不变；
+    //  - 这是唯一"还没真的派发"的点，此后任何环节都视为"已经在容器里跑了"。
+    // 默认容器闸全 0（不限）→ 这里直接放行，行为与改动前逐字一致。
+    const lane = containerJailLane(call.tool);
+    const jail = lane === null ? null : await this.jail.acquire(call.dot_id, lane);
+    if (lane !== null && jail === null) {
+      // 排队超时：降级成"容器忙"（可重试），不是工具本身失败
+      this.fleet.failCall(call.call_id, 'container_busy', call);
+      return {
+        call_id: call.call_id,
+        status: 'error',
+        error: {
+          code: 'container_busy',
+          message:
+            `容器内 ${lane} 档并发已满（上限 ${lane === 'browser' ? this.jailCfg.browser : this.jailCfg.shell}）` +
+            `且排队超时（${this.jailCfg.queueMs}ms）`,
+          retryable: true,
+        },
+        finished_at: at,
+      };
+    }
+
     // ④ 状态机 ready→busy（§4.1：领取调用）
     const prev = this.incInflight(call.dot_id);
     if (prev === 0) this.fleet.transition(call.dot_id, 'busy', { reason: 'runTool' });
@@ -410,6 +529,8 @@ export class ExecServiceImpl implements ExecService {
     } finally {
       // 取消标志只用在这一趟派发里：终态即销户，别让 Set 无界长个。
       this.cancelled.delete(call.call_id);
+      // P1-1：归还容器闸许可（必须在所有出口都执行，否则名额泄漏 → 后续全部排队超时）
+      jail?.release();
       const left = this.decInflight(call.dot_id);
       if (left === 0 && this.fleet.getContainer(call.dot_id)?.state === 'busy') {
         this.fleet.transition(call.dot_id, 'ready', { reason: 'calls drained' });

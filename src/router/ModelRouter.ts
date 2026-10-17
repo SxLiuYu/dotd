@@ -71,7 +71,7 @@ import { ModeManager } from './mode.ts';
 import { OutboxWriter } from './outbox.ts';
 import { PoolManager } from './pool.ts';
 import { ReconScanner } from './recon.ts';
-import { RouterRuntime } from './runtime.ts';
+import { RouterRuntime, SlotSemaphore } from './runtime.ts';
 import type { AlertChannelName, ChatCall, ModelTransport, ModelsConfig, ProbeResult, WarmState } from './types.ts';
 import {
   createModelTransport,
@@ -111,6 +111,50 @@ const POOL_QUALIFY_CAP_MS = 40_000;
 const HEALTH_PROBE_MS = 5000;
 /** 合成探活（breaker.probe_timer 的 light ping）超时。 */
 const PROBE_CHAT_MS = 8000;
+
+// ═══════════════════════════════════════════════════════════════════
+// P1-1 生产请求闸的参数（取值依据见各处注释）
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 生产排队上限：拿到端点槽位前最多等多久。
+ *
+ * 取值依据：`DEFAULT_BUDGET_MS.primary = 300_000`（轨总预算），一个请求在单个端点上的
+ * 合理排队不该吃掉整个预算；`MIN_USEFUL_MS = 5000`（剩余预算不足以再试一个候选的下限）。
+ * 取 **30s**：
+ *  - 远大于单次模型请求的典型耗时（秒级到十几秒），足够把"并发请求"排成一列逐个通过；
+ *  - 又明显小于轨预算（300s/1），排队超时后仍有充足预算换端点/等重试；
+ *  - 与 `local.queue_reject_ms` 的默认 8000ms 同量级偏宽松——本地引擎 8s 排队失败是
+ *    "启动期 warm 没跟上"的语义，而生产并发排队是**常态**，不该同样苛刻。
+ */
+const PRODUCTION_QUEUE_MS = 30_000;
+
+/**
+ * 未声明并发能力的**远程**端点，生产闸的默认容量。
+ *
+ * 取值依据（重要，别想当然）：
+ *  - 远程 OpenAI 兼容服务（OpenRouter 等）的 capacity 是**服务端共享配额**，
+ *    我们本地既测不到也不该猜；设成 1 会把本来能并行的调用强行串行化，
+ *    反而拖慢每个任务（收益为负）；设成很大则等于没有闸。
+ *  - 这里取 **4**：与 `DEFAULT_CP.maxRunningTasks` 的"人工开并发时通常会开到几"对齐，
+ *    足以让 2–4 个任务并行跑不同的模型请求，同时又不至于把远端打成 429 风暴。
+ *  - 真正有单并发约束的端点**应当显式声明**（`local.max_concurrency` 或 `max_concurrency`），
+ *    声明了就严格按声明值排队——本常量只是"没声明时"的保守兜底。
+ */
+const DEFAULT_REMOTE_CONCURRENCY = 4;
+
+/**
+ * 端点生产并发容量（按可靠性递减）。
+ *
+ * 1. `ep.local.max_concurrency`：本地引擎的硬上限（Colibrì 无 batching，=1），最权威；
+ * 2. `ep.maxConcurrency`：远程端点的可选显式声明；
+ * 3. `DEFAULT_REMOTE_CONCURRENCY`：未声明时的兜底。
+ */
+function capacityOf(ep: EndpointDef): number {
+  if (ep.local !== undefined && ep.local.max_concurrency > 0) return ep.local.max_concurrency;
+  if (ep.maxConcurrency !== undefined && ep.maxConcurrency > 0) return ep.maxConcurrency;
+  return DEFAULT_REMOTE_CONCURRENCY;
+}
 
 /** 心跳调度器（契约 J4:ControlPlane.registerInternalJob 的 spec 形状）。 */
 export interface HeartbeatApi {
@@ -184,6 +228,12 @@ export class ModelRouter {
   private endpoints: EndpointDef[] = [];
   /** Tier2 warm 状态（按端点 id 索引）。 */
   private readonly warm = new Map<string, WarmState>();
+  /**
+   * P1-1 生产请求信号量（按端点 id）。与 `runtime` 的探活槽**刻意分开**：
+   * 那套只服务 tier2 本地引擎 + busy 记账；这套是"所有 tier 的在途模型请求数"闸，
+   * 超限排队、排队超时才降级，且**绝不**参与熔断结算。
+   */
+  private readonly productionSlots = new Map<string, SlotSemaphore>();
   /** route() 内置 helpDirty 位（§4.5 同签名节流，1min 心跳结算）。 */
   private helpDirty = false;
   /** 当前实际服务端点（mode 恢复判定/模板"当前承载"）。 */
@@ -567,7 +617,7 @@ export class ModelRouter {
             continue;
           }
           try {
-            return await this.runModelChain(ep, req, cap, tried, () => attemptSeq++);
+            return await this.runWithProductionSlot(ep, req, cap, tried, () => attemptSeq++);
           } catch {
             // 记账（tried + model_call_log + 熔断结算）已在 runModelChain 内逐模型完成，
             // 这里只负责"换下一个端点"——再记一次会把一次失败算成两次，窗口比例被污染。
@@ -579,7 +629,7 @@ export class ModelRouter {
 
         // Tier1/Tier3/Tier4
         try {
-          return await this.runModelChain(ep, req, cap, tried, () => attemptSeq++);
+          return await this.runWithProductionSlot(ep, req, cap, tried, () => attemptSeq++);
         } catch {
           // 同 Tier2 分支：失败记账已在 runModelChain 内完成
           continue;
@@ -874,6 +924,37 @@ export class ModelRouter {
     return { release: () => lease.release() };
   }
 
+  /**
+   * 过生产信号量再跑模型链（P1-1）。
+   *
+   * 语义与 `runModelChain` 完全一致，只多一道"按端点排队"：
+   *  - 拿到槽位 → 跑链 → finally 归还；
+   *  - 排队超时（`PRODUCTION_QUEUE_MS`）→ **不记端点故障**、不 bump busy、不入熔断窗口，
+   *    只记一条 `engine_unavailable` 的 tried 记录并抛可重试错误，让上层换端点/降级。
+   *    这与现有 busy 规则（§4.1：单次 busy 不入窗）保持同口径。
+   */
+  private async runWithProductionSlot(
+    ep: EndpointDef,
+    req: RouteRequest,
+    cap: { connect_ms: number; idle_ms: number; total_ms: number },
+    tried: TryEntry[],
+    nextSeq: () => number,
+  ): Promise<RouteResult> {
+    const slot = await this.acquireProductionSlot(ep);
+    if (slot === null) {
+      const err = new Error(
+        `端点 ${ep.id} 生产并发已满且排队超时（${PRODUCTION_QUEUE_MS}ms，capacity=${capacityOf(ep)}）`,
+      );
+      this.noteFail(req, ep, tried, 'engine_unavailable', nextSeq(), err.message, { settle: false });
+      throw err;
+    }
+    try {
+      return await this.runModelChain(ep, req, cap, tried, nextSeq);
+    } finally {
+      slot.release();
+    }
+  }
+
   /** 探活用（不 bump busy）。 */
   private async tryAcquireSlot(ep: EndpointDef): Promise<{ release(): void } | null> {
     if (ep.local === undefined) return { release: () => undefined };
@@ -881,6 +962,51 @@ export class ModelRouter {
     const lease = await sem.tryAcquire(ep.local.queue_reject_ms);
     return lease === null ? null : { release: () => lease.release() };
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // P1-1 生产请求信号量（§4.1 槽位规则的**生产侧**补充，与探活分开）
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * 生产请求闸：按端点限制**同时在途的模型请求数**，超出则**排队**（不是快速失败）。
+   *
+   * 为什么必须与 `acquireSlot`/`tryAcquireSlot` 分开：
+   *  - 那套只对 `ep.local !== undefined` 生效，且只在 `tier === 2` 分支里调用；
+   *    Tier1/Tier3/Tier4 的生产主路径（`runModelChain`）**完全没有闸**。
+   *  - 它的语义是"本地引擎健康探活 + busy 记账"（`bumpBusy` 会参与熔断结算）。
+   *    生产并发是另一回事：这里**绝不 bump busy、绝不入窗**，排队等待也不记为故障。
+   *
+   * 容量从哪来（按可靠性递减）：
+   *  1. `ep.local.max_concurrency`（本地引擎声明的硬上限，最权威）；
+   *  2. `ep.maxConcurrency`（远程端点可选声明，见 config.ts）；
+   *  3. 未声明 = `DEFAULT_REMOTE_CONCURRENCY`（保守：远程端点按"未知能力"当 1 处理？
+   *     **不是**——见下面的取值依据）。
+   *
+   * 取值依据见 {@link defaultProductionConcurrency}。
+   */
+  private productionSem(ep: EndpointDef): SlotSemaphore {
+    let sem = this.productionSlots.get(ep.id);
+    if (sem === undefined) {
+      sem = new SlotSemaphore(capacityOf(ep));
+      this.productionSlots.set(ep.id, sem);
+    } else {
+      const want = capacityOf(ep);
+      if (sem.capacity !== want) sem.resize(want);
+    }
+    return sem;
+  }
+
+  /**
+   * 取一次生产请求许可（排队上限 `PRODUCTION_QUEUE_MS`）。
+   *
+   * 返回 null = 排队超时：调用方按**可重试的暂时性不可用**处理（换端点/降级），
+   * 而不是记为端点故障——这与 `busy` 的记账规则一致（单次不入窗）。
+   */
+  private async acquireProductionSlot(ep: EndpointDef): Promise<{ release(): void } | null> {
+    const lease = await this.productionSem(ep).tryAcquire(PRODUCTION_QUEUE_MS);
+    return lease === null ? null : { release: () => lease.release() };
+  }
+
 
   // ═══════════════════════════════════════════════════════════════════
   // §4.8 callAndSettle：成功/失败都落 model_call_log（tried 与日志一一对）

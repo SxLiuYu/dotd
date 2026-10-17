@@ -19,6 +19,7 @@ import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_DOT_ID } from '../shared/ids.ts';
+import { renderTaskView, type TaskView } from './task-view.ts';
 
 /** 本文件所在目录（入口判据用，与 src/daemon.ts 同一手法）。 */
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -337,29 +338,68 @@ export function buildCli(opts: CliOptions = {}): Command {
 
   program
     .command('logs')
-    .description('入站拒绝审计（surf_ingress_rejects 经 daemon 读出）')
-    .option('--limit <n>', '条数', '50')
+    .description('入站拒绝审计（surf_ingress_rejects，GET /api/logs）')
+    .option('--limit <n>', '条数（1..500）', '50')
     .action(async (lo: { limit: string }) => {
       const o = merged();
-      // §5.2 路由表无 /api/logs；经 /api/events 的旁路不可行——这里直接读库的只读投影
-      // 由 daemon 暴露（见 http.ts 'events' 分支的同一张 events 表不适用）。
-      // 阶段一：CLI 通过 /api/guard 的 recent 资源事件 + 提示 daemon 侧查询。
-      const r = await api('GET', '/api/guard', undefined, o);
+      // P1-6：`/api/logs` 路由已补齐（此前这里只能拿 /api/guard 凑近似值并附"待补"说明）。
+      const r = await api<{ rejects: Array<{ at: string; source: string; actor: string | null; reason: string; detail: string | null }>; limit: number }>(
+        'GET',
+        `/api/logs?limit=${encodeURIComponent(lo.limit)}`,
+        undefined,
+        o,
+      );
       if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
-      emit(o, render({ guard: r.body, limit: lo.limit, note: 'surf_ingress_rejects 的读路径待 /api/logs 路由补齐（surfaces.md §5.2 未列）' }, o.json === true));
+      const rejects = r.body.rejects ?? [];
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      if (rejects.length === 0) {
+        emit(o, `最近没有入站被拒记录（已查最近 ${r.body.limit} 条）。`);
+        return;
+      }
+      const lines = [`入站被拒 ${rejects.length} 条（最近的在前）：`];
+      for (const x of rejects) {
+        const who = x.actor !== null && x.actor.length > 0 ? x.actor : '匿名';
+        lines.push(`  ${x.at}  ${x.source.padEnd(10)} ${x.reason.padEnd(9)} ${who}${x.detail !== null ? `  ${x.detail}` : ''}`);
+      }
+      emit(o, lines.join('\n'));
     });
 
   program
     .command('task <taskId>')
-    .description('查看任务（含 journal 步骤）')
-    .action(async (taskId: string) => {
+    .description('查看任务（--verbose 给出花了多少 / 卡在哪 / 每一步多久）')
+    .option('--verbose', '详细视图：成本、耗时、瓶颈（GET /api/tasks/:id?verbose=1）', false)
+    .action(async (taskId: string, opts: { verbose?: boolean }) => {
       const o = merged();
-      // §5.2 路由表的 tasks/journal 子集由 CP 转调（H2）；阶段一经 /api/queue 投影 +
-      // 任务明细 GET /api/tasks/:id 尚未在路由表——这里用 queue 里的行回答。
-      const q = await api<{ queue: Array<{ id: string }> }>('GET', `/api/queue?dot=${encodeURIComponent(dot())}`, undefined, o);
-      if (!q.ok) return fail(o, q.message, q.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
-      const found = (q.body.queue ?? []).find((t) => t.id === taskId);
-      emit(o, render(found ?? { error: 'not_found', taskId, note: 'GET /api/tasks/:id 路由待补（surfaces.md §5.2 转调 CP getTask）' }, o.json === true));
+      // P1-6：`/api/tasks/:id` 路由已补齐（此前用 /api/queue 的一行凑，且只覆盖 queued/running）。
+      const q = opts.verbose === true ? '?verbose=1' : '';
+      const r = await api<{
+        task: { id: string; title: string; status: string; attempt: number; priority: number };
+        steps: unknown[];
+        view?: TaskView;
+        error?: string;
+        message?: string;
+      }>('GET', `/api/tasks/${encodeURIComponent(taskId)}${q}`, undefined, o);
+      if (!r.ok) {
+        // 404 = 任务不存在：给出人话 + 下一步，而不是一个裸 error
+        if (r.kind === 'http' && r.status === 404) {
+          emit(o, `任务 ${taskId} 不存在。可用 \`dotd queue\` 看待办、\`dotd events\` 看最近入站事件。`);
+          return;
+        }
+        return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      }
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      if (r.body.view !== undefined) {
+        emit(o, renderTaskView(r.body.view));
+        return;
+      }
+      const t = r.body.task;
+      emit(o, `任务 ${t.id}「${t.title}」\n状态：${t.status}（attempt ${t.attempt}，priority ${t.priority}）\n步骤 ${r.body.steps?.length ?? 0} 条（加 --verbose 看耗时与成本）`);
     });
 
   program

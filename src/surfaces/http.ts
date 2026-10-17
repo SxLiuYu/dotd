@@ -51,6 +51,7 @@ import { createIngress, ingest, MAX_BODY_BYTES, normalizeHook, originAllowed } f
 import { handleFeishuCallback, maybeDecryptFeishuBody } from './feishu-inbound.ts';
 import { SseBus, parseStreamQuery } from './sse.ts';
 import { createHeartbeatAdmin } from './heartbeat-tick.ts';
+import { buildTaskView, type CallLogRow } from './task-view.ts';
 import { serveStatic } from './web.ts';
 import { resolve } from 'node:path';
 
@@ -86,6 +87,8 @@ export type Route =
   | 'hooks_admin'
   | 'heartbeat_admin'
   | 'hook_ingest'
+  | 'task_by_id'
+  | 'logs'
   | 'static';
 
 export interface MatchResult {
@@ -124,6 +127,8 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   if (m === 'GET' && p === '/api/stream') return { route: 'stream', params: {} };
   if (m === 'POST' && p === '/api/hooks') return { route: 'hooks_admin', params: {} };
   if (m === 'POST' && p === '/api/heartbeat') return { route: 'heartbeat_admin', params: {} };
+  // P1-6：入站拒绝审计（`dotd logs` 的属主端点；此前 CLI 只能拿 /api/guard 凑）。
+  if (m === 'GET' && p === '/api/logs') return { route: 'logs', params: {} };
 
   // 参数化
   let mm = /^\/api\/queue\/([^/]+)\/cancel$/.exec(p);
@@ -142,6 +147,13 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   mm = /^\/api\/approvals\/([^/]+)\/decision$/.exec(p);
   if (m === 'POST' && mm !== null) {
     return { route: 'approval_decision', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+
+  // P1-6 可观测性：任务明细（CP getTask + getJournal 的投影，供 `dotd task <id>` 用）。
+  // 细节查询参数走 query（`?verbose=1` 带每步耗时与 token 成本汇总）。
+  mm = /^\/api\/tasks\/([^/]+)$/.exec(p);
+  if (m === 'GET' && mm !== null) {
+    return { route: 'task_by_id', params: { id: decodeURIComponent(mm[1]!) } };
   }
 
   mm = /^\/hooks\/([^/]+)$/.exec(p);
@@ -684,6 +696,93 @@ export function createHttpServer(deps: HttpDeps): Server {
       case 'guard': {
         const st = deps.cp.getGuardStatus();
         json(res, 200, st);
+        return;
+      }
+
+      /**
+       * P1-6 `GET /api/tasks/:id[?verbose=1]` —— 任务明细。
+       *
+       * 事实源全是已有属主投影（CP getTask/getJournal + model_call_log），
+       * 本路由只做"读 + 投影"，不写库、不新增表。
+       * `verbose=1` 时附带 `taskView`（成本/耗时/瓶颈三段），`dotd task <id> --verbose` 直接渲染它。
+       */
+      case 'task_by_id': {
+        const id = match.params.id!;
+        const task = deps.cp.getTask(id);
+        if (task === null) {
+          json(res, 404, { error: 'not_found', taskId: id, message: `任务 ${id} 不存在` });
+          return;
+        }
+        const steps = deps.cp.getJournal(id);
+        const callIds = steps.map((s) => s.callId).filter((c): c is string => c !== null && c.length > 0);
+        // model_call_log 只取本任务 LLM 步对应的行（契约 J1：attempt_id = 步 call_id）
+        const callLogs: CallLogRow[] =
+          callIds.length === 0
+            ? []
+            : (deps.db
+                .prepare(
+                  `SELECT attempt_id AS attemptId, outcome,
+                          latency_ms AS latencyMs, prompt_tokens AS promptTokens,
+                          completion_tokens AS completionTokens,
+                          endpoint_id AS endpointId, model, degraded
+                     FROM model_call_log
+                    WHERE attempt_id IN (${callIds.map(() => '?').join(',')})
+                    ORDER BY id ASC`,
+                )
+                .all(...callIds) as unknown as CallLogRow[]);
+        const base = {
+          task: {
+            id: task.id,
+            title: task.title,
+            status: task.status,
+            priority: task.priority,
+            dotId: task.dotId,
+            attempt: task.attempt,
+            createdAt: task.createdAt,
+            updatedAt: task.updatedAt,
+          },
+          steps,
+        };
+        if (url.searchParams.get('verbose') === '1' || url.searchParams.get('verbose') === 'true') {
+          json(res, 200, { ...base, view: buildTaskView({ task, steps, callLogs, now: now().getTime() }) });
+          return;
+        }
+        json(res, 200, base);
+        return;
+      }
+
+      /**
+       * P1-6 `GET /api/logs` —— 入站拒绝审计（`surf_ingress_rejects` 的属主端点）。
+       *
+       * 此前 CLI 的 `dotd logs` 只能拿 `/api/guard` 凑一个近似值并附带
+       * "读路径待补"的说明——那是"承诺有了、路没通"。这里把路补上：
+       * 直接读 SF 自己的拒绝审计表（`auth/origin/rate/schema/size/allowlist/parse`）。
+       */
+      case 'logs': {
+        const limitRaw = url.searchParams.get('limit');
+        let limit = 50;
+        if (limitRaw !== null) {
+          const n = Number(limitRaw);
+          if (!Number.isInteger(n) || n < 1 || n > 500) {
+            json(res, 400, { error: 'bad_limit', message: 'limit 必须是 1..500 的整数' });
+            return;
+          }
+          limit = n;
+        }
+        const rows = deps.db
+          .prepare(
+            `SELECT id, at, source, actor, reason, detail
+               FROM surf_ingress_rejects ORDER BY id DESC LIMIT ?`,
+          )
+          .all(limit) as unknown as Array<{
+          id: number;
+          at: string;
+          source: string;
+          actor: string | null;
+          reason: string;
+          detail: string | null;
+        }>;
+        json(res, 200, { rejects: rows, limit });
         return;
       }
 

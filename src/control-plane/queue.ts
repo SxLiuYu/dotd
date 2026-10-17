@@ -49,6 +49,18 @@ export interface QueueDeps {
     outcome: 'done' | 'failed' | 'cancelled',
     reason?: string,
   ) => Promise<void>;
+  /**
+   * P1-1 抢占后的 journal 对账钩子（**异步**，由装配层接 `journal.reconcileAndResolve`）。
+   *
+   * 为什么必须有：抢占会把一个**正在跑**的后台任务退回 queued，而它的 journal 里
+   * 可能还留着 `started` 的孤儿步（当时正在等工具返回）。不做对账的话，
+   * 「抢占」就等于「批量制造 unknowns」——与 P0-3 刚立的"不重复执行"规矩冲突。
+   *
+   * `pop()` 在同步事务里，不能 await；因此这里只做 fire-and-forget，
+   * 由装配层按 CP §5.3 的三分流（replayed / deferred / took_result）收口。
+   * 未注入时跳过（老装配行为不变）。
+   */
+  reconcileAfterPreempt?: (taskId: string) => void;
 }
 
 /** CP §4.1 非法转移错误（队列类错误；与 stale_writer 的围栏拒绝区分）。 */
@@ -244,8 +256,44 @@ export class Queue {
     const level = this.deps.guardLevel();
     if (level === 'throttled' || level === 'halted') return null;
     return tx(this.db, () => {
-      if (this.runningCount(dot) >= this.cfg.maxRunningTasks) return null;
       const now = Date.now();
+      const running = this.runningCount(dot);
+      /**
+       * P1-1「交互优先 + 后台让路」：
+       *
+       * 老实现第一行就是 `if (running >= maxRunningTasks) return null` —— 额度一满，
+       * **连"看看队列里有没有主人对话"都不做**。于是后台 heartbeat 任务占满额度时，
+       * 主人在飞书说一句话只能等它跑完（30 分钟级的饿死窗口）。
+       *
+       * 现在满额时先问一句"能不能为对话腾位置"，只有三种情况会继续往下走：
+       *  1. 还有额度（原路径，行为不变）；
+       *  2. 队列里有 interactive（priority=1）且仍在 `maxRunningTasks + interactiveReserve` 内
+       *     → 放行（预留格）；
+       *  3. 队列里有 interactive、预留用完，但存在可抢占的后台任务
+       *     （priority >= preemptiblePriority）→ 抢占**最晚开始**的那条回 queued，放行。
+       * 默认配置（reserve=0, preemptible=0）下 2、3 都不成立 → 与改动前逐字一致。
+       */
+      let preemptVictim: string | null = null;
+      if (running >= this.cfg.maxRunningTasks) {
+        const level = this.deps.guardLevel();
+        if (level !== 'normal' && level !== 'guarded') return null;
+        const hasInteractive =
+          this.db
+            .prepare(
+              `SELECT 1 AS x FROM tasks
+               WHERE dot_id=? AND status='queued' AND priority=1 AND (run_at IS NULL OR run_at<=?)
+               LIMIT 1`,
+            )
+            .get(dot, now) !== undefined;
+        if (!hasInteractive) return null;
+        const reserved = running < this.cfg.maxRunningTasks + Math.max(0, this.cfg.interactiveReserve);
+        if (!reserved) {
+          // 预留格用完：看能不能抢占一个后台任务
+          preemptVictim = this.pickPreemptible(dot);
+          if (preemptVictim === null) return null;
+          this.preemptTask(preemptVictim, now);
+        }
+      }
       const row = this.db
         .prepare(
           `SELECT id FROM tasks
@@ -274,6 +322,70 @@ export class Queue {
       });
       return out;
     });
+  }
+
+  /**
+   * 选一个可抢占的后台任务：priority >= `preemptiblePriority`（>0 才启用），
+   * 且**最晚开始**的那条（尽量保护已经跑了很久的进度），且它没有在途审批
+   * （awaiting_approval 的任务本来就不在 running 里，无需额外判断）。
+   */
+  private pickPreemptible(dotId: string): string | null {
+    const threshold = this.cfg.preemptiblePriority;
+    if (threshold <= 0) return null;
+    const row = this.db
+      .prepare(
+        `SELECT id FROM tasks
+         WHERE dot_id=? AND status='running' AND priority >= ?
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+      )
+      .get(dotId, threshold) as { id: string } | undefined;
+    return row?.id ?? null;
+  }
+
+  /**
+   * 抢占：把后台任务退回 queued。
+   *
+   * **不惩罚被抢占者**：attempt 不变（它不是失败，不该消耗重试次数）、
+   * stop_reason 不写、priority 不降。下次有空位时它会被重新领走
+   * （journal 里的步记录照旧，恢复由 CP §5.3 的对账路径处理）。
+   *
+   * 记一条 resource_events(kind='watchdog') 之外的审计：用 'preempt' 语义写 detail，
+   * 便于复盘"谁抢了谁"。
+   */
+  private preemptTask(taskId: string, now: number): void {
+    const res = this.db
+      .prepare(
+        `UPDATE tasks SET status='queued', last_heartbeat_at=NULL, updated_at=?
+         WHERE id=? AND status='running'`,
+      )
+      .run(now, taskId);
+    if (res.changes === 0) return;
+    this.deps.record(
+      'watchdog',
+      'normal',
+      JSON.stringify({ taskId, preempt: true, reason: 'interactive_priority', at: now }),
+    );
+    this.deps.bus.publish('task.state', {
+      taskId,
+      from: 'running',
+      to: 'queued',
+      epoch: this.getRow(taskId)?.run_epoch ?? 0,
+    });
+    // P1-1：抢占可能留下 started 孤儿步（当时正在等工具返回）。
+    // 不接对账 = 把"抢占"变成"制造 unknowns"，与 P0-3 的"绝不重复执行"冲突。
+    // 注意：pop() 在同步事务里，这里只能 fire-and-forget；对账本体是异步的（要对账 exec）。
+    const reconcile = this.deps.reconcileAfterPreempt;
+    if (reconcile !== undefined) {
+      // 事务提交后再跑：直接调用会在事务内发起异步 IO，且可能看到未提交的状态。
+      setImmediate(() => {
+        try {
+          reconcile(taskId);
+        } catch {
+          // 对账失败不炸队列（下轮 pop/看门狗/重启恢复仍会兜底）
+        }
+      });
+    }
   }
 
   /** runningCount（CP §4.2 门控）：只数 running——paused/awaiting_approval 不占额度。 */

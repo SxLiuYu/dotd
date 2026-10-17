@@ -573,6 +573,8 @@ interface MutableEndpoint {
   emergencyEligible: boolean;
   /** 中间态：原始字符串值；finalizeEndpoint 转成 EndpointDef['local']。 */
   local?: Record<string, string>;
+  /** P1-1：端点顶层的生产并发上限（与 `local.max_concurrency` 不同，远程端点用）。 */
+  maxConcurrency?: number;
 }
 
 function applyEndpointField(ep: MutableEndpoint, key: string, value: string): void {
@@ -603,6 +605,13 @@ function applyEndpointField(ep: MutableEndpoint, key: string, value: string): vo
     case 'emergency_eligible':
       ep.emergencyEligible = bool(value, true);
       break;
+    // P1-1：端点**顶层**的 max_concurrency = 生产请求并发上限（远程端点用）。
+    // 注意与 `local:` 段下的同名续行键区分：那个是 Tier2 本地引擎的硬上限。
+    case 'max_concurrency': {
+      const n = Number(scalar(value));
+      if (Number.isFinite(n) && n > 0) ep.maxConcurrency = Math.floor(n);
+      break;
+    }
     case 'models': {
       const m = inlineMap(v);
       const models: Partial<Record<Track, string>> = {};
@@ -694,6 +703,10 @@ function finalizeEndpoint(ep: MutableEndpoint): EndpointDef {
   };
   const fb = sanitizeFallbackModels(ep.fallbackModels);
   if (fb !== undefined) base.fallbackModels = fb;
+  // P1-1：端点顶层的 max_concurrency = 生产请求并发上限（远程端点用，与 local: 段无关）。
+  if (ep.maxConcurrency !== undefined && ep.maxConcurrency > 0) {
+    base.maxConcurrency = ep.maxConcurrency;
+  }
   if (ep.local === undefined) return base;  const raw = ep.local;
   const local: NonNullable<EndpointDef['local']> = {
     health_url: raw.health_url ?? '',
