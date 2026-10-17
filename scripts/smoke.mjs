@@ -225,6 +225,55 @@ function toWireCompletion(item, model) {
   };
 }
 
+/**
+ * 把一条脚本项编成 OpenAI 兼容 SSE 流（P0-2 之后 daemon 的 Runner 会带 `stream:true`）。
+ *
+ * 线格式与真 provider 一致：正文按小块下发、工具调用按 `delta.tool_calls[]` 增量下发
+ * （index 相同 = 同一调用，参数是文本分片），最后 `[DONE]`。
+ * 这样冒烟验证的就是生产那条「SSE 解析 → 增量聚合 → 派发工具」的真实链路。
+ */
+function toWireStream(item, model) {
+  const frames = [];
+  const content = String(item.content ?? '');
+  // 正文：每 4 字符一块
+  for (const piece of content.match(/.{1,4}/gs) ?? []) {
+    frames.push({ choices: [{ index: 0, delta: { content: piece } }] });
+  }
+  // 工具调用：首块带 id/name/首段参数，其余块只带参数分片
+  for (const [i, tc] of (item.toolCalls ?? []).entries()) {
+    const args = String(tc.arguments ?? '');
+    const argPieces = args.match(/.{1,8}/gs) ?? [''];
+    frames.push({
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: i,
+                id: tc.id,
+                type: 'function',
+                // 上游看到的是消毒后的名字，且**按线上名字回显**——顺带验证 transport 的还原表
+                function: { name: String(tc.name).replace(/[^a-zA-Z0-9_-]/g, '_'), arguments: argPieces[0] ?? '' },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    for (const rest of argPieces.slice(1)) {
+      frames.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: rest } }] } }] });
+    }
+  }
+  const finishReason = (item.toolCalls ?? []).length > 0 ? 'tool_calls' : 'stop';
+  frames.push({
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+    usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+  });
+  void model;
+  return frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join('') + 'data: [DONE]\n\n';
+}
+
 /** 起假上游；返回 { baseUrl, requests, close }。 */
 async function startFakeUpstream(scriptItems) {
   const take = makeFakeUpstreamScript(scriptItems);
@@ -253,6 +302,12 @@ async function startFakeUpstream(scriptItems) {
       if (item === null) {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ id: 'x', choices: [], usage: { prompt_tokens: 1, completion_tokens: 0 } }));
+        return;
+      }
+      // P0-2：Runner 现在会带 stream:true → 按 SSE 下发（线格式与真 provider 同形）。
+      if (parsed?.stream === true) {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.end(toWireStream(item, model));
         return;
       }
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -558,7 +613,8 @@ try {
       `paths=${[...new Set(reqs.map((r) => r.path))].join(',')}`,
     );
 
-    // 线格式：tools 必须是 {type:'function',function:{name,parameters}}，名字已消毒
+    // 线格式：tools 必须是 {type:'function',function:{name,parameters}}，名字已消毒。
+    // P0-2 之后 Runner 走流式 → 请求体 stream:true（假上游按 SSE 回应，见 toWireStream）。
     const withTools = chatReqs.filter((r) => Array.isArray(r.body?.tools) && r.body.tools.length > 0);
     const wireOk =
       withTools.length > 0 &&
@@ -571,10 +627,10 @@ try {
               /^[a-zA-Z0-9_-]+$/.test(t.function.name) &&
               typeof t.function?.parameters === 'object',
           ) &&
-          r.body.stream === false,
+          r.body.stream === true,
       );
     check(
-      '假上游分支：tools 线格式合法（type=function / 名字已消毒 / stream:false）',
+      '假上游分支：tools 线格式合法（type=function / 名字已消毒 / stream:true 走 SSE）',
       wireOk,
       withTools.length === 0
         ? '没有带 tools 的请求'

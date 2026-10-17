@@ -222,8 +222,8 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     pop(dotId?: string): Task | null {
       return queue.pop(dotId);
     },
-    heartbeat(taskId, epoch, usage) {
-      return queue.heartbeat(taskId, epoch, usage);
+    heartbeat(taskId, epoch, usage, opts) {
+      return queue.heartbeat(taskId, epoch, usage, opts);
     },
     finish(taskId, epoch, r) {
       queue.finish(taskId, epoch, r);

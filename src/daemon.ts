@@ -629,6 +629,15 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     db,
     bus,
     cfg: { ...execConfigFromEnv(), tokenDir: process.env.DOTD_TOKEN_DIR ?? join(cfg.dataDir, 'exec-tokens') },
+    // P0-3 在途心跳：工具在途期间由执行面轮询驱动心跳（CP 的 heartbeat 在此注入，
+    // EX 不 import CP、不直写 tasks 表——CONVENTIONS §4 模块边界）。
+    // 语义：每轮**成功**的 GET /jobs 续一次；getJob 抛错/容器判死/本地 deadline 都很
+    // 不再续 → 真卡死仍会被看门狗按 180s 回收（不掩盖卡死）。
+    liveness: {
+      live: ({ taskId, epoch, now }) => {
+        cp.heartbeat(taskId, epoch, undefined, { live: { at: now } });
+      },
+    },
   });
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);
@@ -734,6 +743,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       : null;
 
   // ⑨ Runner 常驻协程（CP §12：pop 循环；AbortSignal 让位）
+  // `bus` = roadmap P0-2 的会话增量通道：Runner 每步把模型正文增量推到 `chat.delta`。
+  // 总线**只认装配层这一个实例**（SSE 订阅的就是它），故这里是唯一的接线点；
+  // 不注入时 Runner 逐字走 complete() 路径（零行为变化）。
   const runner = new DotRunner(
     {
       cp,
@@ -742,7 +754,12 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       memory: memApiOf(memory),
       governance: govApiOf(),
     },
-    { dotId: cfg.dotIds[0] ?? 'dot1', idlePollMs: cfg.idlePollMs, log },
+    {
+      dotId: cfg.dotIds[0] ?? 'dot1',
+      idlePollMs: cfg.idlePollMs,
+      log,
+      bus: { publish: (topic, payload, o) => bus.publish(topic, payload, o) },
+    },
   );
 
   // ⑩ 恢复（CP §7.1 步骤 3–6；在 Runner 起循环之前）

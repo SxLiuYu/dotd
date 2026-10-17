@@ -1,4 +1,4 @@
-/**
+﻿/**
  * tests/router-http-transport.test.ts —— **真实 HTTP 传输**的端到端取证。
  *
  * 为什么需要这个文件：仓库里其他 router 测试全部用 StubTransport（内存回放，零网络），
@@ -50,6 +50,7 @@ import {
 import type { ChatCall } from '../src/router/types.ts';
 import type { ChatChunk, ChatResponse, EndpointDef, RouteMeta, Track } from '../src/shared/contracts.ts';
 import { classifyError } from '../src/router/candidates.ts';
+import { StreamToolCallAccumulator } from '../src/shared/tool-stream.ts';
 import { ModelRouter } from '../src/router/ModelRouter.ts';
 
 // ═══════════════════════════════════════════════════════════════════
@@ -383,6 +384,42 @@ describe('② 流式 SSE：逐块解析 + usage 尾部块', () => {
     assert.equal(sent.stream, true);
     assert.equal(sent.max_tokens, 64);
     assert.equal(up.requests[0]!.headers.accept, 'text/event-stream');
+  });
+
+  it('P0-2：SSE 的 delta.tool_calls 按增量下发，且工具名已从消毒名还原', async () => {
+    const up = await upstream([
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        // 真 provider 形状：首个分片带 id + 消毒名 + 首段参数，后续分片只带参数
+        res.write(
+          'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"fs_write","arguments":"{\\"path\\":"}}]}}]}\n\n',
+        );
+        res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"/dot/home/a.md\\"}"}}]}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+      },
+    ]);
+    const ep = endpointFor(up.baseUrl);
+    const h = new HttpTransport().stream(
+      callFor(ep, { tools: [{ name: 'fs.write', description: 'd', parameters: { type: 'object' } }] }),
+    );
+    const chunks: ChatChunk[] = [];
+    for await (const c of h) chunks.push(c);
+
+    // 增量通道确实把工具调用带出来了（旧实现整块丢弃 → 模型要调工具时静默变"完结轮"）
+    const deltas = chunks.flatMap((c) => c.toolCalls ?? []);
+    assert.ok(deltas.length >= 2, `工具调用增量至少两块，实得 ${deltas.length}`);
+    // 工具名在 transport 层就还原成契约名（fs_write → fs.write），与非流式 parseChatBody 一致
+    assert.equal(deltas[0]?.name, 'fs.write', '消毒名已还原');
+    assert.equal(deltas[0]?.id, 'call_x');
+
+    // 聚合后：参数是完整 JSON（拼接规则在 shared/tool-stream.ts，已在那边单测）
+    const acc = new StreamToolCallAccumulator();
+    for (const c of chunks) if (c.toolCalls !== undefined) acc.push(c.toolCalls);
+    assert.deepEqual(acc.settle(), [
+      { id: 'call_x', name: 'fs.write', arguments: '{"path":"/dot/home/a.md"}' },
+    ]);
   });
 
   it('Anthropic 形状的 cache_read_input_tokens 也认', async () => {

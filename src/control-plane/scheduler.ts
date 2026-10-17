@@ -25,6 +25,7 @@ import type { Queue } from './queue.ts';
 import type { Guard } from './guard.ts';
 import type { Journal } from './journal.ts';
 import type { Matcher } from './match.ts';
+import { DEFAULT_CP_CONFIG } from './types.ts';
 
 /** CP §8 registerInternalJob spec（契约 J4）。 */
 export interface InternalJobSpec {
@@ -69,6 +70,14 @@ export class Scheduler {
   constructor(deps: SchedulerDeps) {
     this.deps = deps;
     this.cfg = deps.cfg;
+    this.watchdogImpl = new ControlPlaneWatchdog({
+      db: deps.db,
+      queue: deps.queue,
+      journal: deps.journal,
+      bus: deps.bus,
+      record: deps.record,
+      cfg: deps.cfg,
+    });
   }
 
   // ── 注册（契约 J4：周期任务唯一宿主）────────────────────────────────
@@ -338,10 +347,104 @@ export class Scheduler {
    * 硬兜底（CP §6.4）：usage≥1.2×budget 时看门狗旁路 abort（记 resource_events
    * kind='budget'），Runner 迟到写被 epoch 围栏拒。**该兜底不依赖心跳超时**——
    * 预算爆掉的任务即使心跳新鲜也必须被拦（Runner 可能卡在预算判断之前）。
+   *
+   * P0-3 说明：心跳不再只来自 Runner 步尾——执行面在工具在途期间每轮成功
+   * `GET /jobs/{id}` 都续一次（ExecService 的注入回调 → `queue.heartbeat(live)`）。
+   * 因此"工具跑 10 分钟"不会被误回收，而"工具真的卡死"时上游不再答话、
+   * 心跳自然停，本方法仍按 180s 回收。
+   */
+  watchdog(now: number): void {
+    this.watchdogImpl.watchdog(now);
+  }
+
+  /**
+   * 看门狗本体（P0-3 抽出为独立类，见文件尾 `ControlPlaneWatchdog`）：
+   * 行为与旧的内联实现逐字一致，只是从"不可测的 Scheduler 方法"变成可直接驱动。
+   * 注意：**在构造函数里建**（不能写字段初始化器——TS 规定参数属性 `deps` 要等
+   * 父构造跑完才可用，字段初始化器会先于它执行）。
+   */
+  private readonly watchdogImpl: ControlPlaneWatchdog;
+
+  // ── ⑤ 内部 job 执行 ────────────────────────────────────────────────
+
+  private async runJob(job: InternalJob, now: number): Promise<void> {
+    job.nextAt = this.nextDue(job, now);
+    job.lastRunAt = now;
+    try {
+      await job.run();
+    } catch (err) {
+      job.lastError = err instanceof Error ? err.message : String(err);
+      this.deps.record('watchdog', 'normal', JSON.stringify({ job: job.name, error: job.lastError }));
+    }
+  }
+
+  private nextDue(spec: InternalJobSpec, now: number): number {
+    if (spec.cron !== undefined) {
+      try {
+        return this.cronNext(spec.cron, now);
+      } catch {
+        return now + (spec.everyMs ?? 60_000);
+      }
+    }
+    return now + (spec.everyMs ?? 60_000);
+  }
+
+  // ── 诊断 ───────────────────────────────────────────────────────────
+
+  jobStatus(): Array<{ name: string; kind: string; nextAt: number; lastRunAt: number | null; lastError: string | null }> {
+    return this.jobs.map((j) => ({
+      name: j.name,
+      kind: j.kind,
+      nextAt: j.nextAt,
+      lastRunAt: j.lastRunAt,
+      lastError: j.lastError,
+    }));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 看门狗（P0-3：从 Scheduler 方法原样抽出成独立类，行为逐字不变）
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 看门狗本体（CP §4.1/§2.2 + §6.4 硬兜底）。
+ *
+ * 为什么单独成类而不是留在 Scheduler 里：
+ *  - Scheduler 一构造就要 Matcher/Guard/bus/record 一整套依赖，单元测试很难只钉"回收判据"；
+ *  - 看门狗是唯一能把 running 任务打回 queued、让副作用重跑的地方（P0-3 事故点），
+ *    它必须能被测试直接驱动（含注入虚拟 now），而不是绕 tester 的整条 tick 链。
+ * Scheduler.watchdog(now) 只是转发：tick 的调用点、行为、异常语义全部不变。
+ */
+export interface ControlPlaneWatchdogDeps {
+  db: DatabaseSync;
+  queue: Pick<Queue, 'getTask' | 'markFailed'>;
+  journal: Pick<Journal, 'tail' | 'skipStep'>;
+  bus: { publish(topic: string, payload: unknown, opts?: { dotId?: string }): unknown };
+  record(kind: string, level: 'normal' | 'guarded' | 'throttled' | 'halted', detail: string): void;
+  cfg?: Partial<Pick<ControlPlaneConfig, 'heartbeatTimeoutMs' | 'budgetHardFactor'>>;
+}
+
+export class ControlPlaneWatchdog {
+  constructor(private readonly deps: ControlPlaneWatchdogDeps) {}
+
+  private get cfg(): { heartbeatTimeoutMs: number; budgetHardFactor: number } {
+    return {
+      heartbeatTimeoutMs: this.deps.cfg?.heartbeatTimeoutMs ?? DEFAULT_CP_CONFIG.heartbeatTimeoutMs,
+      budgetHardFactor: this.deps.cfg?.budgetHardFactor ?? DEFAULT_CP_CONFIG.budgetHardFactor,
+    };
+  }
+
+  /**
+   * 看门狗：10s 扫 `status='running' AND now-last_heartbeat_at > HEARTBEAT_TIMEOUT_MS`
+   * → abort 旧协程 → resolveOpenStep（epoch 围栏使旧协程迟到写回被拒）
+   * → 回 queued、attempt+1；run_epoch 已在下次 pop 时递增。
+   *
+   * 硬兜底（CP §6.4）：usage≥1.2×budget 时看门狗旁路 abort（记 resource_events
+   * kind='budget'），Runner 迟到写被 epoch 围栏拒。**该兜底不依赖心跳超时**——
+   * 预算爆掉的任务即使心跳新鲜也必须被拦（Runner 可能卡在预算判断之前）。
    */
   watchdog(now: number): void {
     const cutoff = now - this.cfg.heartbeatTimeoutMs;
-    // ① 预算硬兜底：扫所有 running（与心跳无关）
     const overBudget = this.deps.db
       .prepare(
         `SELECT id, run_epoch AS epoch, usage_tokens AS usage, budget_tokens AS budget
@@ -391,15 +494,27 @@ export class Scheduler {
       // 孤儿 started 步：reconcileAndResolve 是异步的（要对账 exec），看门狗路径用
       // 同步的"标 interrupted"收尾，异步对账由 daemon 重启恢复/exec.interrupted 路径补齐
       // （CP §5.3：daemon 重启与 Runner abort 后重领共用同一函数）。
+      //
+      // ⚠ 顺序曾经反了（2026-10-18 修）：老代码先 `skipStep(callId,'watchdog_reclaim')`
+      // 把 started 改成 **skipped**，再 UPDATE `WHERE status='started'` → 条件已不成立，
+      // 那条 UPDATE 是**空操作**（实测终态恒为 skipped）。后果不只是"死语句"：
+      //   - `skipped` 的契约语义是"治理拒绝/审批过期，这一步从未打算执行"（GOV §8.2），
+      //     拿它标记"已经派发出去、结果未知"的调用是把事故伪装成正常跳过；
+      //   - Runner 重建上下文时只把 **interrupted** 步注入恢复注记（dot.ts 的
+      //     `feedSystemNote(noteText(s))`，"上一步结果未知，先观测再决定"），skipped 不注入
+      //     —— 模型下一轮会以为没发生过，直接重做。
+      // 现在：先把 started → interrupted 并**写入原因**，skipStep 只兜 pending 的（从未派发）步。
       for (const s of this.deps.journal.tail(t.id, 50)) {
-        if (s.status === 'started') {
-          this.deps.journal.skipStep(s.callId ?? '', 'watchdog_reclaim');
-          this.deps.db
-            .prepare(
-              `UPDATE steps SET status='interrupted', finished_at=?
-               WHERE task_id=? AND seq=? AND status='started'`,
-            )
-            .run(now, t.id, s.seq);
+        if (s.status !== 'started') continue;
+        const cur = this.deps.db
+          .prepare(
+            `UPDATE steps SET status='interrupted', result_json=?, finished_at=?
+             WHERE task_id=? AND seq=? AND status='started'`,
+          )
+          .run('watchdog_reclaim', now, t.id, s.seq);
+        if (cur.changes === 0 && s.callId !== null) {
+          // 已被别处改过（并发对账/竞态）：按 skipped 兜底留痕，至少不留在 started。
+          this.deps.journal.skipStep(s.callId, 'watchdog_reclaim');
         }
       }
       const nextAttempt = t.attempt + 1;
@@ -430,41 +545,5 @@ export class Scheduler {
         });
       }
     }
-  }
-
-  // ── ⑤ 内部 job 执行 ────────────────────────────────────────────────
-
-  private async runJob(job: InternalJob, now: number): Promise<void> {
-    job.nextAt = this.nextDue(job, now);
-    job.lastRunAt = now;
-    try {
-      await job.run();
-    } catch (err) {
-      job.lastError = err instanceof Error ? err.message : String(err);
-      this.deps.record('watchdog', 'normal', JSON.stringify({ job: job.name, error: job.lastError }));
-    }
-  }
-
-  private nextDue(spec: InternalJobSpec, now: number): number {
-    if (spec.cron !== undefined) {
-      try {
-        return this.cronNext(spec.cron, now);
-      } catch {
-        return now + (spec.everyMs ?? 60_000);
-      }
-    }
-    return now + (spec.everyMs ?? 60_000);
-  }
-
-  // ── 诊断 ───────────────────────────────────────────────────────────
-
-  jobStatus(): Array<{ name: string; kind: string; nextAt: number; lastRunAt: number | null; lastError: string | null }> {
-    return this.jobs.map((j) => ({
-      name: j.name,
-      kind: j.kind,
-      nextAt: j.nextAt,
-      lastRunAt: j.lastRunAt,
-      lastError: j.lastError,
-    }));
   }
 }

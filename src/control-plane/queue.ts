@@ -284,16 +284,41 @@ export class Queue {
     return row.n;
   }
 
-  /** CP §8 heartbeat：围栏 + 预算返回位（CP §2.2/§6.4）。 */
+  /**
+   * CP §8 heartbeat：围栏 + 预算返回位（CP §2.2/§6.4）。
+   *
+   * `live`（P0-3 在途心跳）与步尾心跳的**唯一区别**在于副作用约束：
+   *  - 步尾心跳带 `usage.tokens`，并且会（首次越线时）置 `budget_exhausted`、发
+   *    `task.budget_exhausted` 事件——这些是"这一轮真的烧了 token"的记账，**每轮只该发生一次**；
+   *  - 在途心跳只是"容器还活着、工具确实在推进"的证据，**不带 token**，若走同一路径会
+   *    变成 500ms 一次的空心跳，进而让 nextSeq 的预算判据/事件流被噪声污染：
+   *    每次都被判 overBudget → 每次注册 `budget_exhausted` 事件。
+   * 因此 `live` 只做两件事：围栏校验 + 刷新 `last_heartbeat_at`。
+   * 围栏语义完全一致（epoch 不符/任务已非 running → `aborted:true`）。
+   *
+   * `skipBudget`（联调/测试用）：只刷新心跳，不读不写预算位。装配层不使用。
+   */
   heartbeat(
     taskId: string,
     epoch: number,
     usage?: { tokens: number },
+    opts: { live?: { at?: number }; skipBudget?: boolean } = {},
   ): { overBudget: boolean; aborted: boolean } {
     const row = this.getRow(taskId);
     if (row === null) return { overBudget: false, aborted: false };
-    const now = Date.now();
+    const now = opts.live !== undefined ? (opts.live.at ?? Date.now()) : Date.now();
     const usageTokens = row.usage_tokens + (usage?.tokens ?? 0);
+    if (opts.live !== undefined) {
+      // 在途心跳：只续时刻，不动 usage/预算位（见方法注释）
+      const alive = this.fenceUpdate(
+        taskId,
+        epoch,
+        'last_heartbeat_at=?, updated_at=?',
+        [now, now],
+        'heartbeat',
+      );
+      return { overBudget: false, aborted: !alive };
+    }
     const ok = this.fenceUpdate(
       taskId,
       epoch,
@@ -303,6 +328,7 @@ export class Queue {
     );
     // 围栏拒绝 = 看门狗/背压已 abort（CP §2.2），Runner 必须让位。
     if (!ok) return { overBudget: false, aborted: true };
+    if (opts.skipBudget === true) return { overBudget: false, aborted: false };
     const overBudget = usageTokens >= row.budget_tokens;
     if (overBudget && row.budget_exhausted === 0) {
       this.db

@@ -21,6 +21,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { existsSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import type { EventBus } from '../shared/bus.ts';
+import { StreamToolCallAccumulator, type AggregatedToolCall } from '../shared/tool-stream.ts';
 import type {
   BreakerState,
   ChatChunk,
@@ -601,8 +602,17 @@ export class ModelRouter {
    * 分界点 = 首字节:`meta()` 在选定端点、首个 chunk 下发前 resolve；首字节前的失败等价于
    * 非流式（换下一候选）；首字节后断流**绝不自动换端点重放**（重发会吐重复内容，
    * 直接违反 journal"绝不重复执行"）——抛 StreamInterruptedError 交调用方裁决。
+   *
+   * 工具调用（roadmap P0-2）：transport 逐块吐 `ChatChunk.toolCalls` 增量，本方法用
+   * `StreamToolCallAccumulator`（shared/tool-stream.ts，容错规则只此一份）边收边聚合；
+   * 回合正常结束后通过返回对象的 `toolCalls()` 交出**成品**。调用方必须**等流读完**
+   * 再读 `toolCalls()`（未读完时它反映的是"目前收到多少"，不是定稿）。
    */
-  stream(req: RouteRequest): AsyncIterable<ChatChunk> & { meta(): Promise<RouteMeta> } {
+  stream(req: RouteRequest): AsyncIterable<ChatChunk> & {
+    meta(): Promise<RouteMeta>;
+    /** 回合结束后的完整工具调用（无调用 = 空数组）。流未读完时为当前进度。 */
+    toolCalls(): AggregatedToolCall[];
+  } {
     const deadline = req.deadlineMs ?? DEFAULT_BUDGET_MS[req.track];
     const startedAt = this.now();
     const tried: TryEntry[] = [];
@@ -611,6 +621,9 @@ export class ModelRouter {
     let consumed = 0;
     let text = '';
     const self = this;
+    // 工具调用增量聚合器：**每次尝试新建**（换候选/换模型时不能串账）。
+    // 当前这轮（成功那轮）的聚合器存这里，收口后由 handle.toolCalls() 读出。
+    let toolAcc = new StreamToolCallAccumulator();
 
     let metaResolve!: (m: RouteMeta) => void;
     let metaReject!: (e: unknown) => void;
@@ -697,6 +710,9 @@ export class ModelRouter {
               const mySeq = attemptSeq++;
               const isLast = i === chain.length - 1;
               const streamT0 = self.now();
+              // 每次尝试一个全新聚合器：换模型/换候选时工具调用不能串账。
+              toolAcc = new StreamToolCallAccumulator();
+              const myAcc = toolAcc;
               try {
                 const handle = self.transport.stream(
                   self.chatCall(ep, req.track, req.messages, req.tools, req.tool_choice, cap.total_ms, false, req, model),
@@ -715,8 +731,17 @@ export class ModelRouter {
                       streamStarted: true,
                     });
                   }
+                  // 工具调用增量：先入聚合器（不受"正文为空则不 yield"影响——
+                  // 纯工具轮的 delta 为空，旧实现会把它整块丢掉）。
+                  if (chunk.toolCalls !== undefined && chunk.toolCalls.length > 0) {
+                    myAcc.push(chunk.toolCalls);
+                  }
                   if (chunk.delta.length > 0) {
                     text += chunk.delta;
+                    yield chunk;
+                  } else if (chunk.toolCalls !== undefined && chunk.toolCalls.length > 0) {
+                    // 不带正文的工具增量也要往下传（调用方据此知道"这是工具轮"），
+                    // 但 `text` 不计入——首字节后断流的 textSoFar 语义保持不变。
                     yield chunk;
                   }
                   if (chunk.done === true) break;
@@ -724,9 +749,13 @@ export class ModelRouter {
                 const usage = await handle.usage();
                 consumed = usage?.completionTokens ?? 0;
                 // 零用量空壳：流式路径同一个坑（handle 跑完、一个 delta 都没有、
-                // usage 也是空的）。**没向调用方吐过任何字节**（text 为空）才够资格重试，
-                // 否则就是 §4.7 首字节后断流，绝不重放。
-                if (isEmptyShellResponse({ content: text, toolCalls: undefined }, usage) && text.length === 0) {
+                // usage 也是空的）。**没向调用方吐过任何字节、也没收到工具调用**
+                // 才够资格重试，否则就是 §4.7 首字节后断流，绝不重放。
+                if (
+                  isEmptyShellResponse({ content: text, toolCalls: undefined }, usage) &&
+                  text.length === 0 &&
+                  myAcc.size === 0
+                ) {
                   throw new EmptyResponseError(
                     `端点 ${ep.id} 模型 ${model} 返回零用量空壳（流式无正文、completion_tokens=${consumed}）`,
                   );
@@ -786,6 +815,9 @@ export class ModelRouter {
       [Symbol.asyncIterator]: () => gen(),
       meta(): Promise<RouteMeta> {
         return metaPromise;
+      },
+      toolCalls(): AggregatedToolCall[] {
+        return toolAcc.settle();
       },
     };
   }

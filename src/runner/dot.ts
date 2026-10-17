@@ -58,8 +58,9 @@ import type {
   Step,
   Task,
   ToolName,
+  ToolSpec,
 } from '../shared/contracts.ts';
-import { AllEndpointsDownError, DotdError, NoQualifiedPrimaryError, StepLimitError } from '../shared/errors.ts';
+import { AllEndpointsDownError, DotdError, NoQualifiedPrimaryError, StepLimitError, StreamInterruptedError } from '../shared/errors.ts';
 import { newNonJournalAttemptId } from '../shared/ids.ts';
 import { composeSystemPrompt } from './system-prompt.ts';
 import { buildToolSpecs } from './tool-catalog.ts';
@@ -103,6 +104,38 @@ export interface RunnerOptions {
   idlePollMs?: number;
   /** 生命周期日志（默认静默；测试/装配层可注入）。 */
   log?: (msg: string) => void;
+  /**
+   * 会话增量总线（roadmap P0-2）。缺省 undefined = 不发布任何 chat.* 主题，
+   * 行为与接入流式之前**逐字一致**；装配层注入 daemon 的 `EventBus.publish`。
+   * 只在总线注入**且**未显式关闭流式时才走 `router.stream()`（见 `streamMode`）。
+   */
+  bus?: ChatDeltaPublisher;
+  /**
+   * 流式文本增量开关：缺省 = 由 `DOTD_STREAM_CHAT` 决定（除 `off` 外都算开）。
+   * 关闭 = 逐字回退到 `router.complete()` 路径（roadmap P0-2「风险与回退」）。
+   */
+  streamChat?: boolean;
+  /**
+   * delta 合帧窗口（毫秒）。SSE 有每订阅者 200 条 delta 上限
+   * （surfaces/sse.ts `SSE_DELTA_QUEUE_LIMIT`），逐 token 推送会溢出丢帧，
+   * 故按窗口合并；窗口内文本很短时合并后照样下发，保证首个字**立刻**可见。
+   */
+  streamFlushMs?: number;
+  /** delta 合帧的字符阈值（与 streamFlushMs 取先到者）。 */
+  streamFlushChars?: number;
+}
+
+/**
+ * `chat.delta` / `chat.final` 的最小发布面（结构上兼容 `shared/bus.ts` 的
+ * `EventBus.publish`）。Runner 只 import shared 类型，不 import bus 实现（CONVENTIONS §4）。
+ *
+ * payload 形状**照抄现有生产者/消费者**，不另造格式：
+ * - 生产者 `surfaces/http.ts:522`：`chat.final = {kind:'chat.final', threadId, taskId, text}`
+ * - 消费者 `web-ui/src/views/ChatView.tsx:75-94`：按 `threadId` 过滤、按 `taskId` 聚合
+ *   `text`（delta 累加、final 覆盖同 taskId 的 delta 行）。
+ */
+export interface ChatDeltaPublisher {
+  publish(topic: string, payload: Record<string, unknown>, opts?: { dotId?: string }): unknown;
 }
 
 /** 一次 `runNext()` 的结果（Runner 协程的单次让位语义）。 */
@@ -229,7 +262,15 @@ class RunContext {
    * 模型要按 code 判断"改参数"还是"重试"，只给一句中文摘要它会当成噪声跳过。
    * 只有 deny / 记忆拒写这类"没派发"的结果保持单行文本（它们的语义是改道，不是执行失败）。
    */
-  feed(res: { ok: boolean; callId: string; value: unknown; toolName?: string; dispatched?: boolean }): void {
+  feed(res: {
+    ok: boolean;
+    callId: string;
+    value: unknown;
+    toolName?: string;
+    dispatched?: boolean;
+    /** 本次派发实际用的参数（`stepTool` 传给 exec 的那份，已补 home 前缀）。 */
+    calledWith?: Record<string, unknown>;
+  }): void {
     const toolName = res.toolName ?? this.pendingCalls.get(res.callId);
     if (toolName !== undefined) this.pendingCalls.set(res.callId, toolName);
     if (res.dispatched === false) {
@@ -238,6 +279,21 @@ class RunContext {
       this.pendingCalls.delete(res.callId);
       this.callArgs.delete(res.callId);
       return;
+    }
+    // 派发成功/失败都保留调用声明：`drainResults()` 靠 `pendingCalls` 判断
+    // "这条结果有对应声明"（→ 进 tool 通道），并从 `callArgs` 复原
+    // `assistant.tool_calls` 的原始参数串。**这里不能删**——原实现删了，回喂参数退化 `{}`。
+    //
+    // 补登记 name/args（**仅在缺失时**）：`stepTool` 收到的 `callId` 是 **journal 步
+    // call_id**，而 `noteToolCalls()` 登记的是**模型给的** tool_call id。两者在真实链路
+    // 上并不相等（Runner 用 journal callId 派发，保证契约 J1/幂等），所以按模型 id 登记
+    // 的声明在这里查不到 → 必须用 `res.toolName` 与本次派发实参兜底，否则回喂给模型的
+    // `assistant.tool_calls.arguments` 会退化成 `{}`（模型看不到自己当初传了什么）。
+    if (!this.pendingCalls.has(res.callId) && res.toolName !== undefined) {
+      this.pendingCalls.set(res.callId, res.toolName);
+    }
+    if (!this.callArgs.has(res.callId) && res.calledWith !== undefined) {
+      this.callArgs.set(res.callId, JSON.stringify(res.calledWith));
     }
     this.pendingResults.set(res.callId, JSON.stringify(res.value ?? null));
   }
@@ -289,19 +345,36 @@ class RunContext {
   drainResults(): Array<{ callId: string; toolName: string; args: string; text: string; dispatched: boolean }> {
     const out: Array<{ callId: string; toolName: string; args: string; text: string; dispatched: boolean }> = [];
     for (const [callId, json] of this.pendingResults) {
+      // 声明（name + 原始参数串）与结果表**同寿命**：两边的清理都只在这里发生。
+      const decl = this.takeCallDecl(callId);
       out.push({
         callId,
-        toolName: this.pendingCalls.get(callId) ?? '',
-        args: this.callArgs.get(callId) ?? '{}',
+        toolName: decl.name,
+        args: decl.args,
         text: json,
         // 有调用声明 = 本轮真的派发过 → 可进 tool 通道；否则是恢复期补喂的历史结果。
-        dispatched: this.pendingCalls.has(callId),
+        dispatched: decl.dispatched,
       });
-      this.pendingCalls.delete(callId);
-      this.callArgs.delete(callId);
     }
     this.pendingResults.clear();
     return out;
+  }
+
+  /**
+   * 取一条工具调用声明（name + 原始参数串）并清掉。
+   *
+   * 2026-10-18 修（P0-2 把这条真实缺陷照出来了）：原先 `feed()` 在把结果登记进
+   * `pendingResults` 的同时就把 `pendingCalls` **删掉了**，于是 `drainResults()` 再查
+   * `pendingCalls` 永远查不到 → `dispatched` 恒为 false、本轮的 `assistant.tool_calls`
+   * 声明整段丢失，回喂给模型的参数退化成 `{}`（journal 里明明有正确 args）。
+   * 修法：`feed()` 不再删声明，清理统一在本方法里做——两张表同寿命。
+   */
+  private takeCallDecl(callId: string): { name: string; args: string; dispatched: boolean } {
+    const name = this.pendingCalls.get(callId);
+    const args = this.callArgs.get(callId);
+    this.pendingCalls.delete(callId);
+    this.callArgs.delete(callId);
+    return { name: name ?? '', args: args ?? '{}', dispatched: name !== undefined };
   }
 
   /**
@@ -452,9 +525,26 @@ export class DotRunner {
   private readonly sealOnFinish: boolean;
   private readonly idlePollMs: number;
   private readonly log: (msg: string) => void;
+  /** 会话增量总线（roadmap P0-2）。null = 不发布 chat.*（行为与接入前一致）。 */
+  private readonly chatBus: ChatDeltaPublisher | null;
+  /** 三个流式参数在构造期定版（读一次 env，运行期不再看环境，便于测试可复现）。 */
+  private readonly streamEnabled: boolean;
+  private readonly streamFlushMs: number;
+  private readonly streamFlushChars: number;
 
   /** 工具 sideEffect 词表缓存（契约 J2：唯一事实源 = exec.getCapabilities）。 */
   private sideEffectOf = new Map<string, 'safe' | 'replayable' | 'unknown'>();
+  /**
+   * 工具 mode / max_deadline_ms 缓存（P0-3：`deadline_ms` 的选档依据）。
+   *
+   * 缺陷本体：两个 `runTool` 调用点过去一律发 `toolDeadlineMs`（缺省 60_000，
+   * 语义是"EX §5.2 的 sync 上限"），于是 async 工具（shell.run 等，目录声明
+   * max_deadline_ms=30min）在容器侧只剩 60s —— 任何 3 分钟以上的工具都会先被
+   * 本地 deadline 标成 timeout，任务回 queued 重跑、副作用干两遍。
+   * 修复：按 catalog mode 选档——async 取目录声明的 max_deadline_ms，
+   * sync 保持 `toolDeadlineMs`（同步工具的既有上限一字不改）。
+   */
+  private deadlineCapOf = new Map<string, { mode: 'sync' | 'async'; maxDeadlineMs: number }>();
   /**
    * 接缝 M6：beforeWrite 软限 warning 暂存（callId → warning），
    * 等工具结果回来后附回响应；派发失败/异常时随步清理。
@@ -475,6 +565,10 @@ export class DotRunner {
     this.sealOnFinish = opts.sealOnFinish ?? false;
     this.idlePollMs = opts.idlePollMs ?? 1_000;
     this.log = opts.log ?? (() => {});
+    this.chatBus = opts.bus ?? null;
+    this.streamEnabled = opts.streamChat ?? streamChatFromEnv();
+    this.streamFlushMs = opts.streamFlushMs ?? STREAM_FLUSH_MS;
+    this.streamFlushChars = opts.streamFlushChars ?? STREAM_FLUSH_CHARS;
   }
 
   // ── 3.1 pop 循环（CP §12 `for await (const task of loop)`）──────────────
@@ -691,17 +785,27 @@ export class DotRunner {
   > {
     const { seq, callId } = this.cp.journal.beginLlm(task.id, epoch, digestOf(ctx.goal));
     const messages = ctx.buildMessages(this.cachedBundle(ctx));
+    // roadmap P0-2：总线在场 + 开关打开 → 走流式（增量实时上总线）；
+    // 其余情况**逐字**走 complete()。两条路径的返回值归一成同一个 LlmStep，
+    // 失败也抛给下面同一个 catch 分支——失败/降级语义只存在一份实现。
+    //
+    // 注意 `req` **两条路径共用同一份对象**：除 `stream` 标记外没有任何字段差异，
+    // 这样"无总线时行为不变"是可对照的（tests/runner-stream.test.ts 断言了请求体）。
+    const tools = await this.toolSpecs();
+    // 先问"能不能流式"，再定请求体：`stream` 标记只在确实走流式时才出现（complete 请求逐字不变）。
+    const useStream = this.useStream();
     const req: RouteRequest = {
       track: 'primary',
       messages: messages.map(toChatMessage),
-      tools: await this.toolSpecs(),
+      tools,
       tool_choice: 'auto',
       attemptId: callId, // 契约 J1：attemptId = journal 步 callId
       maxTokens: 4096,
+      ...(useStream ? { stream: true } : {}),
     };
     let resp;
     try {
-      resp = await this.router.complete(req);
+      resp = useStream ? await this.streamLlm(task, req, callId) : await this.completeLlm(task, req);
     } catch (err) {
       // 模型故障支线：熔断耗尽 → paused(circuit_open)，等 router.mode_changed 批量回 queued
       if (err instanceof AllEndpointsDownError || err instanceof NoQualifiedPrimaryError) {
@@ -722,8 +826,47 @@ export class DotRunner {
       };
     }
 
+    const { step, tokens } = resp;
+    this.cp.journal.endLlm(task.id, epoch, seq, digestOf(step.content));
+    ctx.feedLlm(step, tokens);
+    // ⑩ 结果回报前半句：assistant 全文 appendMessage 入 thread（接缝契约 §8 ⑩）。
+    // 只落有正文的轮次；纯工具调用轮（content 为空）不入 thread，避免噪声刷屏。
+    if (step.toolCalls.length === 0 && step.content.length > 0) {
+      await this.reportAssistant(ctx, task, step.content);
+      // 会话流式：正文定稿 → chat.final 覆盖前端按 taskId 拼出来的增量行
+      // （web-ui ChatView 的覆盖逻辑；与 http.ts:522 同 payload）。纯工具调用轮不推，
+      // 与「不入 thread」同口径——那轮没有给主人看的内容。
+      this.publishChatFinal(task, step.content);
+    }
+    return { kind: 'ok', step, tokens };
+  }
+
+  /**
+   * 是否具备流式条件：总线在场 + `DOTD_STREAM_CHAT` 未关 + router 确有 stream 方法（鸭子类型）。
+   *
+   * 工具调用**不是**障碍：`ChatChunk.toolCalls`（增量）→ `StreamToolCallAccumulator`
+   * （shared/tool-stream.ts 的容错聚合）→ `stream.toolCalls()`（成品）这条链已经打通，
+   * 流式回合与 complete() 回合一样能派发工具，见 `streamLlm` 与防假完成用例。
+   */
+  private useStream(): boolean {
+    if (!this.streamEnabled) return false;
+    if (this.chatBus === null) return false;
+    return typeof (this.router as Partial<ModelRouterApi>).stream === 'function';
+  }
+
+  // ── 3.3a ⑥ 两条模型调用路径（返回值同形，失败都抛给 stepLlm 的统一 catch）────
+
+  /**
+   * 非流式路径（与接入流式之前**逐字**相同的那几行）：`router.complete` →
+   * `{response:{content,toolCalls}}` + usage → 归一成 LlmStep + tokens。
+   */
+  private async completeLlm(
+    task: Task,
+    req: RouteRequest,
+  ): Promise<{ step: LlmStep; tokens: number }> {
+    void task;
+    const resp = await this.router.complete(req);
     const usage = resp.usage ?? { promptTokens: 0, completionTokens: 0 };
-    const tokens = usage.promptTokens + usage.completionTokens;
     const chat = resp.response as { content?: string; toolCalls?: Array<{ id: string; name: string; arguments: string }> };
     const step: LlmStep = {
       content: typeof chat.content === 'string' ? chat.content : '',
@@ -733,14 +876,128 @@ export class DotRunner {
         arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
       })),
     };
-    this.cp.journal.endLlm(task.id, epoch, seq, digestOf(step.content));
-    ctx.feedLlm(step, tokens);
-    // ⑩ 结果回报前半句：assistant 全文 appendMessage 入 thread（接缝契约 §8 ⑩）。
-    // 只落有正文的轮次；纯工具调用轮（content 为空）不入 thread，避免噪声刷屏。
-    if (step.toolCalls.length === 0 && step.content.length > 0) {
-      await this.reportAssistant(ctx, task, step.content);
+    return { step, tokens: usage.promptTokens + usage.completionTokens };
+  }
+
+  /**
+   * 流式路径（roadmap P0-2；MR §4.7）。
+   *
+   * 分工（不越界、不重造）：
+   * - **候选扫描 / 首字节分界 / tier 降级 / 熔断结算 / `meta.tried` 记账 / 零用量空壳重试**
+   *   全在 `ModelRouter.stream()`（src/router/ModelRouter.ts:605-791）里，本方法一律不碰；
+   * - 本方法只做三件事：把 `chunk.delta` 合帧推到 `chat.delta`、把流收成与非流式同形的
+   *   `LlmStep`、给首字节后的断流留一条可排查的日志后**原样上抛**。
+   *
+   * 失败语义对齐 complete() 路径（`dot.ts` 的 stepLlm catch 分支）：
+   * - 首字节前全候选耗尽 → router 抛 `AllEndpointsDownError`/`NoQualifiedPrimaryError`
+   *   → 原样上抛 → 同一个 catch 走 `pauseByReason(circuit_open)`，与 complete 逐字一致；
+   * - 首字节前首候选失败 → router 自己换下一候选（等价非流式"换端点"），Runner 无感；
+   * - 首字节后断流 → router 抛 `StreamInterruptedError`（**绝不自动重放**）。它落到 catch
+   *   里的 "其余模型错误" 分支，与非流式网络错误的收口完全同路（journal 记 error、
+   *   finish(ok:false)、seal(failed,'model_error')、任务 queued 重试）。
+   *   **本方法绝不把已吐出的半句当成功**：那样 `ctx.feedLlm` 会把任务判成 done，
+   *   等于拿半截答案交差。
+   *
+   * usage：`ModelRouter.stream()` 目前不把 transport 的 usage 透传出来（见交付报告
+   * 「router 缺陷观察」），故这里按本仓库既有的字符近似（`tokenEst = len/3.5`）
+   * 记 completion 用量；断流时按已交付字数记账（半句也不白算）。
+   */
+  private async streamLlm(
+    task: Task,
+    req: RouteRequest,
+    callId: string,
+  ): Promise<{ step: LlmStep; tokens: number }> {
+    const stream = this.router.stream(req);
+    const sink = new ChatDeltaSink(
+      (text) => this.publishChatDelta(task, callId, text),
+      this.streamFlushMs,
+      this.streamFlushChars,
+    );
+    let content = '';
+    try {
+      for await (const chunk of stream) {
+        const delta = typeof chunk.delta === 'string' ? chunk.delta : '';
+        if (delta.length > 0) {
+          content += delta;
+          sink.push(delta);
+        }
+        if (chunk.done === true) break; // 与 ModelRouter 同口径：done 后不再等下一个值
+      }
+      sink.close();
+    } catch (err) {
+      // 已交付的增量先落总线上：前端能看见"模型说到哪儿了"（回合最终会失败收尾）。
+      sink.close();
+      // 首字节后断流（StreamInterruptedError）**不得**折成一条 step 返回：
+      // `ctx.feedLlm` 对 toolCalls=[] 的响应会置 done=true，而 `stepLlm` 的成功分支
+      // 必然调 `endLlm`+`feedLlm`——返回半句就等于把任务判成 done、拿半截答案交差。
+      // 正确收口是让它**上抛**，落到 stepLlm 里与 complete() 路径**共用**的 catch：
+      // 同一个"其余模型错误"分支 → journal 记 error、finish(ok:false)、
+      // seal(failed,'model_error')、attempt<max 回 queued 重试（可恢复）。
+      // 已吐出的半句只留在总线与 journal 的错误摘要里，不进 ctx.messages。
+      if (err instanceof StreamInterruptedError) {
+        this.log(
+          `runner: 流式回合首字节后断流 ${task.id}（已交付 ${err.textSoFar.length} 字，` +
+            `consumedTokens=${err.consumedTokens}）→ 按模型错误收口（不重放）`,
+        );
+      }
+      throw err;
     }
-    return { kind: 'ok', step, tokens };
+    // 工具调用：**等流读完**才取（roadmap P0-2 第 4 条：不在流中途派发），
+    // 由 MR 用 shared/tool-stream.ts 的聚合器收成成品，与 complete() 的
+    // `chat.toolCalls` 同形——下游 `stepTool`/`ctx.noteToolCalls` 完全无感。
+    const toolCalls = stream.toolCalls().map((c) => ({
+      id: c.id,
+      name: c.name,
+      arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
+    }));
+    // 防假完成硬兜底：既没有正文、也没有工具调用的回合不是完结轮，不能以 done 收口。
+    if (content.trim().length === 0 && toolCalls.length === 0) {
+      throw new Error('流式回合既无正文也无工具调用，按模型错误收口以触发重试');
+    }
+    return { step: { content, toolCalls }, tokens: approxTokens(content.length) };
+  }
+
+  // ── 3.3b chat.* 总线（roadmap P0-2：payload 照抄 http.ts:522 与 ChatView 的约定）────
+
+  /** `chat.delta`：一次合帧后的增量。payload 至少含 {taskId, threadId, callId, delta}。 */
+  private publishChatDelta(task: Task, callId: string, delta: string): void {
+    if (this.chatBus === null || delta.length === 0) return;
+    try {
+      this.chatBus.publish(
+        'chat.delta',
+        {
+          kind: 'chat.delta',
+          taskId: task.id,
+          threadId: this.threadIdOf(task),
+          callId,
+          delta,
+        },
+        { dotId: this.dotId },
+      );
+    } catch (err) {
+      // 总线是展示面：发布失败绝不能炸主循环（与记忆软线同策）。
+      this.log(`runner: publish chat.delta 失败 ${task.id}：${errText(err)}`);
+    }
+  }
+
+  /** `chat.final`：回合定稿全文 + 工具调用计数（前端据此覆盖同 taskId 的增量行）。 */
+  private publishChatFinal(task: Task, text: string): void {
+    if (this.chatBus === null) return;
+    try {
+      this.chatBus.publish(
+        'chat.final',
+        {
+          kind: 'chat.final',
+          taskId: task.id,
+          threadId: this.threadIdOf(task),
+          text,
+          toolCalls: 0,
+        },
+        { dotId: this.dotId },
+      );
+    } catch (err) {
+      this.log(`runner: publish chat.final 失败 ${task.id}：${errText(err)}`);
+    }
   }
 
   /** 文件记忆只在任务开始时注入一次；这里持有该快照供后续每步复用。 */
@@ -784,8 +1041,23 @@ export class DotRunner {
 
   private async getCapabilities(): Promise<Array<{ name: string; mode: 'sync' | 'async'; max_deadline_ms: number; args_schema: object; sideEffect: 'safe' | 'replayable' | 'unknown' }>> {
     const caps = await this.exec.getCapabilities(this.dotId);
-    for (const c of caps) this.sideEffectOf.set(c.name, c.sideEffect);
+    for (const c of caps) {
+      this.sideEffectOf.set(c.name, c.sideEffect);
+      this.deadlineCapOf.set(c.name, { mode: c.mode, maxDeadlineMs: c.max_deadline_ms });
+    }
     return caps;
+  }
+
+  /**
+   * 派发一个工具时该声明多少 deadline（P0-3）。
+   *
+   * - async 工具：用目录声明的 `max_deadline_ms`（缺省 ExecConfig.asyncDeadlineMs）。
+   *   这些工具本来就可能跑几十分钟，用 sync 档的 60s 去卡它们是**本地凭空造出来的超时**；
+   * - sync 工具：保持 Runner 的 `toolDeadlineMs`（EX §5.2 的 60s 档），一字不改。
+   * 未登记的目录项按 sync 处理（保守：不放大未知工具的上限）。
+   */
+  private toolDeadlineMsFor(tool: string): number {
+    return toolDeadlineMsFor(this.toolDeadlineMs, this.deadlineCapOf.get(tool));
   }
 
   // ── 3.4 ⑦ 工具步 ──────────────────────────────────────────────────────
@@ -880,7 +1152,7 @@ export class DotRunner {
     }
 
     // allow / review_pass：执行（S1 ledger 幂等 = 同 call_id 至多一次）
-    const res = await this.exec.runTool(toolCall(task, callId, call.name, args, this.toolDeadlineMs));
+    const res = await this.exec.runTool(toolCall(task, callId, call.name, args, this.toolDeadlineMsFor(call.name)));
     const ok = res.status === 'ok';
     const warning = this.memoryWarnings.get(callId);
     const result = warning === undefined
@@ -888,7 +1160,7 @@ export class DotRunner {
       : { ...(ok ? (res.result ?? {}) : (res.error ?? {})), warning };
     this.cp.journal.endTool(task.id, epoch, seq, ok ? 'succeeded' : 'failed', result ?? null);
     // 成败都以 JSON 回喂（失败 = 容器端的 {code,message,retryable}）：模型要靠 code 决定改参还是重试。
-    ctx.feed({ ok, callId, toolName: call.name, value: result });
+    ctx.feed({ ok, callId, toolName: call.name, value: result, calledWith: withHomeRootArgs(call.name, args) });
     this.memoryWarnings.delete(callId);
     // ⑩ 结果回报：tool 消息只 digest+200 预览入 thread（S6 双写禁令；全文在 steps）
     await this.reportTool(ctx, task, callId, call.name, ok, result);
@@ -936,7 +1208,7 @@ export class DotRunner {
     }
 
     const toolName = target.toolName ?? '';
-    const res = await this.exec.runTool(toolCall(task, callId, toolName, args, this.toolDeadlineMs));
+    const res = await this.exec.runTool(toolCall(task, callId, toolName, args, this.toolDeadlineMsFor(toolName)));
     const ok = res.status === 'ok';
     const result = ok ? res.result : res.error;
     this.cp.journal.endTool(task.id, epoch, seq, ok ? 'succeeded' : 'failed', result ?? null);
@@ -1133,6 +1405,91 @@ export class DotRunner {
  */
 const START_MAX_BACKOFF_MS = 60_000;
 
+// ── 流式增量上总线（roadmap P0-2）────────────────────────────────────────────
+
+/**
+ * delta 合帧窗口：50ms / 32 字符取先到者（roadmap P0-2 第 2 条的节流口径）。
+ * 逐 token 推送会让 `SSE_DELTA_QUEUE_LIMIT`（每订阅者 200 条，surfaces/sse.ts:204-207）
+ * 在长回答里溢出丢帧；合帧后一次回答只占几十帧。
+ */
+const STREAM_FLUSH_MS = 50;
+const STREAM_FLUSH_CHARS = 32;
+
+/** `DOTD_STREAM_CHAT`：`off`/`0`/`false`/`no`/`disable*` 关；缺省与其它值都算开（roadmap P0-2）。 */
+function streamChatFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.DOTD_STREAM_CHAT;
+  if (raw === undefined) return true;
+  return !/^(off|0|false|no|disable[d]?)$/i.test(raw.trim());
+}
+
+/**
+ * 既有字符近似（`RunContext` 的 `tokenEst` 同口径）：MR 的流式面不透出 transport usage，
+ * 用它给流式回合记一次与离线聚合可比的 completion 用量，而不是记 0
+ * （记 0 会让 `overBudget` 永不触发，预算形同虚设）。
+ */
+function approxTokens(chars: number): number {
+  return Math.ceil(chars / 3.5);
+}
+
+/**
+ * `chat.delta` 合帧器。
+ *
+ * 第一个 delta **立即**下发（首字延迟 ≤ 一次流读取），之后攒到窗口/字数再发：
+ * - `flushMs` 由第一段未发送文本到达时起算（不无脑 setInterval）；
+ * - `flush()` 幂等，回合结束与断流路径都会调，保证最后一段不丢。
+ *
+ * 前端按 `taskId` 累加 `delta`、被 `chat.final` 覆盖（web-ui ChatView:74-94），
+ * 所以这里只需保证**顺序**与**不丢**，不承担全文正确性（那是 chat.final 的活）。
+ */
+class ChatDeltaSink {
+  private buf = '';
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private sent = false;
+  private closed = false;
+
+  constructor(
+    private readonly emit: (text: string) => void,
+    private readonly flushMs: number,
+    private readonly flushChars: number,
+  ) {}
+
+  push(delta: string): void {
+    if (this.closed) return;
+    this.buf += delta;
+    if (!this.sent || this.buf.length >= this.flushChars) {
+      this.flush();
+      return;
+    }
+    if (this.timer === null) {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.flush();
+      }, this.flushMs);
+      // 展示面定时器不得吊住进程（与 idleWait 的 unref 同策）
+      if (typeof this.timer.unref === 'function') this.timer.unref();
+    }
+  }
+
+  flush(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this.buf.length === 0) return;
+    const text = this.buf;
+    this.buf = '';
+    this.sent = true;
+    this.emit(text);
+  }
+
+  /** 收口（断流/正常结束）：清定时器并发出残留增量。 */
+  close(): void {
+    if (this.closed) return;
+    this.flush();
+    this.closed = true;
+  }
+}
+
 /** 容器 home 根（EX §7 护栏；与 exec/protocol.ts:393 同值，跨模块不 import 实现）。 */
 const CONTAINER_HOME_ROOT = '/dot/home';
 
@@ -1156,9 +1513,29 @@ function withHomeRootArgs(tool: string, args: Record<string, unknown>): Record<s
 }
 
 /**
+ * 一次工具派发的 `deadline_ms` 选档（P0-3，与 `resolveToolDeadlineMs` 同一套口径的 Runner 侧投影）。
+ *
+ * - `cap` 缺省（目录里没有这个工具）：保守按 sync 档，用 `syncTierMs`（不放大未知工具上限）；
+ * - `cap.mode === 'async'`：用目录声明的 `max_deadline_ms`（≤0 时回落 `syncTierMs` 以外的
+ *   既有常量 ASYNC_*，见下）。这些工具的用户语义就是"可能要跑很久"，
+ *   用 60s 卡它属于本地凭空造超时；
+ * - `cap.mode === 'sync'`：`syncTierMs` 原样（EX §5.2 的 60s 档）。
+ */
+export function toolDeadlineMsFor(
+  syncTierMs: number,
+  cap: { mode: 'sync' | 'async'; maxDeadlineMs: number } | undefined,
+): number {
+  if (cap === undefined || cap.mode === 'sync') return syncTierMs;
+  return cap.maxDeadlineMs > 0 ? cap.maxDeadlineMs : ASYNC_TOOL_DEADLINE_FALLBACK_MS;
+}
+
+/** async 工具目录未声明上限时的兜底（= 执行面 ExecConfig.asyncDeadlineMs 的同值）。 */
+const ASYNC_TOOL_DEADLINE_FALLBACK_MS = 30 * 60_000;
+
+/**
  * ExecToolCall（EX §5.3）：call_id/dot_id/identity 顶层 + deadline_ms。
- * `deadlineMs` 由 Runner 的 `toolDeadlineMs` 选项传入（EX §5.2 sync 上限 60s）——
- * 自由函数不持默认值，避免选项形同虚设（审码 finding：死选项）。
+ * `deadlineMs` 由调用点按 toolDeadlineMsFor() 选档后传入（P0-3：async 工具
+ * 不再被 sync 档的 60s 掐断）——自由函数不持默认值，避免选档逻辑被绕开。
  *
  * 路径域适配（接缝契约 §S5 / memory.md:237）：模型与记忆层的唯一权威域是
  * HomeRelPath（`notes/2026-10-15-x.md`），而 EX 能力目录要求 fs.* 的 path 为

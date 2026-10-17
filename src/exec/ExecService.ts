@@ -65,6 +65,79 @@ import { DEFAULT_EXEC_CONFIG } from './types.ts';
 import type { StubRuntime, StubRuntimeOptions } from './stub-runtime.ts';
 
 // ═══════════════════════════════════════════════════════════════════
+// 在途心跳接缝（P0-3 看门狗误回收）
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 在途心跳回调（**由装配层注入**，EX 绝不 import CP、更不直写 tasks 表——
+ * CONVENTIONS §4 模块边界：EX → CP 只能经注入的回调）。
+ *
+ * 语义要点（这是"修误杀不能换来永不回收"的关键）：
+ *  - EX 只在**上游确实有推进**时调它：`pollJob` 里每轮 `GET /jobs/{id}` **成功返回**
+ *    之后一次（含读到终态的那次）。`getJob` 抛错（连接拒绝/5xx）、容器被运行期判死、
+ *    本地 deadline 到期 —— 这几种情况**一律不回调**，因此心跳会自然停下，
+ *    看门狗 `heartbeatTimeoutMs` 之后照常回收。
+ *  - 即"心跳 = 容器还活着的证据"，不是"Runner 协程还在跑的证据"。
+ *  - 回调自身抛错只记日志：心跳是附带动作，绝不影响工具结果（判死另有看门狗）。
+ */
+export interface ExecLiveness {
+  live(input: { taskId: string; epoch: number; callId: string; dotId: string; tool: string; now: number }): void;
+}
+
+/**
+ * 工具调用的 deadline 口径（P0-3 顺带核出的一处分叉）。
+ *
+ * 事实（实测）：`CAPABILITY_CATALOG` 里 async 工具自带 `max_deadline_ms`（shell.run=1_800_000，
+ * 逐字等于 `ExecConfig.asyncDeadlineMs`），而 `validateToolCall` 只**校验**它、不会替你抬。
+ * Runner 过去把 `toolDeadlineMs`（缺省 60s，语义正是"sync 上限"）**不加区分**地发给所有工具，
+ * 于是 `shell.run` 这类异步工具拿到的 `deadline_ms` 只有 60s：3 分钟以上的工具根本轮不到
+ * 看门狗出手，本地 deadline 就先把它标成 timeout（任务重跑，副作用干两遍）。
+ *
+ * 修复口径：**async 工具按它自己声明的 max_deadline_ms 封顶**；调用方给的值只能在更小时
+ * 收紧（同步工具保持原样——它本来就是 60s 档，按调用方口径）。
+ * 这同时保证"容器端声明的上限"与"宿主派发的请求"不会再次分叉。
+ *
+ * 谁负责选档：Runner 侧 `toolDeadlineMsFor()` 按 catalog mode 选（async → 不传/传上限，
+ * sync → 传 toolDeadlineMs）；本函数只是把"缺省"填成同一套常量，供两者复用。
+ */
+export function resolveToolDeadlineMs(tool: string, requested: number | undefined): number {
+  const cap = CAPABILITY_CATALOG.find((c) => c.name === tool);
+  if (cap?.mode !== 'async') return requested ?? DEFAULT_EXEC_CONFIG.syncDeadlineMs;
+  return requested ?? (cap.max_deadline_ms > 0 ? cap.max_deadline_ms : DEFAULT_EXEC_CONFIG.asyncDeadlineMs);
+}
+
+/**
+ * `pollJob` 单轮取数的语义内核（**抽出来只为可测**）。
+ *
+ * 一轮 = **恰好一次** `GET /jobs/{id}`：
+ *  - 返回**非 running**（终态）：不续心跳（没有"在途"可言），原样返回；
+ *  - 返回 **running**：这是"上游确实在推进"的唯一证据 → 续**一次**心跳，原样返回；
+ *  - `getJob` 抛错：不续心跳，异常原样冒泡（由 pollJob 走 probeHealth 分支）。
+ *
+ * ⚠ 这里**绝不能**写成"循环取数直到非 running"：pollJob 自己负责 sleep 与
+ * 容器状态守卫，把循环搬进来会 (a) 让运行期守卫（容器转 unhealthy → 立刻收手）
+ * 永远等不到执行、(b) 把本来 500ms 一轮的轮询变成零间隔忙等。
+ * 心跳是附带动作用：回调抛错只记日志，绝不影响工具结果。
+ */
+export async function pollJobOnceWithLiveness(
+  getJob: () => Promise<ExecToolResult>,
+  input: { taskId: string; epoch: number; callId: string; dotId: string; tool: string },
+  liveness: ExecLiveness | null,
+  now: () => number = Date.now,
+  onLivenessError: (err: unknown) => void = () => {},
+): Promise<ExecToolResult> {
+  const res = await getJob();
+  if (res.status === 'running' && liveness !== null) {
+    try {
+      liveness.live({ ...input, now: now() });
+    } catch (err) {
+      onLivenessError(err);
+    }
+  }
+  return res;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 服务实现
 // ═══════════════════════════════════════════════════════════════════
 
@@ -77,6 +150,13 @@ export interface ExecServiceDeps {
   runtime?: RuntimeClient;
   /** stub 后端的运行时行为预设（DOTD_FLEET=stub）。 */
   stubRuntime?: StubRuntimeOptions;
+  /**
+   * 在途心跳回调（P0-3；装配层把 CP 的 heartbeat 接进来，EX 不感知 CP）。
+   * 也可装配后用 `setLiveness()` 注入。
+   */
+  liveness?: ExecLiveness;
+  /** 时钟（测试注入虚拟时间用；缺省 Date.now）。 */
+  clock?: () => number;
 }
 
 export class ExecServiceImpl implements ExecService {
@@ -97,8 +177,14 @@ export class ExecServiceImpl implements ExecService {
   private readonly cancelled = new Set<string>();
   /** 本地 in-flight 计数（busy↔ready 收敛用）。 */
   private inflight = new Map<string, number>();
+  /** 在途心跳回调（P0-3：轮询驱动；只看"上游确实答了一次"）。 */
+  private liveness: ExecLiveness | null;
+  /** 时钟（测试注入虚拟时间；生产恒 Date.now）。 */
+  private readonly clock: () => number;
 
   constructor(private readonly deps: ExecServiceDeps) {
+    this.liveness = deps.liveness ?? null;
+    this.clock = deps.clock ?? Date.now;
     // 默认值集中在 src/exec/types.ts 的 DEFAULT_EXEC_CONFIG（§7「集中定义」）；
     // 此处只做覆盖合并，不再维护第二份字面量（审码：双份定义会静默分叉）。
     const base: ExecConfig = { ...DEFAULT_EXEC_CONFIG, ...deps.cfg };
@@ -331,7 +417,17 @@ export class ExecServiceImpl implements ExecService {
     }
   }
 
-  /** 按 catalog mode 选端点派发（§5.2/§10）。 */
+  /**
+   * 在途心跳回调的装配后注入点（CLI/daemon 装配顺序：先建 EX，再建 CP，
+   * 心跳回调要拿到 CP，故不能只在构造参数里给）。传 null 关闭。
+   */
+  setLiveness(liveness: ExecLiveness | null): void {
+    this.liveness = liveness;
+  }
+
+  /**
+   * 按 catalog mode 派发（§5.2/§10）。
+   */
   private async dispatch(
     endpoint: string,
     token: string,
@@ -362,7 +458,45 @@ export class ExecServiceImpl implements ExecService {
       jobId: job_id,
       at: new Date().toISOString(),
     });
+    // 先续一次：派发本身已经证明上游可达（P0-3：心跳与"容器确实活着"同源）。
+    this.beatLive(call);
     return await this.pollJob(endpoint, token, call, job_id);
+  }
+
+  /** 续一次在途心跳（回调抛错只记日志：心跳是附带动作）。 */
+  private beatLive(call: ExecToolCall): void {
+    if (this.liveness === null) return;
+    try {
+      this.liveness.live({
+        taskId: call.task_id,
+        epoch: this.epochOf(call.task_id),
+        callId: call.call_id,
+        dotId: call.dot_id,
+        tool: call.tool,
+        now: this.clock(),
+      });
+    } catch (err) {
+      // 心跳失败绝不影响工具调用（工具结果才是要保的东西）
+      this.deps.bus.publish('exec.call.interrupted', {
+        callId: call.call_id,
+        dotId: call.dot_id,
+        taskId: call.task_id,
+        reason: `liveness_error:${errText(err)}`,
+        at: new Date().toISOString(),
+      });
+    }
+  }
+
+  /** 当前 run_epoch（心跳围栏用；exec_dots 表不持任务，读 tasks 只读一列）。 */
+  private epochOf(taskId: string): number {
+    try {
+      const row = this.deps.db.prepare('SELECT run_epoch AS e FROM tasks WHERE id=?').get(taskId) as
+        | { e: number }
+        | undefined;
+      return row?.e ?? 0;
+    } catch {
+      return 0;
+    }
   }
 
   /** 轮询 /jobs/{id} 至 done/error/deadline；deadline 到 → cancel → 标 timeout（§5.5）。 */
@@ -373,7 +507,7 @@ export class ExecServiceImpl implements ExecService {
     jobId: string,
   ): Promise<ExecToolResult> {
     const client = this.requireRuntime();
-    const deadline = Date.now() + call.deadline_ms;
+    const deadline = this.clock() + call.deadline_ms;
     for (;;) {
       if (this.cancelled.has(call.call_id)) {
         await this.cancelRemote(endpoint, token, jobId);
@@ -406,7 +540,24 @@ export class ExecServiceImpl implements ExecService {
         };
       }
       try {
-        res = await client.getJob(endpoint, token, jobId);
+        // P0-3：本轮**成功**的 GET /jobs 若报 running，就续一次心跳（上游确实在推进的证据）。
+        // getJob 抛错时不会回调 → 心跳自然停 → 看门狗照常回收（不掩盖真卡死）。
+        // 注意：这里**只取一轮**，sleep/容器守卫/收手判据仍由下面的循环负责。
+        res = await pollJobOnceWithLiveness(
+          () => client.getJob(endpoint, token, jobId),
+          { taskId: call.task_id, epoch: this.epochOf(call.task_id), callId: call.call_id, dotId: call.dot_id, tool: call.tool },
+          this.liveness,
+          this.clock,
+          (err) => {
+            this.deps.bus.publish('exec.call.interrupted', {
+              callId: call.call_id,
+              dotId: call.dot_id,
+              taskId: call.task_id,
+              reason: `liveness_error:${errText(err)}`,
+              at: new Date().toISOString(),
+            });
+          },
+        );
       } catch (cause) {
         // 连接拒绝/5xx → healthcheck 探测（§5.5 失败路径）
         const healthy = await this.probeHealth(call.dot_id);
@@ -421,11 +572,11 @@ export class ExecServiceImpl implements ExecService {
           throw cause;
         }
         await sleep(this.cfg.pollIntervalMs);
-        if (Date.now() > deadline) break;
+        if (this.clock() > deadline) break;
         continue;
       }
       if (res.status !== 'running') return { ...res, job_id: res.job_id ?? jobId };
-      if (Date.now() > deadline) break;
+      if (this.clock() > deadline) break;
       await sleep(this.cfg.pollIntervalMs);
     }
     // deadline 到：cancel → 标 timeout

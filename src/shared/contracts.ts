@@ -228,6 +228,13 @@ export interface ControlPlane {
     taskId: string,
     epoch: number,
     usage?: { tokens: number },
+    /**
+     * P0-3 在途心跳（执行面轮询驱动）：
+     *  - `live`：只做围栏校验 + 刷新 last_heartbeat_at（不记账、不发预算事件）；
+     *  - `skipBudget`：只刷新心跳，不读不写预算位（联调/测试用）。
+     * 省略 = 步尾心跳（原语义：记 usage、判预算）。
+     */
+    opts?: { live?: { at?: number }; skipBudget?: boolean },
   ): { overBudget: boolean; aborted: boolean };
   finish(taskId: string, epoch: number, r: { ok: boolean; summary: string }): void;
   cancel(taskId: string, by: 'user' | 'guard' | 'watchdog'): void;
@@ -528,6 +535,30 @@ export interface ChatResponse {
 export interface ChatChunk {
   delta: string;
   done?: boolean;
+  /**
+   * 流式回合中的工具调用**增量**（roadmap P0-2；对齐 OpenAI 兼容 SSE 的
+   * `choices[0].delta.tool_calls`）。
+   *
+   * 语义是**增量**，不是成品：同一个 `index` 的多块要按到达顺序拼接
+   * （`name` 取首个非空值、`argumentsDelta` 逐块累加）才是完整调用；
+   * 完整调用 = `{id, name, arguments}`，与 `ChatResponse.toolCalls` 同形（见 shared/tool-stream.ts 的
+   * `StreamToolCallAccumulator`）。
+   *
+   * 可选字段：不产出工具调用的 chunk（纯文本流）不带它，旧调用方读取 `delta`/`done` 不受影响。
+   */
+  toolCalls?: StreamToolCallDelta[];
+}
+
+/** `ChatChunk.toolCalls` 的单条增量（只增不改，`ChatResponse.toolCalls` 仍是成品形状）。 */
+export interface StreamToolCallDelta {
+  /** 同一回合内工具调用的序号（OpenAI 语义；缺省时由聚合器按到达顺序对待）。 */
+  index: number;
+  /** 调用 id：通常只在首个分片出现。 */
+  id?: string;
+  /** 工具名：可能被拆成多个分片，拼接后才是全名。 */
+  name?: string;
+  /** 参数 JSON 的**文本分片**，逐块累加才是完整 JSON。 */
+  argumentsDelta?: string;
 }
 export interface ToolSpec {
   name: string;
@@ -868,7 +899,14 @@ export interface RouterPort {
  */
 export interface ModelRouterApi {
   complete(req: RouteRequest): Promise<RouteResult>;
-  stream(req: RouteRequest): AsyncIterable<ChatChunk> & { meta(): Promise<RouteMeta> };
+  /**
+   * 流式（§4.7）：正文增量经异步迭代器下发；**工具调用**在回合结束后经 `toolCalls()`
+   * 以成品形状交回（与 `ChatResponse.toolCalls` 同形），调用方须**等流读完**再读它。
+   */
+  stream(req: RouteRequest): AsyncIterable<ChatChunk> & {
+    meta(): Promise<RouteMeta>;
+    toolCalls(): Array<{ id: string; name: string; arguments: string }>;
+  };
   trackForEvent(eventType: string): Track;
   /**
    * 按请求形状判轨道（2026-10-17 起，迁移自 PilotDeck 的 difficulty judge）。

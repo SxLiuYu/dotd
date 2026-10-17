@@ -1,4 +1,4 @@
-/**
+﻿/**
  * src/router/transport.ts —— 模型出网 transport 的两份实现。
  *
  * 依据（逐字可溯）：
@@ -19,7 +19,7 @@ import { get as httpGet, request as httpRequest } from 'node:http';
 import { get as httpsGet, request as httpsRequest } from 'node:https';
 import { URL } from 'node:url';
 import type { IncomingMessage } from 'node:http';
-import type { ChatResponse, EndpointDef, FailureKind, Track } from '../shared/contracts.ts';
+import type { ChatResponse, EndpointDef, FailureKind, StreamToolCallDelta, Track } from '../shared/contracts.ts';
 import type {
   ChatCall,
   ChatChunk,
@@ -274,6 +274,16 @@ export class StubTransport implements ModelTransport {
     const item = this.take(call.endpoint.id, call.track, call.model);
     const parts = item.content.length === 0 ? [] : (item.content.match(/.{1,4}/gs) ?? []);
     const chunks: ChatChunk[] = parts.map((delta) => ({ delta }));
+    // 工具调用按真流式形状下发：名字在首块、参数按 4 字节切片（同为"增量语义"），
+    // 这样流式冒烟/单测走的就是和生产一样的聚合路径，而不是特例。
+    for (const [i, tc] of (item.toolCalls ?? []).entries()) {
+      const argChunks = tc.arguments.match(/.{1,4}/gs) ?? [''];
+      const first = argChunks[0] ?? '';
+      chunks.push({ delta: '', toolCalls: [{ index: i, id: tc.id, name: tc.name, argumentsDelta: first }] });
+      for (const rest of argChunks.slice(1)) {
+        chunks.push({ delta: '', toolCalls: [{ index: i, argumentsDelta: rest }] });
+      }
+    }
     chunks.push({ delta: '', done: true });
     return {
       async *[Symbol.asyncIterator](): AsyncIterator<ChatChunk> {
@@ -603,6 +613,36 @@ export function restoreToolCallNames(
  * **仅 env 门控调用**：`createModelTransport()` 只在 DOTD_MODEL_TRANSPORT !== 'stub' 时
  * 返回本实例；stub 模式下本类永不被装配，因此不会发出任何请求。
  */
+/**
+ * OpenAI 兼容 `delta.tool_calls[]` → `ChatChunk.toolCalls` 增量。
+ *
+ * 只做形状搬运，**不做拼接**（拼接归 shared/tool-stream.ts 的聚合器，规则只此一份）：
+ * - index 缺失 → 不给 index（聚合器按"当前打开的调用"处理）
+ * - 只下发 id / name / arguments 中实际出现的字段，其余留给聚合器
+ * - **工具名还原**：上游回显的是消毒名（`fs_write`），这里按 `back` 映射还原成契约名
+ *   （`fs.write`）——与非流式 `parseChatBody` 同一张表、同一语义。不还原的话
+ *   流式回合派发出去的工具名对不上能力目录，会被治理按"未登记工具"拒绝。
+ */
+function toStreamToolCallDeltas(
+  raw: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }> | undefined,
+  back: Map<string, string>,
+): StreamToolCallDelta[] {
+  if (raw === undefined || raw.length === 0) return [];
+  const out: StreamToolCallDelta[] = [];
+  for (const tc of raw) {
+    const rawName = tc.function?.name;
+    const name = rawName === undefined ? undefined : (back.get(rawName) ?? rawName);
+    const args = tc.function?.arguments;
+    out.push({
+      ...(typeof tc.index === 'number' ? { index: tc.index } : {}),
+      ...(typeof tc.id === 'string' && tc.id.length > 0 ? { id: tc.id } : {}),
+      ...(typeof name === 'string' && name.length > 0 ? { name } : {}),
+      ...(typeof args === 'string' && args.length > 0 ? { argumentsDelta: args } : {}),
+    } as StreamToolCallDelta);
+  }
+  return out;
+}
+
 export class HttpTransport implements ModelTransport {
   async chat(call: ChatCall): Promise<ChatOutcome> {
     const key = apiKeyFor(call.endpoint);
@@ -669,7 +709,18 @@ export class HttpTransport implements ModelTransport {
         const payload = t.slice(5).trim();
         if (payload === '[DONE]') break;
         let json: {
-          choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>;
+          choices?: Array<{
+            delta?: {
+              content?: string;
+              /** OpenAI 兼容：工具调用增量（index 相同 = 同一个调用） */
+              tool_calls?: Array<{
+                index?: number;
+                id?: string;
+                function?: { name?: string; arguments?: string };
+              }>;
+            };
+            finish_reason?: string | null;
+          }>;
           usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
         };
         try {
@@ -686,8 +737,16 @@ export class HttpTransport implements ModelTransport {
             ...(cached === undefined ? {} : { cachedPromptTokens: cached }),
           };
         }
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta !== undefined && delta.length > 0) yield { delta };
+        const choice = json.choices?.[0];
+        const delta = choice?.delta?.content;
+        // 工具调用增量与正文增量**同一条 chunk 一起下发**（不额外拆帧，保持顺序）。
+        // index 缺失时的处理交给 shared/tool-stream.ts 的聚合器（容错策略 1）。
+        const toolCalls = toStreamToolCallDeltas(choice?.delta?.tool_calls, mapped.back);
+        if (toolCalls.length > 0) {
+          yield { delta: delta ?? '', ...(toolCalls.length > 0 ? { toolCalls } : {}) };
+        } else if (delta !== undefined && delta.length > 0) {
+          yield { delta };
+        }
       }
       yield { delta: '', done: true };
     }
