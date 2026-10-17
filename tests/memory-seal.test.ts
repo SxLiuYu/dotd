@@ -84,8 +84,8 @@ afterEach(() => {
   tmp.cleanup();
 });
 
-describe('sealTask：done 且未写记忆 → 一轮提醒 + memory_missed（§4.3）', () => {
-  it('落 task_end + 刷新 last_task_finished_at + 提醒文案 + missed 计数', async () => {
+describe('sealTask：done 且未写记忆 → 记账（P1-4 后不再"假提醒"）', () => {
+  it('落 task_end + 刷新 last_task_finished_at + 记 seal_missed（不再追加无人读的提醒消息）', async () => {
     const t = await mem.create();
     journalReturns = [[]]; // 没写任何记忆文件
     await mem.sealTask(makeTask({ threadId: t }), 'done');
@@ -96,12 +96,22 @@ describe('sealTask：done 且未写记忆 → 一轮提醒 + memory_missed（§4
     assert.ok(end!.content.includes('"outcome":"done"'));
     assert.equal(loaded?.thread.lastTaskFinishedAt, 2000, '用 task.updatedAt 作锚点');
 
-    const remind = loaded?.messages.find((m) => m.kind === 'text');
-    assert.equal(remind?.content, SEAL_REMINDER_TEXT);
+    // P1-4：这里**不再**追加提醒文案。补写一轮已提前到 Runner 收口之前
+    // （cp.finish 之前调 memory.needsMemoryRedo → 真跑一轮 LLM），sealTask 在终态之后
+    // 追加的消息永远没人读（= 老的"假提醒"）。所以本函数只负责记账。
+    assert.equal(
+      loaded?.messages.find((m) => m.kind === 'text'),
+      undefined,
+      'sealTask 不再追加提醒消息（补写轮由 Runner 在 finish 前真正执行）',
+    );
 
     const st = await mem.status();
-    assert.equal(st.seal.missed, 1);
-    assert.equal(st.seal.violations, 0, '正常收口不算 violation');
+    assert.equal(st.seal.missed, 1, '仍要记一次 missed（观测面：这个任务没沉淀记忆）');
+    assert.equal(
+      st.seal.violations,
+      1,
+      'done 且从未提醒过 → 记 seal_missed 违规（说明补写轮没跑：装配漏注入或开关被关）',
+    );
   });
 
   it('done 且写了记忆 → 不提醒、不记 missed', async () => {
@@ -116,17 +126,21 @@ describe('sealTask：done 且未写记忆 → 一轮提醒 + memory_missed（§4
     assert.equal(st.seal.missed, 0);
   });
 
-  it('提醒只注入一轮（同 task 二次 sealTask 不再提醒，但 missed 幂等只记一次）', async () => {
+  it('已提醒过（injectOnce 命中）→ 不重复提醒、missed 幂等', async () => {
     const t = await mem.create();
+    const task = makeTask({ threadId: t });
     journalReturns = [[], []];
-    await mem.sealTask(makeTask({ threadId: t }), 'done');
-    await mem.sealTask(makeTask({ threadId: t }), 'done');
+    // P1-4：Runner 在补写轮之前就记了"已提醒"。这里模拟那一笔。
+    mem.markMemoryReminder(task.id);
+    await mem.sealTask(task, 'done');
+    await mem.sealTask(task, 'done');
 
     const loaded = await mem.load(t);
     const reminds = loaded?.messages.filter((m) => m.kind === 'text') ?? [];
-    assert.equal(reminds.length, 1, '一轮提醒，只出现一次');
+    assert.equal(reminds.length, 0, 'sealTask 自己不再产生任何提醒消息');
     const st = await mem.status();
     assert.equal(st.seal.missed, 1, 'missed 幂等：同 task 只计一次');
+    assert.equal(st.seal.violations, 0, '已提醒过 → 不算漏提醒违规');
   });
 });
 
@@ -407,12 +421,19 @@ describe('sealTask：journal 探针的路径判据（§4.3 anyMemoryFileTouchedS
     assert.equal(st.seal.missed, 1, '写了非记忆文件 → 视为未写记忆');
   });
 
-  it('无 journal 探针 → 查不到 = 未写（软线语义，宁可多提醒一轮也不谎报已写）', async () => {
+  it('无 journal 探针 → 判不出"写没写" → 不补写、也不谎报已写', async () => {
     const noProbe = new MemoryServiceImpl({ db: tmp.db, bridge, outboxPath: tmp.outboxPath });
     const t = await noProbe.create();
-    await noProbe.sealTask(makeTask({ threadId: t }), 'done');
+    const task = makeTask({ threadId: t });
+
+    // P1-4：判定挪到收口之前（needsMemoryRedo）。无探针时它必须说"不用补写"——
+    // 老语义"查不到就当没写、宁可多提醒一轮"在补写轮上会变成**每个任务都白花一次模型调用**，
+    // 所以这里明确改成 fail-closed（判不出来就不问）。
+    assert.equal(await noProbe.needsMemoryRedo(task, 'done'), false);
+
+    await noProbe.sealTask(task, 'done');
     const loaded = await noProbe.load(t);
-    assert.ok(loaded?.messages.find((m) => m.kind === 'text') !== undefined, '应提醒');
+    assert.equal(loaded?.messages.find((m) => m.kind === 'text'), undefined, '不再产生假提醒消息');
   });
 });
 

@@ -231,7 +231,27 @@ export interface MemoryDeps {
   onCorruption?: (error: Error) => void;
   /** 测试注入时钟；缺省 Date.now。 */
   now?: () => number;
+  /**
+   * §4.4 会话摘要的模型入口（P1-2）。
+   *
+   * **必须是注入的低智能轨路由**（装配层传 `router.complete({track:'light'})`），
+   * MEM 模块绝不自己发 HTTP——这是分层与"密钥只在 MR 手里"的硬约束。
+   * 缺省 null = 摘要功能关闭（buildContextBundle 照旧只用近 N 条消息，行为与改动前一致）。
+   */
+  summarize?: SummarizeProbe;
 }
+
+/**
+ * §4.4 摘要生成 seam：给一段对话文本，返回一段摘要。
+ *
+ * 实现方（装配层/测试）负责选轨与提示词；返回值是**纯文本**，超长由 MemoryService
+ * 按 SUMMARY_TOKEN_LIMIT 截断。抛错 = 本次摘要失败（软降级，不写库）。
+ */
+export type SummarizeProbe = (
+  threadId: string,
+  transcript: string,
+  opts: { maxTokens: number },
+) => Promise<string>;
 
 // ═══════════════════════════════════════════════════════════════════
 // §5 对外服务接口（memory.md §8，逐条对齐 + §5.2 两个检查点补充）
@@ -279,6 +299,12 @@ export interface MemoryService {
   sealThread(threadId: string): Promise<void>;
   /** §4.4 回写通道（rev2 补）。 */
   updateContextSummary(threadId: string, summary: string, uptoSeq: number): Promise<void>;
+  /**
+   * §4.4 摘要的**真实触发点**（P1-2）：够阈值就把 upto_seq 之后的增量压成摘要写回。
+   * 走注入的 summarize seam（装配层接 track:'light'），MEM 不发 HTTP；失败不写不抛。
+   * @returns 是否真的更新了。
+   */
+  refreshContextSummary(threadId: string): Promise<boolean>;
 
   // 注入与重建（契约 M1：恢复唯一入口 = buildSessionReplay）
   buildContextBundle(
@@ -291,6 +317,20 @@ export interface MemoryService {
 
   // 收口与限额检查点（契约 M3：三种终态全走）
   sealTask(task: SealTaskInput, outcome: 'done' | 'failed' | 'cancelled', stopReason?: string): Promise<void>;
+  /**
+   * §4.3「补写一轮」的**前置判定**（P1-4，2026-10-18）。
+   *
+   * 为什么必须与 sealTask 分开：sealTask 由 CP 的钩子在 `queue.finish()` 内部调用，
+   * 那时任务已进终态、Runner 主循环已退出，**不可能再发一次 LLM 请求**。
+   * 所以"要不要补写"必须由 Runner 在 finish **之前**问一次，本方法只做判定、不写任何东西。
+   *
+   * @returns true = 本次任务 done 且没写过记忆文件，值得再问模型一轮。
+   */
+  needsMemoryRedo(task: SealTaskInput, outcome: 'done' | 'failed' | 'cancelled'): Promise<boolean>;
+  /** §4.3 injectOnce：同一任务已提醒过就不再提醒（跨 attempt 幂等）。 */
+  hasMemoryReminder(taskId: string): boolean;
+  /** 记录"已经提醒过"（判定的另一半：Runner 补写一轮时调一次）。 */
+  markMemoryReminder(taskId: string, at?: number): void;
   beforeWrite(dotId: string, path: HomeRelPath, content: string): Promise<MemoryWriteResult>;
   /** §5.2 检查点 2：返回 tmp+rename 计划（write 由工具层执行）。 */
   atomicWrite(dotId: string, path: HomeRelPath, content: string): Promise<AtomicWritePlan>;
@@ -306,10 +346,21 @@ export interface MemoryService {
     opts: { status?: ThreadStatus; limit: number; cursor?: string },
   ): Promise<ThreadSummary[]>;
   listMessages(threadId: string, opts: { beforeSeq?: number; limit: number }): Promise<Message[]>;
+  /**
+   * 会话历史检索（P1-3：FTS5 + CJK bigram，bm25 排序）。
+   * FTS 不可用（老库未迁移 / 表被 DROP / 索引损坏）时自动降级为 LIKE 全表扫描，
+   * 降级记入 maintenance kv（`fts_degraded_count` / `fts_degraded_last`），不静默。
+   */
   searchMessages(
     query: string,
     opts: { dotId?: string; sinceDays?: number; limit: number },
   ): Promise<MessageHit[]>;
+  /** P1-3：FTS 索引健康（条数是否与 mem_messages 一致）；诊断/自检用。 */
+  ftsStatus(): { available: boolean; indexed: number; messages: number; inSync: boolean };
+  /** P1-3：全量重建 FTS 索引（contentless 表不支持 rebuild，只能清空重灌）。 */
+  resyncMessageFts(): number;
+  /** P1-3：迁移后首次回填（幂等：索引条数少于消息条数才重灌）。 */
+  ensureMessageFts(): number;
 
   // §6.4 人工纠错记录（dotd feedback note → thr_feedback，kind='memory_note'）
   /**

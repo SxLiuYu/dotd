@@ -37,6 +37,7 @@ import type { FsOpsBridge } from './fsops-client.ts';
 import { buildContextBundle as buildBundle, readMemoryMd, packSessionReplay } from './inject.ts';
 import { ensureMemoryMdText } from './inject.ts';
 import { rankManuals } from './inject.ts';
+import { ftsIndexText, ftsMatchQuery, highlightSnippet } from './cjk-tokenize.ts';
 import { sealTask as runSeal } from './seal.ts';
 import {
   checkFileLimits,
@@ -84,6 +85,7 @@ import type {
   SearchSignal,
   SearchStats,
   SessionBreak,
+  SummarizeProbe,
   ThreadSummary,
 } from './types.ts';
 
@@ -121,6 +123,15 @@ export class MemoryServiceImpl implements MemoryService {
   private readonly unresolvedSignatures: (() => string[] | Promise<string[]>) | null;
   private readonly onCorruption: ((error: Error) => void) | null;
   private readonly now: () => number;
+  /** §4.4 摘要生成 seam（P1-2；缺省 null = 摘要功能关闭）。 */
+  private readonly summarize: SummarizeProbe | null;
+  /**
+   * FTS5 可用性缓存（P1-3）。`null` = 尚未探测；探测结果在首次检索/首次写入时落定。
+   * 表被 DROP / 老库没迁移 / 迁移失败 → `false`，检索自动降级 LIKE 并留痕。
+   */
+  private ftsAvailable: boolean | null = null;
+  /** 首次探测时是否已做过"索引是否落后于消息表"的对账（只做一次，见 ftsProbe）。 */
+  private ftsBackfilled = false;
 
   constructor(deps: MemoryDeps) {
     this.db = deps.db;
@@ -134,6 +145,7 @@ export class MemoryServiceImpl implements MemoryService {
     this.unresolvedSignatures = deps.unresolvedSignatures ?? null;
     this.onCorruption = deps.onCorruption ?? null;
     this.now = deps.now ?? Date.now;
+    this.summarize = deps.summarize ?? null;
 
     // §6.3：启动检查点由装配层显式调 checkIntegrity()，构造期不做 IO 副效应。
   }
@@ -268,7 +280,118 @@ export class MemoryServiceImpl implements MemoryService {
       );
     // §5.3：last_active_at 在任意消息追加时刷新
     this.db.prepare('UPDATE mem_threads SET last_active_at = ? WHERE id = ?').run(now, threadId);
+    // P1-3：写路径同步 FTS（external content 表无法在触发器里调 JS 做 CJK bigram，
+    // 故由这里双写；索引 token 文本与查询侧共用 cjk-tokenize.ts 的同一个纯函数）。
+    this.syncMessageFts(midOfLastInsert(this.db), msg.content);
     return { id, seq };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // P1-3 FTS5 索引维护（contentless 表，见 db/migrations/110_memory_fts.sql）
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * 探测 FTS 表是否可用（存在且是虚表）。结果缓存在 `ftsAvailable`。
+   * 不可用 = 老库未迁移 / 迁移失败 / 表被人工 DROP —— 检索降级 LIKE。
+   */
+  private ftsProbe(): boolean {
+    if (this.ftsAvailable !== null) return this.ftsAvailable;
+    try {
+      const row = this.db
+        .prepare("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='mem_messages_fts'")
+        .get() as { x?: number } | undefined;
+      if (row === undefined) {
+        this.ftsAvailable = false;
+        return false;
+      }
+      // 真正打一次（虚表存在但索引损坏时，MATCH 会抛错；这里用 count 轻量探活）
+      this.db.prepare('SELECT count(*) AS c FROM mem_messages_fts').get();
+      this.ftsAvailable = true;
+      // 首次可用时做一次"索引是否落后于消息表"的对账（迁移回填 / 旁路写入兜底）。
+      // 只在探测那一次做，不进入热路径。
+      if (!this.ftsBackfilled) {
+        this.ftsBackfilled = true;
+        this.ensureMessageFts();
+      }
+    } catch {
+      this.ftsAvailable = false;
+    }
+    return this.ftsAvailable;
+  }
+
+  /**
+   * 写一条消息的 FTS 索引（contentless 表：INSERT(rowid, tokens)）。
+   * 失败不抛——记忆检索是增强能力，不得炸主循环；失败会让下次检索降级 LIKE。
+   */
+  private syncMessageFts(rowid: number | null, content: string): void {
+    if (rowid === null) return;
+    if (!this.ftsProbe()) return;
+    try {
+      this.db
+        .prepare('INSERT INTO mem_messages_fts(rowid, tokens) VALUES (?, ?)')
+        .run(rowid, ftsIndexText(content));
+    } catch {
+      this.ftsAvailable = false; // 下次检索自动降级，并留痕
+    }
+  }
+
+  /**
+   * 全量重建索引：contentless FTS 不支持 `rebuild`（没有内容表），只能清空后重灌。
+   * 用在迁移后的首次启动 / 健康检查发现索引落后时（见 `resyncMessageFts()`）。
+   */
+  resyncMessageFts(): number {
+    if (!this.ftsProbe()) return 0;
+    try {
+      this.db.exec("INSERT INTO mem_messages_fts(mem_messages_fts) VALUES('delete-all')");
+      const rows = this.db.prepare('SELECT rowid, content FROM mem_messages').all() as Array<{
+        rowid?: number;
+        content?: string;
+      }>;
+      const ins = this.db.prepare('INSERT INTO mem_messages_fts(rowid, tokens) VALUES (?, ?)');
+      let n = 0;
+      for (const r of rows) {
+        if (typeof r.rowid !== 'number' || typeof r.content !== 'string') continue;
+        ins.run(r.rowid, ftsIndexText(r.content));
+        n++;
+      }
+      return n;
+    } catch {
+      this.ftsAvailable = false;
+      return 0;
+    }
+  }
+
+  /** 索引是否与消息表同步（条数一致）。诊断 / 测试用。 */
+  ftsStatus(): { available: boolean; indexed: number; messages: number; inSync: boolean } {
+    const messages = (this.db.prepare('SELECT count(*) AS c FROM mem_messages').get() as { c?: number } | undefined)?.c ?? 0;
+    if (!this.ftsProbe()) return { available: false, indexed: 0, messages, inSync: false };
+    const indexed = (this.db.prepare('SELECT count(*) AS c FROM mem_messages_fts').get() as { c?: number } | undefined)?.c ?? 0;
+    return { available: true, indexed, messages, inSync: indexed === messages };
+  }
+
+  /** 记录一次降级（§6.4 maintenance kv，非静默）。 */
+  private recordFtsDegraded(reason: string): void {
+    const at = this.now();
+    const key = 'fts_degraded_count';
+    const prev = this.readKvNumber(key) ?? 0;
+    this.writeKv(key, String(prev + 1), at);
+    this.writeKv('fts_degraded_last', JSON.stringify({ reason, at }), at);
+  }
+
+  /**
+   * 迁移后的首次回填（幂等）：索引条数 < 消息条数时全量重灌。
+   *
+   * 为什么放在代码里而不是迁移包：迁移包是纯 SQL，contentless FTS 没有内容表、
+   * `'rebuild'` 命令对它无效；逐行喂入还需要 bigram 切分（JS）。而且迁移包写数据行会
+   * 破坏"新建库模板 = 结构 + 空表"的不变式（tests/db-template.test.ts 会红）。
+   *
+   * @returns 实际灌入的条数（0 = 已同步或 FTS 不可用）。
+   */
+  ensureMessageFts(): number {
+    const st = this.ftsStatus();
+    if (!st.available) return 0;
+    if (st.inSync) return 0;
+    return this.resyncMessageFts();
   }
 
   async appendSystemMessage(
@@ -283,6 +406,72 @@ export class MemoryServiceImpl implements MemoryService {
     this.db
       .prepare(`UPDATE mem_threads SET status = 'sealed', last_task_finished_at = ? WHERE id = ?`)
       .run(now, threadId);
+  }
+
+  /**
+   * §4.4 会话摘要的**真实触发点**（P1-2，2026-10-18）。
+   *
+   * 为什么之前恒为 NULL：`updateContextSummary()` 有实现、接口有声明，但**全仓库零调用方**
+   * （`needsSummarize()` 同样零调用）。于是 `thread.context_summary` 永远是 null，
+   * `buildContextBundle` 只能用"最近 N 条消息"，会话一长就只能硬截断——越聊越忘，而且静默。
+   *
+   * 触发判据（`needsSummarize`）：消息条数 > SUMMARIZE_MESSAGE_THRESHOLD(64) 或注入 token 超预算。
+   * 只摘要**新增的尾部**（upto_seq 之后），已进摘要的不重算——代价是 O(增量) 不是 O(会话)。
+   *
+   * 语义：
+   *  - 摘要走注入的 `summarize`（装配层接 `router.complete({track:'light'})`），MEM 不发 HTTP；
+   *  - `context_summary_upto_seq` = 本次被摘要覆盖到的**最后一条消息 seq**（精确值，不是行数）；
+   *  - `buildContextBundle`/`packSessionReplay` 只重放 upto_seq 之后的消息（见 inject.ts）；
+   *  - 任何失败（无 summarize 入口 / 模型抛错 / 返回空）→ **不写、不抛**，下次再试。
+   *
+   * @returns 是否真的更新了摘要（供观测/测试；永不抛）。
+   */
+  async refreshContextSummary(threadId: string): Promise<boolean> {
+    if (this.summarize === null) return false;
+    try {
+      const row = this.loadThreadRow(threadId);
+      if (row === null) return false;
+      const thread = toThread(row);
+      const uptoSeq = thread.contextSummaryUptoSeq;
+
+      // 只取 upto_seq 之后的**增量**；只保留有对话语义的 kind（记账类消息不进摘要）
+      const fresh = (
+        this.db
+          .prepare('SELECT * FROM mem_messages WHERE thread_id = ? AND seq > ? ORDER BY seq ASC')
+          .all(threadId, uptoSeq) as unknown as Array<Record<string, unknown>>
+      ).map(toMessage);
+      const usable = fresh.filter(
+        (m) => m.kind === 'text' || m.kind === 'tool_result' || m.kind === 'task_start',
+      );
+      if (usable.length === 0) return false;
+
+      const allCount = this.db
+        .prepare('SELECT COUNT(*) AS c FROM mem_messages WHERE thread_id = ?')
+        .get(threadId) as { c?: number } | undefined;
+      const prev = thread.contextSummary;
+      const prevTokens = prev === null ? 0 : tokensOfText(prev);
+      const freshTokens = usable.reduce((n, m) => n + m.tokenEst, 0);
+      if (!needsSummarize(allCount?.c ?? 0, prevTokens + freshTokens)) return false;
+
+      const transcript = [
+        prev !== null ? `【已有摘要】\n${prev}` : '',
+        '【新增对话】',
+        ...usable.map((m) => `${m.role}：${m.content}`),
+      ]
+        .filter((s) => s.length > 0)
+        .join('\n');
+      const produced = await this.summarize(threadId, transcript, { maxTokens: SUMMARY_TOKEN_LIMIT });
+      const summary = (produced ?? '').trim();
+      if (summary.length === 0) return false; // 空摘要 = 本次没成功，不覆盖已有摘要
+
+      // upto_seq 取"被覆盖的最后一条消息的 seq"（精确值，不是条数）
+      const lastSeq = usable[usable.length - 1]!.seq;
+      await this.updateContextSummary(threadId, summary, lastSeq);
+      return true;
+    } catch {
+      // 记忆问题不炸主循环（§8）：摘要失败保持原状，下次任务再试
+      return false;
+    }
   }
 
   async updateContextSummary(threadId: string, summary: string, uptoSeq: number): Promise<void> {
@@ -310,13 +499,24 @@ export class MemoryServiceImpl implements MemoryService {
   ): Promise<ContextBundle> {
     const threadId = opts.threadId ?? null;
     const thread = threadId !== null ? this.loadThreadRow(threadId) : null;
-    const messages =
+    // P1-2：已进摘要的那段消息**不再重复注入**——否则摘要与原文双份占预算，越摘要越挤。
+    // 只取 context_summary_upto_seq 之后的消息。
+    //
+    // ⚠ 边界：若 upto_seq 已经覆盖到**最后一条**消息（摘要把整段会话都吃掉了），
+    // 这里不能把消息列表清空——那样"会话部分"恒为空、摘要反而永远放得下，
+    // 与 §4.2 的预算砍序（消息优先于摘要）自相矛盾，也让"最近几条"这个锚点消失。
+    // 所以此时保留全部消息，由 buildBundle 的既有预算逻辑决定谁被砍。
+    const uptoSeq = typeof thread?.context_summary_upto_seq === 'number' ? thread.context_summary_upto_seq : 0;
+    const rawMessages =
       threadId !== null
-        ? this.db
-            .prepare('SELECT * FROM mem_messages WHERE thread_id = ? ORDER BY seq ASC')
-            .all(threadId)
-            .map((r) => toMessage(r as Record<string, unknown>))
+        ? (
+            this.db
+              .prepare('SELECT * FROM mem_messages WHERE thread_id = ? ORDER BY seq ASC')
+              .all(threadId) as unknown as Array<Record<string, unknown>>
+          ).map((r) => toMessage(r))
         : [];
+    const hasTail = rawMessages.some((m) => m.seq > uptoSeq);
+    const messages = hasTail ? rawMessages.filter((m) => m.seq > uptoSeq) : rawMessages;
     const manuals = this.db
       .prepare(
         `SELECT path, title, tags, size_bytes AS sizeBytes
@@ -380,9 +580,12 @@ export class MemoryServiceImpl implements MemoryService {
   async buildSessionReplay(threadId: string, taskId: string, budgetTokens: number): Promise<Message[]> {
     const row = this.loadThreadRow(threadId);
     if (row === null) return [];
+    // P1-2：与 buildContextBundle 同口径——只重放 upto_seq 之后的消息，
+    // 之前那段已由 context_summary 代表（packSessionReplay 会把摘要排在最前）。
+    const uptoSeq = typeof row.context_summary_upto_seq === 'number' ? row.context_summary_upto_seq : 0;
     const messages = this.db
-      .prepare('SELECT * FROM mem_messages WHERE thread_id = ? ORDER BY seq ASC')
-      .all(threadId)
+      .prepare('SELECT * FROM mem_messages WHERE thread_id = ? AND seq > ? ORDER BY seq ASC')
+      .all(threadId, uptoSeq)
       .map((r) => toMessage(r as Record<string, unknown>));
     const packed = packSessionReplay(toThread(row), messages, budgetTokens);
     // taskId 参与命中段，便于交互面回看（不改消息内容）
@@ -424,6 +627,49 @@ export class MemoryServiceImpl implements MemoryService {
       outcome,
       stopReason,
     );
+  }
+
+  /**
+   * §4.3「补写一轮」的前置判定（P1-4，2026-10-18）。
+   *
+   * 只回答一个问题：**这次收口值不值得再问模型一轮"要么写记忆、要么 SKIP"**。
+   * 判据与 sealTask 内部同源（probeMemoryWrites + 路径前缀），只是**提前到 finish 之前**问——
+   * 因为 sealTask 由 CP 钩子在 `queue.finish()` 内部调用，那时任务已终态、Runner
+   * 主循环已退出，不可能再发 LLM 请求（这正是老的"假提醒"缺陷）。
+   *
+   * 不写库、不抛（判不出来 = 不补写，软降级）。
+   */
+  async needsMemoryRedo(
+    task: SealTaskInput,
+    outcome: 'done' | 'failed' | 'cancelled',
+  ): Promise<boolean> {
+    // failed/cancelled：止损优先，不问（§4.3：只记 missed）
+    if (outcome !== 'done') return false;
+    // injectOnce：本任务已经提醒过 → 不再重复提醒（跨 attempt 幂等）
+    if (this.readKv(`reminded:${task.id}`) !== null) return false;
+    try {
+      if (this.journalMemoryProbe === null) {
+        // 无探针 = 无法判定"写没写"。此时**不补写**：假提醒的坑已经踩过一次，
+        // 不能再靠"查不到就当没写"去打一轮白工。
+        return false;
+      }
+      const since = task.createdAt > 0 ? task.createdAt : task.updatedAt;
+      const paths = await this.journalMemoryProbe(task.id, since);
+      return paths.filter(isMemoryWritePathLoose).length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** §4.3 injectOnce 的读侧（跨 attempt 幂等）。 */
+  hasMemoryReminder(taskId: string): boolean {
+    return this.readKv(`reminded:${taskId}`) !== null;
+  }
+
+  /** §4.3 injectOnce 的写侧（Runner 决定补写时先记账再问）。 */
+  markMemoryReminder(taskId: string, at?: number): void {
+    const t = at ?? this.now();
+    this.writeKv(`reminded:${taskId}`, String(t), t);
   }
 
   async beforeWrite(dotId: string, path: HomeRelPath, content: string): Promise<MemoryWriteResult> {
@@ -608,6 +854,25 @@ export class MemoryServiceImpl implements MemoryService {
     const since =
       opts.sinceDays !== undefined ? this.now() - opts.sinceDays * DAY_MS : 0;
     const dotId = opts.dotId;
+
+    // P1-3：优先走 FTS5（bm25 排序 + CJK bigram，见 cjk-tokenize.ts 头注）；
+    // FTS 不可用（老库/表被 DROP/索引损坏）或无有效 token 时，**降级到原来的 LIKE 全表扫描**，
+    // 结果不丢，且降级行为记入 maintenance kv（不静默）。
+    const matchExpr = ftsMatchQuery(query);
+    if (matchExpr.length > 0 && this.ftsProbe()) {
+      const hits = this.searchMessagesFts(matchExpr, { dotId, since, limit, query });
+      if (hits !== null) {
+        recordSearchStat(this.db, hits.length === 0, this.now());
+        return hits;
+      }
+      // FTS 查询抛错（索引损坏等）→ 落到 LIKE，并记一次降级
+      this.ftsAvailable = false;
+      this.recordFtsDegraded('query_error');
+    } else {
+      // 表不存在 = 迁移缺失；空查询不算降级（与 LIKE 版同样返回空）
+      if (matchExpr.length > 0 && !this.ftsProbe()) this.recordFtsDegraded('unavailable');
+    }
+
     const rows =
       dotId !== undefined
         ? this.db
@@ -632,6 +897,46 @@ export class MemoryServiceImpl implements MemoryService {
     // §6.4 埋点归属：本模块 searchMessages 内联写 mem_maintenance_state.search_stats
     recordSearchStat(this.db, hits.length === 0, this.now());
     return hits;
+  }
+
+  /**
+   * FTS 分支。返回 `null` 表示"FTS 查询失败，调用方应降级 LIKE"。
+   *
+   * 排序 = `bm25(mem_messages_fts)` **升序**（SQLite 的 bm25() 返回负数，越小越相关），
+   * 再按 recency 兜底——与 LIKE 版的"最新优先"在相关性打平时保持一致。
+   */
+  private searchMessagesFts(
+    matchExpr: string,
+    opts: { dotId?: string; since: number; limit: number; query: string },
+  ): MessageHit[] | null {
+    const { dotId, since, limit, query } = opts;
+    try {
+      const rows =
+        dotId !== undefined
+          ? this.db
+              .prepare(
+                `SELECT m.*, bm25(mem_messages_fts) AS rank FROM mem_messages_fts
+                 JOIN mem_messages m ON m.rowid = mem_messages_fts.rowid
+                 JOIN mem_threads t ON t.id = m.thread_id
+                 WHERE mem_messages_fts MATCH ? AND t.dot_id = ? AND m.created_at >= ?
+                 ORDER BY rank ASC, m.created_at DESC LIMIT ?`,
+              )
+              .all(matchExpr, dotId, since, limit)
+          : this.db
+              .prepare(
+                `SELECT m.*, bm25(mem_messages_fts) AS rank FROM mem_messages_fts
+                 JOIN mem_messages m ON m.rowid = mem_messages_fts.rowid
+                 WHERE mem_messages_fts MATCH ? AND m.created_at >= ?
+                 ORDER BY rank ASC, m.created_at DESC LIMIT ?`,
+              )
+              .all(matchExpr, since, limit);
+      return (rows as Array<Record<string, unknown>>).map((r) => {
+        const m = toMessage(r);
+        return { message: m, snippet: highlightSnippet(m.content, query) } satisfies MessageHit;
+      });
+    } catch {
+      return null;
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════
@@ -1221,6 +1526,12 @@ export class MemoryServiceImpl implements MemoryService {
 // ═══════════════════════════════════════════════════════════════════
 // 纯函数辅助（导出供测试）
 // ═══════════════════════════════════════════════════════════════════
+
+/** 读刚写入那行的 rowid（contentless FTS 需要用它当键；mem_messages 是 rowid 表）。 */
+function midOfLastInsert(db: DatabaseSync): number | null {
+  const row = db.prepare('SELECT last_insert_rowid() AS r').get() as { r?: number } | undefined;
+  return typeof row?.r === 'number' && row.r > 0 ? row.r : null;
+}
 
 /** LIKE 转义（§6.4：会话历史检索 = content LIKE + thread 时间窗）。 */
 export function escapeLike(q: string): string {

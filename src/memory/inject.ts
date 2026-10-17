@@ -133,11 +133,113 @@ interface ManualCandidate {
   sizeBytes: number;
 }
 
+/** rankManuals 的单条打分明细（测试与诊断用；不影响返回值）。 */
+export interface ManualScore {
+  path: HomeRelPath;
+  /** 加权命中分（旧算法口径：标题/路径 ×2 + tag ×1）。 */
+  weighted: number;
+  /** 自然词频：命中的 token 在候选文本里出现的总次数（不乘权重）。 */
+  tf: number;
+  /** 命中 token 的 IDF 之和。 */
+  idfSum: number;
+  /** 最终分 = Σ(权重 × (1 + ln tf) × idf)。 */
+  final: number;
+}
+
+/**
+ * IDF 语料：候选文本（title + path + tags）切成 token 后的文档集合。
+ * 用 `N / (1 + df)` 而不是经典 `log(N/df)`：所有词都出现在所有文档里（df=N）时
+ * IDF 退化为 N/(N+1)≈1 而不是 0——这样"全命中"仍然给分（不硬塞的前提不变：
+ * 一个词都没命中 → weighted=0 → 直接不进候选列表）。
+ */
+function buildCorpus(manuals: ManualCandidate[]): { n: number; df: Map<string, number> } {
+  const df = new Map<string, number>();
+  for (const c of manuals) {
+    const seen = new Set(tokenize(`${c.title ?? ''} ${c.path} ${c.tags.join(' ')}`));
+    for (const t of seen) df.set(t, (df.get(t) ?? 0) + 1);
+  }
+  return { n: Math.max(1, manuals.length), df };
+}
+
+/** 单条候选的词频统计：命中的 token 在"标题+路径"与每个 tag 里各出现几次。 */
+function countHits(taskTokens: Set<string>, text: string): number {
+  let n = 0;
+  for (const t of tokenize(text)) if (taskTokens.has(t)) n++;
+  return n;
+}
+
 /**
  * 从 mem_files_index 的 manuals 行里按关键词匹配打分，取 top-N（§4.2 top-2）。
- * 打分 = 命中标题/路径词数 ×2 + 命中 tag 词数 ×1；无命中返回空（不硬塞）。
+ *
+ * 打分（P1-3 增强，旧算法保留为 `weighted` 分量）：
+ *   final = Σ_{命中的 token} weight(token) × (1 + ln tf(token)) × idf(token)
+ *   weight = 出现在标题/路径 ×2，出现在 tag ×1（与旧算法一致）
+ *   tf     = 该 token 在候选文本中出现的总次数（旧算法只有"0/1 命中"，无词频）
+ *   idf    = N / (1 + df)，df = 含该 token 的候选篇数（现算，不落库）
+ *
+ * 为什么要 TF-IDF：
+ * - **词频**：一篇手册反复提到"部署 部署 部署"显然是部署主题，旧算法只给 1 次分；
+ * - **IDF**：`notes/`、`dot1`、`md` 这类在每篇路径里都出现的词，旧算法每命中一个都
+ *   加 2 分，等于把"噪声词"当强信号；IDF 让它们几乎不计分，而"kafka""报销"这种
+ *   稀有词才会把文档推上去。
+ *
+ * 无命中返回空（不硬塞）——这个语义没变：`weighted === 0` 的候选不进结果。
  */
 export function rankManuals(
+  taskText: string,
+  manuals: ManualCandidate[],
+  topN: number = MANUALS_TOP_N,
+): ManualCandidate[] {
+  return rankManualsScored(taskText, manuals, topN).map((s) => s.candidate);
+}
+
+/** 带明细的版本（`rankManuals` 的实现体；测试用它可以断言"哪个词贡献了分"）。 */
+export function rankManualsScored(
+  taskText: string,
+  manuals: ManualCandidate[],
+  topN: number = MANUALS_TOP_N,
+): Array<{ candidate: ManualCandidate; score: ManualScore }> {
+  const q = new Set(tokenize(taskText));
+  if (q.size === 0) return [];
+  const corpus = buildCorpus(manuals);
+  const idfOf = (t: string): number => corpus.n / (1 + (corpus.df.get(t) ?? 0));
+
+  const scored: Array<{ candidate: ManualCandidate; score: ManualScore }> = [];
+  for (const c of manuals) {
+    const titleText = `${c.title ?? ''} ${c.path}`;
+    const tagsText = c.tags.join(' ');
+    let weighted = 0;
+    let tf = 0;
+    let idfSum = 0;
+    let final = 0;
+    for (const t of q) {
+      // 在"标题+路径"里出现的次数（旧口径的 ×2 分量）与 tag 里出现的次数（×1 分量）。
+      // 注意必须用**单 token 集合**去统计：countHits 的语义是"这段文本里有多少个词属于给定集合"。
+      const inTitle = countHits(new Set([t]), titleText);
+      const inTags = countHits(new Set([t]), tagsText);
+      if (inTitle === 0 && inTags === 0) continue;
+      const weight = inTitle > 0 ? 2 : 1;
+      const freq = inTitle + inTags;
+      const idf = idfOf(t);
+      weighted += weight;
+      tf += freq;
+      idfSum += idf;
+      final += weight * (1 + Math.log(freq)) * idf;
+    }
+    if (weighted === 0) continue; // 无命中 → 不硬塞（与旧算法一致）
+    scored.push({ candidate: c, score: { path: c.path, weighted, tf, idfSum, final } });
+  }
+  scored.sort(
+    (a, b) =>
+      b.score.final - a.score.final ||
+      b.score.weighted - a.score.weighted ||
+      a.candidate.path.localeCompare(b.candidate.path),
+  );
+  return scored.slice(0, topN);
+}
+
+/** 旧算法（token 交集，标题/路径 ×2 + tag ×1）——保留为对照基准，不参与生产路径。 */
+export function rankManualsLegacy(
   taskText: string,
   manuals: ManualCandidate[],
   topN: number = MANUALS_TOP_N,

@@ -255,6 +255,9 @@ async function fixture(opts: {
           beforeWrite: (d, p, c) =>
             opts.beforeWrite !== undefined ? opts.beforeWrite(d, p, c) : memory.beforeWrite(d, p, c),
           sealTask: (t, o, r) => memory.sealTask(t, o, r),
+          needsMemoryRedo: (t, o) => memory.needsMemoryRedo(t, o),
+          hasMemoryReminder: (id) => memory.hasMemoryReminder(id),
+          markMemoryReminder: (id, at) => memory.markMemoryReminder(id, at),
         };
         return wrapped;
       })(),
@@ -821,6 +824,9 @@ test('WRITE-SEAL：sealTask 抛错不得登记去重键（后续同键收口仍�
         buildContextBundle: (d, text, b, o) => base.memory.buildContextBundle(d, text, b, o),
         buildSessionReplay: (t, task, b) => base.memory.buildSessionReplay(t, task, b),
         beforeWrite: (d, p, c) => base.memory.beforeWrite(d, p, c),
+        needsMemoryRedo: (t, o) => base.memory.needsMemoryRedo(t, o),
+        hasMemoryReminder: (id) => base.memory.hasMemoryReminder(id),
+        markMemoryReminder: (id, at) => base.memory.markMemoryReminder(id, at),
         sealTask: async () => {
           calls += 1;
           throw new Error('seal boom');

@@ -97,6 +97,9 @@ test('模板库等价性：内存模板 = 真迁移库（schema/列定义/user_v
       assertEquivalent(tpl, ref, '内存模板');
       // 模板必须真的"空"（只是结构，没有数据行）
       for (const row of masterRows(tpl).filter((r) => r.type === 'table')) {
+        // FTS5 虚表的内部影子表（<name>_data/_idx/_docsize/_config）由 SQLite 自管，
+        // _config 恒有 1 行（存 version 与 segment 计数），不是业务数据，跳过。
+        if (/^mem_messages_fts_/.test(row.name)) continue;
         const n = tpl.prepare(`SELECT count(*) AS c FROM "${row.name}"`).get() as { c?: number } | undefined;
         assert.equal(n?.c, 0, `模板表 ${row.name} 应为空表`);
       }
@@ -132,7 +135,7 @@ test('模板缓存：getDbTemplate() 幂等，且模板脚本必须回放 ALTER�
   const a = getDbTemplate();
   const b = getDbTemplate();
   assert.equal(a, b, '模板只建一次（进程内缓存）');
-  assert.equal(a.userVersion, 100, '迁移终态 user_version=100');
+  assert.equal(a.userVersion, 110, '迁移终态 user_version=110');
   // 090/100 两个迁移包是纯 ADD COLUMN：模板脚本必须显式带上 ALTER，否则重建出来的表缺列。
   assert.match(a.script, /ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMN/i, '模板脚本必须回放 ADD COLUMN');
   const tpl = openMigratedTemplateDb();
@@ -155,12 +158,16 @@ test('反例守卫：只看 sqlite_master.sql 重建会丢 user_version（说明
   const ref = referenceDb();
   try {
     const script = buildSchemaScript(ref);
-    assert.match(script, /^PRAGMA user_version=100;/);
+    assert.match(script, /^PRAGMA user_version=110;/);
     const naive = new DatabaseSync(':memory:');
     try {
       const texts = (
         ref
-          .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid")
+          // FTS5 的影子表（mem_messages_fts_data/_idx/_docsize/_config）由虚表自管：
+          // 按 sqlite_master 顺序重建时会先建虚表、再撞影子表 "already exists"，所以排除。
+          .prepare(
+            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'mem_messages_fts_%' ORDER BY rowid",
+          )
           .all() as Array<{ sql: string }>
       ).map((r) => r.sql);
       naive.exec(texts.join(';\n'));

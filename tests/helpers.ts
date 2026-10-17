@@ -35,7 +35,7 @@ import type {
 
 /**
  * 按需建库文件（池模式下用）：池库是内存库，`dir.dbPath` 只在真有独立连接/子进程要用时
- * 才需要存在。建出来的文件与池库同结构（同一模板），且同样是 user_version=100。
+ * 才需要存在。建出来的文件与池库同结构（同一模板），且同样是迁移终态 user_version。
  */
 function ensureOwnDbFile(dbPath: string): void {
   if (existsSync(dbPath)) return;
@@ -52,7 +52,7 @@ export interface TempDataDir {
   outboxPath: string;
   /** journal-blobs 目录路径（已创建）。 */
   blobDir: string;
-  /** 打开并迁移好的唯一连接（user_version=100）。 */
+  /** 打开并迁移好的唯一连接（迁移终态 user_version）。 */
   db: DatabaseSync;
   bus: EventBus;
   /** 清理：关库 + 删目录。测试 afterEach 调用；重复调用安全。 */
@@ -74,7 +74,7 @@ export interface TempDataDir {
  * 需要"真跑一遍迁移"的用例（迁移 runner 自身）请直接用 `migrate()`，不要用本工厂。
  *
  * @param opts.pool 从**空库池**借库（`db/template.ts` 的 acquire/release）：每用例仍拿到
- *   "空表 + user_version=100"，但复用已建好的表结构。要求：该用例**不自带库文件路径假设**
+ *   "空表 + 迁移终态 user_version"，但复用已建好的表结构。要求：该用例**不自带库文件路径假设**
  *   （默认全满足）；`dir.dbPath` 指向的子进程会用**独立的新库文件**（池库是内存库，
  *   无法给子进程用），仅 `{pool:true}` 时成立。
  */
@@ -92,7 +92,7 @@ export function makeTempDataDir(opts: { pool?: boolean } = {}): TempDataDir {
     // 子进程/独立连接要用的库文件：按需建一份（与池库表结构相同），仅当有人真的去开它。
     ensureOwnDbFile(dbPath);
   } else {
-    db = openMigratedTemplateDb(dbPath); // 终态 schema = user_version 100（与旧 openDb+migrate 相同）
+    db = openMigratedTemplateDb(dbPath); // 终态 schema（与旧 openDb+migrate 相同，版本号跟随迁移目录）
   }
 
   const bus = new EventBus();

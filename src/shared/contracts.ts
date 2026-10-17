@@ -965,6 +965,25 @@ export interface MemoryServiceApi {
    */
   beforeWrite(dotId: string, path: HomeRelPath, content: string): Promise<MemoryWriteResult>;
   sealTask(task: Task, outcome: 'done' | 'failed' | 'cancelled', stopReason?: string): Promise<void>;
+  /**
+   * P1-4 §4.3「补写一轮」的前置判定：done 且没写过记忆文件 → true。
+   * **必须在 cp.finish() 之前问**——sealTask 在 finish 内部被调用时任务已终态，
+   * Runner 不可能再发 LLM 请求（老的"假提醒"就死在这里）。只判定、不写库、不抛。
+   *
+   * 可选（与 `trackForRequest?` 同款理由）：旧装配/测试替身没有它时 Runner
+   * 跳过补写轮，行为逐字回到改动之前——而不是让整个 Runner 依赖面变 hard break。
+   */
+  needsMemoryRedo?(task: Task, outcome: 'done' | 'failed' | 'cancelled'): Promise<boolean>;
+  /** §4.3 injectOnce：同一任务已提醒过则不再提醒（跨 attempt 幂等）。可选，缺省视为未提醒。 */
+  hasMemoryReminder?(taskId: string): boolean;
+  /** 记录"已提醒"（Runner 决定补写时先记账再问）。可选。 */
+  markMemoryReminder?(taskId: string, at?: number): void;
+  /**
+   * P1-2 §4.4：会话摘要触发（够阈值时把 upto_seq 之后的增量压成摘要写回）。
+   * 走 MEM 内部注入的 track:'light' seam，Runner 只负责**在收口前**调一次。
+   * 可选：旧装配没有它时跳过（行为回到"摘要恒为 null"）。
+   */
+  refreshContextSummary?(threadId: string): Promise<boolean>;
 }
 
 /**

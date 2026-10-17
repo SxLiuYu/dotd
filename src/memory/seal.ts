@@ -90,16 +90,20 @@ export async function sealTask(
 
   const wrote = (await host.probeMemoryWrites(task.id, task.createdAt)).length > 0;
   if (!wrote) {
-    if (outcome === 'done' && !host.hasReminded(task.id)) {
-      await host.appendSystemMessage(threadId, {
-        kind: 'text',
-        taskId: task.id,
-        content: SEAL_REMINDER_TEXT,
-      });
-      host.markReminded(task.id, now);
-    }
-    // failed/cancelled：止损优先，不追加提醒轮，只记 missed（§4.3）
-    host.markMissed(task.id, outcome, now);
+    // P1-4（2026-10-18）：这里**不再**追加"提醒"。
+    //
+    // 老实现走到这里会 appendSystemMessage(SEAL_REMINDER_TEXT)，但 sealTask 由 CP 的
+    // 钩子在 queue.finish() **内部**调用——那一刻任务已是终态、Runner 主循环已退出，
+    // 不会有任何一轮 LLM 去读这条消息。于是"补写一轮"从未发生，那条提醒只会在
+    // 下次同 thread 的任务里当历史噪音出现（= 假提醒）。
+    //
+    // 现在把"要不要补写"的判定提前到 Runner 收口之前（MemoryService.needsMemoryRedo），
+    // 补写轮由 Runner 真的跑一次；这里只做**收口记账**（单一分支，不连写两笔）：
+    //   - done 且**从未被提醒过** → 记 'seal_missed'：观测面表明"该提醒却没提醒"，
+    //     说明补写轮没跑（装配漏注入 / memoryRedo 关闭 / 判定探针缺失）；
+    //   - 其余（done 但已提醒过 = 模型回了 SKIP；以及 failed/cancelled 止损）→ 记 outcome。
+    const neverReminded = outcome === 'done' && !host.hasReminded(task.id);
+    host.markMissed(task.id, neverReminded ? 'seal_missed' : outcome, now);
   }
 }
 

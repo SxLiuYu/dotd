@@ -1,0 +1,32 @@
+-- 110_memory_fts.sql —— 记忆检索进 FTS5（roadmap P1-3，零依赖）
+--
+-- 依据：契约 D2/D3（改表结构必须走迁移包；user_version 单调递增）。
+-- 040_memory.sql:49-50 预留的注释在此落地。
+--
+-- ── 为什么是 contentless（content=''）而不是外部内容表 ────────────────
+-- 原预留写法是 `content='mem_messages', content_rowid='rowid'`（外部内容表）。实测
+-- （SQLite 3.50.4）它在本项目的用法下**有两个硬伤**：
+--   1. 外部内容表的索引内容必须与 `mem_messages.content` 逐字相同，FTS5 才会在
+--      `snippet()`/重建时读回一致的数据；而我们要把 CJK 切成 bigram 再入索引，
+--      写进去的 token 文本 ≠ 原文，`snippet()` 会读 `mem_messages` 原文并按"整段中文
+--      是一个 token"去高亮 —— 等于把中文检索的优势又还回去了；
+--   2. 外部内容表的标准触发器会写 `content` 原文，而触发器里**无法调 JS 做 bigram**，
+--      真要靠触发器同步就只能拥有两套切分实现（写入 SQL 侧 / 查询 JS 侧），必然漂移。
+--
+-- 因此改成 **contentless FTS**（只存倒排索引，不存原文）+ 代码侧同步：
+--   写入 = `MemoryService.appendMessage()` 里调 `ftsIndexText()`（与查询侧同一个纯函数）；
+--   原文永远以 `mem_messages` 为唯一真相（join 回原文，片段由 `highlightSnippet()` 生成）。
+-- 代价：绕过 MemoryService 直接写 `mem_messages` 的调用方要自己同步索引 → 由
+-- `MemoryService.resyncMessageFts()` 全量重建兜底（见该方法注释）。
+--
+-- ── 为什么 tokenize='unicode61' 而不是 trigram ─────────────────────────
+-- CJK 已由代码切成二元组，`unicode61` 只需按空格把 token 再切一次（它对 CJK 的
+-- "整段不切"缺陷因而不发生）。trigram 只支持 ≥3 字符查询，"会议""报销"这类两字
+-- 中文词是最高频查询形态，召回会漏。
+--
+-- ── 回填 ──────────────────────────────────────────────────────────────
+-- contentless 表没有内容表，FTS5 的 `'rebuild'` 命令对它无效（会报 "no such content table"）。
+-- 已有消息的回填由 `MemoryService` 的 `ensureMessageFts()` 在首次连接时按 `mem_messages`
+-- 全量灌入完成（幂等：索引条数少于消息条数才重灌）。迁移包里**只建表**，
+-- 不写任何数据行——新建库模板（db/template.ts）要求「结构到位 + 无数据」。
+CREATE VIRTUAL TABLE mem_messages_fts USING fts5(tokens, content='', tokenize='unicode61');

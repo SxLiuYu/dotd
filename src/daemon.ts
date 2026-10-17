@@ -85,6 +85,7 @@ import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
 import { createMemoryService } from './memory/MemoryService.ts';
+import { memoryWritePathsOfStep } from './memory/step-paths.ts';
 import type { MemoryServiceImpl } from './memory/MemoryService.ts';
 import { assertHttpConfig, startHttpServer } from './surfaces/http.ts';
 import { loadSurfacesConfig } from './surfaces/config.ts';
@@ -358,6 +359,10 @@ function memApiOf(memory: MemoryServiceImpl): MemoryServiceApi {
       memory.buildSessionReplay(threadId, taskId, budgetTokens),
     beforeWrite: (dotId, path, content) => memory.beforeWrite(dotId, path, content),
     sealTask: (task, outcome, reason) => memory.sealTask(task, outcome, reason),
+    // P1-4：收口前"补写一轮"的判定与幂等（sealTask 在 finish 之后才跑，来不及）
+    needsMemoryRedo: (task, outcome) => memory.needsMemoryRedo(task, outcome),
+    hasMemoryReminder: (taskId) => memory.hasMemoryReminder(taskId),
+    markMemoryReminder: (taskId, at) => memory.markMemoryReminder(taskId, at),
   };
 }
 
@@ -413,10 +418,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 100）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 110）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 100 });
+    const res = migrate(db, { expectedVersion: 110 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -673,11 +678,37 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     db,
     outboxPath,
     taskStatusProbe: (taskId) => cp.getTask(taskId)?.status ?? null,
+    // §4.3 `anyMemoryFileTouchedSince`：探针必须交出**真实路径**。
+    // 老实现返回 `fs.write:<callId>`（没有路径），而 MEM 侧按路径前缀判定
+    // （isMemoryWritePathLoose：/dot/home/{MEMORY.md,notes/,manuals/}），于是**永远判不出"写过"**
+    // → WRITE-SEAL 每次都认为没写记忆（P1-4 的第二个根因，与"终态之后才提醒"叠加）。
+    // 现在从 steps.args_json 取 path；同时把 fs.write 与 shell.run（写 home 的常用手段）都算上。
     journalMemoryProbe: (taskId, sinceMs) =>
       cp
         .getJournal(taskId)
-        .filter((s) => s.startedAt >= sinceMs)
-        .map((s) => `${s.toolName ?? s.kind}:${s.callId ?? s.seq}`),
+        .filter((s) => s.startedAt >= sinceMs && s.status === 'succeeded')
+        .flatMap((s) => memoryWritePathsOfStep(s)),
+    // §4.4 会话摘要（P1-2）：MEM 只负责"够阈值就压增量"，**生成走注入的低智能轨**——
+    // 这里接 router.complete({track:'light'})，MEM 绝不自己发 HTTP（密钥只在 MR 手里）。
+    // 摘要失败由 MEM 侧软降级（不写、不抛），这里不需要再兜。
+    summarize: async (_threadId, transcript, { maxTokens }) => {
+      const r = await router.complete({
+        track: 'light',
+        messages: [
+          {
+            role: 'system',
+            content:
+              '你是会话压缩器。把下面的对话压成一段可长期沿用的摘要：保留事实、结论、' +
+              '未完成事项与关键约束；不要复述原话，不要编造，不要加标题或前言。只输出摘要正文。',
+          },
+          { role: 'user', content: transcript },
+        ],
+        attemptId: `sum:${Date.now()}`,
+        maxTokens,
+      });
+      const resp = r.response as { content?: string };
+      return typeof resp.content === 'string' ? resp.content : '';
+    },
     bridge: makeExecFsOpsBridge(exec),
     // §4.2 骨架补建落盘：经工具层 fs.write（FsOpsBridge 只读，无 write 原语）。
     // task_id 用 dotId 派生——这不是任务调用，是装配期一次性补建；exec_calls
@@ -759,6 +790,11 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       idlePollMs: cfg.idlePollMs,
       log,
       bus: { publish: (topic, payload, o) => bus.publish(topic, payload, o) },
+      // P1-4 §4.3「补写一轮」：**生产语义由装配层显式声明**。
+      // RunnerOptions.memoryRedo 缺省 false（= 与既有行为逐字相同，不悄悄给每个任务
+      // 多加一轮模型调用）；这里显式打开，才让"任务 done 但没写记忆"时真的再问一轮。
+      // 关掉它 = 回到老行为：sealTask 记 missed，但不会再提醒（也就不会补写）。
+      memoryRedo: true,
     },
   );
 

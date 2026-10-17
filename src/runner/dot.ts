@@ -123,6 +123,15 @@ export interface RunnerOptions {
   streamFlushMs?: number;
   /** delta 合帧的字符阈值（与 streamFlushMs 取先到者）。 */
   streamFlushChars?: number;
+  /**
+   * §4.3「补写一轮」开关（P1-4）：任务 done 且本次没写过记忆文件时，
+   * 在 `cp.finish()` **之前**再问模型一轮"要么写 notes/manuals，要么回 SKIP"。
+   *
+   * **默认 false = 与既有行为逐字相同**（不多花一次模型调用、主循环 LLM 轮次不变）。
+   * 生产语义由装配层显式打开：`src/daemon.ts` 传 `memoryRedo: true`。
+   * 关着 = 老行为：sealTask 记 missed，但不会再提醒（也就不会补写）。
+   */
+  memoryRedo?: boolean;
 }
 
 /**
@@ -531,6 +540,8 @@ export class DotRunner {
   private readonly streamEnabled: boolean;
   private readonly streamFlushMs: number;
   private readonly streamFlushChars: number;
+  /** P1-4：收口前"补写一轮"开关（RunnerOptions.memoryRedo，默认开）。 */
+  private readonly memoryRedoEnabled: boolean;
 
   /** 工具 sideEffect 词表缓存（契约 J2：唯一事实源 = exec.getCapabilities）。 */
   private sideEffectOf = new Map<string, 'safe' | 'replayable' | 'unknown'>();
@@ -569,6 +580,7 @@ export class DotRunner {
     this.streamEnabled = opts.streamChat ?? streamChatFromEnv();
     this.streamFlushMs = opts.streamFlushMs ?? STREAM_FLUSH_MS;
     this.streamFlushChars = opts.streamFlushChars ?? STREAM_FLUSH_CHARS;
+    this.memoryRedoEnabled = opts.memoryRedo ?? false;
   }
 
   // ── 3.1 pop 循环（CP §12 `for await (const task of loop)`）──────────────
@@ -1311,6 +1323,19 @@ export class DotRunner {
     epoch: number,
     r: { ok: boolean; summary: string },
   ): Promise<TaskRunOutcome> {
+    // ── P1-4：WRITE-SEAL 的"补写一轮"必须发生在 finish **之前** ──────────
+    //
+    // 老的"假提醒"：sealTask 由 CP 钩子在 queue.finish() **内部**调用，那一刻任务
+    // 已是终态、主循环已退出，它追加的提醒消息永远没有下一轮 LLM 去读。
+    // 所以这里在 finish 前先把"该不该补写"问清楚（needsMemoryRedo 只做判定、不写库），
+    // 该补就真跑一轮（memoryWriteRedo），然后才 finish —— 这样补写轮里的
+    // fs.write 落在**任务仍 running** 的时间窗内，journal/心跳/围栏全部照常成立。
+    if (r.ok) {
+      await this.memoryWriteRedo(task, epoch);
+    }
+    // P1-2：会话摘要也在收口前触发（同样因为 finish 之后主循环已退出）。
+    // 与补写轮的顺序：先补写（可能产生新的 notes），再摘要（把本轮的对话压进去）。
+    await this.refreshSummary(task);
     this.cp.finish(task.id, epoch, r);
     await this.seal(task, r.ok ? 'done' : 'failed', r.ok ? undefined : r.summary);
     return {
@@ -1319,6 +1344,153 @@ export class DotRunner {
       status: r.ok ? 'done' : 'failed',
       summary: r.summary,
     };
+  }
+
+  /**
+   * P1-2 §4.4：会话摘要触发（收口前）。
+   *
+   * 为什么放在这里而不是"每步之后"：摘要是**会话级**的压缩动作，一次任务结束时做一次
+   * 最划算（消息已成批、且不影响本轮的上下文）。放在 finish 之前同样是因为
+   * finish 之后主循环已退出——虽然摘要本身不需要再跑主循环，但"任务仍在 running"
+   * 时做的记忆写更容易与 STALE/恢复路径对账。
+   *
+   * Runner 只做两件事：判 threadId、调注入的 `refreshContextSummary`。
+   * 摘要**怎么生成**（低智能轨 / 提示词 / JSON）全在 MEM 与装配层，Runner 不碰 router。
+   * 任何异常都吞掉（§8 记忆软线），且不带 outcome 条件——failed 的任务对话同样值得摘要。
+   */
+  private async refreshSummary(task: Task): Promise<void> {
+    const fn = this.memory.refreshContextSummary?.bind(this.memory);
+    if (fn === undefined) return;
+    const threadId = this.threadIdOf(task);
+    if (threadId === null) return;
+    try {
+      const updated = await fn(threadId);
+      if (updated) this.log(`runner: 已更新会话摘要 ${task.id}/${threadId}`);
+    } catch (err) {
+      this.log(`runner: refreshContextSummary 失败 ${task.id}：${errText(err)}`);
+    }
+  }
+
+  /**
+   * §4.3「补写一轮」的**真实执行**（P1-4，2026-10-18）。
+   *
+   * 为什么是一条独立路径，而不是复用 stepLlm：补写轮要的是"**只能写记忆**"这个约束，
+   * 而 stepLlm 是主循环的通用回合（带全部工具、会推进 ctx.done、会走流式与 chat.* 总线）。
+   * 两者语义不同，硬塞进 stepLlm 只会把主循环的完成判据搞脏（流式回合甚至需要 toolCalls
+   * 才能算"有内容"）。这里复用同一套**原语**（journal.beginLlm/endLlm、router.complete、
+   * stepTool 派发）但把它们串成一条受控的、只有一次机会的回合：
+   *   1. beginLlm 记账（attemptId = 本步 callId，与主循环同口径）；
+   *   2. complete(不带 tools 的请求) → 模型要么调 fs.write/shell.run，要么回 SKIP；
+   *   3. 若它调了工具，走 stepTool（治理/幂等/journal 全照常，不绕过任何门）；
+   *   4. 一轮即止：**绝不**循环追问（追问会把"补写"变成"再来一轮猜"）。
+   *
+   * 零打扰条件（任一成立就跳过，不花任何模型调用）：
+   *   - `memoryRedoEnabled=false`（开关）；
+   *   - 本任务不是 done、或已经提醒过（injectOnce 跨 attempt 幂等）；
+   *   - 本次任务已经写过记忆文件（needsMemoryRedo 的判据与 sealTask 同源）。
+   *
+   * 任何异常都吞掉并记日志：记忆问题不炸主循环（memory.md §8 软线），
+   * 补写失败绝不能把一个本来成功的任务拖成失败。
+   */
+  private async memoryWriteRedo(task: Task, epoch: number): Promise<void> {
+    if (!this.memoryRedoEnabled) return;
+    // 任务可能已被看门狗/背压改道：不再替它跑任何回合（epoch 围栏由 CP 兜底，这里先省掉调用）
+    if (this.cp.getTask(task.id)?.status !== 'running') return;
+
+    let need = false;
+    try {
+      // 能力探测：旧装配/测试替身没有 needsMemoryRedo 时，行为逐字回到"不补写"
+      const probe = this.memory.needsMemoryRedo?.bind(this.memory);
+      if (probe === undefined) return;
+      need = await probe(task, 'done');
+    } catch (err) {
+      this.log(`runner: needsMemoryRedo 失败 ${task.id}：${errText(err)}`);
+      return;
+    }
+    if (!need) return;
+
+    // injectOnce：先记账再问——即使这一轮模型崩溃/超时，也不会在下一 attempt 里重复提醒
+    try {
+      this.memory.markMemoryReminder?.(task.id);
+    } catch {
+      // 记账失败不拦主路径
+    }
+
+    let seq = -1;
+    let callId = '';
+    try {
+      const begin = this.cp.journal.beginLlm(task.id, epoch, digestOf(MEMORY_REDO_PROMPT));
+      seq = begin.seq;
+      callId = begin.callId;
+      // 请求体刻意**不带 tools**：这一步只允许"写记忆或 SKIP"，不给它别的动作面。
+      // 有的模型会无视约束照样发 tool_calls（尤其 tool_choice:'none' 不被支持时），
+      // 那种情况在下面按"不认识的名字 → deny 回喂"处理，不派发。
+      const req: RouteRequest = {
+        track: 'primary',
+        messages: [
+          { role: 'system', content: MEMORY_REDO_PROMPT },
+          {
+            role: 'user',
+            content:
+              `任务「${task.title}」已完成：${task.goal}\n` +
+              '如果本次产生了可复用的经验，请用 fs.write 写进 notes/ 或 manuals/；' +
+              '没有值得沉淀的内容就只回复 SKIP。',
+          },
+        ],
+        attemptId: callId,
+        maxTokens: 1024,
+        // 不组网、不流式：这是收口路径上的附加回合，必须最短最可控
+        tool_choice: 'none',
+      };
+      const resp = await this.router.complete(req);
+      const chat = resp.response as { content?: string; toolCalls?: Array<{ id: string; name: string; arguments: string }> };
+      const content = typeof chat.content === 'string' ? chat.content : '';
+      const tokens = (resp.usage?.promptTokens ?? 0) + (resp.usage?.completionTokens ?? 0);
+
+      const calls = (chat.toolCalls ?? []).map((c) => ({
+        id: c.id,
+        name: c.name,
+        arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
+      }));
+      const skipped = calls.length === 0 && /^\s*SKIP\s*$/i.test(content);
+
+      if (skipped) {
+        // SKIP = 模型明确说"没有可沉淀的"：记一次 missed（不重复提醒已由 injectOnce 保证）
+        this.cp.journal.endLlm(task.id, epoch, seq, 'memory_redo:skip');
+        this.log(`runner: 补写轮 SKIP ${task.id}`);
+      } else if (calls.length > 0) {
+        this.cp.journal.endLlm(task.id, epoch, seq, digestOf(content));
+        // 补写轮的工具调用同样要过治理与幂等：用与主循环**同一个** stepTool 入口。
+        // 主循环已结束、没有会话上下文可喂，因此给一个一次性 scratch ctx：
+        // 结果照常落 journal + thread（reportTool），只是不进主循环的 messages。
+        const scratch = new RunContext(task.goal);
+        for (const call of calls) {
+          const out = await this.stepTool(task, epoch, scratch, call);
+          if (out.kind === 'suspend' || out.kind === 'abort' || out.kind === 'fail') {
+            this.log(`runner: 补写轮工具受阻（${call.name}，${out.kind}），按收口继续`);
+            break;
+          }
+        }
+        this.log(`runner: 补写轮执行了 ${calls.length} 个工具调用 ${task.id}`);
+      } else {
+        // 有正文但不是 SKIP：模型可能真写了（工具调用被网关吞掉）或只是解释。
+        // 判定"写没写"交给收口判定（journal 探针），不在这里猜。
+        this.cp.journal.endLlm(task.id, epoch, seq, digestOf(content));
+        this.log(`runner: 补写轮无工具调用（正文 ${content.length} 字）${task.id}`);
+      }
+      // 用量记账：补写轮的 token 也算任务成本（否则预算会被悄悄透支）
+      if (tokens > 0) this.cp.heartbeat(task.id, epoch, { tokens });
+    } catch (err) {
+      // 软降级：补写轮失败不影响任务终态。LLM 步按 error 收口留痕即可。
+      this.log(`runner: 补写轮失败 ${task.id}：${errText(err)}`);
+      if (seq >= 0) {
+        try {
+          this.cp.journal.endLlm(task.id, epoch, seq, `error:${errText(err)}`);
+        } catch {
+          // 迟到写被围栏拒绝是正常竞态
+        }
+      }
+    }
   }
 
   /**
@@ -1404,6 +1576,22 @@ export class DotRunner {
  * 又足以让 SQLITE_BUSY 这类瞬时故障自愈而不打爆日志。
  */
 const START_MAX_BACKOFF_MS = 60_000;
+
+// ── P1-4：WRITE-SEAL 补写一轮的系统提示 ─────────────────────────────────────
+
+/**
+ * 补写轮的 system 文案（导出供测试断言"这一轮的 prompt 确实带提醒"）。
+ *
+ * 两条硬约束写死在提示里：① 只允许写记忆文件（notes/ 或 manuals/）；② 没有可沉淀的
+ * 内容就**只回 SKIP**（Runner 靠这个字面量判定"模型拒绝补写"，并据此记 missed 而不是
+ * 再猜它写了没写——猜会退化成又一种"假提醒"）。
+ */
+export const MEMORY_REDO_PROMPT = [
+  '任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。',
+  '如果有：用 fs.write 把它写进 notes/（过程与结论）或 manuals/（可复用的操作手册），',
+  '写法要能让以后的自己直接照着做；没有值得沉淀的内容时，只回复一个词：SKIP。',
+  '不要重复任务已经完成的内容，也不要执行任何与写记忆无关的动作。',
+].join('\n');
 
 // ── 流式增量上总线（roadmap P0-2）────────────────────────────────────────────
 

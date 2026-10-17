@@ -83,6 +83,15 @@ P0 剩下的 4 项 + P1 全部做完，我判断 dotd 就能"一个人用一周�
 
 ## P0-2 把流式接到 Runner（三处已就绪，缺一根线）
 
+> **状态：✅ 已完成（2026-10-17，commit `0f692b2`）。** 下面保留原始分析，末尾补"实际做完后发现的两件事"。
+
+> **实际做完后发现的第一件事（原计划没想到的）**：这条线**不是"缺一根线"那么简单**。`ChatChunk` 当时只有 `delta`/`done`，`HttpTransport.stream()` 的 SSE 解析**只读 `delta.content`，把工具调用分片静默丢弃**。而主循环每轮都带 `tools` + `tool_choice:'auto'`——用真 HTTP + 假 SSE 上游实测：只回 tool_calls 的流产出 **0 个 chunk**，Runner 会把工具轮当成"纯文本完结轮" → **任务 done，但工具从未执行**。这不是"没有流式"，是**静默假完成**。
+> 所以真正的修法是先补契约：`ChatChunk.toolCalls?`（增量）+ `src/shared/tool-stream.ts` 的 `StreamToolCallAccumulator`（6 条容错：index 缺失/跳号/整段下发/名字拆片/id 缺失/同 index 重发）+ `stream().toolCalls()`（成品，等流读完再取）。
+>
+> **第二件事**：`RunContext.feed()` 登记结果时把调用声明一起删了，导致三重退化——`dispatched` 恒 false（结果不进 tool 通道、降级成 system 注记）、`assistant.tool_calls` 声明消失（`role:tool` 变无主消息被网关拒）、参数退化成 `{}`（模型看不到自己传过什么）。因 `noteToolCalls` 按模型给的 id 登记、`stepTool` 用 journal call_id 派发，两者真实链路上不相等，所以长期没暴露。
+>
+> **验收实测**：`tests/runner-stream.test.ts` 11 条 + `tests/shared-tool-stream.test.ts` 10 条全绿，其中最关键的是「流式回合里模型返回 tool_calls → 工具确实被执行，任务不提前 done」。回退开关 `DOTD_STREAM_CHAT=off` 与"未注入总线"两条路径都逐字退回 `complete()`。
+
 **为什么做**
 矩阵 §7.2 与 §12 附条：SSE 总线定义了 `chat.delta`（`src/shared/bus.ts:78`），前端已经做了增量拼装（`web-ui/src/views/ChatView.tsx:54-95`），transport 与 router 两层流式都实现了（`src/router/transport.ts:626-630`、`src/router/ModelRouter.ts:605-701`），**而且 `daemon.ts:368` 已经把 `stream()` 递进了 Runner 的端口面**。唯一缺的是 `src/runner/dot.ts` 里的消费。
 现在的体感是：发出问题 → 转圈 → 整段答案突然出现。这是"演示级 vs 日常级"最直观的分界线之一。
@@ -105,6 +114,12 @@ P0 剩下的 4 项 + P1 全部做完，我判断 dotd 就能"一个人用一周�
 ---
 
 ## P0-3 修看门狗误回收（心跳在途静止）
+
+> **状态：✅ 已完成（2026-10-17，commit `0f692b2`）。**
+> 选了**轮询驱动（a）**而不是 Runner 定时器（b）：只有每轮 `GET /jobs` **成功且报 running** 才续一次心跳，因此"工具在跑"与"协程卡死"被区分开——`getJob` 抛错 / 容器被判 unhealthy·lost·removed / 本地 deadline 到达 / 读到终态，**四种情况一律不续**，心跳自然停、看门狗按 180s 照收。注入缝是 `ExecServiceDeps.liveness`（EX 不 import CP、不直写 tasks）。
+> **顺带修掉第二个真缺陷**：`pollJob` 用的是 Runner 传来的 `toolDeadlineMs`（缺省 **60s**），所以"允许跑 30 分钟"以前只是文档里的话——3 分钟以上的工具根本轮不到看门狗，本地 deadline 先标 timeout 然后重跑。现在按 catalog 的 `mode` 选档：async 用目录声明的 `max_deadline_ms`（1800000），sync 仍是 60s，未登记工具保守按 sync。
+> **A/B 证据**（同一套测试、同一虚拟时钟，不 sleep 200s）：HEAD = `aborted/stale_writer, attempt=1, deadlineMs=60000`（工具已成功返回、副作用已落地却被回收 → 重跑）；FIXED = `done, attempt=0, execCount=1, deadlineMs=1800000`。
+> **真卡死仍回收**（阴性用例）：最后一次上游推进后 +180s 不回收、+180001ms 必回 queued + attempt+1。
 
 **为什么做**
 `heartbeatTimeoutMs` = **180 秒**（`src/control-plane/types.ts:189`），但心跳只在每步之后写（`src/runner/dot.ts:839-851` 的 `afterStep`）。而单个 `shell.run` 的 deadline 上限是 **30 分钟**（`src/exec/protocol.ts:130-142`）。**任何超过 180 秒的工具调用都会被看门狗判成"卡死"并回收**。
