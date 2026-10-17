@@ -25,7 +25,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
@@ -63,6 +63,7 @@ export const CHECKS = Object.freeze([
   'tier1-key',
   'db',
   'home-dir',
+  'mcp',
 ]);
 
 // ── 工具 ────────────────────────────────────────────────────────────────
@@ -402,7 +403,168 @@ export async function runChecks(opts = {}) {
     add('home-dir', STATUS.WARN, `${dotdHome} 还不存在`, '首次启动会创建', 'npm run serve');
   }
 
+  // 11. MCP 外部工具（P2-1）：声明了 server 但 command 找不到 = 每次调用都失败，
+  //     而失败只在"任务跑到那一步"时才暴露——正是 doctor 该提前拦下的那类坑。
+  //     未声明任何 server 时显示"未启用"，**不制造噪音**（默认配置下用户不该被提醒）。
+  const mcpPath =
+    env.DOTD_MCP_CONFIG !== undefined && env.DOTD_MCP_CONFIG !== ''
+      ? env.DOTD_MCP_CONFIG
+      : join(repoRoot, 'config', 'mcp-servers.yml');
+  if (!existsSync(mcpPath)) {
+    add('mcp', STATUS.SKIP, '未启用', `没有 ${mcpPath}（MCP 外部工具默认关闭）`);
+  } else {
+    const parsed = parseMcpServers(readFileSync(mcpPath, 'utf8'));
+    // 顺序要紧：**先判错误**再判"有没有声明"。写错的配置在解析失败时 servers 也是空的，
+    // 若先看 length===0 就会把"配置写错了"误报成"未启用"——那正是最该拦下的情况。
+    if (parsed.error !== null) {
+      add(
+        'mcp',
+        STATUS.FAIL,
+        `MCP 配置写错了：${parsed.error}`,
+        mcpPath,
+        '按 config/mcp-servers.yml 顶部的模板改：每个 server 必填 name 与 command',
+      );
+    } else if (parsed.servers.length === 0) {
+      add('mcp', STATUS.SKIP, '未启用', `${mcpPath} 里没有声明任何 server（servers: []）`);
+    } else {
+      // 逐个核对：command 能否解析到 + args 里的脚本路径是否存在
+      const bad = [];
+      for (const s of parsed.servers) {
+        const cmd = resolveCommand(s.command, { env, repoRoot });
+        if (cmd === null) {
+          bad.push({ server: s.name, why: `command 找不到：${s.command}` });
+          continue;
+        }
+        const missingArg = s.args.find((a) => looksLikePath(a) && !existsSync(resolve(repoRoot, a)));
+        if (missingArg !== undefined) {
+          bad.push({ server: s.name, why: `args 里的文件不存在：${missingArg}` });
+        }
+      }
+      if (bad.length === 0) {
+        add(
+          'mcp',
+          STATUS.WARN,
+          `已声明 ${parsed.servers.length} 个 MCP server`,
+          `${parsed.servers.map((s) => s.name).join(', ')}——**每次调用都会走 dangerous 档人工审批**，` +
+            'server 是宿主上运行的任意程序，只声明你信任的',
+          '不需要时把 config/mcp-servers.yml 改回 servers: []',
+        );
+      } else {
+        add(
+          'mcp',
+          STATUS.FAIL,
+          `${bad.length} 个 MCP server 起不来`,
+          bad.map((b) => `${b.server}：${b.why}`).join('; '),
+          '改 config/mcp-servers.yml 的 command/args（用绝对路径或确保在 PATH 里），然后重跑 npm run doctor',
+        );
+      }
+    }
+  }
+
   return results;
+}
+
+/**
+ * 极简解析 mcp-servers.yml（与 src/exec/mcp-config.ts 同口径的**只读**版本）。
+ *
+ * 为什么不 import 那个 TS 模块：doctor 是 `.mjs`，跑在**没有 tsx 的裸 node** 下
+ * （这正是它存在的意义——装不起来的时候也能诊断）。所以这里独立实现一份最小的，
+ * 只取 doctor 需要的 name/command/args；解析失败不抛，改为回报 error 字符串。
+ *
+ * @returns {{servers: Array<{name:string,command:string,args:string[]}>, error: string|null}}
+ */
+export function parseMcpServers(text) {
+  const servers = [];
+  let cur = null;
+  const clean = (raw) => {
+    let v = String(raw).trim();
+    if (!(v.startsWith('"') || v.startsWith("'"))) {
+      const hash = v.indexOf(' #');
+      if (hash >= 0) v = v.slice(0, hash).trim();
+    }
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    return v;
+  };
+  const inlineList = (raw) => {
+    const v = clean(raw);
+    if (!v.startsWith('[') || !v.endsWith(']')) return [];
+    const inner = v.slice(1, -1).trim();
+    return inner.length === 0 ? [] : inner.split(',').map(clean).filter((x) => x.length > 0);
+  };
+  const flush = () => {
+    if (cur === null) return;
+    if (cur.name.length === 0) throw new Error('某个 server 缺 name');
+    if (cur.command.length === 0) throw new Error(`server ${cur.name} 缺 command`);
+    servers.push(cur);
+    cur = null;
+  };
+  try {
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.replace(/\t/g, '  ');
+      const trimmed = line.trim();
+      if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
+      const indent = line.length - line.trimStart().length;
+      if (indent === 0) continue; // 顶层键（servers:）
+      if (trimmed.startsWith('- ')) {
+        flush();
+        cur = { name: '', command: '', args: [] };
+        applyMcpField(cur, trimmed.slice(2).trim(), clean, inlineList);
+        continue;
+      }
+      if (cur === null) continue;
+      applyMcpField(cur, trimmed, clean, inlineList);
+    }
+    flush();
+    return { servers, error: null };
+  } catch (e) {
+    return { servers: [], error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+function applyMcpField(spec, line, clean, inlineList) {
+  const colon = line.indexOf(':');
+  if (colon <= 0) return;
+  const key = line.slice(0, colon).trim();
+  const val = line.slice(colon + 1).trim();
+  if (key === 'name') spec.name = clean(val);
+  else if (key === 'command') spec.command = clean(val);
+  else if (key === 'args') spec.args = inlineList(val);
+  // 其余（timeout_ms / allow_tools / env）doctor 不需要，忽略
+}
+
+/** args 里一项看起来像文件路径吗？（含分隔符或 .mjs/.js/.py 扩展名） */
+function looksLikePath(arg) {
+  return /[\\/]/.test(arg) || /\.(mjs|cjs|js|ts|py|sh)$/i.test(arg);
+}
+
+/**
+ * 解析 command 到绝对路径；找不到返回 null。
+ *
+ * 与 spawn 的语义对齐：带路径分隔符的按路径查（相对路径按 repoRoot 解析），
+ * 否则在 PATH 里找（Windows 还要试 .exe/.cmd/.bat——npm 全局装的命令常是 .cmd）。
+ */
+export function resolveCommand(command, { env, repoRoot }) {
+  const exts =
+    process.platform === 'win32'
+      ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter((x) => x.length > 0)
+      : [''];
+  const hasSep = /[\\/]/.test(command);
+  if (hasSep) {
+    const abs = isAbsolute(command) ? command : resolve(repoRoot, command);
+    if (existsSync(abs)) return abs;
+    // 无扩展名时按 PATHEXT 再试一遍（Windows）
+    for (const ext of exts) if (existsSync(abs + ext)) return abs + ext;
+    return null;
+  }
+  const pathVar = env.PATH ?? env.Path ?? '';
+  for (const dir of pathVar.split(delimiter).filter((d) => d.length > 0)) {
+    const base = join(dir, command);
+    if (existsSync(base)) return base;
+    for (const ext of exts) if (existsSync(base + ext)) return base + ext;
+  }
+  // 兜底：本进程的 node（node 通常总在 PATH 里，但 doctor 可能跑在裁剪过的环境里）
+  if (command === 'node' && existsSync(process.execPath)) return process.execPath;
+  return null;
 }
 
 /** 从 db/migrations 的 NNN_ 前缀算期望 user_version；目录缺失返回 null。 */

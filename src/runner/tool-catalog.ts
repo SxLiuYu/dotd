@@ -373,7 +373,7 @@ export const NET_SEARCH_GUIDE = `联网查资料的判据（没有内置搜索�
  * 工具清单里发给模型的整体引导段（放在 system prompt 之后、工具定义之前使用，
  * 也可直接拼进 system prompt）。讲清 11 个工具的分工与通用约束。
  */
-export const TOOLS_GUIDE = `可用工具共 11 个，按"先便宜后昂贵"选：
+export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额外接了自己的工具，见各自说明）：
 1. 看盘：fs.list（目录）→ fs.stat（在不在/多大）→ fs.read（读文本）。这是绝大多数任务的第一步。
 2. 写盘：fs.write（覆盖整篇，改文件前必须先 fs.read 出原文再整篇写回）。任务收尾写记忆用它。
 3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。

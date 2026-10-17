@@ -886,6 +886,11 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       // 多加一轮模型调用）；这里显式打开，才让"任务 done 但没写记忆"时真的再问一轮。
       // 关掉它 = 回到老行为：sealTask 记 missed，但不会再提醒（也就不会补写）。
       memoryRedo: true,
+      // P2-2 显式计划：**与 memoryRedo 相反——默认关闭**，由 `DOTD_PLAN=on` 显式开启。
+      // 打开后每个任务多一次模型调用（写一份 3–7 条的计划），之后每轮把它作为一条
+      // system 注记带上（抗跑偏 + 可在 `dotd task --verbose` 看到）。
+      // 关着 = 请求体与改动前逐字一致（静态守卫见 tests/runner-plan.test.ts）。
+      plan: process.env.DOTD_PLAN === 'on',
     },
   );
 

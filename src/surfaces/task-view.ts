@@ -17,6 +17,7 @@
  */
 
 import type { Step, Task } from '../shared/contracts.ts';
+import type { Plan } from '../runner/plan.ts';
 
 /** `model_call_log` 里与本任务 LLM 步相关的行（只取投影需要的列）。 */
 export interface CallLogRow {
@@ -95,6 +96,24 @@ export interface TaskView {
     /** 失败/中断的步。 */
     failed: Array<{ seq: number; kind: 'llm' | 'tool'; toolName: string | null; error: string | null }>;
   };
+  /**
+   * P2-2 「它打算怎么干」：当前计划 + 计划 vs 实际的对照。
+   * null = 该任务没有计划（功能关闭，或模型没写出可解析的计划）。
+   */
+  plan: PlanView | null;
+}
+
+/** 计划条目的对照视图（状态来自计划自身的标记，不是 Runner 的推断）。 */
+export interface PlanView {
+  version: number;
+  /** 修订过几次（版本号 - 1；0 = 首版未改）。 */
+  revisions: number;
+  items: Array<{ index: number; text: string; status: string; statusLabel: string }>;
+  /** 计划里标了已完成 / 总数 —— 主人最关心的那一行数字。 */
+  completed: number;
+  total: number;
+  /** 最近一次修订的原因（首版为空串）。 */
+  revisionReason: string;
 }
 
 /** 输入投影的三份事实（全部来自已有属主投影）。 */
@@ -105,7 +124,37 @@ export interface TaskViewInput {
   callLogs: CallLogRow[];
   /** 当前时间（毫秒），用于"在途步已耗时"。 */
   now: number;
+  /**
+   * P2-2 计划（可选）：调用方从 thread 消息里用 `plansFromMessages()` 取出当前计划后传进来。
+   * 缺省/undefined = 该任务没有计划（功能关闭时永远是这个值）。
+   */
+  plan?: Plan | null;
 }
+
+/** 把计划投影成"主人能看懂"的对照视图（纯函数）。 */
+export function buildPlanView(plan: Plan): PlanView {
+  return {
+    version: plan.version,
+    revisions: Math.max(0, plan.version - 1),
+    items: plan.items.map((it) => ({
+      index: it.index,
+      text: it.text,
+      status: it.status,
+      statusLabel: PLAN_STATUS_LABEL[it.status] ?? it.status,
+    })),
+    completed: plan.items.filter((i) => i.status === 'done').length,
+    total: plan.items.length,
+    revisionReason: plan.revisionReason,
+  };
+}
+
+/** 计划状态 → 中文（与 plan.ts 的渲染口径保持一致）。 */
+const PLAN_STATUS_LABEL: Record<string, string> = {
+  todo: '未开始',
+  doing: '进行中',
+  done: '已完成',
+  dropped: '已放弃',
+};
 
 /** 从工具步的 result_json 里抽错误摘要（不打印整段结果，避免把上下文撑爆）。 */
 export function summarizeStepError(resultJson: string | null): string | null {
@@ -126,8 +175,7 @@ export function summarizeStepError(resultJson: string | null): string | null {
  * 把三份事实投影成 `TaskView`（纯函数；不读库、不看时钟）。
  */
 export function buildTaskView(input: TaskViewInput): TaskView {
-  const { task, steps, callLogs, now } = input;
-  const byAttempt = new Map<string, CallLogRow[]>();
+  const { task, steps, callLogs, now } = input;  const byAttempt = new Map<string, CallLogRow[]>();
   for (const row of callLogs) {
     const list = byAttempt.get(row.attemptId) ?? [];
     list.push(row);
@@ -250,6 +298,7 @@ export function buildTaskView(input: TaskViewInput): TaskView {
       open,
       failed,
     },
+    plan: input.plan !== undefined && input.plan !== null ? buildPlanView(input.plan) : null,
   };
 }
 
@@ -322,5 +371,17 @@ export function renderTaskView(v: TaskView): string {
       lines.push(`  ${String(s.seq).padStart(2)}. ${what.padEnd(14)} ${humanMs(s.durationMs).padStart(7)}${ongoing}  ${s.status}${cost}${err}`);
     }
   }
+  // ④ 它打算怎么干（P2-2）：计划 + 计划 vs 实际
+  if (v.plan !== null) {
+    const p = v.plan;
+    lines.push('');
+    lines.push(
+      `它打算怎么干（第 ${p.version} 版${p.revisions > 0 ? `，改过 ${p.revisions} 次` : ''}）：` +
+        `已完成 ${p.completed}/${p.total} 条`,
+    );
+    for (const it of p.items) lines.push(`  ${it.index}. ${it.statusLabel.padEnd(4)} ${it.text}`);
+    if (p.revisionReason.length > 0) lines.push(`  最近一次调整：${p.revisionReason}`);
+  }
+
   return lines.join('\n');
 }

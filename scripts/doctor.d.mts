@@ -64,6 +64,35 @@ export interface Tier1Endpoint {
   primaryModel: string | null;
 }
 export function parseTier1Endpoint(text: string): Tier1Endpoint[];
+
+/** P2-1：mcp-servers.yml 的最小只读解析结果（doctor 只需要 name/command/args）。 */
+export interface McpServerSummary {
+  name: string;
+  command: string;
+  args: string[];
+}
+
+/**
+ * 解析 mcp-servers.yml（与 `src/exec/mcp-config.ts` 同口径的只读子集）。
+ *
+ * 解析失败**不抛**，改为 `error` 带回原因（doctor 要能把"配置写错了"报成人话）。
+ */
+export function parseMcpServers(text: string): {
+  servers: McpServerSummary[];
+  error: string | null;
+};
+
+/**
+ * 把 `command` 解析成绝对路径；找不到返回 null。
+ *
+ * 与 spawn 的语义对齐：含分隔符的按路径（相对路径以 repoRoot 为基准），
+ * 否则查 PATH（Windows 还要试 PATHEXT 里的 .exe/.cmd/.bat）。
+ */
+export function resolveCommand(
+  command: string,
+  ctx: { env: Record<string, string | undefined>; repoRoot: string },
+): string | null;
+
 export function expandWithDefault(
   value: string,
   env: Record<string, string | undefined>,

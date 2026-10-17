@@ -52,6 +52,7 @@ import { handleFeishuCallback, maybeDecryptFeishuBody } from './feishu-inbound.t
 import { SseBus, parseStreamQuery } from './sse.ts';
 import { createHeartbeatAdmin } from './heartbeat-tick.ts';
 import { buildTaskView, type CallLogRow } from './task-view.ts';
+import { PLAN_MARKER, plansFromMessages } from '../runner/plan.ts';
 import { serveStatic } from './web.ts';
 import { resolve } from 'node:path';
 
@@ -744,7 +745,32 @@ export function createHttpServer(deps: HttpDeps): Server {
           steps,
         };
         if (url.searchParams.get('verbose') === '1' || url.searchParams.get('verbose') === 'true') {
-          json(res, 200, { ...base, view: buildTaskView({ task, steps, callLogs, now: now().getTime() }) });
+          // P2-2：带上"它打算怎么干"。计划存成该任务在 thread 里的 system 消息
+          // （kind='text' + PLAN_MARKER，见 src/runner/plan.ts 文件头的选型理由），
+          // 这里只读不写：取该任务最后一条计划即当前版本。
+          const planMessages = deps.db
+            .prepare(
+              `SELECT role, kind, content FROM mem_messages
+                WHERE task_id=? AND role='system' AND kind='text' AND content LIKE ?
+                ORDER BY seq ASC`,
+            )
+            .all(id, `${PLAN_MARKER}%`) as Array<{ role: string; kind: string; content: string }>;
+          const plan = plansFromMessages(
+            planMessages.map((m, i) => ({
+              id: `plan:${i}`,
+              threadId: '',
+              seq: i,
+              role: m.role as 'system',
+              kind: m.kind as 'text',
+              content: m.content,
+              tokenEst: 0,
+              createdAt: 0,
+            })),
+          ).current;
+          json(res, 200, {
+            ...base,
+            view: buildTaskView({ task, steps, callLogs, now: now().getTime(), plan }),
+          });
           return;
         }
         json(res, 200, base);

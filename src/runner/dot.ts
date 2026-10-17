@@ -64,6 +64,16 @@ import { AllEndpointsDownError, DotdError, NoQualifiedPrimaryError, StepLimitErr
 import { newNonJournalAttemptId } from '../shared/ids.ts';
 import { composeSystemPrompt } from './system-prompt.ts';
 import { buildToolSpecs } from './tool-catalog.ts';
+import {
+  PLAN_MARKER_HINT,
+  PLAN_REQUEST_TEXT,
+  formatPlanForPrompt,
+  parsePlan,
+  plansFromMessages,
+  samePlan,
+  serializePlan,
+  type Plan,
+} from './plan.ts';
 
 // ── 1. 依赖面 ────────────────────────────────────────────────────────────
 
@@ -132,6 +142,23 @@ export interface RunnerOptions {
    * 关着 = 老行为：sealTask 记 missed，但不会再提醒（也就不会补写）。
    */
   memoryRedo?: boolean;
+  /**
+   * P2-2 显式计划开关。
+   *
+   * **默认 false = 与既有行为逐字一致**（不多花模型调用、请求体一条字节都不多）。
+   * 生产语义由装配层显式打开：`DOTD_PLAN=on`（见 `src/daemon.ts`），并有静态守卫
+   * （tests/runner-plan.test.ts）防止默认值被悄悄改成开。
+   *
+   * 打开后只做一件事：任务开始时多问模型一轮，产出一份 3–7 条的短计划；之后每轮把它
+   * 作为一条 system 注记带上。**计划不驱动执行**（不是固定 DAG，见 `plan.ts` 文件头）。
+   */
+  plan?: boolean;
+  /**
+   * 计划每多少轮刷新一次（让模型有机会修订）。默认 0 = 只在任务开始时写一次，
+   * 执行中靠模型自己在回复里给出新版本来修订（推荐：零额外调用）。
+   * >0 时每 N 轮追加一次"要改计划就现在改"的提示（仍由模型决定改不改）。
+   */
+  planRefreshEvery?: number;
 }
 
 /**
@@ -326,6 +353,42 @@ class RunContext {
     return this.tokens;
   }
 
+  /**
+   * P2-2 当前计划（null = 没有计划 / 功能关闭）。
+   *
+   * **只作为上下文**：每轮请求以一条 system 注记带上它，绝不用来决定下一步调什么工具
+   * （计划不是控制流，见 `plan.ts` 文件头）。`setPlan` 由 Runner 在计划产出/修订时调用。
+   */
+  private planNote: string | null = null;
+  /** 计划占用的估算 token（供成本口径与"何时省略"判据使用）。 */
+  private planTokens = 0;
+
+  setPlan(text: string | null): void {
+    this.planNote = text !== null && text.length > 0 ? text : null;
+    this.planTokens = this.planNote === null ? 0 : Math.ceil(this.planNote.length / 3.5);
+  }
+
+  /** 当前计划文本（null = 无）。 */
+  get plan(): string | null {
+    return this.planNote;
+  }
+
+  /** 本任务已记录的计划修订历史（供"只有真变了才算修订"与复盘使用）。 */
+  private planVersions: Plan[] = [];
+
+  recordPlan(plan: Plan): void {
+    this.planVersions.push(plan);
+  }
+
+  planHistory(): Plan[] {
+    return [...this.planVersions];
+  }
+
+  /** 计划每轮额外占用的估算 token 数（0 = 功能关闭或无计划）。 */
+  get planTokenCost(): number {
+    return this.planTokens;
+  }
+
   /** CP §12 `ctx.done`。 */
   get done(): boolean {
     return this.doneFlag;
@@ -431,6 +494,21 @@ class RunContext {
         kind: 'text',
         content: joined,
         tokenEst: Math.ceil(joined.length / 3.5),
+        createdAt: 0,
+      });
+    }
+
+    // ②b P2-2 当前计划（关闭时 planNote 恒 null，本段一行不产出 → 请求体逐字不变）。
+    //     位置在"文件记忆之后、会话历史之前"：既要每轮都在，又不能盖过运行手册。
+    if (this.planNote !== null) {
+      out.push({
+        id: 'sys:plan',
+        threadId: '',
+        seq: 0,
+        role: 'system',
+        kind: 'text',
+        content: this.planNote,
+        tokenEst: this.planTokens,
         createdAt: 0,
       });
     }
@@ -542,6 +620,10 @@ export class DotRunner {
   private readonly streamFlushChars: number;
   /** P1-4：收口前"补写一轮"开关（RunnerOptions.memoryRedo，默认开）。 */
   private readonly memoryRedoEnabled: boolean;
+  /** P2-2：显式计划开关（RunnerOptions.plan，**默认关** —— 见 RunnerOptions 注释）。 */
+  private readonly planEnabled: boolean;
+  /** P2-2：每 N 轮提示模型"要不要修订计划"（0 = 不主动提示，只靠模型自发）。 */
+  private readonly planRefreshEvery: number;
 
   /** 工具 sideEffect 词表缓存（契约 J2：唯一事实源 = exec.getCapabilities）。 */
   private sideEffectOf = new Map<string, 'safe' | 'replayable' | 'unknown'>();
@@ -581,6 +663,8 @@ export class DotRunner {
     this.streamFlushMs = opts.streamFlushMs ?? STREAM_FLUSH_MS;
     this.streamFlushChars = opts.streamFlushChars ?? STREAM_FLUSH_CHARS;
     this.memoryRedoEnabled = opts.memoryRedo ?? false;
+    this.planEnabled = opts.plan ?? false;
+    this.planRefreshEvery = opts.planRefreshEvery ?? 0;
   }
 
   // ── 3.1 pop 循环（CP §12 `for await (const task of loop)`）──────────────
@@ -733,6 +817,23 @@ export class DotRunner {
     // 文件记忆快照缓存到 ctx（后续每步 LLM 请求复用同一份注入）
     this.cacheBundle(ctx, bundle);
 
+    // P2-2 显式计划：任务开始时（或从会话历史里恢复出旧计划）把它挂到 ctx 上。
+    //
+    // 三条纪律（见 plan.ts 文件头）：
+    //   1. **默认关闭** —— planEnabled=false 时本段一次都不进，请求体逐字不变；
+    //   2. **失败不阻塞** —— 模型没写出可解析的计划就静默跳过，主循环照常跑；
+    //   3. **不驱动执行** —— 计划只是每轮带上的 system 注记，Runner 从不据它调度。
+    if (this.planEnabled) {
+      const restored = plansFromMessages(replay).current;
+      if (restored !== null) {
+        // 续跑/重试：沿用上一代写下的计划（不重复问模型，省一次调用）
+        ctx.setPlan(formatPlanForPrompt(restored));
+        this.log(`runner: 沿用已有计划 ${session.id}（第 ${restored.version} 版，${restored.items.length} 条）`);
+      } else {
+        await this.seedPlan(session, ctx);
+      }
+    }
+
     // ⑨ 审批续跑：领到的任务带 resume_from_seq → 该 pending 步 pending→started（同 callId）
     if (session.resumeFromSeq !== null) {
       const resumed = await this.resumePendingStep(session, epoch, session.resumeFromSeq, ctx);
@@ -758,6 +859,10 @@ export class DotRunner {
       if (llm.kind === 'pause') return llm.out;
       if (llm.kind === 'abort') return llm.out;
 
+      // P2-2 计划修订：模型可以**在正文里**给出新版本计划（显式动作）。
+      // 修订只是"记下来 + 下一轮注入"，**绝不改本轮的工具调用**——计划不是控制流。
+      if (this.planEnabled) this.capturePlanRevision(session, ctx, llm.step.content);
+
       if (llm.step.toolCalls.length === 0) {
         ctx.feedLlm({ content: llm.step.content, toolCalls: [] }, llm.tokens);
         continue; // done=true → 退出 while
@@ -782,6 +887,89 @@ export class DotRunner {
 
     // ⑪ 任务终态：WRITE-SEAL → finish(ok:true)
     return this.finishTask(session, epoch, { ok: true, summary: ctx.summary });
+  }
+
+  // ── 3.2b P2-2 显式计划（可观测产物，不是控制流）─────────────────────────
+
+  /**
+   * 任务开始前问模型要一份计划。
+   *
+   * **怎么问**：单独发一次 `router.complete`（不带 tools），prompt = 运行手册 + 目标
+   * + `PLAN_REQUEST_TEXT`。为什么不复用主循环第一轮？因为那一轮的产出是"工具调用"，
+   * 让它在同一轮里既出计划又出工具调用会让计划变成"事后合理化"；单独问一次，
+   * 计划才是"动手前想清楚"。
+   *
+   * **失败怎么办**：解析不出、模型报错、超时 —— 一律**静默跳过**（记一条日志），
+   * 主循环照常跑。计划是增强项，不能成为新的失败点（memory.md §8 软线语义）。
+   *
+   * **成本**：一次额外调用（约 300 输出 token）。这就是它默认关闭的原因。
+   */
+  private async seedPlan(task: Task, ctx: RunContext): Promise<void> {
+    const systemPrompt = composeSystemPrompt();
+    const req: RouteRequest = {
+      track: 'primary',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `${task.goal}\n\n${PLAN_REQUEST_TEXT}` },
+      ],
+      attemptId: newNonJournalAttemptId(),
+      maxTokens: 512,
+    };
+    let text = '';
+    try {
+      const resp = await this.router.complete(req);
+      const chat = resp.response as { content?: string };
+      text = typeof chat.content === 'string' ? chat.content : '';
+    } catch (err) {
+      // 计划写不出来不是任务失败：记一笔，主循环照常（顶多失去抗跑偏这条增强）。
+      this.log(`runner: 生成计划失败 ${task.id}（${errText(err)}），本轮无计划继续`);
+      return;
+    }
+    const plan = parsePlan(text);
+    if (plan === null) {
+      this.log(`runner: 计划无法解析 ${task.id}，本轮无计划继续`);
+      return;
+    }
+    await this.savePlan(task, plan, ctx);
+  }
+
+  /** 把模型在**正文里**给出的新计划记下来（修订）；不是计划 JSON 就什么都不做。 */
+  private capturePlanRevision(task: Task, ctx: RunContext, content: string): void {
+    if (content.indexOf(PLAN_MARKER_HINT) === -1 && content.indexOf('"items"') === -1) return;
+    const parsed = parsePlan(content);
+    if (parsed === null) return;
+    // 只有"确实变了"才算一次修订：否则每轮正文里带一句 JSON 示例都会刷版本号。
+    const hist = ctx.planHistory();
+    const current = hist.length > 0 ? hist[hist.length - 1]! : null;
+    if (current !== null && samePlan(current, parsed)) return;
+    const next: Plan = {
+      version: current === null ? 1 : current.version + 1,
+      items: parsed.items,
+      revisionReason: parsed.revisionReason,
+    };
+    void this.savePlan(task, next, ctx);
+  }
+
+  /** 落库（追加一条 thread 消息）+ 挂到 ctx（下一轮起生效）。 */
+  private async savePlan(task: Task, plan: Plan, ctx: RunContext): Promise<void> {
+    ctx.recordPlan(plan);
+    ctx.setPlan(formatPlanForPrompt(plan));
+    const threadId = this.threadIdOf(task);
+    if (threadId === null) return;
+    try {
+      // role='system' + kind='text'：mem_messages.kind 的 CHECK 白名单写死在已发布迁移
+      // （040_memory.sql:26-28，契约 D2 不改已发布包），故用现成 kind，靠 PLAN_MARKER 区分。
+      // taskId 带上：主人的会话历史与 task --verbose 都能按任务找到它。
+      await this.memory.appendMessage(threadId, {
+        role: 'system',
+        kind: 'text',
+        content: serializePlan(plan),
+        taskId: task.id,
+      });
+    } catch (err) {
+      // 记忆问题不炸主循环；ctx 上的计划仍生效（本任务内可用）。
+      this.log(`runner: 计划落库失败 ${task.id}（${errText(err)}）`);
+    }
   }
 
   // ── 3.3 ⑥ LLM 步 ──────────────────────────────────────────────────────

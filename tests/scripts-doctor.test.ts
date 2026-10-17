@@ -181,6 +181,7 @@ test('体检项清单是契约：顺序与名字固定（删一项就会有测�
     'tier1-key',
     'db',
     'home-dir',
+    'mcp',
   ]);
 });
 
@@ -296,6 +297,193 @@ test('全部正常时退出码为 0，且报告里给得出结论', async () => 
     const text = formatReport(results);
     assert.ok(text.includes('结论：'), '人读模式下必须有结论行');
     assert.ok(results.every((r) => typeof r.title === 'string' && r.title.length > 0));
+  } finally {
+    s.cleanup();
+  }
+});
+
+// ── 3. P2-1 MCP：声明了但起不来要判 fail；没声明要判 skip（不制造噪音） ──────────
+
+/** 造一份只含 MCP 声明的临时配置，返回路径。 */
+function writeMcp(dir: string, body: string): string {
+  const p = join(dir, 'mcp-servers.yml');
+  writeFileSync(p, body, 'utf8');
+  return p;
+}
+
+test('MCP：未声明任何 server（仓库默认 servers: []）→ skip「未启用」，不是 warn/fail', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const env = { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', WB2API_KEY: 'k' };
+    // 用仓库里真实的那份（默认空）
+    const results = await runChecks({
+      env: { ...env, DOTD_MCP_CONFIG: join(repoRoot, 'config', 'mcp-servers.yml') },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.SKIP, '默认配置下 MCP 未启用 → skip（不制造噪音）');
+    assert.match(mcp.title, /未启用/);
+    assert.equal(mcp.next, null, 'skip 不该给"下一步"（没事可做）');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP：文件不存在 → skip「未启用」，不判失败', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const results = await runChecks({
+      env: {
+        DOTD_MASTER_TOKEN: 'm',
+        DOTD_RO_TOKEN: 'r',
+        HOOK_GRAFANA: 'h',
+        DOTD_MCP_CONFIG: join(s.home, 'no-such-mcp.yml'),
+      },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    assert.equal(byName(results, 'mcp').status, STATUS.SKIP);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP：声明了不存在的 command → **fail**，并给出可操作的修法', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const p = writeMcp(s.home, 'servers:\n  - name: ghost\n    command: no-such-command-xyz-123\n');
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', DOTD_MCP_CONFIG: p },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.FAIL, '声明了但 command 找不到 = 每次调用都会失败，必须拦住');
+    assert.match(mcp.title, /起不来/);
+    assert.match(mcp.detail, /ghost.*no-such-command-xyz-123/, '要点名是哪个 server、哪个 command');
+    assert.match(mcp.next ?? '', /command\/args/, '下一步要指向怎么改');
+    assert.equal(exitCodeFor(results), 1, 'fail 必须让退出码非零');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP：command 对但 args 里的脚本不存在 → fail', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const p = writeMcp(
+      s.home,
+      'servers:\n  - name: half\n    command: node\n    args: ["scripts/definitely-not-here.mjs"]\n',
+    );
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', DOTD_MCP_CONFIG: p },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.FAIL);
+    assert.match(mcp.detail, /definitely-not-here\.mjs/, '要点名缺的是哪个文件');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP：配置写错（缺 command）→ fail 并说明原因', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const p = writeMcp(s.home, 'servers:\n  - name: nocmd\n');
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', DOTD_MCP_CONFIG: p },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.FAIL);
+    assert.match(mcp.title, /配置写错/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP：声明正确（本仓库自带的 echo server）→ warn（可用但每次都要审批），不是 fail', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const p = writeMcp(
+      s.home,
+      'servers:\n  - name: echo\n    command: node\n    args: ["scripts/mcp-echo-server.mjs"]\n',
+    );
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', DOTD_MCP_CONFIG: p },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.WARN, '能用但要认真读：每次调用走 dangerous 审批');
+    assert.match(mcp.title, /1 个 MCP server/);
+    assert.match(mcp.detail, /dangerous/, '必须提醒最严档审批');
+    assert.match(mcp.next ?? '', /servers: \[\]/, '要给"怎么关掉"的下一步');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP resolveCommand：node 能解析到；明显不存在的命令返回 null；不打印任何密钥', async () => {
+  const { resolveCommand } = await import('../scripts/doctor.mjs');
+  assert.ok(resolveCommand('node', { env: process.env, repoRoot }) !== null, 'node 应能解析');
+  assert.equal(
+    resolveCommand('definitely-not-a-command-abc-987', { env: process.env, repoRoot }),
+    null,
+  );
+  // 带路径分隔符时按 repoRoot 解析
+  assert.ok(
+    resolveCommand('scripts/mcp-echo-server.mjs', { env: process.env, repoRoot }) !== null,
+    '相对仓库根的脚本路径应能解析',
+  );
+  assert.equal(resolveCommand('scripts/nope.mjs', { env: process.env, repoRoot }), null);
+});
+
+test('MCP parseMcpServers：与 src/exec/mcp-config.ts 同口径（空表/声明/写错）', async () => {
+  const { parseMcpServers } = await import('../scripts/doctor.mjs');
+  assert.deepEqual(parseMcpServers('servers: []\n'), { servers: [], error: null });
+  assert.deepEqual(parseMcpServers('# 只有注释\n'), { servers: [], error: null });
+  const ok = parseMcpServers(
+    'servers:\n  - name: echo\n    command: node\n    args: ["a.mjs", "b.mjs"]\n',
+  );
+  assert.equal(ok.error, null);
+  assert.deepEqual(ok.servers, [{ name: 'echo', command: 'node', args: ['a.mjs', 'b.mjs'] }]);
+  const bad = parseMcpServers('servers:\n  - name: x\n');
+  assert.equal(bad.error !== null, true, '缺 command 必须回报错误（不抛）');
+});
+
+test('MCP：doctor 不打印 MCP 配置里的敏感值（env 段一律不进 detail）', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const p = writeMcp(
+      s.home,
+      'servers:\n  - name: secretive\n    command: node\n    args: []\n    env:\n      API_KEY: sk-super-secret-value\n',
+    );
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', DOTD_MCP_CONFIG: p },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const text = formatReport(results);
+    assert.ok(!text.includes('sk-super-secret-value'), '绝不能把 server 的环境变量值打出来');
   } finally {
     s.cleanup();
   }

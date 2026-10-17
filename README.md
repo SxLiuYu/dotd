@@ -59,8 +59,8 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 类型检查 | `node node_modules/typescript/bin/tsc --noEmit -p .` | exit **0**，0 错误（约 9s） |
-| 测试套件 | `npm test`（并行 4） | `tests 1302 / pass 1302 / fail 0`，exit **0**（61 个 `.test.ts` 量级，128 suite） |
-| 测试套件（串行） | `npm run test:serial` | 同样 `1302/1302`、0 失败（约 5 分钟，排查并行问题时用） |
+| 测试套件 | `npm test`（并行 4） | `tests 1390 / pass 1390 / fail 0`，exit **0**（61 个 `.test.ts` 量级，128 suite） |
+| 测试套件（串行） | `npm run test:serial` | 同样 `1390/1390`、0 失败（约 5 分钟，排查并行问题时用） |
 | 端到端冒烟 | `node scripts/smoke.mjs` | **11/11 通过**，exit **0** |
 | 冒烟（真 HTTP 模型链路） | `DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` | **16/16 通过**，exit **0**（daemon → ModelRouter → 真 HttpTransport → 真 TCP → 假上游） |
 | 上线前体检 | `npm run doctor` | 10 项检查，每项给「结论 + 下一步命令」；本机当前 2 项 fail（缺 `WB2API_KEY`、严格占位符未展开） |
@@ -189,16 +189,26 @@ npm run init-config      # scripts/init-config.mjs：生成 config.yml + 补齐 
 
 ## 快速开始
 
-### 60 秒版：起 daemon，让它自己跑完一条任务
-
-四条命令，全部存在于仓库，没有一条是编的。这一步用 stub 模型和 stub fleet，**零网络请求、不起容器**，但 daemon、队列、journal、审批、HTTP/CLI 全是真的：
+### 三条命令装完：`npm run setup`
 
 ```bash
-node --version                        # 必须 >= 24
-npm run init-config                   # 生成 ~/.dotd/tokens.env + ~/.dotd/config.yml（幂等）
-source ~/.dotd/tokens.env             # PowerShell 用户见脚本输出的提示
-DOTD_MODEL_TRANSPORT=stub DOTD_FLEET=stub npm run serve
+node --version          # ① 唯一必须人做的前置：Node ≥ 24
+npm run setup           # ② 检测 + 自动做能做的 + 最后跑 doctor（幂等，可反复跑）
+npm run serve           # ③ 起来（stub 模型 + stub fleet：零网络、不起容器）
 ```
+
+`setup` 做的事：检查 Node → 装依赖（`npm install`）→ 建 `~/.dotd` → 调 `init-config`
+生成 `config.yml`/`tokens.env`（**已有内容一律不覆盖**）→ 探测 WSL/docker/镜像/relay →
+**自动跑一遍 `doctor`** 并把结论打出来。已满足的步骤标 `⏭️ 跳过` 并说明原因；
+需要你动手的标 `👉` 并给出下一条命令。跑两次结果一致（实测 `config.yml`/`tokens.env` 的 SHA256 与 mtime 均不变）。
+
+它**不会**替你做的事（都只报告命令）：装 Node、`docker pull` 2GB 基座镜像、
+覆盖已有 token、改你的 `config.yml`。用 `--fleet=docker` 声明"要真容器"，用 `--check` 只体检不动作。
+
+> **为什么只要 3 条**（必答题①的结论）：原 12 步里真正必须人做的只有**装 Node、给模型 key、声明要哪种 fleet**。
+> 其余 9 步都可检测/幂等：`npm install`、`init-config`、WSL 侧准备、镜像构建
+> （`src/exec/image.ts:ensureImage()` 在 boot 时缺镜像自动构建，**根本不需要单独一步**）、
+> relay 转发（只有 WSL 部署需要）。详见下面「安装流程：12 步 → 3 步」。
 
 daemon 起来后另开一个 shell，你就能看到它"自己干活"：
 
@@ -316,19 +326,65 @@ tier1 端点连不上、**tier1 的 key 不在环境里**（这是"daemon 正常
 
 ### 6. WSL 真容器路径（可选）
 
+**先按上面的三条命令装完**，再在 WSL 里补真容器需要的两步：
+
 ```bash
-# 在 WSL Ubuntu-24.04 里：
-bash scripts/wsl-pull-image.sh     # docker pull mcr.microsoft.com/playwright:v1.49.1-noble
-bash scripts/wsl-install-node24.sh
-bash scripts/wsl-fleet-prep.sh     # rsync 仓库到 ~/dotd + npm install
-# 然后用生产代码路径构建镜像、真容器 boot + fsOps 写文件 + docker exec 读回验证：
-npx tsx scripts/wsl-build-image.mts
-npx tsx scripts/wsl-fleet-boot.mts
+# 在 WSL Ubuntu-24.04 里（setup 已检测过 WSL 里有没有 Node 24）：
+bash scripts/wsl-install-node24.sh   # ① 仅当 setup 报 WSL 内 Node < 24
+bash scripts/wsl-fleet-prep.sh       # ② rsync 仓库到 ~/dotd + npm install
+# 然后用生产代码路径验证真容器（可选，用于自检）：
+npx tsx scripts/wsl-fleet-boot.mts   # 真容器 boot + fsOps 写文件 + docker exec 读回
 ```
 
-WSL 部署时，Windows 侧的 loopback 模型服务需要 `scripts/win-relay.mts` 转发（WSL2 NAT 下，WSL 里的 127.0.0.1 是独立命名空间，够不着 Windows 的 loopback），启动器 `scripts/start-relay.ps1`。该脚本目前只转两条：`:13065`→`127.0.0.1:3065`、`:18001`→`127.0.0.1:8001`（`scripts/win-relay.mts:3-4,69-70`）。**注意 tier1 的现役端口没被转发**：`:3065` 那一端的 Agent2API 代理已停用，tier1 现行代理是 `:7863` 的 workbuddy2api（`config/models.yml:19-21`），而 `scripts/` 里没有任何 `7863` 的转发规则（`grep -rn "7863" scripts/` 零命中）。在 WSL 里跑 primary 轨之前，需要自己给 `win-relay.mts` 补一条（如 `listen(13066, 7863)`）并把 `config/models.yml` 里 tier1 的 `base_url` 改成转发后的地址。原生 Windows 部署不需要（daemon 与模型服务同在 Windows loopback）。
+**不需要单独「构建镜像」一步**：`src/exec/image.ts:ensureImage()` 在 daemon boot 时发现镜像缺失就会自动构建（`fleet.ts:387-392` 的 boot 序列：ping → **ensureImage** → ensureNetwork → netguard → reconcile）。`scripts/wsl-build-image.mts` 只是"想单独预热/预检镜像"时的便捷脚本，不是安装必经步骤。
+
+只有一件事需要你自己确认：**2GB 基座镜像要不要预拉**。`docker build` 时也会自动拉，但如果你想先把这 2GB 下完再起 daemon，跑一次 `bash scripts/wsl-pull-image.sh`（`setup` 只报告这条命令，不会替你拉）。
+
+WSL 部署时，Windows 侧的 loopback 模型服务需要 `scripts/win-relay.mts` 转发（WSL2 NAT 下，WSL 里的 127.0.0.1 是独立命名空间，够不着 Windows 的 loopback），启动器 `scripts/start-relay.ps1`。该脚本目前只转两条：`:13065`→`127.0.0.1:3065`、`:18001`→`127.0.0.1:8001`（`scripts/win-relay.mts:3-4,69-70`）。**注意 tier1 的现役端口没被转发**：`:3065` 那一端的 Agent2API 代理已停用，tier1 现行代理是 `:7863` 的 workbuddy2api（`config/models.yml:19-21`），而 `scripts/` 里没有任何 `7863` 的转发规则。在 WSL 里跑 primary 轨之前，需要自己给 `win-relay.mts` 的 `rules` 数组补一条 `{ listenPort: 13066, targetPort: 7863 }` 并把 `config/models.yml` 里 tier1 的 `base_url` 改成转发后的地址（`setup` 会检测并提示这条缺口——转发哪个端口取决于你的模型服务，脚本猜不出来，所以它只报告不代劳）。原生 Windows 部署不需要 relay。
 
 ---
+
+## 安装流程：12 步 → 3 步
+
+| # | 旧流程的 12 步 | 现在 | 为什么能省 |
+|---|---|---|---|
+| 1 | 装 Node ≥ 24 | **人来（①）** | 系统级前置，装它会改变整台机器运行时 |
+| 2 | `npm install` | `setup` 自动 | 检测 `node_modules` 与 lock 新鲜度 |
+| 3 | `init-config` | `setup` 自动 | 幂等；已存在则跳过 |
+| 4 | `source tokens.env` | `setup` 自动注入 doctor | doctor 检查的是进程环境，setup 会把 tokens.env 喂给它，避免"装好了却报缺 key"的假警报 |
+| 5 | 装 WSL | 人来（可选） | 只有要真容器才需要；原生 Windows 用 stub 即完整体验 |
+| 6 | 拉 2GB 基座镜像 | **人来（可选）** | 昂贵动作，`setup` 只给命令 |
+| 7 | rsync 仓库进 WSL | 半自动 | `wsl-fleet-prep.sh`（`setup` 检测 WSL 内 Node） |
+| 8 | WSL 里 `npm install` | 同上 | 并入第 7 步那条脚本 |
+| 9 | **构建 exec 镜像** | **删掉这一步** | `ensureImage()` 在 boot 时自动构建，原本就是重复劳动 |
+| 10 | 补 relay 转发（`:7863`） | 人来（仅 WSL） | 转发哪个端口取决于你的模型服务，无法猜 |
+| 11 | 给模型 key | **人来（②）** | 只有主人有 key；脚本只检查、不生成、不打印 |
+| 12 | 确认 fleet 模式 | **人来（③）** | 这是"意图声明"（要不要真容器），不是检测得出来的东西 |
+
+**两类用户各自的 3 步**：
+
+- **原生 Windows（stub 模式，完整体验 daemon/队列/审批/CLI，只是模型与执行是假的）**
+  1. `node --version`（≥ 24）
+  2. `npm run setup`
+  3. `npm run serve`
+- **WSL（真容器）**
+  1. `node --version` + `npm run setup`（Windows 侧；会检测 WSL 与 docker）
+  2. 在 WSL 里 `bash scripts/wsl-install-node24.sh && bash scripts/wsl-fleet-prep.sh`
+  3. Windows 侧填模型 key 进 `~/.dotd/tokens.env`，然后 `DOTD_FLEET=docker npm run serve`
+
+### `setup` 与 `doctor` 的关系（必答题②）
+
+**`doctor` 是唯一真相源，`setup` 是"把能自动做的做掉，然后调 doctor"。**
+
+- 检查逻辑只写一份：`setup` 不复制 doctor 的 11 项诊断，而是 `import { runChecks, formatReport, exitCodeFor }`（`scripts/doctor.mjs` 早已导出这几个函数）。
+- **退出码服从 doctor**：`setup` 自己出错 = 2；doctor 有 fail = 1；否则 0。所以 `npm run setup` 可以直接当 CI 门禁用。
+- 两者的分工：`setup` 回答"**装到哪一步了、下一步敲什么**"（有副作用，幂等）；`doctor` 回答"**现在这份配置起 daemon 会不会出问题**"（纯只读）。
+- 平时排障只需 `npm run doctor`；换机器/首次部署才需要 `npm run setup`。
+
+---
+
+## 出网工具（`net.get` / `net.post`）：默认关闭
+
 
 ## 出网工具（`net.get` / `net.post`）：默认关闭
 

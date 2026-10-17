@@ -19,7 +19,9 @@
     "test": "node --import tsx --test --test-concurrency=4 tests/*.test.ts",
     "test:serial": "node --import tsx --test --test-concurrency=1 tests/*.test.ts",
     "test:fast": "node --import tsx --test --test-concurrency=4 tests/*.test.ts",
-    "build:web": "npm --prefix web-ui run build"
+    "build:web": "npm --prefix web-ui run build",
+    "setup": "node scripts/setup.mjs",
+    "setup:check": "node scripts/setup.mjs --check"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.76.0",
