@@ -756,6 +756,21 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   for (const f of recovery.inFlightFailed) {
     log(`[recovery] 在途对账失败 task=${f.taskId}（已兜底回 queued）：${f.error}`);
   }
+  // 副作用未知的孤儿步已降级为「等主人审批」——必须在启动时就喊出来，
+  // 否则主人只会看到一条莫名卡住的任务（审批单本身经 approval:created → SSE 可见，
+  // 也可 GET /api/approvals?state=pending 拉取）。
+  if (recovery.inFlightDeferred.length > 0) {
+    log(
+      `[recovery] ${recovery.inFlightDeferred.length} 个孤儿步副作用未知，已转审批等确认：` +
+        recovery.inFlightDeferred
+          .map((d) => `${d.tool}(task=${d.taskId}#${d.seq} approval=${d.approvalId ?? '无单'})`)
+          .join(', '),
+    );
+    appendOutbox(
+      cfg.dataDir,
+      `启动恢复：${recovery.inFlightDeferred.length} 个孤儿步副作用未知，已转审批（见 GET /api/approvals?state=pending）`,
+    );
+  }
 
   // ⑩b CP §7.1 步骤 7：scheduler.start（registerInternalJob 全部就位后起 tick）。
   //     recoverOnStartup 只做恢复动作、不起定时器（recovery.ts:170-203），起 tick

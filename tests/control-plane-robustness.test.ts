@@ -320,6 +320,46 @@ test.describe('A 崩溃恢复对账：unknown 副作用不得重复执行', () =
     assert.equal(stepRowOf(f, taskId, 1).approval_id, 21);
   });
 
+  // 可观测性补强（2026-10-17）：A 修复把 unknown 步从"可重放"改成"必须审批"，
+  // 若启动侧只把 outcome 塞进 openStepsResolved 字符串里，主人无从得知
+  // "有几个东西在等我批"。RecoveryReport.inFlightDeferred 是显式事实，daemon 据此打日志。
+  test('A10b 可观测：deferred 孤儿步进 inFlightDeferred（带 taskId/seq/tool/approvalId）', async () => {
+    const f = makeFixture({ exec: execReporting('aborted') });
+    f.withGovernance({ approvalId: 21 });
+    const { taskId, epoch } = f.makeRunning();
+    f.journal.beginTool(taskId, epoch, 'shell.run', { cmd: 'rm -rf /dot/home' }, 'unknown');
+
+    const report = await recoverOnStartup(recoveryDepsOf(f), f.scheduler);
+
+    assert.deepEqual(report.inFlightDeferred, [
+      { taskId, seq: 1, tool: 'shell.run', approvalId: 21 },
+    ]);
+  });
+
+  test('A10c 可观测：治理不可用（无审批单）时仍记 inFlightDeferred 且 approvalId=null', async () => {
+    const f = makeFixture({ exec: execReporting('aborted') });
+    f.withGovernance(new Error('治理未就绪'));
+    const { taskId, epoch } = f.makeRunning();
+    f.journal.beginTool(taskId, epoch, 'shell.run', { cmd: 'rm -rf x' }, 'unknown');
+
+    const report = await recoverOnStartup(recoveryDepsOf(f), f.scheduler);
+
+    assert.deepEqual(report.inFlightDeferred, [
+      { taskId, seq: 1, tool: 'shell.run', approvalId: null },
+    ]);
+  });
+
+  test('A10d 可观测：safe 步走重放时不进 inFlightDeferred（不制造假审批告警）', async () => {
+    const f = makeFixture();
+    const { taskId, epoch } = f.makeRunning();
+    f.journal.beginTool(taskId, epoch, 'fs.read', { path: '/a' }, 'safe');
+
+    const report = await recoverOnStartup(recoveryDepsOf(f), f.scheduler);
+
+    assert.deepEqual(report.inFlightDeferred, []);
+    assert.deepEqual(report.openStepsResolved, [{ taskId, seq: 1, outcome: 'replayed' }]);
+  });
+
   // 混合：同一条任务上 safe 与 unknown 两种孤儿步各自走对分支
   test('A11 混合：safe 孤儿重放、unknown 孤儿 deferred（同一任务两次对账互不影响）', async () => {
     const f = makeFixture({ exec: execReporting('aborted') });

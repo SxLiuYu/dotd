@@ -1,0 +1,377 @@
+/**
+ * src/runner/tool-catalog.ts —— Runner 私有的「给模型看的工具说明书」。
+ *
+ * 定位（CONVENTIONS.md §4 模块边界表）：Runner = `src/runner/`；本文件只被
+ * `dot.ts` 的 `toolSpecs()` 消费，**不对外导出契约、不进 shared/exec/agent-runtime**。
+ *
+ * 为什么要有它：契约层（`src/exec/protocol.ts` 的 CAPABILITY_CATALOG）给的是
+ * JSON Schema，模型从 schema 只能看出「有 path 这个字段」，看不出「什么时候该用它、
+ * 路径怎么写、失败长什么样」。schema 是给校验器看的，description 是给模型看的——
+ * 两者职责不同，故分开维护，schema 仍逐字透传 CAPABILITY_CATALOG（不在此处复制）。
+ *
+ * 内容口径（**每一条都必须能在仓库里找到出处，禁止编造**）：
+ * - 参数名/必填：以 `/capabilities` 真实返回的 `args_schema.properties/required` 为准；
+ *   宿主（`src/exec/protocol.ts`）与容器（`agent-runtime/protocol.ts`）两份目录
+ *   有差异，`toolDescriptionFor()` 会自动剔除当前 schema 里不存在的参数行——
+ *   宁可不提，也不教模型填一个会被 `additionalProperties:false` 拒掉的字段。
+ * - 成功/失败形状：`agent-runtime/fs.ts`、`shell.ts`、`server.ts`（真容器）与
+ *   `src/exec/stub-runtime.ts`（stub 容器）两套实现的**交集**。
+ * - 错误码：`agent-runtime/protocol.ts` 的 ERROR_CODES + stub 侧同码名。
+ *
+ * 单测：`tests/runner-tool-catalog.test.ts`（11 个工具全覆盖、参数名防编造、
+ * 不含模板串、长度上限、system prompt 进 messages[0]）。
+ */
+
+import type { Capability } from '../shared/contracts.ts';
+
+/** 一个工具在 prompt 里的完整说明书。 */
+export interface ToolDoc {
+  /** 工具名（= 契约词表 11 名之一）。 */
+  name: string;
+  /**
+   * 工具描述（ToolSpec.description）。写法：一句"干什么"，再"何时用/何时别用"、
+   * "典型调用"、"限制"。不写"这是 X 工具"这类废话。
+   */
+  description: string;
+  /**
+   * 参数逐条说明（参数名 → 一行说明）。**只写真实存在的问题**：
+   * 渲染时会与当前 schema 求交，schema 里没有的键一律丢弃。
+   */
+  params: Record<string, string>;
+  /** 参数说明之后追加的"调用形态/取值约定"，用于 enum、组合约束这类一行装不下的信息。 */
+  notes?: string[];
+  /** 成功返回什么（给模型读的一行）。 */
+  returns: string;
+  /** 失败返回什么（错误码 → 该怎么处理）。 */
+  failures: string;
+}
+
+/**
+ * 容器 home 根（EX §7）。与 `src/exec/protocol.ts` 的 HOME_ROOT 同值；
+ * 跨模块不 import 实现，故此处字面量 + 单测断言一致。
+ */
+export const HOME_ROOT = '/dot/home';
+
+/** 错误码词表里与本说明书相关的几条（agent-runtime/protocol.ts ERROR_CODES 同名字面量）。 */
+export const TOOL_ERROR_HINTS: Readonly<Record<string, string>> = {
+  not_a_file: '路径不存在或不是常规文件 —— 先用 fs.list 确认目录里有什么，别猜文件名',
+  not_found: '文件不存在 —— 先 fs.list / fs.stat 确认，再决定是新建还是换路径',
+  not_a_directory: '目标不是目录 —— fs.list 只枚举目录',
+  path_outside_home: '路径越出 /dot/home —— 换成 home 内路径重试',
+  path_hidden: '/dot/home/.dotd 下是被隐藏的内部保留区，不可访问，换路径',
+  symlink_escape: '路径链到 home 外（symlink）—— 换真实路径重试',
+  bad_path: 'path 不是非空字符串 —— 补齐参数',
+  bad_args: '参数类型/取值不合法 —— 对照本文说明改正后重试，不要原样重发',
+  too_large: '文件超过体积上限 —— 分片处理或换策略，重试无用',
+  too_deep: 'fs.list 递归深度超过 4 —— 分层列目录',
+  deadline_exceeded: '执行超时（进程组已被 kill）—— 缩小工作量后重试',
+  interrupted: '上一次运行被打断、本调用未完成 —— 可安全重试',
+  browser_crashed: '浏览器进程崩溃（retryable）—— 下次调用会自动重开，直接重试',
+  too_many_pages: '该身份并发页面已达上限 3 —— 先 browser.close 再开新页',
+  identity_required: '浏览器类工具缺登录身份 —— 只能以非登录态（匿名）浏览',
+  unknown_tool: '工具不在能力目录（治理一律拒绝）—— 换登记过的工具',
+};
+
+/** 11 个工具的说明书（顺序与契约词表一致，便于人工核对）。 */
+export const TOOL_DOCS: readonly ToolDoc[] = [
+  {
+    name: 'fs.read',
+    description:
+      '读取 /dot/home 下的一个文本文件，原样返回全文。任务一开始就应该用它读 MEMORY.md（系统已注入一份，被截断或需要看原文件时再读）；读笔记、读上次留下的手册、核对文件内容都用它。' +
+      '只能读文本，不要用它读二进制；一次只能读一个文件，要遍历目录先 fs.list。它不返回"第几行到第几行"，大文件请用 shell.run 配合 head/sed 截取。',
+    params: {
+      path: '要读的文件路径。写 home 内相对路径即可（如 MEMORY.md、notes/2026-10-15-x.md），也可写完整的 /dot/home/... 绝对路径；两种都会被解析到同一个文件。',
+    },
+    returns:
+      '返回值是 JSON：path（home 内相对路径）、size_bytes、content（UTF-8 全文）、truncated（恒为 false，超 4MB 直接报错而不是截断）。',
+    failures:
+      'not_a_file（不存在或不是文件）、too_large（>4MB）、path_outside_home / path_hidden / symlink_escape（路径不合法）。' +
+      '读不到时先 fs.list 看目录，不要换个拼写反复试同一个路径。',
+  },
+  {
+    name: 'fs.write',
+    description:
+      '把一段 UTF-8 文本整体写进 /dot/home 下的文件，**覆盖**同路径原有内容，父目录不存在会自动创建。' +
+      '任务结束时把值得留到下次的东西写进 notes/ 或 manuals/，以及维护 MEMORY.md 索引，都靠它。' +
+      '注意它是覆盖不是追加：改已有文件要先 fs.read 出原文，在内存里改好再整篇写回（否则会丢内容）；只追加一行用 shell.run 的 `>>` 更省事。',
+    params: {
+      path: '目标文件路径（home 内相对路径或 /dot/home/... 绝对路径）。父目录不必先建，会自动创建。',
+      content: '要写入的完整 UTF-8 文本。必须是整篇文件的最终内容，不是"要追加的那段"。',
+    },
+    returns: '返回值是 JSON：path（home 内相对路径）、size_bytes（写入字节数）、written_at（ISO 时间）。',
+    failures:
+      'bad_args（content 不是字符串）、too_large（>8MB）、路径类错误同 fs.read。' +
+      '另有一种特殊失败：记忆层判定该文件超硬限时，工具根本不会被派发，你会收到 memory_rejected（如 HARD_LIMIT）——' +
+      '这时应拆分文件或改成追加到更小的文件，而不是改写同样大的内容再试。',
+  },
+  {
+    name: 'fs.list',
+    description:
+      '列出一个目录里有什么（文件名、类型 file/dir、字节数），按名字排序。' +
+      '读文件前不确定路径、不确定笔记放在哪、想看看上次留下了什么，先 fs.list 再动手，比盲猜路径省一整轮。' +
+      '它只列目录，不读内容；最多递归 4 层，单次最多返回 2000 条（超了 truncated=true）。',
+    params: {
+      path: '要枚举的目录。列整个 home 根就写 /dot/home（或直接写 /dot/home）。',
+      depth: '递归深度，整数 1–4，缺省 1 = 只看这一层。目录不深时直接用 2，省一次调用。',
+    },
+    returns:
+      '返回值是 JSON：path、entries[]（每项 name / path / type: file|dir / size_bytes，目录没有 size_bytes）、truncated。',
+    failures: 'not_a_directory（路径是文件或不存在）、too_deep（depth>4）、路径类错误同 fs.read。',
+  },
+  {
+    name: 'fs.stat',
+    description:
+      '查单个路径的元信息：是文件还是目录、多大、最后修改时间。' +
+      '两种情况用它：① 写之前先确认文件存在不存在（决定走 fs.write 新建还是先 fs.read 再覆盖）；② 判断记忆/笔记是不是过期了（mtime）。' +
+      '要内容就 fs.read，fs.stat 只给元信息。',
+    params: {
+      path: '要查的路径（home 内相对路径或 /dot/home/... 绝对路径），文件或目录都可以。',
+    },
+    returns: '返回值是 JSON：path、type（file|dir）、size_bytes、mtime（ISO 时间）、mode（Unix 权限位数字）。',
+    failures: 'not_a_file（路径根本不存在）、路径类错误同 fs.read。',
+  },
+  {
+    name: 'shell.run',
+    description:
+      '在容器里执行一条 bash 命令（`bash -c`，工作目录是 /dot/home，无 TTY），返回退出码与 stdout/stderr。' +
+      '适合：grep 搜内容、按行截取大文件、统计/排序、批量处理、装在本机工具链里的命令行工具。' +
+      '简单读一个文件用 fs.read 更快更省；fs.read 读不动的大文件、需要"按条件筛"时才用 shell。' +
+      '限制：环境变量只有 PATH/HOME/LANG/DISPLAY/SHELL（家里拿不到任何密钥）；**不能联网**（没有 curl 到外网的通道，要联网用 net.*）；' +
+      'stdout/stderr 各截断 1MB；timeout_ms 必填且到时整组进程会被 SIGKILL。命令里出现 rm/sudo/docker/`> /dev/` 会触发人工审批，任务会挂起等主人，能用 fs.* 就别写 rm。',
+    params: {
+      cmd: '完整的 bash 命令串（可以带管道、&&、重定向）。例：`grep -rn "关键词" notes/ | head -50`。不要在 cmd 里再套一层 `bash -c`。',
+      timeout_ms: '整数毫秒，必填。按真实预期给（grep 几秒就够，批量处理给足），超时即杀。必须 ≤ 本次调用的硬截止（正常装配下为 60000）。',
+      cwd: '可选，命令的工作目录（home 内的绝对或相对路径）；不写就是 /dot/home。',
+    },
+    returns:
+      '返回值是 JSON：exit_code（整数，被杀时为 null）、signal、stdout、stderr、stdout_truncated / stderr_truncated（是否被 1MB 截断）、uid、degraded。' +
+      '**退出码非 0 也是 status=ok**——要自己看 exit_code 和 stderr 判断命令是否真的成功。',
+    failures:
+      'bad_args（缺 timeout_ms / timeout_ms 超过 deadline）、deadline_exceeded（超时被杀）、路径类错误（cwd 不合法）。',
+  },
+  {
+    name: 'browser.open',
+    description:
+      '在容器内的真实 Chromium（已装反检测隐身插件、有图形显示）里打开一个 http(s) 网址，返回最终 URL 与页面标题。' +
+      '需要点按钮、填表单、看登录后的页面、抓渲染后的内容时才用它；能用 net.get 直接拿到 JSON/HTML 的接口就别开浏览器（慢且吃内存）。' +
+      '每调用一次就进入"这个身份的浏览器会话"：登录态按身份持久保存在 profile 卷里，下次调用还在。' +
+      '跑完记得 browser.close：每个身份最多 2 个浏览器上下文、3 个页面，不关会被回收或撞上限。',
+    params: {
+      url: 'http(s) 开头的完整网址。只接受 http/https，不能是 file:// 或 data:。',
+    },
+    returns: '返回值是 JSON：url（跳转后的最终地址）、title（页面标题）。页面正文要用 browser.snapshot 拿。',
+    failures:
+      'bad_args（url 不是字符串）、browser_crashed（进程崩了，retryable，直接重试）、too_many_pages（并发页超限，先 browser.close）、' +
+      'identity_required（没给登录身份，被拒）。',
+  },
+  {
+    name: 'browser.act',
+    description:
+      '在已打开的页面上做一个动作：点击、输入、按键、下拉选择、滚动、等待。' +
+      '必须先 browser.open（否则没有页面可用）；每次动作前最好先 browser.snapshot 看结构，动作后也要 snapshot 确认结果——' +
+      '网页会异步加载，点完立刻断言往往读到旧内容（必要时先 act wait 等一下）。' +
+      '定位只认 CSS 选择器；用 `text=提交` 这种 Playwright 角色写法不稳定，优先 `#submit`、`button[type=submit]`、`input[name=q]` 这类确定的选择器。',
+    params: {
+      action: '动作名，只能是 click | type | press | select | scroll | wait 之一（见下方约定）。',
+      selector: 'CSS 选择器，如 `#login`、`input[name="q"]`、`button.submit`。click / type / press / select 必填；scroll / wait 不需要。',
+      value: 'type = 要填的文本；press = 按键名（如 Enter、Escape）；select = 选项 value。click / scroll / wait 忽略此参数。',
+      timeout_ms: '可选，本动作的等待上限（毫秒）；不写时 scroll 默认滚动 800 像素、wait 默认等 1000 毫秒。',
+    },
+    notes: [
+      'wait：不传 selector 时只等待；配合 timeout_ms 当"等一下再截图"用。',
+      '点击/输入后页面若跳转或重绘，下一轮先 browser.snapshot 再决定下一步。',
+    ],
+    returns:
+      '返回值是 JSON，随动作不同：click → {clicked}、type → {filled}、press → {pressed, key}、select → {selected, value}、scroll → {scrolled}、wait → {waited_ms}。',
+    failures:
+      'bad_args（action 不在枚举内 / 缺 selector / 缺 value）、browser_crashed（retryable）。' +
+      '找不到元素通常表现为动作超时后 browser_crashed——先把选择器改准再重试，别原样循环。',
+  },
+  {
+    name: 'browser.snapshot',
+    description:
+      '取当前页面的可读快照（页面结构/无障碍树的文本形式），用来"看"页面：按钮叫什么、输入框在哪、列表里有哪些项。' +
+      'browser.open 之后、以及每次 browser.act 之后都应该用它确认状态，这是浏览器流程里唯一的"读"动作。' +
+      '它不返回截图图片，返回的是文本结构。',
+    params: {
+      selector: '可选的 CSS 选择器，只看某一块区域（如 `#main`、`div.list`）。整页看就省略。',
+    },
+    returns: '返回值是 JSON：text（可读快照文本），部分实现另带 html（简化后的 DOM）。',
+    failures: 'browser_crashed（retryable）。没有打开页面时也返回 ok，但 text 为空——先 browser.open。',
+  },
+  {
+    name: 'browser.close',
+    description:
+      '关闭当前身份的浏览器上下文，释放内存。' +
+      '浏览器流程做完就调一次；**profile 目录留在卷上，登录态不会丢**，下次 browser.open 还是登录的。' +
+      '不调也不报错，但占用会被计数（每身份 3 页上限），后续开页可能撞 too_many_pages。',
+    params: {},
+    returns: '返回值是 JSON：closed: true。',
+    failures: '极少失败；浏览器已崩溃时也返回成功（幂等）。',
+  },
+  {
+    name: 'net.get',
+    description:
+      '发一个 HTTP GET 取数据，适合调 JSON API、抓静态页面源码、看某个 URL 的响应头。' +
+      '能直接拿到数据的接口一律用它，比开浏览器快一个数量级；需要执行页面 JS、要携带登录 Cookie 的，才退回 browser.*。' +
+      '限制：只有 http/https；单次调用硬截止 60 秒；只准 GET，带副作用的请求用 net.post。',
+    params: {
+      url: '完整的 http(s) 网址，查询参数直接写在 URL 上（如 ?q=x&limit=5）。',
+      headers: '可选，一个键值对象，如 {"accept":"application/json"}。值必须是字符串。',
+    },
+    returns: '返回值是 JSON：url（请求地址）、status（HTTP 状态码）、body（响应体文本）。',
+    failures:
+      'bad_args（url 不是字符串）、not_implemented（部分运行环境尚未实现网络工具，看到这个码就改用 shell/浏览器）、' +
+      'deadline_exceeded（超时）。4xx/5xx 也要看 status 与 body，不要当成"没结果"。',
+  },
+  {
+    name: 'net.post',
+    description:
+      '发一个 HTTP POST（JSON 或表单）到外部服务。' +
+      '只在确实需要提交数据时用它：它对**外部世界有副作用**（可能下单、发帖、改远端数据），治理会按写操作级别审查，必要时会请主人审批。' +
+      '能读就别写；写之前想清楚参数，因为一旦提交，重试可能重复生效。',
+    params: {
+      url: '完整的 http(s) 网址。',
+      body: '请求体字符串。发 JSON 就自己序列化成字符串，并配 Content-Type 头。',
+      headers: '可选，一个键值对象。发 JSON 记得写 {"content-type":"application/json"}。',
+    },
+    returns: '返回值是 JSON：url、status（HTTP 状态码）、body（响应体文本）。',
+    failures:
+      'bad_args（url 不是字符串）、not_implemented（环境未实现）、deadline_exceeded（超时）。' +
+      '提交成功但对方报错时看 status 与 body，不要盲目重发。',
+  },
+];
+
+/** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
+export function toolDocOf(name: string): ToolDoc | null {
+  return TOOL_DOCS.find((d) => d.name === name) ?? null;
+}
+
+/** `args_schema` 的属性名集合（非对象/无 properties 时为空）。 */
+export function schemaParamNames(argsSchema: object | undefined): string[] {
+  if (argsSchema === null || typeof argsSchema !== 'object') return [];
+  const props = (argsSchema as { properties?: unknown }).properties;
+  if (props === null || typeof props !== 'object' || Array.isArray(props)) return [];
+  return Object.keys(props as Record<string, unknown>);
+}
+
+/**
+ * 把参数说明渲染成 text（只保留 schema 里真实存在的参数；顺序跟 schema 走，
+ * 这样模型看到的顺序与它填 JSON 的顺序一致）。
+ *
+ * `extraParams` 用于 schema 里有、说明书里没写到的字段：由渲染器兜底生成
+ * 一行，**不会**因为漏写就让模型面对一个裸字段。
+ */
+export function renderParamLines(doc: ToolDoc, argsSchema: object | undefined): string[] {
+  const names = schemaParamNames(argsSchema);
+  if (names.length === 0) return [];
+  return names.map((n) => {
+    const line = doc.params[n];
+    // 兜底行必须自己讲清"本环境支持它"，否则模型会以为这是别的版本才有的字段而绕开。
+    const text = line ?? '本环境支持该字段（可选），按下方调用形态里的取值约定填写。';
+    return `- ${n}：${text}`;
+  });
+}
+
+/**
+ * 一个工具发给模型的完整 description（ToolSpec.description）。
+ *
+ * @param cap      `/capabilities` 返回的能力项（schema 从 `cap.args_schema` 读，保真）
+ * @param fallback 说明书缺失时的兜底描述（真实环境里 = 旧模板串；单测断言它永不命中）
+ */
+export function toolDescriptionFor(cap: Capability, fallback?: string): string {
+  const doc = toolDocOf(cap.name);
+  if (doc === null) {
+    return fallback ?? `工具 ${cap.name}（mode=${cap.mode}，sideEffect=${cap.sideEffect}）`;
+  }
+  const lines: string[] = [doc.description];
+  const paramLines = renderParamLines(doc, cap.args_schema);
+  if (paramLines.length > 0) lines.push('', '参数：', ...paramLines);
+  const notes = (doc.notes ?? []).filter((n) => {
+    // note 里若点名了某个参数，而该参数在当前 schema 里不存在，就整条不渲染——
+    // 与参数行同一条防编造规则。
+    const mentioned = [...n.matchAll(/`?([a-z][a-z0-9_]{1,24})`?/g)]
+      .map((m) => m[1] ?? '')
+      .filter((w) => w.length > 0);
+    const known = new Set([...schemaParamNames(cap.args_schema), ...Object.keys(doc.params)]);
+    const invented = mentioned.filter((w) => /^[a-z_]+$/.test(w) && KNOWN_PARAM_WORDS.has(w) && !known.has(w));
+    return invented.length === 0;
+  });
+  if (notes.length > 0) lines.push('', ...notes);
+  lines.push('', `成功返回：${doc.returns}`, `失败：${doc.failures}`);
+  // 执行形态提示放最后：模型读描述时先关心"怎么用"，再关心"后台怎么跑"。
+  lines.push(
+    '',
+    `执行形态：mode=${cap.mode}（${cap.mode === 'sync' ? '同步返回结果' : '异步任务，Runner 会自动轮询到终态'}）：` +
+      `sideEffect=${cap.sideEffect}（${SIDE_EFFECT_HINT[cap.sideEffect] ?? '未声明副作用，按最保守处理'}）。` +
+      `单次最长 ${Math.round(cap.max_deadline_ms / 1000)} 秒。`,
+  );
+  return lines.join('\n');
+}
+
+/** sideEffect 档位在 prompt 里的解释（契约 J2：崩溃恢复分流的唯一依据）。 */
+export const SIDE_EFFECT_HINT: Readonly<Record<string, string>> = {
+  safe: '只读或可随时重做，崩溃后重试无风险',
+  replayable: '自带幂等键，同一次调用重复执行不会产生第二份副作用（但内容会被覆盖写，改之前先读）',
+  unknown: '副作用不确定，崩溃/重试可能重复生效，因此这类调用可能被要求人工审批',
+};
+
+/** 说明书里会用到、但**不属于任何工具参数**的常见英文词（用于 notes 防编造过滤）。 */
+const KNOWN_PARAM_WORDS = new Set([
+  'url',
+  'status',
+  'body',
+  'headers',
+  'content',
+  'path',
+  'depth',
+  'cmd',
+  'timeout_ms',
+  'selector',
+  'value',
+  'action',
+  'cwd',
+  'content_base64',
+  'truncated',
+  'size_bytes',
+  'exit_code',
+  'text',
+]);
+
+/**
+ * 工具清单里发给模型的整体引导段（放在 system prompt 之后、工具定义之前使用，
+ * 也可直接拼进 system prompt）。讲清 11 个工具的分工与通用约束。
+ */
+export const TOOLS_GUIDE = `可用工具共 11 个，按"先便宜后昂贵"选：
+1. 看盘：fs.list（目录）→ fs.stat（在不在/多大）→ fs.read（读文本）。这是绝大多数任务的第一步。
+2. 写盘：fs.write（覆盖整篇，改文件前必须先 fs.read 出原文再整篇写回）。任务收尾写记忆用它。
+3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
+4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
+5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。
+通用约定：
+- 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
+- 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。
+- 结果是 JSON；失败时结构是 {"status":"error","error":{"code","message","retryable"}}。
+  先读 code 和 message 再决定：retryable=true 可以重试，false 说明参数或路径错了，原样重发只会再失败一次。
+- 任何工具都可能被治理拦下：deny 时你会收到 {"denied":true,"reason":...}，这表示这条动作不被允许，请换一条路完成目标，而不是换个工具重试同一个动作。`;
+
+/**
+ * 组装一份可直接上线的工具清单：schema 来自能力目录（逐字透传），
+ * description 来自本文件的说明书（参数行与 schema 求交）。
+ *
+ * 分离成纯函数是为了可测：`toolSpecs()` 只是"取能力目录 + 调它"。
+ */
+export function buildToolSpecs(
+  caps: readonly Capability[],
+): Array<{ name: string; description: string; parameters: object }> {
+  return caps.map((c) => ({
+    name: c.name,
+    description: toolDescriptionFor(c),
+    parameters: c.args_schema,
+  }));
+}
+
+/** 所有说明书条目覆盖的工具名（单测拿它与契约词表比对）。 */
+export function documentedToolNames(): string[] {
+  return TOOL_DOCS.map((d) => d.name);
+}

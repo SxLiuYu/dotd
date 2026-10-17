@@ -53,6 +53,19 @@ export interface RecoveryReport {
   inFlightFailed: Array<{ taskId: string; epoch: number; error: string }>;
   /** 步骤 3：处置过的孤儿 started 步。 */
   openStepsResolved: Array<{ taskId: string; seq: number; outcome: string }>;
+  /**
+   * 步骤 3：因「副作用未知/无法判定」而降级为 deferred 的孤儿步（= 启动后等主人审批）。
+   * 需求（2026-10-17 审计）：A 修复把 unknown 孤儿步从"可重放"改成"必须审批"之后，
+   * 这个决策**不能是静默的**——启动日志与诊断接口都要能回答"有没有东西在等我批"。
+   * 与 approvalsPending 的关系：本字段是启动那一刻新产生的；approvals 表是权威待批集合。
+   */
+  inFlightDeferred: Array<{
+    taskId: string;
+    seq: number;
+    tool: string;
+    /** 治理落单后的 approval_id（治理不可用时为 null）。 */
+    approvalId: number | null;
+  }>;
   /** 步骤 4：停机期间已落定的审批续跑。 */
   approvalsResumed: Array<{ taskId: string; approvalId: number; ok: boolean }>;
   /** 步骤 5：补投的心跳次数。 */
@@ -110,6 +123,19 @@ async function recoverInFlight(deps: RecoveryDeps, report: RecoveryReport): Prom
         if (s.status !== 'started') continue;
         const outcome = await deps.journal.reconcileAndResolve(t.id, s.seq);
         report.openStepsResolved.push({ taskId: t.id, seq: s.seq, outcome });
+        if (outcome === 'deferred') {
+          // A 修复的可观测面：unknown 副作用降级为"等审批"时必须能被主人看见。
+          // approval_id 由 journal 回写该步（治理不可用时为 null，此时只剩恢复注记）。
+          const row = deps.db
+            .prepare('SELECT approval_id AS a FROM steps WHERE task_id=? AND seq=?')
+            .get(t.id, s.seq) as { a: number | null } | undefined;
+          report.inFlightDeferred.push({
+            taskId: t.id,
+            seq: s.seq,
+            tool: s.toolName ?? s.kind,
+            approvalId: row?.a ?? null,
+          });
+        }
       }
       deps.queue.reclaimInFlight(t.id, t.epoch, 'recovery');
       report.inFlightRecovered.push(t.id);
@@ -204,6 +230,7 @@ export async function recoverOnStartup(
     inFlightRecovered: [],
     inFlightFailed: [],
     openStepsResolved: [],
+    inFlightDeferred: [],
     approvalsResumed: [],
     heartbeatsCaughtUp: 0,
     eventsReplayed: 0,

@@ -61,6 +61,8 @@ import type {
 } from '../shared/contracts.ts';
 import { AllEndpointsDownError, DotdError, NoQualifiedPrimaryError, StepLimitError } from '../shared/errors.ts';
 import { newNonJournalAttemptId } from '../shared/ids.ts';
+import { composeSystemPrompt } from './system-prompt.ts';
+import { buildToolSpecs } from './tool-catalog.ts';
 
 // ── 1. 依赖面 ────────────────────────────────────────────────────────────
 
@@ -170,6 +172,15 @@ class RunContext {
   readonly messages: Message[] = [];
   /** 已成功执行、尚未以全文回喂给模型的工具结果（callId → resultJson）。 */
   private readonly pendingResults = new Map<string, string>();
+  /**
+   * 本轮工具调用（callId → 工具名）。有工具结果回喂时，必须紧跟一条 assistant 的
+   * tool_calls 消息把它们"接住"：OpenAI 兼容协议里裸的 role=tool 会被网关拒
+   * （`messages with role 'tool' must be a response to a preceding message with
+   * tool_calls`），接缝 S6 的双写禁令只要求"结果只有一份"，没要求丢掉调用声明。
+   */
+  private readonly pendingCalls = new Map<string, string>();
+  /** callId → 原始参数串（在 assistant.tool_calls 里原样复述，便于模型对上号）。 */
+  private readonly callArgs = new Map<string, string>();
   /** 系统注记（merge note / 恢复提示），排在下一次 LLM 请求前。 */
   private readonly notes: string[] = [];
   private tokens = 0;
@@ -185,10 +196,25 @@ class RunContext {
     this.messages.push(...msgs);
   }
 
-  /** CP §12 `ctx.feedToolResult(callId, resultJson)`。 */
-  feedToolResult(callId: string, resultJson: string | null): void {
+  /**
+   * CP §12 `ctx.feedToolResult(callId, resultJson)`。
+   * `toolName` 用于在回喂时补回对应的工具调用声明（见 pendingCalls）。
+   */
+  feedToolResult(callId: string, resultJson: string | null, toolName?: string): void {
     if (resultJson === null) return;
     this.pendingResults.set(callId, resultJson);
+    if (toolName !== undefined && toolName.length > 0) this.pendingCalls.set(callId, toolName);
+  }
+
+  /**
+   * 本轮 LLM 发出的工具调用整体登记（callId → 工具名 → 原始参数串）。
+   * 工具结果回喂时用它在 assistant 消息里复原 tool_calls，保证协议上的因果配对。
+   */
+  noteToolCalls(calls: ReadonlyArray<{ id: string; name: string; arguments: string }>): void {
+    for (const c of calls) {
+      this.pendingCalls.set(c.id, c.name);
+      this.callArgs.set(c.id, c.arguments);
+    }
   }
 
   /** CP §12 `ctx.feedSystemNote(note)`。 */
@@ -196,10 +222,24 @@ class RunContext {
     this.notes.push(note);
   }
 
-  /** CP §12 `ctx.feed(res)`：工具结果落账（不直接进 messages，见 buildMessages）。 */
-  feed(res: { ok: boolean; callId: string; value: unknown }): void {
-    if (res.ok) this.pendingResults.set(res.callId, JSON.stringify(res.value ?? null));
-    else this.notes.push(`工具调用失败：${digestPreview(res.value)}`);
+  /**
+   * CP §12 `ctx.feed(res)`：工具结果落账（不直接进 messages，见 buildMessages）。
+   *
+   * 成功与失败**都**以 JSON 回喂（失败是 `{status:'error',error:{code,message,retryable}}`）：
+   * 模型要按 code 判断"改参数"还是"重试"，只给一句中文摘要它会当成噪声跳过。
+   * 只有 deny / 记忆拒写这类"没派发"的结果保持单行文本（它们的语义是改道，不是执行失败）。
+   */
+  feed(res: { ok: boolean; callId: string; value: unknown; toolName?: string; dispatched?: boolean }): void {
+    const toolName = res.toolName ?? this.pendingCalls.get(res.callId);
+    if (toolName !== undefined) this.pendingCalls.set(res.callId, toolName);
+    if (res.dispatched === false) {
+      // 未派发（deny / 记忆硬限）：一次性系统注记，不进 tool 通道（没有执行结果可回）。
+      this.notes.push(`工具调用未执行：${digestPreview(res.value)}`);
+      this.pendingCalls.delete(res.callId);
+      this.callArgs.delete(res.callId);
+      return;
+    }
+    this.pendingResults.set(res.callId, JSON.stringify(res.value ?? null));
   }
 
   /** CP §12 `ctx.feed(resp)`：LLM 响应。 */
@@ -238,11 +278,27 @@ class RunContext {
     return out;
   }
 
-  /** 取走并清空待回喂的工具结果（tool 消息：digest+预览）。 */
-  drainResults(): Array<{ callId: string; text: string }> {
-    const out: Array<{ callId: string; text: string }> = [];
+  /**
+   * 取走并清空待回喂的工具结果。
+   *
+   * 结果全文回喂：工具返回值是模型下一步决策的唯一依据（`fs.read` 的正文、
+   * `shell.run` 的错误输出都在里面），digest 后的 200 字预览会让它对着半截
+   * 内容猜。双写禁令（S6）约束的是**入 thread** 的那份（`reportTool` 仍只存预览），
+   * 不是发给模型的请求体。
+   */
+  drainResults(): Array<{ callId: string; toolName: string; args: string; text: string; dispatched: boolean }> {
+    const out: Array<{ callId: string; toolName: string; args: string; text: string; dispatched: boolean }> = [];
     for (const [callId, json] of this.pendingResults) {
-      out.push({ callId, text: digestPreview(json) });
+      out.push({
+        callId,
+        toolName: this.pendingCalls.get(callId) ?? '',
+        args: this.callArgs.get(callId) ?? '{}',
+        text: json,
+        // 有调用声明 = 本轮真的派发过 → 可进 tool 通道；否则是恢复期补喂的历史结果。
+        dispatched: this.pendingCalls.has(callId),
+      });
+      this.pendingCalls.delete(callId);
+      this.callArgs.delete(callId);
     }
     this.pendingResults.clear();
     return out;
@@ -250,9 +306,11 @@ class RunContext {
 
   /**
    * 组装发给模型的 ChatMessage[]（接缝 ⑥ 的请求体）。
-   * 顺序：文件记忆（MEMORY.md + manuals 片段 + context_summary）→ 会话历史（assistant 全文）→
-   * 本回合 tool 结果 → 系统注记 → 任务目标。
-   * 双写禁令（S6）：tool 参数/结果全文只在 steps；这里只放 digest+预览。
+   *
+   * 顺序（CP §7.3）：system prompt（**恒为 messages[0]**）→ 文件记忆快照
+   * （MEMORY.md + manuals 片段 + 会话摘要，作为独立的 system 注记，不混进 prompt，
+   * 以免覆盖 system prompt 这种"伪装成对话的注入"）→ 会话历史（assistant 全文）→
+   * assistant.tool_calls + 本轮 tool 结果 → 系统注记 → 任务目标（user，恒为最后一条）。
    */
   buildMessages(bundle: {
     memoryMd: string;
@@ -260,6 +318,21 @@ class RunContext {
     summary: string | null;
   }): Message[] {
     const out: Message[] = [];
+
+    // ① 运行手册：每一次请求都要在，且必须是第一条（模型只认最前面那份 system）。
+    const prompt = composeSystemPrompt();
+    out.push({
+      id: 'sys:prompt',
+      threadId: '',
+      seq: 0,
+      role: 'system',
+      kind: 'text',
+      content: prompt,
+      tokenEst: Math.ceil(prompt.length / 3.5),
+      createdAt: 0,
+    });
+
+    // ② 文件记忆快照（任务开始时注入的那一份；内容由 MemoryService 控预算）。
     const fileParts: string[] = [];
     if (bundle.memoryMd.length > 0) fileParts.push(`# MEMORY.md\n${bundle.memoryMd}`);
     for (const m of bundle.manualExcerpts) fileParts.push(`# ${m.path}\n${m.text}`);
@@ -267,27 +340,74 @@ class RunContext {
       fileParts.push(`# 会话摘要\n${bundle.summary}`);
     }
     if (fileParts.length > 0) {
+      const joined = fileParts.join('\n\n');
       out.push({
         id: 'sys:file-memory',
         threadId: '',
         seq: 0,
         role: 'system',
         kind: 'text',
-        content: fileParts.join('\n\n'),
-        tokenEst: Math.ceil(fileParts.join('\n\n').length / 3.5),
+        content: joined,
+        tokenEst: Math.ceil(joined.length / 3.5),
         createdAt: 0,
       });
     }
+
     out.push(...this.messages);
-    for (const r of this.drainResults()) {
+
+    // ③ 本回合工具结果：同一轮 LLM 发出的多个调用先合并成**一条** assistant.tool_calls，
+    //    再跟各自的 tool 结果。裸 role=tool 会被 OpenAI 兼容网关以"没有前置 tool_calls"
+    //    拒绝；模型侧回放的 assistant 消息（本文件 messages[]）本就丢弃了调用声明，
+    //    这里按 pendingCalls 复原是唯一的因果来源。
+    //
+    //    没有调用声明的结果（恢复期从 steps 补喂的历史结果）不进 tool 通道——
+    //    它们凑不出 args/name，硬塞进去只会造出一条无主的 role=tool。
+    const results = this.drainResults();
+    const dispatched = results.filter((r) => r.dispatched);
+    const recovered = results.filter((r) => !r.dispatched);
+    for (const r of recovered) {
+      // 恢复重建只有 steps 里的 result_json：以"历史结果"形态告诉模型这件事做过、
+      // 结果是什么，避免它重新执行一遍。
+      const text = `历史工具结果（此前已执行，无需重做）：${r.text}`;
+      out.push({
+        id: `note:recovered:${r.callId}`,
+        threadId: '',
+        seq: 0,
+        role: 'system',
+        kind: 'text',
+        content: text,
+        tokenEst: Math.ceil(text.length / 3.5),
+        createdAt: 0,
+      });
+    }
+    const withName = dispatched;
+    if (withName.length > 0) {
+      const callMsg: Message = {
+        id: `assistant:calls:${withName[0]!.callId}`,
+        threadId: '',
+        seq: 0,
+        role: 'assistant',
+        kind: 'tool_call',
+        content: '',
+        tokenEst: 0,
+        createdAt: 0,
+      };
+      (callMsg as Message & { toolCalls?: Array<{ id: string; name: string; arguments: string }> }).toolCalls =
+        withName.map((r) => ({ id: r.callId, name: r.toolName, arguments: r.args }));
+      out.push(callMsg);
+    }
+    for (const r of dispatched) {
+      // 内容里内嵌 call_id：toChatMessage 靠它填 tool_call_id，与上面 assistant.tool_calls
+      // 的 id 逐一配对（Message 契约不必为此加字段）。
+      const text = `call_id=${r.callId}\n${r.text}`;
       out.push({
         id: `tool:${r.callId}`,
         threadId: '',
         seq: 0,
         role: 'system',
         kind: 'tool_result',
-        content: r.text,
-        tokenEst: Math.ceil(r.text.length / 3.5),
+        content: text,
+        tokenEst: Math.ceil(text.length / 3.5),
         createdAt: 0,
       });
     }
@@ -303,6 +423,8 @@ class RunContext {
         createdAt: 0,
       });
     }
+
+    // ④ 任务目标：恒为最后一条 user 消息（§4.1 事件任务没有历史对话时它是唯一输入）。
     out.push({
       id: 'user:goal',
       threadId: '',
@@ -512,6 +634,9 @@ export class DotRunner {
         continue; // done=true → 退出 while
       }
 
+      // 本轮调用的声明先登记：工具结果回喂时要靠它复原 assistant.tool_calls
+      // （协议要求 role=tool 必须紧跟在一个带 tool_calls 的 assistant 消息之后）。
+      ctx.noteToolCalls(llm.step.toolCalls);
       for (const call of llm.step.toolCalls) {
         if (ctx.done) break;
         const out = await this.stepTool(session, epoch, ctx, call);
@@ -621,14 +746,17 @@ export class DotRunner {
     (ctx as unknown as { __bundle?: unknown }).__bundle = bundle;
   }
 
-  /** 工具清单（MR §3.1 ToolSpec；描述从能力目录拿，参数 schema 透传）。 */
+  /**
+   * 工具清单（MR §3.1 ToolSpec）。
+   *
+   * 两层分工：`parameters` 逐字透传 `/capabilities` 的 args_schema（契约事实源，
+   * Runner 不自己发明参数）；`description` 来自 `tool-catalog.ts` 的说明书
+   * （何时用/参数怎么填/返回什么/失败怎么读），参数行与当前 schema 求交，
+   * 宿主/容器两份目录有差异时也不会教模型填一个不存在的字段。
+   */
   private async toolSpecs(): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
     const caps = await this.getCapabilities();
-    return caps.map((c) => ({
-      name: c.name,
-      description: `工具 ${c.name}（mode=${c.mode}，sideEffect=${c.sideEffect}）`,
-      parameters: c.args_schema,
-    }));
+    return buildToolSpecs(caps);
   }
 
   private async getCapabilities(): Promise<Array<{ name: string; mode: 'sync' | 'async'; max_deadline_ms: number; args_schema: object; sideEffect: 'safe' | 'replayable' | 'unknown' }>> {
@@ -674,9 +802,16 @@ export class DotRunner {
     );
 
     if (verdict.kind === 'deny') {
-      // 接缝 ⑦ deny 支线：步标 skipped + 结果回喂（任务改道，不直接失败）
+      // 接缝 ⑦ deny 支线：步标 skipped + 结果回喂（任务改道，不直接失败）。
+      // 没有实际派发 → dispatched:false，走系统注记（否则会造出一条无主 tool_result）。
       this.cp.journal.skipStep(callId, `deny:${verdict.reason}`);
-      ctx.feed({ ok: false, callId, value: { denied: true, reason: verdict.reason } });
+      ctx.feed({
+        ok: false,
+        callId,
+        toolName: call.name,
+        dispatched: false,
+        value: { denied: true, tool: call.name, reason: verdict.reason },
+      });
       return { kind: 'continue' };
     }
 
@@ -709,7 +844,13 @@ export class DotRunner {
           'failed',
           { memory_rejected: chk.error ?? 'HARD_LIMIT', warning: chk.warning ?? null },
         );
-        ctx.feed({ ok: false, callId, value: { memory_rejected: chk.error ?? 'HARD_LIMIT', warning: chk.warning ?? null } });
+        ctx.feed({
+          ok: false,
+          callId,
+          toolName: call.name,
+          dispatched: false,
+          value: { memory_rejected: chk.error ?? 'HARD_LIMIT', warning: chk.warning ?? null },
+        });
         return { kind: 'continue' };
       }
       if (chk.warning !== undefined) this.memoryWarnings.set(callId, chk.warning);
@@ -723,7 +864,8 @@ export class DotRunner {
       ? (ok ? res.result : res.error)
       : { ...(ok ? (res.result ?? {}) : (res.error ?? {})), warning };
     this.cp.journal.endTool(task.id, epoch, seq, ok ? 'succeeded' : 'failed', result ?? null);
-    ctx.feed({ ok, callId, value: result });
+    // 成败都以 JSON 回喂（失败 = 容器端的 {code,message,retryable}）：模型要靠 code 决定改参还是重试。
+    ctx.feed({ ok, callId, toolName: call.name, value: result });
     this.memoryWarnings.delete(callId);
     // ⑩ 结果回报：tool 消息只 digest+200 预览入 thread（S6 双写禁令；全文在 steps）
     await this.reportTool(ctx, task, callId, call.name, ok, result);
@@ -770,12 +912,17 @@ export class DotRunner {
       if (claimRes.finalParams !== undefined) args = claimRes.finalParams;
     }
 
-    const res = await this.exec.runTool(toolCall(task, callId, target.toolName ?? '', args, this.toolDeadlineMs));
+    const toolName = target.toolName ?? '';
+    const res = await this.exec.runTool(toolCall(task, callId, toolName, args, this.toolDeadlineMs));
     const ok = res.status === 'ok';
     const result = ok ? res.result : res.error;
     this.cp.journal.endTool(task.id, epoch, seq, ok ? 'succeeded' : 'failed', result ?? null);
+    // 续跑执行的结果同样要回喂给模型：否则下一轮 LLM 只看到"主人批了"，看不到批的动作到底
+    // 出了什么结果（approve_once 之后模型往往还要基于这个结果收尾）。
+    ctx.noteToolCalls([{ id: callId, name: toolName, arguments: JSON.stringify(args) }]);
+    ctx.feed({ ok, callId, toolName, value: result });
     // ⑩ 结果回报：审批续跑执行的那一步同样要入 thread（否则续跑步骤在会话里缺席）
-    await this.reportTool(ctx, task, callId, target.toolName ?? '', ok, result);
+    await this.reportTool(ctx, task, callId, toolName, ok, result);
     return 'executed';
   }
 
@@ -1010,15 +1157,37 @@ function identityOf(args: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-/** Message → ChatMessage（主循环请求体；tool_call 消息不进请求，模型自己记得）。 */
+/**
+ * Message → ChatMessage（主循环请求体）。
+ *
+ * role 映射是这一层的全部职责（`ChatMessage` 只有 system/user/assistant/tool 四值，
+ * 而 `Message` 的 kind 有十种）：
+ * - `tool_result` → `role:'tool'` + `tool_call_id`：OpenAI 兼容协议要求它紧跟在一个
+ *   带 tool_calls 的 assistant 消息之后（那条由 buildMessages 按 pendingCalls 复原）。
+ *   没有 callId 的历史结果不会走到这里（buildMessages 已把它降级成系统注记）。
+ * - `tool_call` → `role:'assistant'` + `tool_calls`：声明本身不是给模型读的正文，
+ *   但缺了它，后面的 role=tool 在网关看来就是"无主"的。
+ * - 其余（text / task_start / memory_note …）按 m.role 原样投影。
+ */
 function toChatMessage(m: Message): ChatMessage {
-  // 双写禁令（S6）下 mem_messages 的 tool_* 消息 role 只能是三值之一；
-  // 投影成模型侧 ChatMessage 时把 kind 映射回 role（tool_result→'tool'，
-  // tool_call 已在 assistant 全文里，丢弃）。
   if (m.kind === 'tool_result') {
     const out: ChatMessage = { role: 'tool', content: m.content };
     const cid = callIdOfToolMessage(m);
     if (cid !== null) out.tool_call_id = cid;
+    return out;
+  }
+  const withCalls = m as Message & {
+    toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+  };
+  if (m.kind === 'tool_call' && Array.isArray(withCalls.toolCalls) && withCalls.toolCalls.length > 0) {
+    const out = { role: 'assistant' as const, content: m.content } as ChatMessage & {
+      tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+    };
+    out.tool_calls = withCalls.toolCalls.map((c) => ({
+      id: c.id,
+      type: 'function' as const,
+      function: { name: c.name, arguments: c.arguments },
+    }));
     return out;
   }
   return { role: m.role, content: m.content };

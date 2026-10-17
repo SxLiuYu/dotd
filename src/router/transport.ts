@@ -349,6 +349,93 @@ async function rawHttp(
 ): Promise<RawHttpResult> {
   const u = new URL(url);
   const isHttps = u.protocol === 'https:';
+  const startedAt = Date.now();
+
+  // ── 三档超时的生命周期 ──────────────────────────────────────────────
+  //
+  // 2026-10-17 修复（回归：tests/router-http-transport.test.ts ⑥）。
+  //
+  // 原实现把整个生命周期（total 定时器 + idle 定时器 + finish）**全部建在
+  // `http.request(url, opts, callback)` 的响应回调里**。Node 的 http 客户端在
+  // **收到响应体的第一个字节之前不会调用该回调**——哪怕上游已经把状态行和
+  // 头写出来，只要没有 body 字节，回调就不来（实测 Node v24.13.0：不 flush 也不
+  // 写任何 body 的 200 响应，5s 内回调从未触发）。于是：
+  //   - 上游接了连接、回了头、然后卡住 → total 定时器根本没被 arm，idle 同理
+  //     → **永远挂着**，调用方被钉死，三档超时一个都不生效；
+  //   - 全量测试套件的表现形式就是"整个 node --test 进程挂住不退出"。
+  // 而"上游卡住不回数据"正是这三个超时要防的头号场景，等于防线恰好在这时失效。
+  //
+  // 修法：把生命周期提到**请求对象**上，与响应回调解耦：
+  //   1. 定时器在发请求时立刻 arm；
+  //   2. socket 每有活动（连接建立 / 收到数据）就重置 idle 表（idle = 无进展）；
+  //   3. connect 通道 = "socket 已建立"仍未发生的判据，与 idle 分开计时；
+  //   4. finish 摧毁 **req**（整条 socket）而不只是 res——只 destroy res 时
+  //      没有任何事件会落到 req 上，promise 同样永不 settle。
+  let settled = false;
+  let resolveRes!: (r: RawHttpResult) => void;
+  let reject!: (e: Error) => void;
+  const p = new Promise<RawHttpResult>((res, rej) => {
+    resolveRes = res;
+    reject = rej;
+  });
+
+  const chunks: Buffer[] = [];
+  let res: IncomingMessage | null = null;
+  let idleTimer: NodeJS.Timeout | undefined;
+  let connectTimer: NodeJS.Timeout | undefined;
+  let totalTimer: NodeJS.Timeout | undefined;
+  /** req 在 finish 内被引用，而 finish 可能先于 req 赋值被调用（同步 signal.aborted 等） */
+  let reqRef: import('node:http').ClientRequest | null = null;
+
+  const cleanup = (): void => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    if (connectTimer !== undefined) clearTimeout(connectTimer);
+    if (totalTimer !== undefined) clearTimeout(totalTimer);
+  };
+
+  const finish = (err: Error | null): void => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    // destroy 必须落在 req 上（整条 socket）；对已结束的请求重复 destroy 是幂等的，
+    // 由 settled 闸门兜住重复调用。
+    if (reqRef !== null) reqRef.destroy(err ?? undefined);
+    if (res !== null) res.destroy();
+    if (err !== null) {
+      // 网络层错误统一包成 TransportError，让 classifyError 拿到 kind（MR §4.1）。
+      // 但原始 errno 的 `code`（ECONNREFUSED/ENOTFOUND/ECONNRESET…）必须保留：
+      // classifyNetworkError 正是按 code 归类，且运维排障时需要看见究竟哪种断法。
+      if (err instanceof TransportError) {
+        reject(err);
+      } else {
+        const timedOut = /timeout/i.test(err.message);
+        const code = (err as { code?: unknown }).code;
+        reject(
+          new TransportError(timedOut ? 'timeout' : 'network', err.message, {
+            cause: err,
+            code: typeof code === 'string' ? code : undefined,
+          }),
+        );
+      }
+      return;
+    }
+    resolveRes({
+      status: res?.statusCode ?? 0,
+      headers: res?.headers ?? {},
+      body: Buffer.concat(chunks).toString('utf8'),
+      latencyMs: Date.now() - startedAt,
+    });
+  };
+
+  const armIdle = (): void => {
+    if (settled) return;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = setTimeout(
+      () => finish(new TransportError('timeout', `idle timeout（${opts.idleMs}ms 无进展）`)),
+      opts.idleMs,
+    );
+  };
+
   const req = (isHttps ? httpsRequest : httpRequest)(
     {
       protocol: u.protocol,
@@ -358,71 +445,70 @@ async function rawHttp(
       method,
       headers: opts.headers,
     },
-    (res: IncomingMessage) => {
-      const chunks: Buffer[] = [];
-      let settled = false;
-      let idleTimer: NodeJS.Timeout | undefined;
-      const totalTimer = setTimeout(() => {
-        finish(new Error('total timeout'));
-      }, opts.totalMs);
-      const armIdle = (): void => {
-        if (idleTimer !== undefined) clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => finish(new Error('idle timeout')), opts.idleMs);
-      };
+    (incoming: IncomingMessage) => {
+      res = incoming;
+      // 收到响应头 = 有进展：算 idle 的一次活动（此刻 body 可能一个字节都还没来）
       armIdle();
-      const finish = (err: Error | null): void => {
-        if (settled) return;
-        settled = true;
-        if (idleTimer !== undefined) clearTimeout(idleTimer);
-        clearTimeout(totalTimer);
-        res.destroy();
-        if (err !== null) reject(err);
-        else {
-          resolveRes({
-            status: res.statusCode ?? 0,
-            headers: res.headers,
-            body: Buffer.concat(chunks).toString('utf8'),
-            latencyMs: Date.now() - startedAt,
-          });
-        }
-      };
-      res.on('data', (c: Buffer) => {
+      incoming.on('data', (c: Buffer) => {
         chunks.push(c);
         armIdle();
       });
-      res.on('end', () => finish(null));
-      res.on('error', (e) => finish(e));
-      res.on('aborted', () => finish(new Error('response aborted')));
+      incoming.on('end', () => finish(null));
+      incoming.on('error', (e) => finish(e));
+      // 旧版 node 在响应被对端中断时发 'aborted'，新版本走 'error'（ECONNRESET）
+      incoming.on('aborted', () => finish(new TransportError('network', 'response aborted')));
     },
   );
-  const startedAt = Date.now();
-  let resolveRes!: (r: RawHttpResult) => void;
-  let reject!: (e: Error) => void;
-  const p = new Promise<RawHttpResult>((res, rej) => {
-    resolveRes = res;
-    reject = rej;
-  });
-  const connectTimer = setTimeout(() => {
-    req.destroy(new Error('connect timeout'));
-  }, opts.connectMs);
-  // connect/secureConnect 只在隧道代理（CONNECT）时触发，普通 TCP 直连**从不**发；
-  // keep-alive 复用的 socket 也不会再发。实测：裸 node 直连 127.0.0.1 时
-  // req.on('connect') 无回调、新 socket 在 'socket' 事件里 connected===undefined，
-  // 于是定时器无从清表 → 首字节慢于 connect_ms 的连接被静默 destroy
-  // （hy3 首字节 2.3s，配 connect_ms=2000 时 100% 复现"connect timeout"）。
-  // 正确判据是 socket 的 writable 状态（已可写即连接已建立）。
+
+  reqRef = req;
+
+  // total 通道：从发请求起计满总预算。放在这里（而不是响应回调里）是本轮修复的核心。
+  totalTimer = setTimeout(
+    () => finish(new TransportError('timeout', `total timeout（${opts.totalMs}ms 总预算耗尽）`)),
+    opts.totalMs,
+  );
+
+  // connect 通道：从发请求起就计时，socket 一旦建立即停表。
+  // （connect/secureConnect 事件只在 CONNECT 隧道会触发，普通直连靠 socket 的
+  //  'connect' 事件；这里两者都听，谁先来算谁。）
+  connectTimer = setTimeout(
+    () => finish(new TransportError('timeout', `connect timeout（${opts.connectMs}ms 内未建立连接）`)),
+    opts.connectMs,
+  );
+
   req.on('socket', (s: import('node:net').Socket) => {
-    if (s.writable === true) clearTimeout(connectTimer);
-    // 兜底：socket 稍后就绪也要清表（DNS 解析完成与 socket 分配之间有时间差）
-    else s.once('connect', () => clearTimeout(connectTimer));
+    const connected = (): void => {
+      if (connectTimer !== undefined) {
+        clearTimeout(connectTimer);
+        connectTimer = undefined;
+      }
+      armIdle();
+    };
+    if (s.connecting === false && s.readyState === 'open') connected();
+    else {
+      s.once('connect', connected);
+      // 兜底：socket 已可写（含 keep-alive 复用）也算连通
+      if (s.writable === true && s.connecting === false) connected();
+    }
+    // 收到的任何字节 = 有进展（含上游只回头不吐 body 的情形）
+    s.on('data', () => armIdle());
   });
+
   req.on('error', (e: Error) => {
-    clearTimeout(connectTimer);
-    reject(e);
+    if (settled) {
+      // 超时/中断路径：req.destroy(err) 会把同一个错误再抛一次，吞掉
+      return;
+    }
+    if (connectTimer !== undefined) {
+      clearTimeout(connectTimer);
+      connectTimer = undefined;
+    }
+    finish(e);
   });
+
   if (opts.signal !== undefined) {
-    if (opts.signal.aborted) req.destroy(new Error('aborted'));
-    else opts.signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true });
+    if (opts.signal.aborted) finish(new TransportError('network', 'aborted'));
+    else opts.signal.addEventListener('abort', () => finish(new TransportError('network', 'aborted（调用方取消）')), { once: true });
   }
   if (opts.body !== undefined) req.write(opts.body);
   req.end();
@@ -432,10 +518,17 @@ async function rawHttp(
 /** transport 内的超时/网络错误（带原始 cause，供 classifyError 归类）。 */
 export class TransportError extends Error {
   readonly kind: 'timeout' | 'network';
-  constructor(kind: 'timeout' | 'network', message: string, options?: { cause?: unknown }) {
+  /** 原始 socket 层 errno（ECONNREFUSED / ENOTFOUND / ECONNRESET …），无则 undefined。 */
+  readonly code?: string;
+  constructor(
+    kind: 'timeout' | 'network',
+    message: string,
+    options?: { cause?: unknown; code?: string },
+  ) {
     super(message, options);
     this.name = 'TransportError';
     this.kind = kind;
+    if (options?.code !== undefined) this.code = options.code;
   }
 }
 
