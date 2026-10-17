@@ -192,13 +192,42 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
   },
 ];
 
+/**
+ * P2-1：`mcp.call` —— 外部工具网关（**宿主侧**，不进容器）。
+ *
+ * 刻意**不放进 CAPABILITY_CATALOG**：那张表是 11 名契约（与 `agent-runtime/protocol.ts`
+ * 逐字同形、有 40 条防漂移测试）。MCP 网关是"扩展点"，它的可用性取决于运行期配置
+ * （是否声明了 server），因此由 ExecService 在 `getCapabilities()` 输出时按需附加——
+ * 未声明任何 server 时，模型**看不到这个工具**，11 名契约与所有既有断言一字不变。
+ *
+ * 参数形状：`{ server, tool, arguments }`。
+ * `sideEffect` 恒为 `'unknown'`：外部工具做什么我们不知道 → 治理按最严档处理。
+ */
+export const MCP_CALL_CAPABILITY: Capability = {
+  name: 'mcp.call',
+  mode: 'sync',
+  max_deadline_ms: 60_000,
+  args_schema: obj(
+    {
+      server: str('已声明的 MCP server 名（见工具说明里列出的可用 server）'),
+      tool: str('该 server 暴露的工具名'),
+      arguments: { type: 'object', description: '传给外部工具的参数对象（按其 inputSchema 填）' },
+    },
+    ['server', 'tool'],
+  ),
+  sideEffect: 'unknown',
+};
+
 /** 词表（契约 M5）：治理 tools.yml 登记名必须 ⊆ 本集合。 */
 export const TOOL_NAMES: readonly ToolName[] = CAPABILITY_CATALOG.map((c) => c.name as ToolName);
 
 const CATALOG_BY_NAME = new Map<string, Capability>(CAPABILITY_CATALOG.map((c) => [c.name, c]));
 
 export function findCapability(name: string): Capability | null {
-  return CATALOG_BY_NAME.get(name) ?? null;
+  // P2-1：`mcp.call` 不在 11 名契约表里（见 MCP_CALL_CAPABILITY 的注释），
+  // 但宿主侧仍需走同一套参数/deadline 校验，所以在这里兜住。
+  // 注意顺序：先查正式目录，保证将来若它真进契约也不会被这里遮蔽。
+  return CATALOG_BY_NAME.get(name) ?? (name === 'mcp.call' ? MCP_CALL_CAPABILITY : null);
 }
 
 /** 派发端点判据（§5.2/§10）：catalog[tool].mode，不看时长。未登记工具 = deny（契约 J2 启动校验）。 */

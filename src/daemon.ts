@@ -81,6 +81,8 @@ import {
 } from './governance/gate.ts';
 import type { GovDeps } from './governance/types.ts';
 import { ExecServiceImpl } from './exec/ExecService.ts';
+import { McpClient } from './exec/mcp-client.ts';
+import { loadMcpServers } from './exec/mcp-config.ts';
 import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
@@ -726,6 +728,12 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
         cp.heartbeat(taskId, epoch, undefined, { live: { at: now } });
       },
     },
+    // P2-1：MCP 外部工具通道。**默认关闭**——config/mcp-servers.yml 未声明 server 时
+    // 这里是空列表，`mcp.call` 不会出现在模型工具面里（见 getCapabilities 的过滤）。
+    // 配置解析失败会抛错 → 拒启动（静默忽略一份写错的安全配置最危险）。
+    mcp: new McpClient(
+      loadMcpServers(process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')),
+    ),
   });
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);

@@ -52,6 +52,23 @@ tools:
   - name: net.post
     tier: write_file                        # 对外 POST 有副作用：比 GET 高一档（GOV §2.2）
 
+  # ── P2-1：外部工具网关（MCP）──────────────────────────────────────────────
+  # 为什么是 dangerous 而不是 spend/write_file：
+  #   spend 要求 spendParams.required（金额等固定字段），而 MCP 工具的参数是**任意**的，
+  #   无法预先声明"要花多少钱"——用 spend 会被 catalog 校验拒掉（GOV §2.3）。
+  #   dangerous 才是这里唯一正确的档：
+  #     - 一律人工审批（approve_once，不参与 `all` 批量批准）；
+  #     - 应急模式（EMERGENCY）直接冻结（gate.ts:392）；
+  #     - 治理审计里带 tier，复盘能一眼看出"这是外部工具"。
+  # **这条不要放宽**：外部 MCP server 的行为我们不知道，它可能在宿主上发网络请求、
+  # 读环境变量、写任意文件。给它 write_file/read 档等于让用户无感地执行第三方代码。
+  #
+  # 默认**不启用**：本条目只声明"如果 mcp.call 出现，按最严档管"。
+  # 是否真的出现，取决于 config/tools.yml 的 mcp_servers 段是否声明了 server
+  # （空 = 完全不启用，模型看不到这个工具）。
+  - name: mcp.call
+    tier: dangerous
+
 # ── spend 档条目（结构定型，§9.3：花钱一律人工审批）──────────────────────────
 # GOV §2.3 校验细则：tier == "spend" 的条目必须带 spendParams（缺则加载失败）。
 # 阶段一工具词表（§9.1/M5）无 spend 档工具；购物走 browser.act 由 review 承接。

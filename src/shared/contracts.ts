@@ -704,6 +704,18 @@ export type ToolName =
   | 'net.get'
   | 'net.post';
 
+/**
+ * 契约外工具的**网关名**（P2-1）。
+ *
+ * 刻意不并进 `ToolName`：那 11 个名字是 AGENT↔容器 的逐字契约（两份 protocol.ts
+ * 同形，有防漂移测试）。`mcp.call` 是**宿主侧**的扩展点网关——它不进容器、
+ * 目录由 `mcp_servers` 配置决定是否出现，因此单独成类型。
+ */
+export type GatewayToolName = 'mcp.call';
+
+/** 一次 exec 调用能出现的全部工具名（契约 11 名 + 网关）。 */
+export type ExecToolName = ToolName | GatewayToolName;
+
 export interface ExecToolResult {
   call_id: string;
   job_id?: string;

@@ -42,11 +42,11 @@
 | 档 | 主题 | 项数 | 要解决的一句话问题 | 其中已在做 |
 |---|---|---|---|---|
 | **P0** | 让已有的东西真的能用 | 5 | 它现在跑起来了，但模型是瞎的、答案是憋出来的 | **5/5 已完成** |
-| **P1** | 从"演示级"到"日常可用级" | 6 | 它一次只能干一件事，且不会查自己记过什么 | **3/6 已完成**（P1-2/3/4） |
+| **P1** | 从"演示级"到"日常可用级" | 6 | 它一次只能干一件事，且不会查自己记过什么 | **6/6 已完成** |
 | **P2** | 差距最大的三板斧 | 3 | 工具面封闭、没有计划、装不进来 | 0/3 |
 | **P3** | 长线 + 故意不做 | 4 + 7 | 哪些对标项是**价值观上拒绝**的 | — |
 
-**P0 已全部完成（5/5）**，P1 已完成 3/6（会话摘要、FTS 检索、WRITE-SEAL 闭环）。剩 P1-1（并发）、P1-5（net.* 落地 + 搜索工具）、P1-6（可观测性）与整个 P2。P1 做完，我判断 dotd 就能"一个人用一周不卸载"。P2 做完，差距从矩阵里的"12 项落后"收缩到"3–4 项"，剩下的基本都是刻意选择。
+**P0 5/5、P1 6/6 全部完成**（2026-10-18，commit `6fac6f8`）。剩 P2 三项：工具扩展点（MCP 客户端）、显式计划与目标锚定、部署从 12 步降到 3 步。P2 做完，矩阵里"12 项落后"会收缩到只剩刻意选择的部分。P2 做完，差距从矩阵里的"12 项落后"收缩到"3–4 项"，剩下的基本都是刻意选择。
 
 ---
 
@@ -212,6 +212,11 @@
 
 ## P1-1 并发：从单任务串行到"交互优先 + 后台让路"
 
+> **状态：✅ 已完成（2026-10-18，commit `6fac6f8`）。** 读码时发现**饿死是结构性的**：`pop()` 第一行就判额度，额度一满**连看 `ORDER BY priority` 的机会都没有**——所以光调大并发额度治不了，后台只要再占满，对话又被饿死。
+> 两条互补通道：① `interactiveReserve` 预留格（满额时 interactive 可额外进入，**有界**）；② `preemptiblePriority` 抢占（预留也用完时，把最晚开始的后台任务退回 queued，**attempt 不变、不记失败**）。
+> 顺带补上两处缺闸：**端点生产并发**（`ModelRouter` 唯一的闸只对 `local` 端点生效且只在 tier2 分支调用，Tier1 主路径完全没闸 → 单并发端点下并发必然失败）与**容器内工具闸**（`browser.*` 1 / `shell.run` 2 / `fs.*` 不限，排队超时降级为 `container_busy`）。抢占后接既有 `journal.reconcileAndResolve` 对账，不留 `started` 孤儿步。
+> **默认值全部不变**：`maxRunningTasks=1`、`interactiveReserve=0`、`preemptiblePriority=0`、`containerJail` 全 0；靠 `DOTD_MAX_RUNNING` 等环境变量显式开启，非法值拒启动。
+
 **为什么做**
 矩阵 §7.1：`maxRunningTasks: 1`（`src/control-plane/types.ts:187`），pop 时 `runningCount(dot) >= maxRunningTasks → return null`（`src/control-plane/queue.ts:247`）。一个 30 分钟的 `shell.run` 会把你的 `dotd ask` 堵在后面。**这是我判断"一个人用一周会不会卸载"的第二关键因素**（第一是 P0-1）。
 
@@ -308,6 +313,10 @@
 
 ## P1-5 `net.get` / `net.post` 落地 + Web 搜索工具
 
+> **状态：✅ 已完成（2026-10-18，commit `6fac6f8`），但"Web 搜索工具"判断为**不做**，理由有实测。**
+> A：容器侧其实**从未实现**——`agent-runtime/server.ts` 直接 `return errorResult(..., not_implemented, "阶段二实现")`，即"模型看得见工具、调用必失败"。现已在 `agent-runtime/net.ts` 实现，**默认关闭**（`DOTD_NET_TOOLS` 不设 = off；`get` = 只读；`all` = 含 POST；**拼错按 off 处理 + 告警**，绝不因拼错意外放开出网）。三道护栏：仅 http/https、SSRF 拒内网/云元数据（含 `::ffff:7f00:1` 这种 IPv4 映射被规范化成十六进制的形态）、不跟随重定向 + 4MB + 30s。
+> B：**不做内置搜索**。本机实测 DuckDuckGo / Google 全部连接超时；唯一能通的 Bing 连发 5 次返回**与查询无关**的结果（查 `dotd agent harness` → 返回"DiskGenius 数据恢复软件"）。把这种结果喂给模型**比没有搜索更糟**，而要做稳就得接付费 API —— 违反"唯一外部依赖是可换 base_url 的模型 API"这条立身之本。替代方案：`net.get` + 一份判据手册（优先直连权威数据源、禁止抓搜索引擎网页、**明令禁止用 shell curl 绕过开关**）。
+
 **为什么做**
 矩阵 §12 附条：`net.get`/`net.post` 在能力目录里有、路由里有，但容器内直接返回 `not_implemented`（`agent-runtime/server.ts:609-612`）。后果是 agent **没有轻量的 HTTP 能力**，也没有 web 搜索——所有网络访问都得走完整浏览器（重、慢、且未验证）。
 dotd 是"唯一外部依赖是可换 base_url 的模型 API"的自托管项目，那么"上网查资料"就必须是**成本低、可控、可审计**的一等能力。
@@ -331,6 +340,8 @@ dotd 是"唯一外部依赖是可换 base_url 的模型 API"的自托管项目�
 ---
 
 ## P1-6 可观测性补齐：结构化日志 + 成本口径
+
+> **状态：✅ 已完成（2026-10-18，commit `6fac6f8`）。** 补齐 README 明写"路由待补"的两条路由（`GET /api/tasks/:id`、`GET /api/logs`），`dotd task <id> --verbose` 现在直接回答主人最关心的三件事：**花了多少**（token + 模型/工具耗时拆分 + 调用次数 + 是否降级）、**卡在哪**（在途步优先，其次失败步）、**每一步多久**。成本全部取自 `model_call_log` 现成字段、按契约 J1（`attempt_id = llm 步 call_id`）关联，未重造口径；投影是纯函数（`src/surfaces/task-view.ts`），每条口径可逐字段断言。
 
 **为什么做**
 矩阵 §8：日志只有 `process.stdout.write('['dotd'] …')`（`src/daemon.ts:410`），**无级别、无结构、无轮转**；`model_call_log` 有 token 但**没有一分钱的成本口径**（`db/migrations/010_model_router.sql:74-84`）；无 trace_id。

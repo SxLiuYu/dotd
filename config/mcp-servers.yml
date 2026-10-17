@@ -1,0 +1,40 @@
+# mcp-servers.yml —— P2-1 外部工具（MCP）声明
+#
+# ⚠ **本文件默认为空 = MCP 完全关闭。**
+#   没有声明任何 server 时，模型**看不到** `mcp.call` 这个工具，dotd 的行为与
+#   引入 MCP 之前逐字一致（有静态守卫测试钉着）。
+#
+# ## 启用后会发生什么
+# 1. 模型工具面里多出 `mcp.call`，参数 `{ server, tool, arguments }`；
+# 2. **每一次调用都走 dangerous 档审批**：一律人工确认，不参与批量批准，
+#    应急模式（EMERGENCY）下直接冻结。外部工具的行为我们不知道，这条不能放宽；
+# 3. 调用由**宿主进程**转发给对应的 MCP server 子进程（stdio + JSON-RPC），
+#    不经过容器；超时（默认 30s）、输出上限（64KB）、工具白名单三重兜底。
+#
+# ## 怎么声明一个 server
+# ```yaml
+# servers:
+#   - name: echo                                  # 模型在 args.server 里写这个名字
+#     command: node                               # 可执行文件（PATH 里要有）
+#     args: ["scripts/mcp-echo-server.mjs"]       # 命令行参数
+#     timeout_ms: 30000                           # 可选，单次调用超时
+#     allow_tools: [echo, add]                    # 可选，白名单（强烈建议写）
+#     env:                                        # 可选，附加环境变量
+#       SOME_KEY: value
+# ```
+#
+# ## 取证用的示例（取消注释即可试跑本仓库自带的 echo server）
+# servers:
+#   - name: echo
+#     command: node
+#     args: ["scripts/mcp-echo-server.mjs"]
+#     timeout_ms: 5000
+#     allow_tools: [echo, add]
+#
+# ## 安全提醒（写在最显眼的地方）
+# - MCP server 是**宿主上跑的任意程序**。你声明 `command: node args: [某脚本]`，
+#   等于允许 dotd 在你机器上执行它。只声明你信任的来源。
+# - 用 `allow_tools` 收窄可用工具：即使 server 后来多出一个危险工具，模型也调不到。
+# - server 的 stdout 必须只输出 JSON-RPC 帧；诊断信息请走 stderr。
+
+servers: []

@@ -32,6 +32,7 @@ import type {
   ExecToolResult,
 } from '../shared/contracts.ts';
 import { DiskGardener } from './disk.ts';
+import { McpClient } from './mcp-client.ts';
 import { Fleet, createDockerBackend, createStubBackend } from './fleet.ts';
 import { HostNetGuard } from './netguard.ts';
 import { ImageManager } from './image.ts';
@@ -39,6 +40,7 @@ import { createStubRuntime } from './stub-runtime.ts';
 import { HttpRuntime } from './http-runtime.ts';
 import {
   CAPABILITY_CATALOG,
+  MCP_CALL_CAPABILITY,
   FS_LIST_MAX_DEPTH,
   FS_READ_MAX_BYTES,
   FS_WRITE_MAX_BYTES,
@@ -240,6 +242,13 @@ export interface ExecServiceDeps {
    * 也可装配后用 `setLiveness()` 注入。
    */
   liveness?: ExecLiveness;
+  /**
+   * P2-1：MCP 客户端（外部工具通道）。
+   *
+   * 缺省 = 空（未声明任何 server）= MCP 完全关闭：`mcp.call` 不出现在工具面里，
+   * 一切行为与未引入本功能**逐字一致**。
+   */
+  mcp?: McpClient;
   /** 时钟（测试注入虚拟时间用；缺省 Date.now）。 */
   clock?: () => number;
 }
@@ -268,6 +277,8 @@ export class ExecServiceImpl implements ExecService {
   private readonly jail: ContainerJail;
   /** 闸的生效配置（用于错误消息里的上限数字）。 */
   private readonly jailCfg: { browser: number; shell: number; fs: number; queueMs: number };
+  /** P2-1：MCP 客户端（默认空 = 未声明任何 server = 完全关闭）。 */
+  private readonly mcp: McpClient;
   /** 时钟（测试注入虚拟时间；生产恒 Date.now）。 */
   private readonly clock: () => number;
 
@@ -283,6 +294,9 @@ export class ExecServiceImpl implements ExecService {
       ...(base.containerJail ?? { browser: 0, shell: 0, fs: 0, queueMs: 0 }),
     };
     this.jail = new ContainerJail(this.jailCfg);
+    // P2-1：MCP 客户端。空数组 = 未声明任何 server（默认）→ `enabled=false`，
+    // 且 `mcp.call` 根本不会出现在工具面里（见 getCapabilities 的过滤）。
+    this.mcp = deps.mcp ?? new McpClient([]);
 
     if (deps.backend !== undefined) {
       this.backend = deps.backend;
@@ -458,6 +472,21 @@ export class ExecServiceImpl implements ExecService {
 
     const mode = this.modeOf(call.tool);
     const aHash = argsHash(call.args);
+
+    // ③b P2-1 MCP 网关分流：`mcp.call` **不走容器**，由宿主侧 MCP 客户端转发给外部 server。
+    //
+    // 为什么放在这里（容器检查之前）：
+    //  - MCP server 是宿主上的独立子进程，与容器状态无关——容器没起来时它照样能工作；
+    //  - 但**必须在校验之后**：`validateToolCall` 仍然用同一套词表/参数校验把关；
+    //  - 也必须在 `call_sent` / `incInflight` **之前**：外部工具不占容器 busy 状态，
+    //    否则 min-idle 回收/看门狗会把"宿主上的工具调用"误判成容器在忙。
+    // 幂等沿用同一条 ledger（call_id 已在上面的 ① 重放检查里覆盖）。
+    // 注：`ExecToolCall.tool` 的类型是契约 11 名（防漂移测试钉着），网关名只在运行期出现，
+    // 故这里用字符串比较——**类型面一个字没改**，契约仍与 agent-runtime 逐字同形。
+    if ((call.tool as string) === 'mcp.call') {
+      return await this.dispatchMcpCall(call, at, aHash);
+    }
+
     // wake-on-demand：节能档（idle/suspended）不是错误，是待唤醒——派发前原地唤醒。
     // 死锁实测（WSL 2026-10-16）：guard 在 guarded 档 pause 空转容器后，派发路径只会
     // 用 container_not_ready 拒绝，等 guard 解冻回升；水位不回升（netfuzz 基线噪声）
@@ -582,6 +611,86 @@ export class ExecServiceImpl implements ExecService {
     // 先续一次：派发本身已经证明上游可达（P0-3：心跳与"容器确实活着"同源）。
     this.beatLive(call);
     return await this.pollJob(endpoint, token, call, job_id);
+  }
+
+  /**
+   * P2-1：`mcp.call` 的宿主侧派发（不经容器）。
+   *
+   * 与容器工具的区别（也是它安全模型的一部分）：
+   *  - **不占容器 busy/in-flight**：外部 server 与容器健康无关；
+   *  - 仍走同一条 `exec_calls` ledger（幂等键 call_id 不变，重放语义一致）；
+   *  - 失败**一律回成普通工具结果**（`{ok:false,errorCode}`），让模型读到错误后改道，
+   *    而不是把任务判成执行面故障。
+   */
+  private async dispatchMcpCall(call: ExecToolCall, at: string, aHash: string): Promise<ExecToolResult> {
+    const args = (call.args ?? {}) as { server?: unknown; tool?: unknown; arguments?: unknown };
+    const serverName = typeof args.server === 'string' ? args.server : '';
+    const toolName = typeof args.tool === 'string' ? args.tool : '';
+    const toolArgs =
+      args.arguments !== null && typeof args.arguments === 'object' && !Array.isArray(args.arguments)
+        ? (args.arguments as Record<string, unknown>)
+        : {};
+
+    this.fleet.recordCallSent(call, 'sync', null, aHash);
+    this.deps.bus.publish('exec.call.started', {
+      callId: call.call_id,
+      dotId: call.dot_id,
+      taskId: call.task_id,
+      tool: call.tool,
+      mode: 'sync',
+      at,
+    });
+
+    const res = await this.mcp.call(serverName, toolName, toolArgs);
+    let out: ExecToolResult;
+    if (res.ok) {
+      out = {
+        call_id: call.call_id,
+        status: 'ok',
+        result: { server: serverName, tool: toolName, mcp: res.result },
+        usage: { wall_ms: 0, peak_mem_mb: 0 },
+        finished_at: new Date().toISOString(),
+      };
+      this.fleet.finishCall(call.call_id, 'done', out.result, null);
+    } else {
+      // 外部工具的失败是**可读的业务结果**：retryable 只在传输类错误上为真
+      const retryable =
+        res.errorCode === 'mcp_timeout' || res.errorCode === 'mcp_transport' || res.errorCode === 'mcp_protocol';
+      out = {
+        call_id: call.call_id,
+        status: 'error',
+        error: {
+          code: res.errorCode ?? 'mcp_error',
+          message: res.errorMessage ?? 'MCP 调用失败',
+          retryable,
+        },
+        usage: { wall_ms: 0, peak_mem_mb: 0 },
+        finished_at: new Date().toISOString(),
+      };
+      this.fleet.failCall(call.call_id, out.error?.code ?? 'mcp_error');
+    }
+    this.deps.bus.publish('exec.call.finished', {
+      callId: call.call_id,
+      dotId: call.dot_id,
+      taskId: call.task_id,
+      tool: call.tool,
+      mode: 'sync',
+      status: out.status,
+      errorCode: out.error?.code,
+      wallMs: 0,
+      at: out.finished_at ?? at,
+    });
+    return out;
+  }
+
+  /**
+   * 关停（P2-1）：结束所有 MCP 子进程。
+   *
+   * 不调它也能退出（子进程句柄已 unref、且 stdin EOF 会让 server 自行退出），
+   * 但显式关闭更干净：不留孤儿进程，也让关停顺序可预期。
+   */
+  dispose(): void {
+    this.mcp.dispose();
   }
 
   /** 续一次在途心跳（回调抛错只记日志：心跳是附带动作）。 */
@@ -818,7 +927,7 @@ export class ExecServiceImpl implements ExecService {
 
   /** 能力目录（J2：mode + sideEffect 是权限分级与派发路由的唯一词表）。 */
   async getCapabilities(_dotId: string): Promise<Capability[]> {
-    if (this.capCache !== null) return [...this.capCache];
+    if (this.capCache !== null) return this.visibleCaps(this.capCache);
     // 容器在跑时以容器 GET /capabilities 为准（版本化 runtime_ver），否则用宿主内置目录
     const c = this.fleet.getContainer(_dotId);
     const token = await this.fleet.currentToken(_dotId);
@@ -827,14 +936,34 @@ export class ExecServiceImpl implements ExecService {
         const remote = await this.runtime.capabilities(c.endpoint, token);
         if (remote.length > 0) {
           this.capCache = remote;
-          return [...remote];
+          return this.visibleCaps(remote);
         }
       } catch {
         // 回落宿主内置目录
       }
     }
     this.capCache = [...CAPABILITY_CATALOG];
-    return [...this.capCache];
+    return this.visibleCaps(this.capCache);
+  }
+
+  /**
+   * P2-1：**工具面对外可见性的唯一出口**。
+   *
+   * `mcp.call` 是宿主侧的网关工具（不在容器目录里），它在两种情况下必须**不可见**：
+   *  1. 未声明任何 MCP server（默认）——否则模型会看到一个永远失败的调用口；
+   *  2. **容器返回了 remote 目录**却不知 MCP 时也一样按 (1) 处理。
+   *
+   * 这条过滤是"默认配置下行为逐字不变"的**结构保证**：不是靠调用方自觉，
+   * 而是工具清单本身就不会多出来一个名字。
+   */
+  private visibleCaps(base: readonly Capability[]): Capability[] {
+    const out = base.filter((c) => c.name !== 'mcp.call');
+    if (this.mcp.enabled) {
+      const gw = base.find((c) => c.name === 'mcp.call') ?? MCP_CALL_CAPABILITY;
+      // 网关工具的 sideEffect 恒为 'unknown'：外部工具做什么我们不知道（治理据此给最严档）
+      out.push({ ...gw, sideEffect: 'unknown' });
+    }
+    return out;
   }
 
   /** 契约 J5：stats（内部用 dockerode stats API，CP 只按周期调用）。 */
