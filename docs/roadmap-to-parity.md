@@ -41,12 +41,12 @@
 
 | 档 | 主题 | 项数 | 要解决的一句话问题 | 其中已在做 |
 |---|---|---|---|---|
-| **P0** | 让已有的东西真的能用 | 5 | 它现在跑起来了，但模型是瞎的、答案是憋出来的 | P0-1（1/5） |
-| **P1** | 从"演示级"到"日常可用级" | 6 | 它一次只能干一件事，且不会查自己记过什么 | 0/6 |
+| **P0** | 让已有的东西真的能用 | 5 | 它现在跑起来了，但模型是瞎的、答案是憋出来的 | **5/5 已完成** |
+| **P1** | 从"演示级"到"日常可用级" | 6 | 它一次只能干一件事，且不会查自己记过什么 | **3/6 已完成**（P1-2/3/4） |
 | **P2** | 差距最大的三板斧 | 3 | 工具面封闭、没有计划、装不进来 | 0/3 |
 | **P3** | 长线 + 故意不做 | 4 + 7 | 哪些对标项是**价值观上拒绝**的 | — |
 
-P0 剩下的 4 项 + P1 全部做完，我判断 dotd 就能"一个人用一周不卸载"。P2 做完，差距从矩阵里的"12 项落后"收缩到"3–4 项"，剩下的基本都是刻意选择。
+**P0 已全部完成（5/5）**，P1 已完成 3/6（会话摘要、FTS 检索、WRITE-SEAL 闭环）。剩 P1-1（并发）、P1-5（net.* 落地 + 搜索工具）、P1-6（可观测性）与整个 P2。P1 做完，我判断 dotd 就能"一个人用一周不卸载"。P2 做完，差距从矩阵里的"12 项落后"收缩到"3–4 项"，剩下的基本都是刻意选择。
 
 ---
 
@@ -235,6 +235,8 @@ P0 剩下的 4 项 + P1 全部做完，我判断 dotd 就能"一个人用一周�
 
 ## P1-2 会话摘要真的生成（当前 `updateContextSummary` 零调用）
 
+> **状态：✅ 已完成（2026-10-18，commit `783d119`）。** 摘要走**注入的 `summarize` seam**（MEM 模块零 HTTP），daemon 接 `router.complete({track:'light'})`；触发点在 Runner 收口前（补写轮之后、finish 之前）；`upto_seq` 取被覆盖的最后一条消息 seq（精确值）；增量摘要只喂 `upto_seq` 之后的新消息 + 旧摘要。验收 `tests/memory-context-summary.test.ts` 10/10。
+
 **为什么做**
 矩阵 §3.1 偏差 ①：`updateContextSummary()` 定义在 `src/memory/MemoryService.ts:288-299`，**全仓库没有调用方**；`needsSummarize()`（`:1271`）同样无人调用。于是 `context_summary` 恒为 NULL，会话超过 4000 token（`src/memory/limits.ts:59`）后**硬截断**，越聊越忘。
 
@@ -254,6 +256,8 @@ P0 剩下的 4 项 + P1 全部做完，我判断 dotd 就能"一个人用一周�
 ---
 
 ## P1-3 记忆检索进工具面（FTS5，零依赖）
+
+> **状态：✅ 已完成（2026-10-18，commit `783d119`）。** 实测 SQLite 3.50.4 的 `unicode61` 把整段中文当一个 token（"会议记录"查"会议" = 0 条），故用 **bigram 纯函数**（写入与查询共用同一实现，防漂移）。**没有**用原设想的外部内容表 + 触发器：触发器调不了 JS，必然出现两套切分实现；且 `snippet()` 会读回未切分原文、把优势抵消。改 **contentless FTS + 代码侧双写**，原文仍以 `mem_messages` 为唯一真相。降级：表被 DROP/老库/索引损坏 → 回落 LIKE（结果不丢），并写 `fts_degraded_count`/`fts_degraded_last` 留痕。`rankManuals` 加 TF-IDF，反例：「旧算法把噪声手册排第一、真实相关手册排第三；新算法纠正」。验收 `tests/memory-fts.test.ts` 37/37。
 
 **为什么做**
 矩阵 §3.3：`searchHome()` 是**遍历全部索引文件逐个读全文再做 `indexOf`**（`src/memory/MemoryService.ts:502-525`），而且「维护用检索，不进模型工具面」（`:507`）。**模型完全不能检索自己的记忆**——只能靠任务开头注入的 2500 tokens（`src/memory/limits.ts:57`）。记忆越多，召回率越低，这是一个**会随使用时间恶化的缺陷**。
@@ -281,6 +285,9 @@ P0 剩下的 4 项 + P1 全部做完，我判断 dotd 就能"一个人用一周�
 ---
 
 ## P1-4 记忆写入策略闭环（修 WRITE-SEAL 的"假提醒"）
+
+> **状态：✅ 已完成（2026-10-18，commit `783d119`）。** 难点在于"终态之后无法再跑 LLM"：`sealTask` 由 CP 钩子在 `queue.finish()` **内部**调用，那时主循环已退出。解法是把判定提前——`needsMemoryRedo()` 只判定不写库，Runner 在 `cp.finish()` **之前**调用，该补就跑一轮**只给一次机会**的受控回合（请求不带 tools + `tool_choice:'none'`），然后才 finish，因此补写轮的 `fs.write` 落在任务仍 running 的时间窗内。`memoryRedo` 默认 **false**（= 既有行为不变），`daemon.ts` 显式传 true，并由静态守卫防止改回。
+> **顺带修掉的真缺陷**：daemon 的 `journalMemoryProbe` 返回 `fs.write:<callId>`（无路径），而 MEM 侧按 `/dot/home/{MEMORY.md,notes/,manuals/}` 前缀判定 → **永远判不出"写过"**，每个成功任务都被误报 missed。新增 `src/memory/step-paths.ts` 从 `args_json` 还原真实路径。验收 `tests/memory-seal-redo.test.ts` 12/12。
 
 **为什么做**
 矩阵 §12 偏差 ②：`src/memory/seal.ts:91-100` 在任务结束时往 thread 追加一句「若本次有可复用经验，现在写 notes/…」——**但这只是一条静态 `role:'system'` 消息，不会触发新的一轮 LLM 调用**。任务此刻已经 `finish`，Runner 已退出该任务的循环（`sealTask` 在 `Queue.finish` 内部被调，`src/daemon.ts:547-550`）。所以**"提醒补写一轮"从来没发生过**，模型的记忆写入完全取决于它在主任务里恰好想到了。

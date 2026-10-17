@@ -1,10 +1,11 @@
-# 2026-10-17 优化批次：做了什么、凭什么说它成立
+# 2026-10-17/18 优化批次：做了什么、凭什么说它成立
 
 > 本文是这一批优化的**举证材料**。配套阅读：
 > - [`benchmark-agent-capabilities.md`](./benchmark-agent-capabilities.md) —— 与 OpenAI / Grok 的能力对标矩阵（开工前的差距分析）
 > - [`roadmap-to-parity.md`](./roadmap-to-parity.md) —— 往后怎么走（本轮之后还剩什么）
 >
-> 基线 commit：`fb575f4`（优化前快照）。本批结束于 `85c0e5b` 之后的收尾提交。
+> 基线 commit：`fb575f4`（优化前快照）。本批分两轮：第一轮 `fb575f4 → b7e7ee5`（§1–§7），
+> 第二轮执行路线图 P0/P1：`b7e7ee5 → 783d119`（§8–§13）。
 > 写法约定：**每条改动都要能回答"改之前会发生什么"。** 只写"做了什么"而不写"原来的失效形态"的条目，
 > 说明我还没搞清它为什么值得改，那种条目不该出现在这里。
 
@@ -12,12 +13,18 @@
 
 ## 0. 一句话结论
 
-这一批不是加功能，是**把"看起来能用"变成"真的能用"**。四条主线：
+这一批不是加功能，是**把"看起来能用"变成"真的能用"**。八条主线：
 
 1. **模型第一次能看懂这套系统**（工具说明书 + system prompt + 工具结果全文回喂）；
 2. **真实链路第一次被证明**（真 TCP 的 HttpTransport 测试 + 假上游冒烟 + 真实缺陷修复）；
 3. **四个会让人丢数据/丢任务的缺陷被修掉**（崩溃恢复重复执行、daemon 起不来、runner 协程停摆、任务卡审批无提醒）；
-4. **新人第一天不再踩静默坑**（`dotd doctor`）。
+4. **新人第一天不再踩静默坑**（`dotd doctor`）；
+5. **流式真的流起来，而且没有制造"假完成"**（§8：补上契约里缺失的工具调用通道）；
+6. **长命令不再被看门狗误杀**（§9：心跳与"容器真的在推进"同源）；
+7. **会话摘要与文件索引真的在工作**（§10/§11：摘要不再是 NULL，中文检索可用了）；
+8. **记忆写入闭环真的闭环**（§12：WRITE-SEAL 的"补写一轮"从假动作变成真调用）。
+
+门禁总账（两轮结束时实测）：`tsc` exit 0；全量 **1231/1231 通过、0 失败**；冒烟 **11/11** 与 **16/16**。
 
 ---
 
@@ -262,16 +269,269 @@ pop 连抛 3 次后协程必须继续转、收口通道全断时每轮仍回到�
 
 ---
 
-## 7. 本批明确没做的（不要当成"已验证"）
+## 7. 第一轮结束时明确没做的（不要当成"已验证"）
 
-| 项 | 状态 | 说明 |
+> **第二轮已把下面 P0-2 / P0-3 两项做完**，见 §8 / §9。本节保留第一轮结束时的原始快照，
+> 用来对照"当时的判断"与"实际做下来发现的事"——两者差距很大，本身就是一条教训。
+
+| 项 | 第一轮结束时状态 | 说明 |
 |---|---|---|
 | **真模型往返** | ❌ 未验证 | 环境无凭据；`probe-live-model.mjs` 随时可跑 |
 | **真 Docker 容器** | ❌ 未验证 | 本机原生 Windows 无 dockerd；daemon 要在 WSL 里才有真 fleet |
 | **真实飞书链路** | ❌ 未验证 | 无 appId/appSecret；审批推送只在 fake gateway 上验过 |
-| **P0-2 流式接 Runner** | ⏳ 未做 | 三层已就绪，缺 `dot.ts` 里消费那一根线；列在 roadmap P0-2 |
-| **P0-3 看门狗误回收** | ⏳ 未做 | `heartbeatTimeoutMs=180s` 而工具可跑 30 分钟，超 3 分钟的工具必被误杀；列在 roadmap P0-3 |
-| 并发（`maxRunning=1`） | ⏳ 未做 | roadmap P1-1，且**必须等 P0-3 先修** |
+| **P0-2 流式接 Runner** | ⏳ 当时判断"三层已就绪，缺一根线" | **判断错了**：实际缺的是契约里的工具调用通道，见 §8.2 |
+| **P0-3 看门狗误回收** | ⏳ 当时判断"180s 阈值必误杀长命令" | 判断对，但**漏了** deadline 分叉这第二个缺陷，见 §9.3 |
+| 并发（`maxRunning=1`） | ⏳ 未做 | roadmap P1-1；**必须等 P0-3 先修**（现在已具备前提） |
 
 **一句话：本批把"证明得了的部分"做扎实了，但没有改变"真实容器 + 真模型的端到端仍未验证"这一事实。**
 那需要一台有 docker 的 Linux/WSL 环境和一份模型凭据，不是代码问题。
+
+---
+
+# 第二轮：执行路线图 P0 与 P1（2026-10-18）
+
+第一轮结束时，路线图里 P0 还差 4 项、P1 一项没动。这一轮把它们推到：**P0 5/5 完成，P1 3/6 完成**。
+下面每条都按同样口径写——先写"改之前会发生什么"，再写证据。
+
+## 8. 流式：补上契约里根本没有的"工具调用通道"
+
+### 8.1 任务原本被理解成"接一根线"
+
+`ChatChunk` 只有 `delta`/`done`，`HttpTransport.stream()` 的 SSE 解析只读 `choices[0].delta.content`；
+`ModelRouter.stream()`、`chat.delta`/`chat.final` 主题、前端增量渲染**全都就绪**，只有 `src/runner/dot.ts`
+没有消费。所以原计划是："在 `stepLlm()` 里换 `router.complete()` 为 `router.stream()`，20 分钟搞定。"
+
+### 8.2 实际是什么（这是本轮最重要的发现）
+
+主循环每轮都带 `tools` + `tool_choice:'auto'`。而**流式通道会把工具调用分片静默丢弃**。
+用真 HTTP + 假 SSE 上游实测（上游只回 `tool_calls`）：
+
+```
+产出的 chunk 数 = 0
+```
+
+于是 Runner 把这轮当成"纯文本完结轮"（`toolCalls = []`）→ `ctx.done` 置真 →
+**任务标记 done，但工具从未执行。**
+
+这不是"没有流式"，这是**静默假完成**。比不流式严重得多：主人看到"做完了"，实际什么也没做。
+
+### 8.3 修法：先补契约，再接线
+
+| 层次 | 改动 |
+|---|---|
+| `src/shared/contracts.ts` | `ChatChunk.toolCalls?: StreamToolCallDelta[]`（**只加可选字段**，旧调用方零影响）；`ModelRouterApi.stream()` 增加 `toolCalls(): 成品[]` |
+| `src/shared/tool-stream.ts`（新增） | `StreamToolCallAccumulator`——聚合规则**唯一实现**，跨 transport/router/runner 三处共用 |
+| `src/router/transport.ts` | SSE 解析 `delta.tool_calls` → 增量下发；**按 `mapped.back` 把消毒名还原**（`fs_write`→`fs.write`，与非流式同一张表） |
+| `src/router/ModelRouter.ts` | 每次尝试新建聚合器（换候选/换模型不串账）；空壳判据加"无工具调用"条件 |
+| `src/runner/dot.ts` | `stepLlm` 拆 `streamLlm`/`completeLlm`，**共用同一个 catch**；工具调用等流结束才取、照常走 `stepTool` |
+
+聚合器的 6 条容错（逐条有单测）：`index` 缺失归到当前槽 / 跳过不要求连续 / 整段下发与增量等价 /
+`name` 拆片拼接且幂等重发去重 / `id` 缺失补稳定占位 `call_<index>`（**不伪造到已有调用上**）/
+同 `index` 重发新调用顺延新槽。
+
+### 8.4 顺带修掉的真缺陷：`feed()` 三重退化
+
+旧 `feed()` 登记工具结果时**把调用声明一起删了**，`drainResults()` 再查就永远查不到。一处遗漏，三重退化：
+
+1. `dispatched` 恒 false → 本轮结果被当成"恢复期补跑的历史结果"，**不进 tool 通道**，降级成一条 system 注记；
+2. `assistant.tool_calls` 声明整段消失 → 下一轮 `role:tool` 成了**没有前置声明的无主消息**，OpenAI 兼容网关直接拒；
+3. 参数退化为 `{}` → **模型看不到自己当初传了什么**，改参重试与基于上次结果的决策全部失去依据。
+
+为什么长期没暴露：`noteToolCalls()` 按**模型给的 id** 登记，`stepTool` 用 **journal call_id** 派发，
+两者在真实链路上并不相等。修法：`feed()` 只在**缺失时**补登记（不覆盖模型原样串），并传入
+`calledWith`（真正交给 exec 的那份参数，已补 `/dot/home` 前缀），所以回喂给模型的 `arguments` 与它当初的执行输入逐字一致。
+
+### 8.5 证据
+
+`tests/runner-stream.test.ts` 11 条 + `tests/shared-tool-stream.test.ts` 10 条，全绿。最关键的一条：
+
+```
+✔ ④ 防假完成：流式回合里模型返回 tool_calls → 工具确实被执行，任务不提前 done
+  两轮都走 stream（chat 0 次）→ 工具执行恰好 1 次且 call_id 与 journal 一致 →
+  第二轮请求里 role=tool 与 assistant.tool_calls 严格配对 →
+  参数 JSON 由增量分片逐字拼回 {"path":"/dot/home"}
+```
+
+零回退的三条路径各有断言：无 `stream` 方法 → `complete()` 被调用（spy）；`DOTD_STREAM_CHAT=off` → 同上；
+未注入总线 → 逐字退回 `complete()`、不发布任何 `chat.*`。
+
+---
+
+## 9. 看门狗：长命令不再被误杀
+
+### 9.1 改之前
+
+`heartbeatTimeoutMs = 180_000`，而心跳**只在每个工具轮结束时**写一次（`afterStep`）。
+`await exec.runTool(...)` 在途期间心跳完全静止。async 工具允许跑 30 分钟——
+**任何超过 3 分钟的工具调用必被看门狗判成卡死并回收**：side effect 已落地，任务回 queued、`attempt+1`、从第一步重跑。
+
+A/B 实测（同一套测试、同一虚拟时钟，不 sleep 200s）：
+
+```
+HEAD   outs=aborted(stale_writer/abort) task=queued attempt=1 shellStep=succeeded execCount=1 watchdogReclaims=1 deadlineMs=60000
+FIXED  outs=done                        task=done   attempt=0 shellStep=succeeded execCount=1 watchdogReclaims=0 deadlineMs=1800000
+```
+
+读法：HEAD 里工具**成功返回、副作用已落地**（`execCount=1, shellStep=succeeded`），但 180s 时被回收 → 重跑 = **同一件事干两遍**。
+
+### 9.2 修法：心跳必须与"容器真的在推进"同源
+
+否决了 Runner 侧 `setInterval`（那是无脑续命，Runner 卡死时定时器可能还在跳）。
+采用**轮询驱动**：只有每轮 `GET /jobs` **成功且报 `running`** 才续一次心跳。
+四种情况**一律不续** → 心跳自然停 → 看门狗按 180s 照收：
+
+1. `getJob` 抛错（容器挂/网络断）；2. 容器被判 `unhealthy/lost/removed`；3. 本地 deadline 到达；4. 读到终态。
+
+接缝是 `ExecServiceDeps.liveness`（EX 不 import CP、不直写 `tasks`，符合模块边界）。
+
+### 9.3 顺带修掉的第二个真缺陷：deadline 分叉
+
+`pollJob` 用的是 Runner 传来的 `toolDeadlineMs`（缺省 **60s**）——所以"允许跑 30 分钟"以前**只是文档里的话**：
+3 分钟以上的工具根本轮不到看门狗，本地 deadline 先标 timeout 然后重跑。
+`CAPABILITY_CATALOG` 里早就声明了 `shell.run.max_deadline_ms = 1800000`，`validateToolCall` 只校验、从来不替你抬。
+现在按 catalog 的 `mode` 选档：async 用目录声明的上限，sync 仍是 60s（一字不改），未登记工具保守按 sync。
+
+### 9.4 真卡死仍会被回收（阴性证据）
+
+```
+✔ 阴性：前 150s 上游在推进、之后真卡死 → 180s 后看门狗照常回收（interrupted + queued + attempt+1）
+✔ 阴性：续过心跳也救不了真卡死——最后一次推进后 +181s 必回收（心跳只认上游推进）
+✔ 端到端：上游卡死 → 工具步 failed、execCount=0、心跳停写 → 180s 后照收
+```
+
+### 9.5 顺带修掉的第三个真缺陷：`interrupted` 从未落库
+
+看门狗回收里 `skipStep()` 之后那条 `UPDATE steps ... status='interrupted'` 是**空操作**（同一 call_id 已被改成 skipped）。
+这不只是死语句：`skipped` 的契约语义是"治理拒绝/审批过期、从未打算执行"，而 Runner 重建上下文时
+**只对 `interrupted` 步注入恢复注记**（"上一步结果未知，先观测再决定"）——`skipped` 不注入，
+模型下一轮会以为没发生过、直接重做。已改为先 `started → interrupted` + `result_json='watchdog_reclaim'`，
+`skipStep` 只在并发竞态下兜底。
+
+---
+
+## 10. 会话摘要：从"永远 NULL"到真的生成
+
+改之前：`MemoryService.updateContextSummary()` 写好了，但**全仓库零调用方**。`buildContextBundle` 里
+`thread.context_summary` 恒为 null → 会话超过预算只能硬截断——**"越聊越忘"，而且静默**。
+
+修法两个关键决策：
+- **生成走注入的 `summarize` seam**（`src/memory/types.ts`），MEM 模块**零 HTTP**；daemon 把它接到 `router.complete({ track:'light' })`；
+- **触发点在 Runner 收口前**（补写轮之后、`finish` 之前），`upto_seq` 取"被覆盖的最后一条消息的 seq"（精确值），
+  下一次只喂 `upto_seq` 之后的新消息 + 旧摘要（增量摘要，不重复整段会话）。
+
+实现中修掉一个自己引入的边界 bug：`upto_seq` 覆盖到末尾时不能把消息列表清空，否则"会话部分恒空、摘要永远放得下"，
+与 §4.2 的砍序自相矛盾。验收 `tests/memory-context-summary.test.ts` 10/10（含"消息量不够 → 不摘要、不花模型调用"的零打扰用例）。
+
+---
+
+## 11. 记忆检索：FTS5 + 中文 bigram（零依赖）
+
+### 11.1 问题一半在 SQLite 不在我们
+
+实测 SQLite 3.50.4：
+
+```sql
+-- unicode61 把整段连续中文当一个 token
+INSERT '这是一条会议记录';  MATCH '会议'  →  0 条
+```
+
+所以"打开预留的 FTS5"这句话本身不够——**不做 CJK 切分，中文检索仍然不可用**，而主人用中文。
+
+### 11.2 方案与取舍
+
+用 **bigram 纯函数**（`src/memory/cjk-tokenize.ts`）：`这是一条会议记录` → `这是 是一 一条 条会 会议 议记 记录`；
+拉丁/数字整词小写；单字中文保留自身（否则单字查询永远 0 命中）；查询侧逐 token 加引号（防 `AND/OR/NEAR` 被当运算符）。
+
+**没有**采用"外部内容表 + 触发器"这一原设想，三条实测理由：
+1. 外部内容表要求索引内容与 `mem_messages.content` 逐字相同，而我们写的是 bigram 文本 ≠ 原文，
+   `snippet()` 会读回未切分原文并按"整段中文 = 一个 token"高亮，把优势还回去；
+2. 触发器里调不了 JS → 必然出现 SQL 写/JS 查两套切分实现，**必然漂移**；
+3. 代码侧双写让写入与查询**共用同一个纯函数**。
+
+代价写进迁移包头注：绕过 `MemoryService` 直接 `INSERT mem_messages` 的调用方需同步索引，
+由 `ensureMessageFts()` 数量对账 + `resyncMessageFts()` 兜底（首次探测自动对账一次）。
+
+### 11.3 降级不静默
+
+`ftsProbe()` 查表存在性并实测 `count(*)`；表被 DROP / 老库 / 查询抛错 → 回落**原 LIKE SQL（逐字保留）**，
+结果不丢；并写 `mem_maintenance_state` 的 `fts_degraded_count`（自增）与 `fts_degraded_last`（`{reason, at}`）。
+测试断言了计数递增与 reason 内容——**降级是可见事件，不是静默降级**。
+
+### 11.4 `rankManuals` 加 TF-IDF，并给出反例
+
+`final = Σ weight(标题/路径×2、tag×1) × (1+ln tf) × idf`，`idf = N/(1+df)`。
+
+反例（同一组输入，旧算法 vs 新算法）：旧算法把噪声手册 `manuals/dotd misc.md` 排第一、
+真实相关文档 `manuals/release.md` 排第三；新算法 `release.md` 第一（3.0 vs 2.0）。
+原因：旧算法只认"命中位置数"，`dotd` 这类每篇都有的噪声词没有惩罚。
+
+过程中抓到两个真 bug：`isCjk()` 正则带 `g` 标志导致 `lastIndex` 状态污染（`"WSL"` 第二次调用被切成 `"WS","SL"` → 英文检索 0 命中）；
+`countHits` 传参语义用错导致 weighted 分量少算。都已修并加回归断言。
+
+验收 `tests/memory-fts.test.ts` 37/37。
+
+---
+
+## 12. WRITE-SEAL：让"补写一轮"真的发生
+
+### 12.1 改之前是个假动作
+
+`sealTask` 由 CP 的钩子在 `queue.finish()` **内部**调用——那一刻任务已终态、Runner 主循环已退出。
+它追加的那条 `SEAL_REMINDER_TEXT` 消息**永远不会有下一轮 LLM 去读**。所谓"补写一轮"从未发生，
+消息只会在下次同 thread 的任务里当历史噪音。
+
+叠加根因：daemon 的 `journalMemoryProbe` 返回 `fs.write:<callId>`（**没有路径**），
+而 MEM 侧按 `/dot/home/{MEMORY.md,notes/,manuals/}` 前缀判定 → **永远判不出"写过"**，
+于是每个成功任务都被误报 missed。
+
+### 12.2 修法：把判定提前到 finish 之前
+
+`needsMemoryRedo()`（只判定、不写库、不抛）由 Runner 在 `cp.finish()` **之前**调用；该补就跑一轮
+**只给一次机会**的受控回合——请求体**不带 tools** + `tool_choice:'none'`；模型若仍发 tool_calls，
+走**同一个 `stepTool`**（治理/幂等/journal 全照常，不绕过任何门）；一轮即止，绝不循环追问。
+补写轮的 `fs.write` 因此落在任务**仍 running** 的时间窗内，journal / 心跳 / epoch 围栏全部照常成立
+（测试 ①b 直接钉住"补写轮发出时任务状态仍是 running"）。
+
+`src/memory/step-paths.ts`（新增）从 `args_json` 还原真实路径，修掉"永远判不出写过"。
+
+### 12.3 默认值纪律
+
+`memoryRedo` 默认 **false**（= 既有行为逐字不变），`daemon.ts` 显式传 `true`。
+三条守卫钉住：默认值不得变、传 true 时补写轮真的发生、静态守卫禁止改回 `?? true` 或装配漏传。
+这条默认值裁决是有代价的：它一度让两条老用例（"两次 LLM 步"）变红——正确做法是改默认值，
+而**不是**去改老用例的断言。
+
+验收 `tests/memory-seal-redo.test.ts` 12/12。
+
+---
+
+## 13. 第二轮的门禁总账
+
+| 检查 | 结果 |
+|---|---|
+| `tsc --noEmit -p .` | exit 0 |
+| `npm test` | **1231 / 1231 通过，0 失败** |
+| `node scripts/smoke.mjs` | 11/11 |
+| `DOTD_SMOKE_FAKE_UPSTREAM=1 node scripts/smoke.mjs` | 16/16 |
+| `tests/runner-main.test.ts` 三连跑（并行 4） | 245/245 × 3（含记忆用例） |
+
+对比第一轮结束：1172 → **1231** 用例（+59），失败 0 保持。
+
+一条诚实的记录：全量并行跑过一次 `1230/1231`，失败项是 `memory-inject` 的
+「summary 放不下时整段丢」（纯 `buildContextBundle` 预算判定，无墙钟/IO 依赖）。
+分诊结果：单跑 3 次全绿、与含真定时器的文件并行 2 次全绿、复跑全量全绿——
+判定为全体 1231 用例并行时的偶发调度抖动，**不是逻辑缺陷**；保留记录以便日后若复现再追。
+
+---
+
+## 14. 仍然没做 / 没验证的（不要当成已完成）
+
+| 项 | 状态 |
+|---|---|
+| **真模型往返** | ❌ 仍未验证。环境无 `WB2API_KEY`（:7863 返回 401）。`npm run doctor` 会直接判 fail |
+| **真 Docker 容器** | ❌ 仍未验证。本机无 dockerd，daemon 需在 WSL 里才有真 fleet |
+| **真实飞书链路** | ❌ 仍未验证。审批卡片只在 fake gateway 上验过 |
+| **P1-1 并发**（`maxRunningTasks=1`） | ⏳ 未做。**依赖已就绪**：P0-3 修完后"心跳在途静止"不再是常态，可以安全开并发 |
+| **P1-5 `net.get/net.post` 落地 + 搜索工具** | ⏳ 未做 |
+| **P1-6 可观测性**（结构化日志 + 成本口径） | ⏳ 未做 |
+| **P2**（MCP 客户端 / 显式计划 / 部署 3 步） | ⏳ 未做 |
