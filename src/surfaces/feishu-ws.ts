@@ -67,6 +67,25 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
   const dispatcher = new Lark.EventDispatcher({});
 
   const route = (eventType: string) => async (frame: Record<string, unknown>): Promise<void> => {
+    // 无条件先记一行"事件到了"。
+    //
+    // 为什么必须有这条：改之前只有两种结果会落日志（被拒 / 建了任务）。于是
+    // "消息根本没到长连接"、"到了但被静默忽略（sender 不是 owner / bot 回声过滤）"
+    // 这两种最常见的情况**一行日志都不留**，只能去翻数据库猜。
+    // 2026-10-18 排查"飞书发消息没回复"时就卡在这里：堆栈上完全看不出事件有没有进来。
+    try {
+      const ev = (frame['event'] ?? {}) as Record<string, unknown>;
+      const msg = (ev['message'] ?? {}) as Record<string, unknown>;
+      const sender = (ev['sender'] ?? {}) as Record<string, unknown>;
+      const senderId = (sender['sender_id'] ?? {}) as Record<string, unknown>;
+      deps.log(
+        `飞书长连接收到事件 ${eventType}：chat=${String(msg['chat_id'] ?? '-')} ` +
+          `sender=${String(sender['sender_type'] ?? '-')}:${String(senderId['open_id'] ?? senderId['union_id'] ?? '-')} ` +
+          `type=${String(msg['message_type'] ?? '-')} len=${String(msg['content'] ?? '').length}`,
+      );
+    } catch {
+      deps.log(`飞书长连接收到事件 ${eventType}（载荷结构异常，无法摘要）`);
+    }
     const envelope = wsFrameToEnvelope(typeof frame['event_id'] === 'string' ? frame['event_id'] : undefined, eventType, frame);
     try {
       const out = await handleFeishuCallback(envelope, {
