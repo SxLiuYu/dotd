@@ -106,7 +106,18 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     mode: 'sync',
     max_deadline_ms: 60_000,
     args_schema: obj(
-      { path: str('绝对路径，必须位于 /dot/home/ 下'), content: str('UTF-8 文本') },
+      {
+        path: str('绝对路径，必须位于 /dot/home/ 下'),
+        content: str('UTF-8 文本'),
+        /**
+         * 乐观并发控制（2026-10-18）：读-改-写的场景传上 fs.read 看到的 size_bytes。
+         * 若文件在此期间被别人改过，写入会被拒（stale_write），模型重新读一遍即可。
+         *
+         * 为什么需要：实测 10 个并发 RMW 进程写同一文件，最终只剩 2 行（丢 9 行）——
+         * 后写的直接覆盖先写的。模型"读 MEMORY.md → 改 → 写回"正是这个模式。
+         */
+        expected_size: { type: 'integer', minimum: 0 },
+      },
       ['path', 'content'],
     ),
     sideEffect: 'replayable',

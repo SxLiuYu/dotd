@@ -242,6 +242,30 @@ export class FsTools {
         false,
       );
     }
+    // **乐观并发控制**（2026-10-18）：读-改-写的场景可以传 expected_size 来做 CAS。
+    // 实测：10 个并发进程做"读全文→改→写回"，最终只剩 2 行（丢 9 行）——
+    // 后写的直接覆盖先写的。模型"读 MEMORY.md → 改 → 写回"正是这个模式，
+    // 在 DOTD_MAX_RUNNING>1 时会真实丢数据。
+    // 传了 expected_size 就校验当前大小；不符则拒写，模型重读一遍再改即可。
+    const expected = args.expected_size;
+    if (typeof expected === 'number' && Number.isInteger(expected) && expected >= 0) {
+      let current = -1;
+      try {
+        current = statSync(safe.abs).size;
+      } catch {
+        current = -1; // 文件不存在 → 只有 expected_size=0 才允许（视为新建）
+      }
+      const actual = current < 0 ? 0 : current;
+      if (actual !== expected) {
+        return errorResult(
+          callId,
+          ERROR_CODES.stale_write,
+          `文件在你读取之后已被改动（期望 ${expected} 字节，实际 ${actual} 字节）。` +
+            `请重新 fs.read 拿到最新内容，改好后再次写回。`,
+          true,
+        );
+      }
+    }
     mkdirSync(safe.abs.slice(0, safe.abs.lastIndexOf(sep)), { recursive: true });
     this.writeFile(safe.abs, data);
     return okResult(

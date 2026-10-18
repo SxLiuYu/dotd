@@ -512,3 +512,11 @@ test('fs.write 说明里写清 MEMORY.md 的固定结构（防止往末尾乱追
   assert.ok(src.includes('## Current concerns'), '必须指明要记的事该追加到 Current concerns 段');
   assert.ok(src.includes('## Pointers'), '必须说明 Pointers 只放路径条目');
 });
+
+test('system prompt：改已有文件必须带 expected_size（防并发丢更新）', () => {
+  // 现场（2026-10-18）：10 个并发 RMW 进程写同一文件，不带校验时只剩 3 行（丢 8 个更新）。
+  assert.ok(
+    DOT_SYSTEM_PROMPT.includes('改已有文件必须带 expected_size'),
+    '必须有这条硬纪律（仅工具描述不够——实测模型不会主动用）',
+  );
+});

@@ -94,16 +94,21 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '把一段 UTF-8 文本整体写进 /dot/home 下的文件，**覆盖**同路径原有内容，父目录不存在会自动创建。' +
       '任务结束时把值得留到下次的东西写进 notes/ 或 manuals/，以及维护 MEMORY.md 索引，都靠它。' +
       '注意它是覆盖不是追加：改已有文件要先 fs.read 出原文，在内存里改好再整篇写回（否则会丢内容）；只追加一行用 shell.run 的 `>>` 更省事。' +
+      '**改已有文件时请传 expected_size**（就是 fs.read 返回的 size_bytes）：万一你读完之后别人改过这个文件，' +
+      '写入会被拒（stale_write）而不是默默覆盖掉对方的改动——重新读一遍再改即可。这个参数在多个任务并发时就靠它防丢数据。' +
       '**MEMORY.md 有固定结构，别往末尾随便追加**（2026-10-18 实测：直接 append 会把内容塞进最后一个 \'## Pointers\' 段，把索引搞乱）：' +
       '文件是 `# MEMORY (index)` / `updated: <ISO时间>` / `## Interests` / `## Current concerns` / `## Pointers` 五部分；' +
       '要记的事追加到 **`## Current concerns` 段末尾**（写成 `- 一句话 → notes/xxx.md`）；' +
       '`## Pointers` 只放指向 notes 的路径条目；同时把 `updated:` 改成当前时间。',
     params: {
       path: '目标文件路径，**写 home 内相对路径**（如 reports/weekly.md、notes/2026-10-18-review.md）。父目录不必先建，会自动创建。' +
-        '别写 /dot/home/... 开头——记忆层只认相对路径，绝对路径会被当成非法路径拒掉。' +
+        '/dot/home/... 开头也接受（会被规范成同一个文件，2026-10-18 起读写一致），但写相对路径更短。' +
         '**notes/ 下的文件名有硬规范**：必须是 YYYY-MM-DD-短横线-slug.md（例：notes/2026-10-18-model-e2e.md），否则会被拒；' +
         '其它目录（reports/、tmp/、work/ 等）没有命名要求。被拒时读 warning 里的原因，按它改路径再写一次。',
       content: '要写入的完整 UTF-8 文本。必须是整篇文件的最终内容，不是"要追加的那段"。',
+      expected_size:
+        '可选。修改已有文件时传 fs.read 返回的 size_bytes 做乐观锁：' +
+        '若文件在此期间被别人改过，写入会被拒（stale_write）而不是默默覆盖对方改动。新建文件传 0。',
     },
     returns: '返回值是 JSON：path（home 内相对路径）、size_bytes（写入字节数）、written_at（ISO 时间）。',
     failures:

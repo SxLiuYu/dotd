@@ -318,6 +318,11 @@ export const ERROR_CODES = {
   browser_crashed: 'browser_crashed',
   /** 本文件新增：同 call_id 但 args_hash 不同（防 call_id 复用撞车）。 */
   call_id_reuse_mismatch: 'call_id_reuse_mismatch',
+  /**
+   * fs.write 的乐观并发控制失败：文件在读取之后被改过（expected_size 不符）。
+   * 2026-10-18：实测并发 RMW 会丢 9/10 的更新，加 CAS 后由模型重读重试。
+   */
+  stale_write: 'stale_write',
   /** 本文件新增：能力目录缺失该工具名。 */
   unknown_tool: 'unknown_tool',
   /** 本文件新增：把 sync 工具发去 /jobs/start（或反之）。 */
