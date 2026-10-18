@@ -15,7 +15,7 @@
  */
 
 import { realpathSync, statSync, lstatSync, existsSync } from 'node:fs';
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, statSync as statSize, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { FsOpsListEntry, FsOpsOp, FsOpsResponse, ToolResult } from './protocol.ts';
 import {
@@ -144,6 +144,17 @@ export interface FsToolsDeps {
 }
 
 const MAX_ENTRIES = 2000;
+
+/**
+ * 覆盖前归档（§3.4 .archive/：硬限 32MB、按时间 FIFO）。
+ * 2026-10-18 事故催生：模型把 MEMORY.md 写成空串，一千多字记忆瞬间归零。
+ * 防清空只挡"整篇写空"，挡不住"写成别的内容"；留旧版本才是最省的兜底。
+ */
+const ARCHIVE_DIR = '.archive';
+/** 超过这个大小的文件不归档（省得把 .archive 一次撑满）。 */
+const ARCHIVE_MAX_FILE_BYTES = 512 * 1024;
+/** .archive 总量上限（与 limits.ts 的 LIMIT_ARCHIVE_BYTES.hard 同值）。 */
+const ARCHIVE_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 
 export class FsTools {
   private readonly homeRoot: string;
@@ -288,13 +299,81 @@ export class FsTools {
         );
       }
     }
+    // **覆盖前留一份旧版本到 .archive/**（2026-10-18）：上一轮测试中模型把 MEMORY.md
+    // 写成空串，一千多字记忆瞬间没了 —— 靠外部手段才恢复。记忆类文件必须能回滚。
+    // 只对"已有内容且将被覆盖"的文件做；.archive/ 自身与隐藏目录已在 resolve 时排除。
+    const archived = this.archiveBeforeOverwrite(safe);
     mkdirSync(safe.abs.slice(0, safe.abs.lastIndexOf(sep)), { recursive: true });
     this.writeFile(safe.abs, data);
     return okResult(
       callId,
-      { path: safe.rel, size_bytes: data.byteLength, written_at: this.now() },
+      {
+        path: safe.rel,
+        size_bytes: data.byteLength,
+        written_at: this.now(),
+        ...(archived === null ? {} : { archived_as: archived }),
+      },
       { wall_ms: 0, peak_mem_mb: 0 },
     );
+  }
+
+  /**
+   * 覆盖前把旧内容存进 `.archive/<时间戳>-<原名>`，返回归档文件名（失败/无需归档返回 null）。
+   *
+   * 为什么需要（2026-10-18 真实事故）：模型把 MEMORY.md 写成空串，一千多字记忆瞬间归零。
+   * 防清空保护能挡住"整篇写空"，但挡不住"写成别的内容"（比如误删一半、覆盖错文件）。
+   * 留一份旧版本是最省的兜底——归档目录本来就在协议里预留了（.archive/，硬限 32MB、FIFO）。
+   *
+   * 纪律：**归档失败绝不能挡住写入**（它只是保险，不是门槛）。
+   */
+  private archiveBeforeOverwrite(safe: SafePath): string | null {
+    try {
+      if (safe.rel.length === 0) return null;
+      if (safe.rel.split('/').some((seg) => seg.startsWith('.'))) return null; // 隐藏目录不归档
+      const old = this.readFile(safe.abs);
+      if (old.byteLength === 0) return null; // 空文件没有可留的
+      if (old.byteLength > ARCHIVE_MAX_FILE_BYTES) return null; // 太大跳过（.archive 有 32MB 上限）
+      const archiveDirAbs = join(this.homeRoot, ARCHIVE_DIR);
+      mkdirSync(archiveDirAbs, { recursive: true });
+      const stamp = this.now().replace(/[:.]/g, '-');
+      const base = safe.rel.replace(/\//g, '_');
+      const name = `${stamp}__${base}`;
+      this.writeFile(join(archiveDirAbs, name), old);
+      this.pruneArchive(archiveDirAbs);
+      return `${ARCHIVE_DIR}/${name}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /** .archive/ 按时间 FIFO 修剪到配额内（§3.4：硬限 32MB）。失败静默。 */
+  private pruneArchive(dirAbs: string): void {
+    try {
+      const names = this.readdir(dirAbs).sort(); // 时间戳前缀 → 字典序即时间序
+      let total = 0;
+      const sizes = new Map<string, number>();
+      for (const n of names) {
+        try {
+          sizes.set(n, statSize(join(dirAbs, n)).size);
+          total += sizes.get(n) ?? 0;
+        } catch {
+          /* 忽略单个文件的 stat 失败 */
+        }
+      }
+      let i = 0;
+      while (total > ARCHIVE_MAX_TOTAL_BYTES && i < names.length) {
+        const n = names[i]!;
+        try {
+          unlinkSync(join(dirAbs, n));
+          total -= sizes.get(n) ?? 0;
+        } catch {
+          /* 删不掉就跳过 */
+        }
+        i += 1;
+      }
+    } catch {
+      /* 修剪是尽力而为 */
+    }
   }
 
   /**
