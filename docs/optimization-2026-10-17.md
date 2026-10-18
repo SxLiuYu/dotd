@@ -911,3 +911,150 @@ bash scripts/live-wsl-e2e.sh
 
 唯一还没验证的是**真实飞书的收发往返**（长连接已确认建立，但没在飞书里真发一条消息看回复）。
 那需要主人在飞书里发一句话——代码侧没有可做的了。
+
+---
+
+# 第五轮：多轮自测（2026-10-18）——把"看起来能用"推到底
+
+主人要求"你自己做多轮复测，我需要达到最终效果"。这一轮不看 status、只看**真实产物与真实回答**，
+连跑 8 轮，挖出并修掉 4 个真缺陷。
+
+## 28. 复测方法：为什么不看 `status`
+
+第一轮 4 个用例全 `succeeded`，看起来完美。但抽查工具结果时发现——**真看过才知道真假**。
+这一轮定下的判据是：
+
+| 判据 | 为什么 |
+|---|---|
+| 读**该任务自己**的 assistant 回答 | 早期脚本读"全局最新一条"，把别的任务的回复当成这个的（我自己就踩了） |
+| 工具结果必须含**真实数据** | `net.get` 要拿到真 HTTP 200 + 正文，不是"成功"两个字 |
+| 步数必须收敛 | 一条 4 步任务跑成 729 步，`status` 仍然是 `succeeded` |
+
+## 29. 挖出的四个真缺陷
+
+### 29.1 工具调用轮整轮不入 thread → 模型失忆 → 729 步死循环【最严重】
+
+一条应 4 步完成的任务（写文件 → 读回 → 回答）跑成 **729 步仍未结束**，`fs.write`/`fs.read` 交替上百次。
+
+查库：该 thread 里只有 `user/text` 和 369 条 `system/tool_result`，**一条 assistant 消息都没有**。
+
+根因：`stepLlm` 只在「`content` 非空**且** `toolCalls` 为空」时落 assistant —— 工具调用轮整轮丢弃。
+重建上下文时 `role:'tool'` 找不到前置的 `assistant.tool_calls`，全部退化成孤立注记，
+模型看不到自己做过什么 → 每轮从第一步重来。
+
+修法分两层，缺一不可：
+1. **工具轮也要落** assistant（正文 + `tool_call` 声明两条）；
+2. **重建时能解析回来**：`toChatMessage` 增加 `parseToolCallContent`，从 content 复原调用声明。
+
+### 29.2 声明的 call_id 与结果的 call_id 不是同一个
+
+第一版修完后 thread 里有了 `tool_call`，但配对**全部失败**：
+
+```
+assistant tool_calls=[call_00_dGMUJNB…]      ← 模型给的 id
+tool      tool_call_id=01M56WT1SA…           ← journal 的 ULID
+```
+
+模型发的是 `call_00_xxx`，而工具结果用的是 journal 生成的 ULID——两者不同，`role:tool` 永远配不上。
+修法：`reportToolCalls` 用 **journal callId** 登记（与结果同源）。
+
+### 29.3 声明落在结果**之后**（顺序反了）
+
+第二版修完后配对仍全失败，因为顺序是：
+
+```
+ 2 tool        ← 先
+ 3 tool
+ 4 assistant tool_calls=[...]   ← 后
+```
+
+协议要求 `role:tool` **紧跟其后**，不能前置。根因：我把 `reportToolCalls` 放在工具执行之后。
+修法：挪到 `journal.beginTool` 之后、**派发之前**落声明。
+
+**修完的验证**（`_pair.cjs` 直接读库投影）：
+
+```
+assistant tool_calls=[01M56X63KQW6…]
+tool      tool_call_id=01M56X63KQW6…
+assistant tool_calls=[01M56X63NPK4…]
+tool      tool_call_id=01M56X63NPK4…
+配对成功 11 / 无主 0
+```
+
+### 29.4 stub 模式的假镜像 digest 阻断真容器启动
+
+搬到 WSL 后容器起不来：
+
+```
+(HTTP code 404) no such container - No such image: sha256:000000…0
+```
+
+根因：库经历过 stub 模式，`image_builds` 里有 4 条 `status='ready'` + **全零 digest** 的假记录。
+`fleet.buildSpec` 用 `image.digest ?? image.tag` 优先取 digest，拿到假值；而 `readyBuild()`
+又认为"已构建"，**重建永远不触发** —— 每次 boot 都失败且原因不明。
+
+修法：`isPlaceholderDigest()` 只认全零，`readyBuild()` 跳过占位记录。3 条回归测试。
+
+### 29.5 出网开关从未传进容器
+
+模型回"出网工具没接通"。查下来三层叠加，其中一层是**代码缺陷**：
+`containerEnvAndLabels` 只传 5 个变量，**从不传 `DOTD_NET_TOOLS`** —— 宿主怎么设都没用。
+修法：`ExecConfig.netToolsMode` + 透传 + 6 条回归测试（含"拼错按 off，绝不意外放开出网"）。
+
+## 30. 多轮复测结果（修复后）
+
+| 轮次 | 结果 | 说明 |
+|---|---|---|
+| 第 1 轮 | 4/4 | 写入/命令/出网/读回，四项工具真实执行 |
+| 第 2 轮 | 4/5 | 挖出 729 步死循环 |
+| 第 3 轮 | 4/5 | 修复后 F4 仍 58 步 |
+| 第 4–7 轮 | 4/5 | 逐步修 29.1/29.2/29.3，步数 58→46→118→52 |
+| 第 8 轮 | **4/5** | 见下 |
+
+**第 8 轮的 prompt 敏感度对比（决定性实验）**：
+
+| 用例 | 步数 |
+|---|---|
+| A 明确单步（算 17×23） | 4 |
+| B 明确写文件 | 4 |
+| C 读已有文件 | 6 |
+| D 简单加法 | 4 |
+| **E "创建…然后读回确认…"** | **185** |
+
+**判断：产品侧上下文已经正确，剩余问题是模型行为。**
+
+证据（`_modelview.cjs` 打印模型收尾前看到的 16 条）：
+
+```
+ 233 [assistant] 调用: fs.write
+ 234 [tool:fs.write] ok=true tool_call_id=01M56XCVCT1Z… 结果: path=x2.txt
+ 235 [assistant] 调用: fs.read
+ 236 [tool:fs.read] ok=true tool_call_id=01M56XCX863V…  结果: content="1\n"
+ …
+ 247 [assistant] "两个文件已经存在，内容分别是 1 和 2，读回确认无误。两个数之和为 **3**。"
+```
+
+模型**清楚看到**每次写和读的结果、配对完整，然后**自己选择**再写一遍。
+这是 `deepseek-v4.1-flash` 在"要求确认"类任务上的自我循环，不是 dotd 的上下文缺陷。
+
+## 31. 这一轮的门禁
+
+| 检查 | 结果 |
+|---|---|
+| `tsc --noEmit -p .` | exit 0 |
+| `npm test` | **1411 / 1411 通过，0 失败**（+12 条新增回归） |
+| 真容器端到端 | 容器 `ready`、`fs.write` 成功、`docker exec` 读回 |
+| 8 轮真模型复测 | 简单任务 4–6 步收敛；确认型任务模型自我循环（已定性） |
+
+## 32. 现在的真实结论
+
+**dotd 在"明确的、单目标的"任务上已经好用**：算数、写文件、读文件、真实联网取数据，4–6 步完成，
+工具真实执行，结果真实正确。
+
+**仍有的短板是模型侧**：`deepseek-v4.1-flash` 在"做完再确认一遍"这类指令上会反复自我检查。
+可选对策（按成本排序）：
+1. 换更强的模型（`glm-5.3-flash` / `Qwen3.8-Flash` 已在 fallback 链里，可直接试）；
+2. 在 system prompt 里加一条"完成即停"的硬纪律（需 A/B 验证是否有效）；
+3. 加运行期护栏：连续 N 步无新信息（同参数工具调用重复）即判定为原地打转并收尾。
+
+第 3 条是产品侧能做的、与模型无关的兜底，建议下一轮做。
