@@ -79,6 +79,12 @@ async function main() {
   const key = keyEnv === null ? null : process.env[keyEnv];
   if (keyEnv !== null && (key === undefined || key.length === 0)) {
     out(`connect:  未验证 — 环境变量 ${keyEnv} 不存在或为空`);
+    // 这条提示很关键：主人已经把 key 写进 ~/.dotd/tokens.env 之后，裸 shell 里跑本脚本
+    // 仍然会看到"未验证"——因为脚本按纪律**只读环境变量**（不翻 tokens.env、不读 .env）。
+    // 不说清就会让人误判成"key 没配好"。
+    out(`           提示：key 可能已在 ~/.dotd/tokens.env 里。本脚本按纪律只读环境变量，`);
+    out(`           请先 source 它（PowerShell：按行解析后 Set-Item env:）再重跑，例如：`);
+    out(`           bash -lc 'set -a; . ~/.dotd/tokens.env; set +a; node --import tsx scripts/probe-live-model.mjs'`);
     out(`model:    ${model}`);
     out('tool_calls: 未验证（没有发出任何请求）');
     out('latency:  n/a');

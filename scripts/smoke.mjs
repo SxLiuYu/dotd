@@ -342,10 +342,11 @@ if (FAKE_UPSTREAM) {
   // 把真 config/models.yml 的 base_url 换成本地假上游；端点 id / 模型名 / 超时全部保留，
   // 这样路由层看到的配置与生产同形，唯一的变量是"网络那头是谁"。
   const modelsYml = readFileSync(join(REPO_ROOT, 'config', 'models.yml'), 'utf8');
-  const rewritten = modelsYml.replace(
-    /^(\s*base_url:\s*)http:\/\/127\.0\.0\.1:7863\/v1\s*$/m,
-    `$1${fakeUpstream.baseUrl}`,
-  );
+  // 按**结构**定位 tier1 端点，不认死某个地址。
+  // 原先这里正则写死了 127.0.0.1:7863——主人换一次端点这条分支就静默失效（exit 2），
+  // 而它恰恰是"真 HTTP 链路"唯一的端到端证据。改成：找到 endpoints 段里 `- id:` 之后
+  // 第一条 tier: 1 的端点，替换它自己的 base_url。
+  const rewritten = rewriteTier1BaseUrl(modelsYml, fakeUpstream.baseUrl);
   if (rewritten === modelsYml) {
     process.stderr.write('[smoke] 假上游分支：没能在 models.yml 里找到 tier1 base_url，配置改写失败\n');
     await fakeUpstream.close();
@@ -688,3 +689,55 @@ try {
 const passed = checks.filter((c) => c.ok).length;
 process.stdout.write(`\n冒烟结果：${passed}/${checks.length} 通过，退出码 ${exitCode}\n`);
 process.exit(exitCode);
+
+/**
+ * 把 config/models.yml 里**第一条 tier: 1 且 enabled 的端点**的 base_url 换掉。
+ *
+ * 为什么不用一条正则认死地址：端点是主人会换的东西（2026-10-18 就从 :7863 换到了 :3065），
+ * 把冒烟脚本绑在某个具体地址上，等于让"真链路证据"在换端点那天悄悄失效。
+ * 这里按 YAML 结构走：定位每个 `- id:` 块，块内找到 tier: 1 与 base_url 行再替换。
+ *
+ * 找不到就原样返回（调用方据此判"改写失败"并退出 2，不静默改成 stub）。
+ */
+export function rewriteTier1BaseUrl(text, newBaseUrl) {
+  const lines = String(text).split(/\r?\n/);
+  let blockStart = -1;
+  let isTier1 = false;
+  let enabled = true;
+  const replaceIn = (start, end) => {
+    for (let i = start; i < end; i += 1) {
+      if (/^\s*base_url:/.test(lines[i])) {
+        const indent = /^(\s*)/.exec(lines[i])[1];
+        lines[i] = `${indent}base_url: ${newBaseUrl}`;
+        return true;
+      }
+    }
+    return false;
+  };
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/^\s*-\s+id:/.test(line)) {
+      // 收尾上一个块
+      if (blockStart >= 0 && isTier1 && enabled) {
+        if (replaceIn(blockStart, i)) return lines.join('\n');
+      }
+      blockStart = i;
+      isTier1 = false;
+      enabled = true;
+      continue;
+    }
+    if (blockStart < 0) continue;
+    const tier = /^\s*tier:\s*(\d+)\s*$/.exec(line);
+    if (tier !== null) isTier1 = Number(tier[1]) === 1;
+    if (/^\s*enabled:\s*false\s*$/.test(line)) enabled = false;
+    if (/^\S/.test(line)) {
+      // 顶层键：endpoints 段结束
+      if (isTier1 && enabled && replaceIn(blockStart, i)) return lines.join('\n');
+      blockStart = -1;
+    }
+  }
+  if (blockStart >= 0 && isTier1 && enabled && replaceIn(blockStart, lines.length)) {
+    return lines.join('\n');
+  }
+  return text;
+}
