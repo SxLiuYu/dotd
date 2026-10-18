@@ -1492,6 +1492,20 @@ export class DotRunner {
     return toolDeadlineMsFor(this.toolDeadlineMs, this.deadlineCapOf.get(tool));
   }
 
+  /**
+   * 本次调用的实际 deadline：**模型要求的超时**与**档位上限**取较小值。
+   *
+   * - 模型在参数里传了 timeout_ms（正整数）→ 尊重它（更短的超时是模型自己的选择）；
+   * - 模型没传或传得不合法 → 用档位默认（sync 60s / async 目录上限）；
+   * - 无论如何不超过档位上限：那是安全兜底，不能被工具参数绕过。
+   */
+  private effectiveDeadlineMs(tool: string, args: Record<string, unknown>): number {
+    const cap = this.toolDeadlineMsFor(tool);
+    const want = args['timeout_ms'];
+    if (typeof want !== 'number' || !Number.isFinite(want) || want <= 0) return cap;
+    return Math.min(want, cap);
+  }
+
   // ── 3.35 原地打转护栏 ──────────────────────────────────────────────────
 
   /**
@@ -1715,7 +1729,14 @@ export class DotRunner {
     }
 
     // allow / review_pass：执行（S1 ledger 幂等 = 同 call_id 至多一次）
-    const res = await this.exec.runTool(toolCall(task, callId, call.name, args, this.toolDeadlineMsFor(call.name)));
+    // **模型传的 timeout_ms 必须真正生效**（2026-10-18 实测）：
+    // 原来 sync 工具在 Runner 侧固定 60s，模型传 timeout_ms=600000 也只等 60s ——
+    // 工具说"可以等 10 分钟"、Runner 说"我只等 1 分钟"，同一概念两处不一致，
+    // 模型据此做的判断（比如"这命令慢，我把超时设长点"）全部落空。
+    // 取二者较小值：模型要求的更短就听模型的；更长则被 Runner 的档位上限截断（安全兜底不变）。
+    const res = await this.exec.runTool(
+      toolCall(task, callId, call.name, args, this.effectiveDeadlineMs(call.name, args)),
+    );
     const ok = res.status === 'ok';
     const warning = this.memoryWarnings.get(callId);
     const result = warning === undefined
