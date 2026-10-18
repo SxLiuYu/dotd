@@ -32,11 +32,17 @@ endpoints:
     base_url: http://127.0.0.1:3065/v1
     api_key_env: WB2API_KEY
     models:
-      primary: deepseek-v4.1-flash
+      # 2026-10-18 跨模型 A/B（三轮重复，同一批用例）选出：
+      #   glm-5.3-flash      确认型任务中位 8 步  ← 选它
+      #   Qwen3.8-Flash      确认型任务中位 8 步
+      #   deepseek-v4.1-flash 确认型任务中位 14 步（原来用的）
+      # 三者答案正确率都是 3/3。glm 在简单任务上 4-6 步，与 deepseek 的 4 步接近。
+      # light 保持 deepseek-v4.1-flash：只做事件匹配/摘要，便宜即可。
+      primary: glm-5.3-flash
       light:   deepseek-v4.1-flash
     # 模型级 fallback 链（语义见下方注释块）：主模型限流/5xx 时换同名族的下一个，
     # 端点与凭据不换、熔断不结算。**只用实测能调工具的模型**，别把 hy3 放进 primary 链。
-    fallback_models: { primary: [glm-5.3-flash, Qwen3.8-Flash], light: [glm-5.3-flash] }
+    fallback_models: { primary: [Qwen3.8-Flash, deepseek-v4.1-flash], light: [glm-5.3-flash] }
     # 2026-10-17：模型级 fallback 链（迁移自 PilotDeck runFallbackChain / RouterFallbackConfig）。
     #
     # 是什么：同一端点内再分一层——models[track] 先试，失败且故障是"模型级"
