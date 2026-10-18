@@ -392,9 +392,32 @@ export async function evaluate(
   if (tier === 'dangerous' && ctx.emergency) return deny('应急模式冻结危险操作');
 
   // —— 6. 登录态恒人工审批（契约 G1：谓词见 contracts.ts isLoginSensitive）——
+  // 契约 G1 的 fail-closed 补充（2026-10-18 真实踩到）：
+  // browser.* 缺 identity 时**不要走审批**——那是个配置问题，主人点"批准"也解决不了，
+  // 执行面照样会以 identity_required 拒绝。走审批只会白弹一张卡片、白等一轮。
+  // 直接 deny 并说清"缺什么、怎么补"，让模型立刻换路（或如实告诉主人）。
+  if (isIdentityMissing(call)) {
+    const reason = 'identity_missing：该动作需要登录身份，当前没有可用的身份配置';
+    const decisionId = newDecisionId();
+    insertDecision(db, {
+      decisionId,
+      dotId: ctx.dotId,
+      taskId: ctx.taskRef.taskId,
+      journalStep: call.callId,
+      kind: 'deny',
+      tier,
+      tool: call.tool,
+      paramsJson,
+      reason,
+      approvalId: null,
+    });
+    appendAudit(db, auditOf(ctx, call, decisionId, 'deny', tier, reason));
+    return { kind: 'deny', decisionId, reason };
+  }
+
   const loginSensitive = isLoginSensitive(call);
   if (loginSensitive) {
-    const loginReason = isIdentityMissing(call) ? 'identity_missing' : 'login-sensitive';
+    const loginReason = 'login-sensitive';
     const a = insertApproval(rt, ctx, call, {
       kind: 'tool_call',
       tier,

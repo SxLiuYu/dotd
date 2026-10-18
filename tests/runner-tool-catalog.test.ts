@@ -481,3 +481,16 @@ test('运行时：查 model 请求 messages —— [0] 是 system prompt，末�
     assert.ok(m.content.length <= 260, '入 thread 的 tool 消息仍只存 digest+200 预览');
   }
 });
+
+test('system prompt：有「别把过去的话当现在的状态」这条纪律（防复述过时结论）', () => {
+  // 现场（2026-10-18）：出网早已开通并验证过，模型却按会话历史里几小时前的旧回复
+  // 对新问题答"出网通道现在还没接通"，误导了主人。
+  assert.ok(
+    DOT_SYSTEM_PROMPT.includes('别把过去的话当现在的状态'),
+    '必须有"先试一次再回答"的纪律',
+  );
+  assert.ok(
+    DOT_SYSTEM_PROMPT.includes('先实际试一次'),
+    '要明确要求先验证再回答',
+  );
+});
