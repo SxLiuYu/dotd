@@ -550,6 +550,9 @@ export function containerEnvAndLabels(
       `DOTD_CPU_MILLIS=${limits.cpuMillis}`,
       `DOTD_RUNTIME_PORT=${cfg.runtimePort}`,
       'DISPLAY=:99',
+      // 出网策略必须**显式传进容器**：容器读自己的 process.env，宿主设了没用。
+      // 未配置时不传（容器侧缺省 off），保持"默认关闭"的语义不变。
+      ...(cfg.netToolsMode !== undefined ? [`DOTD_NET_TOOLS=${cfg.netToolsMode}`] : []),
       // 契约 T5：容器内工具不得直连模型 ⇒ 不注入任何模型 base_url env（收紧完成）
     ],
     labels: {

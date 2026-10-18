@@ -457,6 +457,22 @@ class RunContext {
    * 以免覆盖 system prompt 这种"伪装成对话的注入"）→ 会话历史（assistant 全文）→
    * assistant.tool_calls + 本轮 tool 结果 → 系统注记 → 任务目标（user，恒为最后一条）。
    */
+  /**
+   * 已经带进上下文的工具调用声明（来自 thread 重建的 assistant/tool_call 消息）。
+   *
+   * `buildMessages` 用它做去重：那些调用已经有 `assistant.tool_calls` 了，
+   * 不能再按内存里的 pendingCalls 补一条——重复声明会让模型被自己的历史带偏。
+   */
+  get declaredCallIds(): ReadonlySet<string> {
+    const ids = new Set<string>();
+    for (const m of this.messages) {
+      if (m.kind !== 'tool_call') continue;
+      for (const c of parseToolCallContent(m.content)) ids.add(c.id);
+    }
+    return ids;
+  }
+
+  /** 任务目标：恒为最后一条 user 消息（§4.1 事件任务没有历史对话时它是唯一输入）。 */
   buildMessages(bundle: {
     memoryMd: string;
     manualExcerpts: Array<{ path: string; text: string }>;
@@ -540,7 +556,11 @@ class RunContext {
         createdAt: 0,
       });
     }
-    const withName = dispatched;
+    // 去重：从 thread 重建时已经带回了 assistant/tool_call 声明的调用，不要再补一条。
+    // 否则同一轮调用会被注入两次（实测：一条 58 步任务的 assistant/tool_call 累积到 20 条、
+    // 1280 token，模型被重复的历史带偏，36 次工具调用里只有 9 种不同参数）。
+    const declared = new Set(this.declaredCallIds);
+    const withName = dispatched.filter((r) => !declared.has(r.callId));
     if (withName.length > 0) {
       const callMsg: Message = {
         id: `assistant:calls:${withName[0]!.callId}`,
@@ -871,9 +891,14 @@ export class DotRunner {
       // 本轮调用的声明先登记：工具结果回喂时要靠它复原 assistant.tool_calls
       // （协议要求 role=tool 必须紧跟在一个带 tool_calls 的 assistant 消息之后）。
       ctx.noteToolCalls(llm.step.toolCalls);
+      // 记录"模型给的 id → 本轮真正用的 journal callId"，供 reportToolCalls 用。
+      // 两者不同：模型发的是 call_00_xxx，journal 发的是 ULID。**tool 结果用的是后者**，
+      // 所以 assistant.tool_calls 必须也用后者，否则 role:tool 永远配不上前置声明，
+      // 模型会看到一堆"无主的工具结果"并无视它们（实测导致写-读死循环 46 步）。
+      const journalIds: Array<{ id: string; name: string; arguments: string }> = [];
       for (const call of llm.step.toolCalls) {
         if (ctx.done) break;
-        const out = await this.stepTool(session, epoch, ctx, call);
+        const out = await this.stepTool(session, epoch, ctx, call, journalIds);
         if (out.kind === 'pause') return out.out;
         if (out.kind === 'abort') return out.out;
         if (out.kind === 'suspend') return out.out;
@@ -1029,13 +1054,24 @@ export class DotRunner {
     const { step, tokens } = resp;
     this.cp.journal.endLlm(task.id, epoch, seq, digestOf(step.content));
     ctx.feedLlm(step, tokens);
-    // ⑩ 结果回报前半句：assistant 全文 appendMessage 入 thread（接缝契约 §8 ⑩）。
-    // 只落有正文的轮次；纯工具调用轮（content 为空）不入 thread，避免噪声刷屏。
-    if (step.toolCalls.length === 0 && step.content.length > 0) {
+    // ⑩ 结果回报：assistant 轮入 thread。
+    //
+    // **工具调用轮也必须入 thread**，而且要落 assistant/text（正文）+ assistant/tool_call
+    // （调用声明）两条。为什么（2026-10-18 真实故障）：
+    //   原先只落「content 非空且无 toolCalls」的轮次，工具调用轮整轮丢弃。于是
+    //   thread 里只剩一堆**没有归属**的 system/tool_result。下一轮重建上下文时，
+    //   `role:'tool'` 找不到前置的 assistant.tool_calls（协议要求它们必须配对），
+    //   结果全被降级成孤立注记 —— 模型看不到自己上一轮做过什么，
+    //   于是**每轮都从第一步重来**。实测一条 4 步任务跑成 729 步死循环仍未停。
+    //
+    // 判据改成"这一轮有任何内容就落"：有正文落正文，有调用落调用声明。
+    if (step.content.length > 0) {
       await this.reportAssistant(ctx, task, step.content);
+    }
+    if (step.toolCalls.length === 0 && step.content.length > 0) {
       // 会话流式：正文定稿 → chat.final 覆盖前端按 taskId 拼出来的增量行
       // （web-ui ChatView 的覆盖逻辑；与 http.ts:522 同 payload）。纯工具调用轮不推，
-      // 与「不入 thread」同口径——那轮没有给主人看的内容。
+      // 那时没有给主人看的定稿内容。
       this.publishChatFinal(task, step.content);
     }
     return { kind: 'ok', step, tokens };
@@ -1267,6 +1303,7 @@ export class DotRunner {
     epoch: number,
     ctx: RunContext,
     call: { id: string; name: string; arguments: string },
+    journalIds?: Array<{ id: string; name: string; arguments: string }>,
   ): Promise<
     | { kind: 'ok' }
     | { kind: 'continue' }
@@ -1288,6 +1325,14 @@ export class DotRunner {
     // S1：sideEffect 词表唯一事实源 = exec.getCapabilities；未声明按 unknown
     const se = this.sideEffectOf.get(call.name) ?? 'unknown';
     const { seq, callId } = this.cp.journal.beginTool(task.id, epoch, call.name, args, se);
+    // 用 **journal callId** 登记声明（与 tool 结果里的 call_id 同源），不是模型给的 id。
+    // **必须在这里落声明**：thread 里的顺序必须是
+    //   assistant/tool_call（声明） → system/tool_result（结果）
+    // 协议要求 role:tool 紧跟在一个带 tool_calls 的 assistant 之后；反过来就是"无主"。
+    // 2026-10-18 实测：声明曾落在工具执行之后，导致 13/13 条 role:tool 全部无主，
+    // 模型完全无视自己上一轮的结果，写-读死循环烧到 118 步。
+    await this.reportToolCalls(task, [{ id: callId, name: call.name, arguments: call.arguments }]);
+    journalIds?.push({ id: callId, name: call.name, arguments: call.arguments });
 
     // 接缝 G5：goalDigest 由 Runner 在 evaluate 前截取（≤800B）注入治理审查档
     const verdict = await this.governance.evaluate(
@@ -1467,6 +1512,36 @@ export class DotRunner {
       });
     } catch (err) {
       this.log(`runner: reportAssistant 失败 ${task.id}：${errText(err)}`);
+    }
+  }
+
+  /**
+   * 把本轮的**工具调用声明**落进 thread（kind='tool_call'，role='assistant'）。
+   *
+   * 为什么必须落：OpenAI 兼容协议要求每条 `role:'tool'` 消息都紧跟在一个带
+   * `tool_calls` 的 assistant 消息之后。重建上下文时 Runner 靠 thread 里的这条声明
+   * 复原配对关系；缺了它，工具结果会退化成孤立注记，模型「失忆」并无限重试同一动作。
+   *
+   * 内容形状与 toChatMessage 的解析约定一致：`{ calls: [{ call_id, name, arguments }] }`，
+   * arguments 用**模型原样给的字符串**（不要 JSON.stringify 二次编码）。
+   */
+  private async reportToolCalls(
+    task: Task,
+    calls: ReadonlyArray<{ id: string; name: string; arguments: string }>,
+  ): Promise<void> {
+    const threadId = this.threadIdOf(task);
+    if (threadId === null) return;
+    try {
+      await this.memory.appendMessage(threadId, {
+        role: 'assistant',
+        kind: 'tool_call',
+        content: JSON.stringify({
+          calls: calls.map((c) => ({ call_id: c.id, name: c.name, arguments: c.arguments })),
+        }),
+        taskId: task.id,
+      });
+    } catch (err) {
+      this.log(`runner: reportToolCalls 失败 ${task.id}：${errText(err)}`);
     }
   }
 
@@ -1974,6 +2049,14 @@ function toChatMessage(m: Message): ChatMessage {
   const withCalls = m as Message & {
     toolCalls?: Array<{ id: string; name: string; arguments: string }>;
   };
+  // tool_call 消息有两条来源，必须都认：
+  //   ① 本轮刚产出、挂在对象属性上的 toolCalls（内存路径）；
+  //   ② **从 thread 重建**时读回来的普通行（只有 content 里那份 JSON）。缺了 ②，
+  //      跨轮/跨任务重建就复原不出 assistant.tool_calls，role:tool 会变成无主消息。
+  if (m.kind === 'tool_call' && !(Array.isArray(withCalls.toolCalls) && withCalls.toolCalls.length > 0)) {
+    const parsed = parseToolCallContent(m.content);
+    if (parsed.length > 0) withCalls.toolCalls = parsed;
+  }
   if (m.kind === 'tool_call' && Array.isArray(withCalls.toolCalls) && withCalls.toolCalls.length > 0) {
     const out = { role: 'assistant' as const, content: m.content } as ChatMessage & {
       tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
@@ -1986,6 +2069,33 @@ function toChatMessage(m: Message): ChatMessage {
     return out;
   }
   return { role: m.role, content: m.content };
+}
+
+/**
+ * 从 tool_call 消息的 content 解析调用声明（reportToolCalls 写入的形状）。
+ *
+ * 内容形如 `{"calls":[{"call_id":"...","name":"fs.write","arguments":"{...}"}]}`。
+ * 解析失败返回空数组——调用方据此退回"没有声明"的降级路径，不抛。
+ */
+function parseToolCallContent(content: string): Array<{ id: string; name: string; arguments: string }> {
+  try {
+    const obj = JSON.parse(content) as { calls?: unknown };
+    if (!Array.isArray(obj.calls)) return [];
+    const out: Array<{ id: string; name: string; arguments: string }> = [];
+    for (const c of obj.calls) {
+      if (c === null || typeof c !== 'object') continue;
+      const r = c as Record<string, unknown>;
+      if (typeof r['call_id'] !== 'string' || typeof r['name'] !== 'string') continue;
+      out.push({
+        id: r['call_id'],
+        name: r['name'],
+        arguments: typeof r['arguments'] === 'string' ? r['arguments'] : '{}',
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
 }
 
 /** tool_result 消息里嵌的 call_id（双写禁令下只从内容解析，全文以 steps 为准）。 */

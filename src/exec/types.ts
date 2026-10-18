@@ -111,6 +111,17 @@ export interface ExecConfig {
   networkName: string;
   /** 容器内 agent-runtime 端口（EX §5.2）。 */
   runtimePort: number;
+  /**
+   * 容器内 `net.*` 出网策略，原样透传给 agent-runtime 的 DOTD_NET_TOOLS。
+   *
+   * 为什么要显式透传：容器侧 server.ts 读的是**容器自己的** process.env，
+   * 宿主设的变量不会自动进去。改之前 containerEnvAndLabels 只传 5 个变量，
+   * 所以无论宿主怎么设 DOTD_NET_TOOLS，容器里永远是 off —— 模型调 net.get
+   * 拿到的是 not_implemented，看起来像"工具没装好"。
+   *
+   * 取值：'off' | 'get' | 'all'；缺省 = 跟随宿主环境变量，缺省仍是 off。
+   */
+  netToolsMode?: 'off' | 'get' | 'all';
   /** sync 工具 deadline 上限 60s（EX §5.2）。 */
   syncDeadlineMs: number;
   /** async 工具全局 deadline 上限 30min（EX §10 Capability.max_deadline_ms / Q5）。 */
@@ -215,6 +226,11 @@ export function execConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ExecCon
     tokenDir: env.DOTD_TOKEN_DIR ?? DEFAULT_EXEC_CONFIG.tokenDir,
     dockerSocketPath: env.DOTD_DOCKER_SOCKET ?? DEFAULT_EXEC_CONFIG.dockerSocketPath,
     repoRoot: env.DOTD_REPO_ROOT ?? DEFAULT_EXEC_CONFIG.repoRoot,
+    // 出网策略：只认精确的 'off'/'get'/'all'；其它值（含拼错）**按 off**，
+    // 与容器侧 parseNetToolsMode 同源语义——拼错绝不意外放开出网。
+    ...(env.DOTD_NET_TOOLS === 'get' || env.DOTD_NET_TOOLS === 'all'
+      ? { netToolsMode: env.DOTD_NET_TOOLS }
+      : {}),
   };
 }
 

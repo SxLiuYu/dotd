@@ -34,6 +34,22 @@ export interface EnsureImageResult {
   built: boolean;
 }
 
+/**
+ * 是否是 stub 后端伪造的占位 digest（全零 sha256）。
+ *
+ * stub fleet 不起 Docker，但它要满足"镜像就绪"的状态机，于是写了一条 ready 记录、
+ * digest 用全零占位。这个值一旦被真实 dockerode 拿去 createContainer，就会得到
+ * `No such image: sha256:000…0`——而且因为 ready 记录被当成"已构建"，
+ * **rebuild 永远不会触发**，boot 每次都失败且看不出原因。
+ *
+ * 判据只认"全零"，不做其它猜测：真实镜像 ID 不可能全零。
+ */
+export function isPlaceholderDigest(digest: string | null | undefined): boolean {
+  if (typeof digest !== 'string') return false;
+  const hex = digest.startsWith('sha256:') ? digest.slice('sha256:'.length) : digest;
+  return /^0+$/.test(hex);
+}
+
 export class ImageManager {
   /** 进程内构建锁（§3.2：防并发双建）。 */
   private building: Promise<EnsureImageResult> | null = null;
@@ -46,12 +62,20 @@ export class ImageManager {
     return imageTag(pwVersion, runtimeVer);
   }
 
-  /** image_builds 中该 tag 的最新 ready 行。 */
+  /**
+   * image_builds 中该 tag 的最新 **可用** ready 行。
+   *
+   * 什么算"不可用"：stub 后端伪造的 digest（全零 sha256）。见 `isPlaceholderDigest`。
+   */
   readyBuild(tag: string): ImageBuildRow | null {
-    const row = this.deps.db
-      .prepare("SELECT * FROM image_builds WHERE tag = ? AND status = 'ready' ORDER BY id DESC LIMIT 1")
-      .get(tag) as unknown as ImageBuildRow | undefined;
-    return row ?? null;
+    const rows = this.deps.db
+      .prepare("SELECT * FROM image_builds WHERE tag = ? AND status = 'ready' ORDER BY id DESC")
+      .all(tag) as unknown as ImageBuildRow[];
+    // 跳过占位 digest：stub 模式下写进来的全零 sha256 不是真镜像，拿它去
+    // `docker create` 会得到 "No such image: sha256:000…0"。
+    // 2026-10-18 真实踩到：库是历史遗留的（先从 stub 跑过），切到 DOTD_FLEET=docker 后
+    // boot 连报两次 "boot 失败 … No such image"，容器永远起不来。
+    return rows.find((r) => !isPlaceholderDigest(r.digest)) ?? null;
   }
 
   /** 历史 ready 行（§8 镜像回收：保留 digest 引用中的除外）。 */
