@@ -243,9 +243,14 @@ export function buildCli(opts: CliOptions = {}): Command {
       const qs = new URLSearchParams();
       if (opts.path !== undefined) qs.set('path', opts.path);
       qs.set('limit', String(Math.max(1, Math.min(500, Number(opts.limit) || 20))));
-      const r = await api<{ items: Array<{ name: string; archivedAt: string; originalPath: string; sizeBytes: number }> }>(
-        'GET', `/api/memory/archive?${qs.toString()}`, undefined, o,
-      );
+      const r = await api<{
+        items: Array<{ name: string; archivedAt: string; originalPath: string; sizeBytes: number }>;
+        total?: number;
+        totalBytes?: number;
+        quotaBytes?: number;
+        usedPct?: number;
+        warning?: string;
+      }>('GET', `/api/memory/archive?${qs.toString()}`, undefined, o);
       if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
       const items = r.body.items ?? [];
       if (o.json === true) {
@@ -262,6 +267,15 @@ export function buildCli(opts: CliOptions = {}): Command {
         console.log(`     ${it.name}`);
       }
       console.log('');
+      // 配额提示（2026-10-18）：快满时说清楚，别让人某天发现老备份被悄悄删掉。
+      const body = r.body ?? {};
+      if (typeof body.totalBytes === 'number' && typeof body.quotaBytes === 'number') {
+        const pct = typeof body.usedPct === 'number' ? body.usedPct : 0;
+        console.log(`占用：${body.totalBytes}/${body.quotaBytes} 字节（${pct}%），共 ${body.total ?? items.length} 份`);
+      }
+      if (typeof body.warning === 'string') {
+        console.log(`⚠️  ${body.warning}`);
+      }
       console.log('回滚：dotd memory restore <上面对应的文件名>');
     });
 

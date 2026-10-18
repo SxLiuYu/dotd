@@ -16,6 +16,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { readFileSync } from 'node:fs';
+
 import { matchRoute } from '../src/surfaces/http.ts';
 
 test('路由：GET /api/memory/archive 与 POST /api/memory/restore', () => {
@@ -47,4 +49,14 @@ test('恢复路径拒绝目录穿越', () => {
   for (const n of bad) {
     assert.ok(n.includes('/') || n.includes('..'), `${n} 应被守卫拦下`);
   }
+});
+
+test('归档配额可见：返回总量/上限/占比，满 80% 给 warning', () => {
+  // 2026-10-18：.archive/ 有 32MB 硬上限 + FIFO 修剪，但没人知道"快满了"，
+  // 会直到某天发现老备份被悄悄删掉。API 把配额算出来；CLI 显示。
+  const src = readFileSync(new URL('../src/surfaces/http.ts', import.meta.url), 'utf8');
+  assert.ok(src.includes('quotaBytes'), '必须返回配额上限');
+  assert.ok(src.includes('usedPct'), '必须返回使用占比');
+  assert.ok(src.includes('usedPct >= 80'), '满 80% 必须给 warning');
+  assert.ok(src.includes('LIMIT_ARCHIVE_BYTES'), '上限必须复用 limits.ts 的常量（单一事实源）');
 });

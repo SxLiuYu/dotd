@@ -46,6 +46,7 @@ import type {
 } from '../shared/contracts.ts';
 import { ConfigError } from '../shared/errors.ts';
 import { DEFAULT_DOT_ID } from '../shared/ids.ts';
+import { LIMIT_ARCHIVE_BYTES } from '../memory/limits.ts';
 import type { HookConfig, SurfacesConfig } from './types.ts';
 import { createIngress, ingest, MAX_BODY_BYTES, normalizeHook, originAllowed } from './ingress.ts';
 import { handleFeishuCallback, maybeDecryptFeishuBody } from './feishu-inbound.ts';
@@ -854,10 +855,32 @@ export function createHttpServer(deps: HttpDeps): Server {
           }
           limit = n;
         }
-        const items = (await deps.listMemoryArchive())
+        const all = await deps.listMemoryArchive();
+        const items = all
           .filter((x) => pathFilter === null || x.originalPath === pathFilter)
           .slice(0, limit);
-        json(res, 200, { items, filter: pathFilter, limit });
+        // 配额可见性（2026-10-18）：.archive/ 有 32MB 硬上限 + FIFO 修剪，
+        // 但如果没人知道"快满了"，会直到某天发现老备份被悄悄删掉。
+        // 这里把总量/占比算出来；达到 80% 给 warning。数字全部来自已列出的条目，不额外 IO。
+        const totalBytes = all.reduce((s, x) => s + x.sizeBytes, 0);
+        const quotaBytes = LIMIT_ARCHIVE_BYTES.hard;
+        const usedPct = quotaBytes === 0 ? 0 : Math.round((totalBytes / quotaBytes) * 1000) / 10;
+        json(res, 200, {
+          items,
+          filter: pathFilter,
+          limit,
+          total: all.length,
+          totalBytes,
+          quotaBytes,
+          usedPct,
+          ...(usedPct >= 80
+            ? {
+                warning:
+                  `备份已占用 ${usedPct}%（${totalBytes}/${quotaBytes} 字节），接近上限后会按时间先后删除最旧的备份。` +
+                  `如需保留某份，请先把它另存到 notes/ 或取回本地。`,
+              }
+            : {}),
+        });
         return;
       }
 
