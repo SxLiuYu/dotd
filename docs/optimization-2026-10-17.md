@@ -1,4 +1,4 @@
-# 2026-10-17/18 优化批次：做了什么、凭什么说它成立
+﻿# 2026-10-17/18 优化批次：做了什么、凭什么说它成立
 
 > 本文是这一批优化的**举证材料**。配套阅读：
 > - [`benchmark-agent-capabilities.md`](./benchmark-agent-capabilities.md) —— 与 OpenAI / Grok 的能力对标矩阵（开工前的差距分析）
@@ -680,3 +680,124 @@ dotd 的卖点就是"不是固定 DAG、由模型在运行时决定下一步"。
 **这轮之后仍然没变的唯一短板**：真模型往返、真 Docker 容器、真实飞书，**三样一次都没跑过**。
 不是代码问题——本机没有 `WB2API_KEY`（`:7863` 返回 401），原生 Windows 没有 dockerd。
 `npm run setup` 与 `npm run doctor` 已经把这两个缺口变成**可执行的下一步**，一有环境就能验证。
+
+
+---
+
+# 第四轮：接上真实模型，端到端第一次跑通（2026-10-18）
+
+前三轮结束时，**真模型往返、真 Docker 容器、真实飞书**三样一次都没跑过——那是唯一没变的短板。
+主人给了可用的模型接口（`http://127.0.0.1:3065/v1` + key），这一轮把它接上并**真的跑通了任务**。
+
+## 23. 接上的过程（每一步都是实测，不是推测）
+
+### 23.1 先说一个只有实测才会发现的事：这个网关上各模型的工具调用能力不同
+
+`GET /v1/models` 返回 10 个模型。逐个带 `tools` 打一次最小请求：
+
+| 模型 | `finish_reason` | 是否返回 `tool_calls` |
+|---|---|---|
+| `hy3` | `stop` | **否**——只出文本，工具调用被吞掉 |
+| `deepseek-v4.1-flash` | `tool_calls` | **是**，`arguments` 是合法 JSON |
+
+这一条直接决定配置怎么写：主循环每轮都带 `tools` + `tool_choice:'auto'`，
+**primary 轨必须是真能调工具的模型**——否则工具永远不执行，任务看起来"做完"了但什么都没干。
+
+所以 `config/models.yml` 的 tier1 改成 `base_url: http://127.0.0.1:3065/v1`、
+`primary: deepseek-v4.1-flash`，并把 `glm-5.3-flash` / `Qwen3.8-Flash` 放进模型级 fallback 链。
+
+### 23.2 真模型往返：从"未验证"变成"通过"
+
+`node --import tsx scripts/probe-live-model.mjs`（key 在环境里）：
+
+```
+端点      openrouter-main（tier1, style=openai）
+base_url  http://127.0.0.1:3065/v1
+模型      deepseek-v4.1-flash
+
+connect:  成功（HTTP 往返完成）
+model:    deepseek-v4.1-flash
+tool_calls: 是（1 个，name=fs.read 已还原为契约名，arguments=合法 JSON {"path": "notes/probe.md"}）
+latency:  1845ms
+```
+
+## 24. 端到端真跑：一个任务，35 步，暴露了两个真缺陷
+
+起 daemon（临时 `DOTD_HOME`，不碰真 `~/.dotd`），通过 `POST /api/messages` 提交中文任务。
+**模型真的在工作**：`model_call_log` 里 8 次真实调用，`endpoint_id=openrouter-main`、
+`model=deepseek-v4.1-flash`、`prompt_tokens` 6147 量级、延迟 1–4.5s——这条链路是真通的。
+
+但任务跑了 **35 步**、`fs.write` 连试 3 次全失败，模型最后放弃并反问主人。查下来是两个真缺陷。
+
+### 24.1 缺陷一（严重）：记忆层写检查点拦下了所有 home 路径
+
+`MemoryService.beforeWrite` 对任意 `fs.write` 都跑记忆规则，而记忆规范只管
+`MEMORY.md` / `notes/*.md` / `manuals/**` 三处。写其余路径时 `classifyHomeArea` 返回 null
+→ 直接 `HARD_LIMIT`，错误信息还是"路径不在记忆规范内"。
+
+实测的两个失败形态：
+
+```
+fs.write {"path":"notes/hello.md"}           -> HARD_LIMIT「note 命名须为 YYYY-MM-DD-<slug>.md」
+fs.write {"path":"/dot/home/notes/hello.md"} -> HARD_LIMIT「非法 home 相对路径」
+```
+
+第一件其实是对的（notes 确实有命名规范），但**模型不知道**；
+第二件暴露的是**说明书与真实护栏矛盾**：工具描述写着"可写相对路径或 `/dot/home/...` 绝对路径"，
+而真护栏只认相对路径。更要命的是普通工作文件（`reports/weekly.md`）也会被拒——这是纯粹的误拦。
+
+修法分两层，**安全边界一步不让**：
+- 记忆层只在自己管辖范围内施加规则（新增 `isMemoryPath`，判据只维护一份）；
+- 形状非法（绝对路径、`..` 逃逸、盘符）**仍然拒**——这是安全边界，执行面同样会拒，两层都守；
+- 工具说明书改成与真实护栏一致，并**把 notes 的命名规范写进 description**，让模型第一次就知道。
+
+### 24.2 缺陷二：冒烟脚本把端点地址写死了
+
+`scripts/smoke.mjs` 的假上游分支用正则匹配 `http://127.0.0.1:7863/v1` 来改写 `base_url`。
+主人换一次端点，这条分支就**静默失效**（exit 2），而它恰恰是"真 HTTP 链路"唯一的端到端证据。
+改成按 YAML **结构**定位（`endpoints` 段里第一条 `tier: 1` 且 `enabled` 的端点）。
+
+## 25. 修复前后的决定性对比（同一类任务）
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 步数 | **35 步** | **4 步** |
+| `fs.write` | 3 次全失败 | **succeeded，59 字节** |
+| 结尾 | 模型放弃并反问主人 | `已创建 reports/weekly.md，内容就是你要的三行` |
+
+修复后的实测：
+
+```
+steps: 1:llm=succeeded | 2:tool:fs.write=succeeded | 3:llm=succeeded | 4:llm=succeeded
+[last fs.write] succeeded -> {"path":"/dot/home/reports/weekly.md","size":59}
+[reply] 已创建 reports/weekly.md，内容就是你要的三行（周报 / 真实模型端到端验证通过 / 日期 2026-10-18）。
+```
+
+**另一个值得记下的现场**：第一次提交任务时我自己的 UTF-8 编码出错，中文变成问号发给模型。
+模型没有瞎猜，而是**停下来反问**"你的消息里出现了乱码，我只能看到一个大概的意思……
+麻烦你确认两点"。这正好验证了 system prompt 里"目标有歧义且猜错代价大时要停下来问"那一条是有效的。
+
+## 26. 第四轮的门禁总账
+
+| 检查 | 结果 |
+|---|---|
+| `tsc --noEmit -p .` | exit 0 |
+| `npm test` | **1399 / 1399 通过，0 失败**（连跑 4 次全绿） |
+| `node scripts/smoke.mjs` | 11/11 |
+| `DOTD_SMOKE_FAKE_UPSTREAM=1` | 16/16 |
+| `probe-live-model.mjs` | **真模型往返通过**（tool_calls 合法） |
+| daemon 真跑 | **任务 done，fs.write succeeded** |
+
+## 27. 现在的真实状态
+
+**真模型往返：✅ 已验证。** 这一条从"零证明力"变成了"真跑通过"。
+
+**真 Docker 容器：❌ 仍未验证。** 本机原生 Windows 无 dockerd；`doctor` 会如实报
+`DOTD_FLEET 未设置 → 实际生效 stub`。任务里看到的 `fs.list` / `shell.run` 成功都来自 stub 容器
+（所以 `date` 返回的是 `(stub) ok`，不是真实日期）——这一条必须说清楚，不能因为任务 done 就当成容器也通了。
+
+**真实飞书：🟡 半验证。** daemon 启动日志显示"飞书凭证校验通过""飞书长连接已建立"，
+但**没有做一次真实的收发往返**（那需要主人那边确认收到了消息）。
+
+**下一步就一件事**：在一台有 docker 的 Linux/WSL 机器上 `DOTD_FLEET=docker` 起一次，
+看真实容器里 `fs.write` / `shell.run` / `browser.*` 是否成立。那是唯一还没跨过的门槛。
