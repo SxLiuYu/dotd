@@ -84,3 +84,27 @@ test('非法 expected_size（负数/小数）不当作校验条件', () => {
   const neg = fs.write('c6', { path: 'd.txt', content: 'ok', expected_size: -1 });
   assert.equal(neg.status, 'ok', '非法值应视为未传，不阻断');
 });
+
+test('防误清空：空内容覆盖非空文件被拒（empty_overwrite）', () => {
+  // 现场（2026-10-18 事故）：模型把 MEMORY.md 写成空串，fs.write 老实执行，
+  // 一千多字记忆被清成 0 字节且返回 succeeded，模型下一轮读到空文件还以为是别的问题。
+  const root = mkdtempSync(join(tmpdir(), 'dotd-cas-'));
+  const fs2 = makeFs(root);
+  const p = join(root, 'mem.md');
+  writeFileSync(p, '# MEMORY\n有内容\n');
+
+  const res = fs2.write('e1', { path: 'mem.md', content: '' });
+  assert.notEqual(res.status, 'ok', '必须拒绝空覆盖');
+  const err = (res as unknown as { error?: { code?: string } }).error;
+  assert.equal(err?.code, 'empty_overwrite');
+  assert.equal(readFileSync(p, 'utf8'), '# MEMORY\n有内容\n', '原内容必须保住');
+});
+
+test('空文件写空内容 → 允许（没有可丢的内容）', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dotd-cas-'));
+  const fs2 = makeFs(root);
+  const p = join(root, 'empty.txt');
+  writeFileSync(p, '');
+  const res = fs2.write('e2', { path: 'empty.txt', content: '' });
+  assert.equal(res.status, 'ok', '空文件写空内容无风险');
+});

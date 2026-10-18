@@ -266,6 +266,28 @@ export class FsTools {
         );
       }
     }
+    // **防误清空**（2026-10-18 实测事故）：模型把 MEMORY.md 当成空字符串整篇写回，
+    // fs.write 老实执行了 → 一千多字的记忆被清成 0 字节，而且返回 succeeded，
+    // 模型下一轮读到空文件还以为是别的问题。
+    // 规则：**用一个空内容覆盖一个非空文件**几乎必然是模型的失误（真要清空该用删除），
+    // 因此拒写并返回 empty_overwrite，让它重新读一遍确认。
+    if (data.byteLength === 0) {
+      let currentSize = 0;
+      try {
+        currentSize = statSync(safe.abs).size;
+      } catch {
+        currentSize = 0;
+      }
+      if (currentSize > 0) {
+        return errorResult(
+          callId,
+          ERROR_CODES.empty_overwrite,
+          `拒绝用空内容覆盖已有文件 ${safe.rel}（当前 ${currentSize} 字节）。` +
+            `如果你是"读-改-写"时拿到空内容，请重新 fs.read 确认原文；真要清空文件请用 shell.run 的 '> file'。`,
+          false,
+        );
+      }
+    }
     mkdirSync(safe.abs.slice(0, safe.abs.lastIndexOf(sep)), { recursive: true });
     this.writeFile(safe.abs, data);
     return okResult(

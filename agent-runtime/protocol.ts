@@ -323,6 +323,11 @@ export const ERROR_CODES = {
    * 2026-10-18：实测并发 RMW 会丢 9/10 的更新，加 CAS 后由模型重读重试。
    */
   stale_write: 'stale_write',
+  /**
+   * 用空内容覆盖非空文件被拒（2026-10-18 实测事故：模型把 MEMORY.md 写成空串，
+   * 一千多字记忆被清成 0 字节且返回 succeeded）。
+   */
+  empty_overwrite: 'empty_overwrite',
   /** 本文件新增：能力目录缺失该工具名。 */
   unknown_tool: 'unknown_tool',
   /** 本文件新增：把 sync 工具发去 /jobs/start（或反之）。 */

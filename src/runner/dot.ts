@@ -341,6 +341,17 @@ function normalizeResultForRepeat(value: unknown): string {
   }
 }
 
+/**
+ * 读-改-写配对用的路径键：把 /dot/home 前缀与 ./ 去掉、反斜杠归一，
+ * 让 "MEMORY.md" 与 "/dot/home/MEMORY.md" 命中同一条记录（与 fs 层同一套规范）。
+ */
+function normalizePathForReadSize(p: string): string {
+  return p
+    .replace(/\\/g, '/')
+    .replace(/^\/dot\/home(?=\/|$)/, '')
+    .replace(/^\.\//, '');
+}
+
 /** 一次 LLM 响应在主循环里的归一形状。 */
 interface LlmStep {
   content: string;
@@ -819,6 +830,18 @@ export class DotRunner {
    * 实测：一条任务里 `sleep 3; echo step1` 被重复 4 次仍未触发护栏，
    * 因为中途经历过一次 kill -9 恢复，计数被重置了。
    */
+  /**
+   * 本任务内**读到过**的文件大小（path → size_bytes）。
+   *
+   * 用途：模型"读文件 → 改 → 整篇写回"时，自动在 fs.write 上补 expected_size，
+   * 让执行面做乐观并发控制（CAS）。2026-10-18 实测：10 个并发 RMW 进程写同一文件
+   * 会丢 8/11 的更新；而**模型自己从不主动传 expected_size**（提示词写了两轮也没用）。
+   * 所以改由 Runner 在派发时自动补——不依赖模型自觉。
+   *
+   * 只在同一任务内有效（跨任务的数据由执行面 statSync 现查，不靠这份缓存）。
+   */
+  private readonly readSizes = new Map<string, number>();
+
   private readonly repeatGuard = new Map<string, Map<string, { count: number; last: string; sameResultCount?: number }>>();
   /** 连续被护栏跳过派发的轮数（按任务 ID）；超过 REPEAT_MAX_SKIPS 就真的收口（防死循环）。 */
   private readonly repeatSkipsByTask = new Map<string, number>();
@@ -939,6 +962,9 @@ export class DotRunner {
   /** CP §12 骨架主体。 */
   private async runTask(task: Task): Promise<TaskRunOutcome> {
     const epoch = task.runEpoch;
+    // readSizes 是"本任务读过的文件大小"，**每个任务开始时清空**（跨任务没有意义，
+    // 而且会把上个任务的数据带进来造成误判）。
+    this.readSizes.clear();
     // 注意：**不清空** repeatGuard —— 计数按 taskId 分桶、跨 run_epoch 保留（见字段注释）。
     this.log(`runner: 领任务 ${task.id}（epoch=${epoch} resume_from_seq=${task.resumeFromSeq ?? '-'}）`);
 
@@ -1499,6 +1525,37 @@ export class DotRunner {
    * - 模型没传或传得不合法 → 用档位默认（sync 60s / async 目录上限）；
    * - 无论如何不超过档位上限：那是安全兜底，不能被工具参数绕过。
    */
+  /**
+   * 给 fs.write 自动补 expected_size（乐观并发控制）。
+   *
+   * 触发条件（缺一不可）：
+   *   1. 工具是 fs.write；
+   *   2. 模型**没有**自己传 expected_size（尊重模型的显式选择）；
+   *   3. 本任务此前 fs.read 过同一个文件（说明这是"读-改-写"，没有基线就无从校验）。
+   *
+   * 补上之后，执行面会校验文件大小；若期间被别的任务改过 → stale_write（可重试），
+   * 模型重读一遍即可。这样并发丢数据从"靠模型自觉"变成"默认就安全"。
+   */
+  private withAutoExpectedSize(tool: string, args: Record<string, unknown>): Record<string, unknown> {
+    if (tool !== 'fs.write') return args;
+    if (args['expected_size'] !== undefined) return args;
+    const path = args['path'];
+    if (typeof path !== 'string') return args;
+    const key = normalizePathForReadSize(path);
+    const size = this.readSizes.get(key);
+    if (size === undefined) return args;
+    return { ...args, expected_size: size };
+  }
+
+  /** 记下一次 fs.read 看到的文件大小（供 withAutoExpectedSize 用）。 */
+  private noteReadSize(args: Record<string, unknown>, value: unknown): void {
+    const path = args['path'];
+    if (typeof path !== 'string') return;
+    const size = (value as { size_bytes?: unknown } | null)?.size_bytes;
+    if (typeof size !== 'number' || !Number.isFinite(size)) return;
+    this.readSizes.set(normalizePathForReadSize(path), size);
+  }
+
   private effectiveDeadlineMs(tool: string, args: Record<string, unknown>): number {
     const cap = this.toolDeadlineMsFor(tool);
     const want = args['timeout_ms'];
@@ -1734,8 +1791,12 @@ export class DotRunner {
     // 工具说"可以等 10 分钟"、Runner 说"我只等 1 分钟"，同一概念两处不一致，
     // 模型据此做的判断（比如"这命令慢，我把超时设长点"）全部落空。
     // 取二者较小值：模型要求的更短就听模型的；更长则被 Runner 的档位上限截断（安全兜底不变）。
+    // **自动补 expected_size**（2026-10-18）：模型不会主动传 CAS 参数（提示词写两轮都没用），
+    // 所以由 Runner 在本任务读到过该文件时自动补上——把并发保护变成"默认行为"而不是"模型自觉"。
+    // 只在本任务 fs.read 过它、且模型自己没传时才补；新建文件（没读过）不补。
+    const argsForExec = this.withAutoExpectedSize(call.name, args);
     const res = await this.exec.runTool(
-      toolCall(task, callId, call.name, args, this.effectiveDeadlineMs(call.name, args)),
+      toolCall(task, callId, call.name, argsForExec, this.effectiveDeadlineMs(call.name, argsForExec)),
     );
     const ok = res.status === 'ok';
     const warning = this.memoryWarnings.get(callId);
@@ -1747,6 +1808,8 @@ export class DotRunner {
     ctx.feed({ ok, callId, toolName: call.name, value: result, calledWith: withHomeRootArgs(call.name, args) });
     // 回填护栏记录：下一次同参数调用时，注记能引用**真实的上一次结果**。
     this.recordRepeatResult(task.id, call, ok ? result : { failed: true, error: result });
+    // fs.read 成功 → 记下大小，供后续 fs.write 自动补 expected_size（CAS）。
+    if (ok && call.name === 'fs.read') this.noteReadSize(args, result);
     this.memoryWarnings.delete(callId);
     // ⑩ 结果回报：tool 消息只 digest+200 预览入 thread（S6 双写禁令；全文在 steps）
     await this.reportTool(ctx, task, callId, call.name, ok, result);
