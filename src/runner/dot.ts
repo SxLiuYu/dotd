@@ -83,7 +83,10 @@ import {
  *
  * 取值依据（2026-10-18 真实数据）：观察到的原地打转是同一 (工具,参数) 重复 3–5 次；
  * 而正常任务里"写完再读"是**不同工具或不同参数**，不会撞这条判据。
- * 取 2/4：第 2 次（= 完全重复一次）就开始提醒，第 4 次强制停。
+ * 取 2/4：第 2 次开始提醒，第 4 次跳过派发强令收尾。
+ * 2026-10-18 校准记录：试过降到 3，但会误伤"合法重复 8 次再收尾"的场景
+ * （tests/runner-plan.test.ts 的抗跑偏用例抓到，模型的正常回答被护栏顶掉）。
+ * 所以**次数不是可靠判据**——真正的判据是"结果有没有变化"（见 repeatSignature + last）。
  * 2026-10-18 实测校准：E 用例每项重复恰好 3 次才收尾，所以硬阈必须 ≤4；
  * 而"写完再读"是不同工具/不同参数，第 2 次软提醒不会误伤它们（有单测钉住判据）。
  */
@@ -252,6 +255,36 @@ function goalDigestOf(goal: string): string {
     else hi = mid - 1;
   }
   return goal.slice(0, lo);
+}
+
+/**
+ * 护栏判重用的"语义签名"：**剔除不影响动作语义的参数**后再序列化。
+ *
+ * 为什么需要（2026-10-18 实测踩到，很隐蔽）：
+ * 模型反复执行同一条命令 `echo A`，但每次把 `timeout_ms` 从 5000 改成 10000 再改回来。
+ * 原始参数串因此不同 —— 护栏认为这是"不同调用"，计数永远到不了硬上限，
+ * 实测 4 次同命令 + 4 次变体 = 18 次 shell.run 仍未触发，任务一直打转。
+ *
+ * timeout/超时这类参数只影响"等多久"，不影响"做什么"。把它们剔掉，
+ * 判重才真正对齐"同一个动作做了几次"。
+ */
+export function repeatSignatureForTest(argumentsJson: string): string {
+  return repeatSignature(argumentsJson);
+}
+
+function repeatSignature(argumentsJson: string): string {
+  // 只看顶层键（工具参数都是扁平对象）；解析失败就退回原串，宁可少判重也不误判。
+  const IGNORED = new Set(['timeout_ms', 'timeoutMs', 'timeout', 'deadline_ms', 'deadlineMs']);
+  try {
+    const obj = JSON.parse(argumentsJson) as unknown;
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return argumentsJson;
+    const entries = Object.entries(obj as Record<string, unknown>)
+      .filter(([k]) => !IGNORED.has(k))
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return JSON.stringify(entries);
+  } catch {
+    return argumentsJson;
+  }
 }
 
 /** 一次 LLM 响应在主循环里的归一形状。 */
@@ -717,9 +750,18 @@ export class DotRunner {
    * 这是与模型无关的产品侧兜底：同一 (工具, 参数) 第 N 次出现时，把"已经做过、结果如下"
    * 强注回喂，让模型无法再假装没做过；超过硬上限则直接收口，避免烧光步数预算。
    */
-  private readonly repeatGuard = new Map<string, { count: number; last: string }>();
-  /** 连续被护栏跳过派发的轮数；超过 REPEAT_MAX_SKIPS 就真的收口（防死循环）。 */
-  private repeatSkips = 0;
+  /**
+   * 原地打转护栏：**按任务 ID 分桶**，跨 run_epoch 保留。
+   *
+   * 为什么必须按任务而不是按"本次 Runner 运行"（2026-10-18 崩溃恢复测试踩到）：
+   * 任务被恢复/重试时会重新领取（run_epoch+1），如果在这里清空计数，
+   * 护栏就从 1 重新数起 —— 而原地打转往往正是**跨 epoch** 的（崩溃后接着重复同一动作）。
+   * 实测：一条任务里 `sleep 3; echo step1` 被重复 4 次仍未触发护栏，
+   * 因为中途经历过一次 kill -9 恢复，计数被重置了。
+   */
+  private readonly repeatGuard = new Map<string, Map<string, { count: number; last: string; sameResultCount?: number }>>();
+  /** 连续被护栏跳过派发的轮数（按任务 ID）；超过 REPEAT_MAX_SKIPS 就真的收口（防死循环）。 */
+  private readonly repeatSkipsByTask = new Map<string, number>();
   private running = false;
 
   constructor(deps: RunnerDeps, opts: RunnerOptions = {}) {
@@ -837,8 +879,7 @@ export class DotRunner {
   /** CP §12 骨架主体。 */
   private async runTask(task: Task): Promise<TaskRunOutcome> {
     const epoch = task.runEpoch;
-    this.resetRepeatGuard();
-    this.repeatSkips = 0;
+    // 注意：**不清空** repeatGuard —— 计数按 taskId 分桶、跨 run_epoch 保留（见字段注释）。
     this.log(`runner: 领任务 ${task.id}（epoch=${epoch} resume_from_seq=${task.resumeFromSeq ?? '-'}）`);
 
     // ⑤ 会话绑定（S5：修旧稿只读不写）
@@ -956,15 +997,16 @@ export class DotRunner {
       for (const call of llm.step.toolCalls) {
         if (ctx.done) break;
         // 原地打转护栏（见 repeatGuard 注释）：同 (工具,参数) 反复调用时介入。
-        const guard = this.checkRepeat(call, ctx);
+        const guard = this.checkRepeat(call, ctx, session.id);
         if (guard === 'stop') {
           // 护栏判定必须收尾：**跳过本次派发**，让下一轮 LLM 在"没有工具可调"的情况下
           // 直接产出结论（而不是由产品替它写结论——那会顶掉模型的正常回答）。
-          this.repeatSkips += 1;
-          if (this.repeatSkips > REPEAT_MAX_SKIPS) {
+          const skips = (this.repeatSkipsByTask.get(session.id) ?? 0) + 1;
+          this.repeatSkipsByTask.set(session.id, skips);
+          if (skips > REPEAT_MAX_SKIPS) {
             // 兜底：模型连"不许调工具"的强令都不理，仍在给工具调用 —— 产品侧收口，
             // 否则外层 while 会一直转（实测能把测试挂死）。
-            this.log(`runner: 护栏连续跳过 ${this.repeatSkips} 轮仍不收敛，产品侧收口 ${session.id}`);
+            this.log(`runner: 护栏连续跳过 ${skips} 轮仍不收敛，产品侧收口 ${session.id}`);
             ctx.markDone(
               `我停下了：同一个动作反复执行且结果没有变化（最近一次：${call.name}），` +
                 `说明这一步已经做完。以现有结果为准收尾。`,
@@ -991,7 +1033,9 @@ export class DotRunner {
     }
 
     // ⑪ 任务终态：WRITE-SEAL → finish(ok:true)
-    return this.finishTask(session, epoch, { ok: true, summary: ctx.summary });
+    const done = await this.finishTask(session, epoch, { ok: true, summary: ctx.summary });
+    this.resetRepeatGuard(session.id);
+    return done;
   }
 
   // ── 3.2b P2-2 显式计划（可观测产物，不是控制流）─────────────────────────
@@ -1395,24 +1439,48 @@ export class DotRunner {
   private checkRepeat(
     call: { id: string; name: string; arguments: string },
     ctx: RunContext,
-  ): { note: string; } | 'stop' | null {
-    const key = `${call.name}::${call.arguments}`;
-    const rec = this.repeatGuard.get(key) ?? { count: 0, last: '' };
+    taskId: string,
+  ): { note: string } | 'stop' | null {
+    const key = `${call.name}::${repeatSignature(call.arguments)}`;
+    let bucket = this.repeatGuard.get(taskId);
+    if (bucket === undefined) {
+      bucket = new Map();
+      this.repeatGuard.set(taskId, bucket);
+    }
+    const rec = bucket.get(key) ?? { count: 0, last: '' };
     rec.count += 1;
-    this.repeatGuard.set(key, rec);
+    bucket.set(key, rec);
+
+    // **结果没变化才是真打转**（2026-10-18 校准）：次数本身不可靠 ——
+    // 有的任务合法地重复同一动作 8 次（tests/runner-plan.test.ts 的抗跑偏用例），
+    // 靠次数拦会误伤；而"同一调用 + 结果一字不差"几乎必然是原地打转。
+    //
+    // 实现：recordRepeatResult 每次记下"这次返回了什么"，并在**结果与上次相同**时
+    // 递增 sameResultCount。同结果的重复从第 2 次起就强令收尾（不等 4 次）。
+    // 同结果重复：第 2 次强令收尾，第 4 次直接返回 stop（跳过派发）。
+    // **必须有 stop 出口**——只回喂注记会让模型"被提醒但照做"，无限循环
+    // （2026-10-18 实测把单测挂在 300s 不动）。
+    const sameResult = rec.sameResultCount ?? 0;
+    if (sameResult >= 4) return 'stop';
+    if (sameResult >= 2) {
+      return {
+        note:
+          `【必须收尾】${call.name} 用完全相同的参数已经调用 ${rec.count} 次，` +
+          `而且**每次都返回一样的结果**：${rec.last}。` +
+          `重复不会产生新信息，现在立刻停止调用工具，直接给出最终结论。`,
+      };
+    }
 
     if (rec.count < REPEAT_SOFT_LIMIT) return null;
 
     if (rec.count >= REPEAT_HARD_LIMIT * 2) {
-      // 已经给过两次强令收尾仍不收敛。这里返回 'stop' 让 Runner 跳过派发，
+      // 已经给过两次强令收尾仍不收敛。返回 'stop' 让 Runner 跳过派发，
       // **仍不代写结论**——由下一轮 LLM 在没有工具可调的情况下产出正文。
       return 'stop';
     }
 
     if (rec.count >= REPEAT_HARD_LIMIT) {
       // 第一次到硬上限：**不直接收口**，而是下一条强指令让模型自己给结论。
-      // 为什么：实测存在"确实要重复调 8 次再收尾"的合法场景（tests/runner-plan.test.ts
-      // 的抗跑偏用例就是），直接掐掉会把模型的正常回答顶掉。先强令收尾，仍不收敛才代它收。
       return {
         note:
           `【必须收尾】你已经用完全相同的参数调用 ${call.name} ${rec.count} 次，结果没有变化。` +
@@ -1430,23 +1498,35 @@ export class DotRunner {
   }
 
   /** 派发后回填该调用的结果摘要，供下一次重复时的注记引用（让模型看到真实结果）。 */
-  private recordRepeatResult(call: { name: string; arguments: string }, value: unknown): void {
-    const key = `${call.name}::${call.arguments}`;
-    const rec = this.repeatGuard.get(key);
+  private recordRepeatResult(
+    taskId: string,
+    call: { name: string; arguments: string },
+    value: unknown,
+  ): void {
+    const key = `${call.name}::${repeatSignature(call.arguments)}`;
+    const rec = this.repeatGuard.get(taskId)?.get(key);
     if (rec === undefined) return;
     try {
       const text = JSON.stringify(value ?? null);
-      rec.last = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+      const trimmed = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+      if (trimmed === rec.last) {
+        rec.sameResultCount = (rec.sameResultCount ?? 1) + 1;
+      } else {
+        rec.sameResultCount = 1;
+      }
+      rec.last = trimmed;
     } catch {
       rec.last = '';
+      rec.sameResultCount = 0;
     }
   }
 
-  /** 任务开始/结束时清空护栏计数（避免跨任务累积导致误伤）。 */
-  private resetRepeatGuard(): void {
-    this.repeatGuard.clear();
-    this.repeatSkips = 0;
+  /** 任务真正终态时清空该任务的护栏状态（避免内存与跨任务误伤）。 */
+  private resetRepeatGuard(taskId: string): void {
+    this.repeatGuard.delete(taskId);
+    this.repeatSkipsByTask.delete(taskId);
   }
+
 
   // ── 3.4 ⑦ 工具步 ──────────────────────────────────────────────────────
 
@@ -1559,7 +1639,7 @@ export class DotRunner {
     // 成败都以 JSON 回喂（失败 = 容器端的 {code,message,retryable}）：模型要靠 code 决定改参还是重试。
     ctx.feed({ ok, callId, toolName: call.name, value: result, calledWith: withHomeRootArgs(call.name, args) });
     // 回填护栏记录：下一次同参数调用时，注记能引用**真实的上一次结果**。
-    this.recordRepeatResult(call, ok ? result : { failed: true, error: result });
+    this.recordRepeatResult(task.id, call, ok ? result : { failed: true, error: result });
     this.memoryWarnings.delete(callId);
     // ⑩ 结果回报：tool 消息只 digest+200 预览入 thread（S6 双写禁令；全文在 steps）
     await this.reportTool(ctx, task, callId, call.name, ok, result);

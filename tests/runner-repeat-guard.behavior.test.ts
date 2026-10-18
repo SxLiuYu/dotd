@@ -123,3 +123,29 @@ test('行为：模型执意重复同一调用时，护栏会在第 4 次强制�
     tmp.cleanup();
   }
 });
+
+test('崩溃恢复：护栏计数按 taskId 保留，run_epoch+1 后仍然生效', async () => {
+  // 现场（2026-10-18 kill -9 测试）：一条任务中途崩溃、恢复后被重新领取（run_epoch 1→2），
+  // 同一条命令 `sleep 3; echo step1` 被重复执行 4 次仍未触发护栏 ——
+  // 因为 runTask 开头清空了 repeatGuard。护栏必须在**跨 epoch** 时依然记得已重复过多少次。
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, '..', 'src', 'runner', 'dot.ts'), 'utf8');
+
+  // ① 计数容器是按 taskId 的二级 Map
+  assert.ok(
+    src.includes('repeatGuard = new Map<string, Map<string,'),
+    '计数必须是 taskId → (调用签名 → 计数) 的二级结构',
+  );
+  // ② runTask 开头**不清空**计数
+  const runTaskHead = src.slice(src.indexOf('private async runTask('), src.indexOf('private async runTask(') + 600);
+  assert.equal(
+    /resetRepeatGuard\(\)/.test(runTaskHead),
+    false,
+    'runTask 开头不得清空护栏（否则崩溃重领就失忆）',
+  );
+  // ③ 终态才清理
+  assert.match(src, /this\.resetRepeatGuard\(session\.id\)/, '任务终态时应清理该任务的护栏状态');
+});

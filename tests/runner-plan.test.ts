@@ -1,4 +1,4 @@
-﻿/**
+/**
  * tests/runner-plan.test.ts —— P2-2 显式计划与目标锚定。
  *
  * 三件事（任务书的"必须证明"）：
@@ -493,7 +493,21 @@ test('抗跑偏①：8 步任务里，计划轮之后的**每一次** LLM 请求
   }
   turns.push({ content: '整理完了。' });
 
-  const f = await planFixture({ turns, runnerOpts: { plan: true }, tools: { 'fs.list': okList } });
+  // 护栏纪律（2026-10-18）：8 次**完全相同**的 fs.list 会被原地打转护栏判为死循环，
+  // 那是正确行为（结果一字不差 = 没有新信息）。本用例要测的是"计划在每轮都挂着"，
+  // 所以让每次调用返回不同结果，模拟"真的在推进"。
+  let seq = 0;
+  const advancingList = (call: ExecToolCall): ExecToolResult => {
+    seq += 1;
+    return {
+      call_id: call.call_id,
+      status: 'ok',
+      result: { entries: [{ name: `f${seq}.md` }] },
+      usage: { wall_ms: 1, peak_mem_mb: 1 },
+      finished_at: new Date().toISOString(),
+    };
+  };
+  const f = await planFixture({ turns, runnerOpts: { plan: true }, tools: { 'fs.list': advancingList } });
   const { taskId } = ingestAndDecide(f.cp);
   await flush();
   const out = await f.runner.runNext();
