@@ -1529,3 +1529,73 @@ runner: 原地打转护栏触发，跳过派发并强制模型收尾 tk_mvdoznm5
 ## 71. 本轮门禁
 
 `tsc` exit 0 · **`npm test` 1427/1427 全绿**（+6 条新增回归）· 崩溃恢复对账正常 · 护栏真实触发
+
+---
+
+# 第十四轮：异常路径与可观察性（2026-10-18）
+
+第十三轮教训是"兜底机制最难验证"。这轮继续找**只在异常路径才暴露**的问题：
+模型端点全挂时会怎样？故障之"后"主人能否知道发生了什么？
+
+## 72. 模型全挂的行为是对的
+
+把 `models.yml` 的 base_url 指到无人监听的端口，然后提交任务：
+
+| 检查 | 结果 |
+|---|---|
+| 任务状态 | **2 秒内 `paused`**（`stop_reason: circuit_open`）——不是永久卡 `running` |
+| 熔断原因 | `AllEndpointsDownError：ALL_ENDPOINTS_DOWN:全部模型端点均不可用（已试 3 个候选）` |
+| 端点恢复后 | 新任务立即 `done`，无需人工干预 |
+
+熔断机制本身**完全正确**。
+
+## 73. 但它"看不见"——这是真缺陷
+
+第一次测完发现：任务状态是对的，但**日志里一个字都没有**，`resource_events` 里也查不到。
+
+主人视角：只看到"DS 不回话"，无从判断是模型端点挂了、还是 dotd 坏了、还是容器挂了。
+
+这与之前踩过的"WSL 密钥错误只藏在数据库里"是**同一类问题**：
+**状态记录正确 ≠ 故障可观察**。可观察性必须是显式要求。
+
+### 修法一：熔断打日志
+
+```
+runner: 模型熔断 → paused(circuit_open) tk_xxx（AllEndpointsDownError：全部模型端点均不可用（已试 3 个候选））。
+端点恢复后由 router.mode_changed 批量回 queued，无需人工干预。
+```
+
+### 修法二：pauseByReason 落 resource_events
+
+熔断/水位/预算/工具风险都走 `pauseByReason` 这个通用入口，统一记一条：
+
+```json
+task_paused [throttled] {"taskId":"tk_xxx","reason":"circuit_open","from":"running"}
+```
+
+## 74. 修复过程中又踩一个坑：CHECK 约束静默吞掉写入
+
+第一次加完事件写入，`resource_events` 里**还是查不到**。根因：
+
+```sql
+kind TEXT NOT NULL CHECK (kind IN ('watermark','container_pause',...))  -- 没有 task_paused
+```
+
+而我把 `INSERT` 包在 `try/catch` 里（审计面不该炸主流程——这个决定是对的），
+于是**唯一的错误信号被自己吞掉了**。
+
+修法：新增迁移 `120_resource_events_task_paused.sql` 重建表、把 `task_paused` 加进白名单
+（SQLite 不支持改 CHECK，只能重建；resource_events 是纯审计表、无外键引用，重建安全）。
+
+**教训**：`try/catch` 保护正确，但必须**另留一条可观察线索**——否则保护就变成了掩盖。
+
+## 75. 迁移的连带影响
+
+改迁移版本要同步 4 处硬编码 `110`（`daemon.ts` 的 `expectedVersion`、
+`daemon-assembly`/`db-template`/`memory-fts`/`temp-cleanup` 四个测试）。
+漏一处就 `MigrationError` 拒启动——这次一次改齐。
+
+## 76. 本轮门禁
+
+`tsc` exit 0 · **`npm test` 1430/1430 全绿**（+3 条可观察性回归）· 迁移 110→120 实跑通过 ·
+熔断日志与 `task_paused` 事件实证落地 · daemon 运行中

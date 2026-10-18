@@ -1158,6 +1158,14 @@ export class DotRunner {
     } catch (err) {
       // 模型故障支线：熔断耗尽 → paused(circuit_open)，等 router.mode_changed 批量回 queued
       if (err instanceof AllEndpointsDownError || err instanceof NoQualifiedPrimaryError) {
+        // **必须留日志**（2026-10-18 实测）：熔断原来只把状态写进 tasks.stop_reason，
+        // 日志里一个字都没有 —— 主人只看到"DS 不回话"，无从判断是模型端点挂了还是 dotd 坏了。
+        // 这与之前"WSL 密钥错误只藏在数据库里"是同一类问题：关键故障必须能在日志里看见。
+        this.log(
+          `runner: 模型熔断 → paused(circuit_open) ${task.id}` +
+            `（${err instanceof Error ? err.name : 'unknown'}：${errText(err)}）。` +
+            `端点恢复后由 router.mode_changed 批量回 queued，无需人工干预。`,
+        );
         this.cp.pauseByReason(task.id, 'circuit_open');
         await this.seal(task, 'cancelled', 'circuit_open');
         return {

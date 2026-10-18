@@ -581,6 +581,18 @@ export class Queue {
     this.db
       .prepare(`UPDATE tasks SET status='paused', stop_reason=?, updated_at=? WHERE id=?`)
       .run(reason, Date.now(), taskId);
+    // 记一条可追溯的事件（2026-10-18）：原来熔断只改 tasks 表，resource_events 里查不到，
+    // 事后想回答"昨晚为什么任务都停了"只能翻日志文本。pauseByReason 是通用入口
+    // （熔断/水位/预算/工具风险都从这里过），统一落一条便于事后查证。
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO resource_events (ts, level, kind, detail) VALUES (?, 'throttled', 'task_paused', ?)`,
+        )
+        .run(Date.now(), JSON.stringify({ taskId, reason, from: row.status }));
+    } catch {
+      // 事件表是审计面：写失败绝不能影响暂停本身（与 bus 发布同策）。
+    }
     this.deps.bus.publish('task.state', {
       taskId,
       from: row.status,
