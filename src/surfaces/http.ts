@@ -523,7 +523,30 @@ export function createHttpServer(deps: HttpDeps): Server {
         const dotId = typeof (body as { dotId?: unknown }).dotId === 'string' ? (body as { dotId: string }).dotId : DEFAULT_DOT_ID;
         // 契约 S-1：POST /api/messages = memory.openThread('web',…) → appendMessage(user)
         //   → cp.submit({threadId, priority:1})
-        const threadId = await deps.mem.openThread(dotId, 'web');
+        //
+        // 2026-10-18 修：**请求里带 threadId 时必须复用该会话**。
+        // 原实现无条件 openThread() 新建，于是每次 POST 都是新会话 —— 多轮对话接不上：
+        //   主人问"我刚才让你记的暗号是什么"，模型看到的是一个全新的空会话，
+        //   答"这个会话刚开场，我们还没聊过别的"（实测）。
+        // 校验：thread 必须存在且属于同一 dotId，否则退回新建（不因脏 id 拒请求）。
+        const requested = (body as { threadId?: unknown }).threadId;
+        let threadId: string;
+        if (typeof requested === 'string' && requested.length > 0) {
+          // 校验会话**确实存在**：listMessages 对不存在的 thread 返回空数组（不抛错），
+          // 拿它判存在会把脏 id 放过去。直接查 surf 层的会话视图（GET /api/conversations
+          // 用的同一个来源），找不到就 404。
+          const known = (await deps.mem.listThreads(dotId, { limit: 500 })).find(
+            (x) => x.id === requested,
+          );
+          if (known !== undefined) {
+            threadId = requested;
+          } else {
+            json(res, 404, { error: 'not_found', message: `会话不存在：${requested}` });
+            return;
+          }
+        } else {
+          threadId = await deps.mem.openThread(dotId, 'web');
+        }
         await deps.mem.appendMessage(threadId, { role: 'user', kind: 'text', content: text });
         const task: Task = deps.cp.submit({
           title: text.slice(0, 60),
