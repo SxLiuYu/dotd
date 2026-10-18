@@ -90,6 +90,8 @@ export type Route =
   | 'hook_ingest'
   | 'task_by_id'
   | 'logs'
+  | 'memory_archive'
+  | 'memory_restore'
   | 'static';
 
 export interface MatchResult {
@@ -121,6 +123,10 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
     return { route: 'approval_decision', params: {} };
   }
   if (m === 'GET' && p === '/api/events') return { route: 'events', params: {} };
+  // 记忆备份入口（2026-10-18）：.archive/ 有内容但原先只能手动 docker exec 恢复，
+  // 等于"有能力、没入口"。这两条把路补上。
+  if (m === 'GET' && p === '/api/memory/archive') return { route: 'memory_archive', params: {} };
+  if (m === 'POST' && p === '/api/memory/restore') return { route: 'memory_restore', params: {} };
   if (m === 'GET' && p === '/api/guard') return { route: 'guard', params: {} };
   if (m === 'GET' && p === '/api/breaker') return { route: 'breaker', params: {} };
   if (m === 'GET' && p === '/api/models/rank') return { route: 'models_rank', params: {} };
@@ -295,6 +301,17 @@ function safeEqualStr(a: string, b: string): boolean {
 
 // ── HTTP 服务 ────────────────────────────────────────────────────────
 
+export interface MemoryArchiveEntry {
+  /** .archive/ 里的文件名（含时间戳前缀）。 */
+  name: string;
+  /** 归档时刻（ISO，取自文件名前缀）。 */
+  archivedAt: string;
+  /** 原始相对路径（把归档名里的 _ 还原成 /）。 */
+  originalPath: string;
+  /** 字节数。 */
+  sizeBytes: number;
+}
+
 export interface HttpDeps {
   db: DatabaseSync;
   bus: EventBus;
@@ -313,6 +330,13 @@ export interface HttpDeps {
   /** Web UI 静态根（绝对路径；缺省 repo 根 web-ui/dist）。 */
   webRoot?: string;
   now?(): Date;
+  /**
+   * 列出 .archive/ 里的记忆备份（按时间倒序）。
+   * 2026-10-18：归档能力做完后补的"入口"——之前只能手动 docker exec cp 恢复。
+   */
+  listMemoryArchive?(): Promise<MemoryArchiveEntry[]>;
+  /** 把某个归档写回原路径（覆盖前同样会归档当前版本）；返回结果供 API 直接回给调用方。 */
+  restoreMemoryArchive?(archive: string): Promise<{ ok: boolean; restoredTo?: string; error?: string }>;
 }
 
 /** §5.2 路由 → 是否需要主人 token（hooks/:source 与 /api/stream 例外处理）。 */
@@ -506,6 +530,7 @@ export function createHttpServer(deps: HttpDeps): Server {
             'POST /api/queue/:id/cancel', 'GET /api/conversations', 'GET /api/approvals',
             'GET /api/approvals/:id', 'POST /api/approvals/:id/decision', 'GET /api/events',
             'GET /api/guard', 'GET /api/breaker', 'GET /api/models/rank', 'GET /api/stream',
+            'GET /api/memory/archive', 'POST /api/memory/restore',
             'POST /api/hooks', 'POST /api/heartbeat', 'POST /hooks/:source',
           ],
         });
@@ -807,6 +832,56 @@ export function createHttpServer(deps: HttpDeps): Server {
        * "读路径待补"的说明——那是"承诺有了、路没通"。这里把路补上：
        * 直接读 SF 自己的拒绝审计表（`auth/origin/rate/schema/size/allowlist/parse`）。
        */
+      /**
+       * GET /api/memory/archive —— 列出 .archive/ 里的备份（按时间倒序）。
+       *
+       * 为什么需要（2026-10-18）：fs.write 覆盖前自动把旧版本存进 .archive/，
+       * 但恢复只能靠手动 `docker exec cp` —— 等于"有能力、没入口"。
+       */
+      case 'memory_archive': {
+        if (deps.listMemoryArchive === undefined) {
+          json(res, 501, { error: 'not_configured', message: '本实例未装配记忆归档查询' });
+          return;
+        }
+        const pathFilter = url.searchParams.get('path');
+        const limitRaw = url.searchParams.get('limit');
+        let limit = 50;
+        if (limitRaw !== null) {
+          const n = Number(limitRaw);
+          if (!Number.isInteger(n) || n < 1 || n > 500) {
+            json(res, 400, { error: 'bad_limit', message: 'limit 必须是 1..500 的整数' });
+            return;
+          }
+          limit = n;
+        }
+        const items = (await deps.listMemoryArchive())
+          .filter((x) => pathFilter === null || x.originalPath === pathFilter)
+          .slice(0, limit);
+        json(res, 200, { items, filter: pathFilter, limit });
+        return;
+      }
+
+      /**
+       * POST /api/memory/restore —— 把某个归档版本写回原文件（覆盖前同样会归档当前版本）。
+       * body: { archive: ".archive/<文件名>" | "<文件名>" }
+       */
+      case 'memory_restore': {
+        if (deps.restoreMemoryArchive === undefined) {
+          json(res, 501, { error: 'not_configured', message: '本实例未装配记忆恢复' });
+          return;
+        }
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const want = (body as { archive?: unknown }).archive;
+        if (typeof want !== 'string' || want.trim().length === 0) {
+          json(res, 400, { error: 'schema', message: '需要 archive（.archive/ 里的文件名）' });
+          return;
+        }
+        const r = await deps.restoreMemoryArchive(want.trim());
+        json(res, r.ok ? 200 : 400, r);
+        return;
+      }
+
       case 'logs': {
         const limitRaw = url.searchParams.get('limit');
         let limit = 50;

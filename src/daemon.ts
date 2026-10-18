@@ -201,6 +201,94 @@ export function appendOutbox(dataDir: string, line: string): void {
  * 非法值**抛错拒启动**（与 DOTD_RESERVE_MB 同口径）：静默回落默认值会让
  * "我明明设了 4 却还是串行"变成最难排查的那种坑。
  */
+/**
+ * 列出 .archive/ 里的记忆备份（按时间倒序）。
+ * 走执行面的 fs.list（.archive/ 就是 home 下的普通目录）。
+ */
+async function listMemoryArchiveViaExec(
+  exec: ExecServiceApi,
+): Promise<Array<{ name: string; archivedAt: string; originalPath: string; sizeBytes: number }>> {
+  try {
+    const r = await exec.runTool({
+      call_id: `arch-list-${Date.now()}`,
+      task_id: 'admin-archive-list',
+      dot_id: 'dot1',
+      issued_at: new Date().toISOString(),
+      tool: 'fs.list',
+      args: { path: '.archive' },
+      deadline_ms: 30_000,
+    });
+    if (r.status !== 'ok') return [];
+    const entries = (r.result as { entries?: Array<{ name?: string; type?: string; size_bytes?: number }> } | null)
+      ?.entries ?? [];
+    const out: Array<{ name: string; archivedAt: string; originalPath: string; sizeBytes: number }> = [];
+    for (const e of entries) {
+      if (typeof e.name !== 'string' || e.type === 'dir') continue;
+      const sep = e.name.indexOf('__');
+      out.push({
+        name: e.name,
+        archivedAt: sep > 0 ? e.name.slice(0, sep) : '',
+        originalPath: sep > 0 ? e.name.slice(sep + 2).replace(/_/g, '/') : e.name,
+        sizeBytes: typeof e.size_bytes === 'number' ? e.size_bytes : 0,
+      });
+    }
+    return out.sort((a, b) => (a.archivedAt < b.archivedAt ? 1 : a.archivedAt > b.archivedAt ? -1 : 0));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 把某个归档写回原路径。
+ *
+ * 走执行面的 fs.read + fs.write，于是**恢复本身也会触发归档**（当前版本先进 .archive/）
+ * —— 这样"恢复"这个动作同样可回滚。
+ */
+async function restoreMemoryArchiveViaExec(
+  exec: ExecServiceApi,
+  archive: string,
+): Promise<{ ok: boolean; restoredTo?: string; error?: string }> {
+  try {
+    const name = archive.replace(/^\.?\/?archive\//, '');
+    if (name.length === 0 || name.includes('/') || name.includes('..')) {
+      return { ok: false, error: '非法的归档名' };
+    }
+    const sep = name.indexOf('__');
+    const target = sep > 0 ? name.slice(sep + 2).replace(/_/g, '/') : '';
+    if (target.length === 0) return { ok: false, error: '无法从归档名还原目标路径' };
+
+    const rd = await exec.runTool({
+      call_id: `arch-read-${Date.now()}`,
+      task_id: 'admin-archive-restore',
+      dot_id: 'dot1',
+      issued_at: new Date().toISOString(),
+      tool: 'fs.read',
+      args: { path: `.archive/${name}` },
+      deadline_ms: 60_000,
+    });
+    if (rd.status !== 'ok') return { ok: false, error: '读不到该归档' };
+    const content = (rd.result as { content?: unknown } | null)?.content;
+    if (typeof content !== 'string') return { ok: false, error: '归档内容不可读' };
+
+    const wr = await exec.runTool({
+      call_id: `arch-write-${Date.now()}`,
+      task_id: 'admin-archive-restore',
+      dot_id: 'dot1',
+      issued_at: new Date().toISOString(),
+      tool: 'fs.write',
+      args: { path: target, content },
+      deadline_ms: 60_000,
+    });
+    if (wr.status !== 'ok') {
+      const err = (wr.error as { message?: string } | null)?.message ?? '写回失败';
+      return { ok: false, error: `写回失败：${err}` };
+    }
+    return { ok: true, restoredTo: target };
+  } catch (cause) {
+    return { ok: false, error: String(cause) };
+  }
+}
+
 export function cpConcurrencyFromEnv(): Partial<{
   maxRunningTasks: number;
   interactiveReserve: number;
@@ -838,6 +926,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     webRoot: cfg.webRoot,
     // §5.7 求救自检要真值：顺序/兜底文件直接从 router 的 alerts 配置取，
     // 不让 /api/channels 与 `dotd sos-test` 拿编译期默认值猜（2026-10-17）。
+    // 记忆备份入口（2026-10-18）：列表走 bridge.list（.archive/ 是 home 下的目录），
+    // 恢复走 exec 的 fs.write 工具（bridge 只读、无 write 原语）。
+    listMemoryArchive: () => listMemoryArchiveViaExec(execApiOf(exec)),
+    restoreMemoryArchive: (archive: string) => restoreMemoryArchiveViaExec(execApiOf(exec), archive),
     alertsRoute: () => router.alertsRoute(),
   });
   log(`HTTP 监听 ${surfCfg.http.host}:${surfCfg.http.port}（契约 H2 默认 127.0.0.1:7788）`);
