@@ -849,5 +849,65 @@ bash scripts/live-wsl-e2e.sh
 特别地，它会在内存不足时**直接拒绝跑并说明原因**，而不是让你对着一个超时去猜——
 这正是这轮踩的坑。
 
-**下一步就一件事**：停掉 netfuzz（或调大 `.wslconfig` 的 memory 后 `wsl --shutdown`），
-然后跑 `bash scripts/live-wsl-e2e.sh`。
+### 27.3 ✅ 真容器端到端跑通了（2026-10-18 11:08）
+
+主人授权停掉 netfuzz 之后，真容器验证**一次通过**：
+
+```
+==> 1/7 前置检查
+	OK   docker 29.1.3
+	OK   node v24.22.0
+	OK   MemAvailable 21007MB
+==> 2/7 凭据与端点
+	OK   WB2API_KEY 已设置（长度 39，形态 sk-a2a…）
+	OK   鉴权通过：模型真的回了一次（chat/completions 200）
+==> 3/7 起 daemon（DOTD_FLEET=docker）
+	OK   daemon 就绪（约 9s）
+==> 5/7 等终态
+	OK   status=succeeded
+==> 6/7 真容器证据
+	OK   容器 ba445a9bc564 存在
+	真容器验证
+	WSL 里的 dotd
+	日期 2026-10-18
+==> 端到端通过：真模型 + 真容器，任务 done 且容器内文件可读回
+```
+
+数据库里对应的两条真步骤：
+
+```json
+{"seq":1,"kind":"llm","status":"succeeded","sideEffect":"safe"}
+{"seq":2,"kind":"tool","toolName":"fs.write","status":"succeeded",
+ "resultJson":"{\"path\":\"reports/wsl.md\",\"size_bytes\":50,\"written_at\":\"2026-10-18T03:08:21.635Z\"}"}
+```
+
+**这意味着 `docs/roadmap-to-parity.md` §0.3 里"真 Docker 容器 ❌ 仍未验证"这一条可以划掉了。**
+现在三条真链路的状态是：真模型 ✅ / 真容器 ✅ / 真飞书 🟡（长连接已建立，收发往返未验）。
+
+### 27.4 过程中暴露并修掉的三个真问题
+
+这一轮不是"跑一下就完事"，每一步踩的坑都是**产品问题**，不是环境问题：
+
+**① WSL 里的 `~/.dotd/tokens.env` 是旧 key，脚本静默用了它。**
+表现为 daemon 正常起、任务卡在 LLM 步 **482 秒**后 `paused`，而 `model_call_log` 里是
+`{"outcome":"fail","kind":"auth"}`——**报错藏在数据库里，不在日志里**。
+修法：脚本凭据优先级改成"仓库里的 `_tokens_src.env` > `~/.dotd/tokens.env`"，并在起 daemon **之前**
+用这个 key 真打一次 `chat/completions`：401 直接 `exit 6` 并说明"通常是 key 用错了"。
+`/v1/models` 不够——它在没鉴权时也可能 200。
+
+**② 内存水位 guard 会把容器 pause 掉，任务就卡死。**
+第一次跑时 `MemAvailable` 只有 7GB，daemon 起来后 guard 判定水位不足 → `docker pause` 容器
+→ `docker exec` 报 `Container is paused`，任务 `paused`。
+修法：脚本把内存前置门槛从 3GB 提到 **6GB**，并说清"即使起来了，水位 guard 也会把容器 pause 掉"。
+
+**③ netfuzz 有自动拉起链，杀 fuzz 进程治不了本。**
+第一次杀掉 60 个 fuzz 进程，几分钟内又回来 60 个。查下来是 crontab 里的
+`*/2 * * * * /root/netfuzz/keeper.sh` 与 `*/30 * * * * .../patrol.sh` → `fleet2.sh` → fuzz。
+**只杀进程是徒劳的**，必须从 cron 断开。已把这两行注释掉（连同备份到
+`/root/netfuzz/work/fleet3/crontab.bak-20261018`），其余 cron 条目一字未动。
+恢复方法：`crontab /root/netfuzz/work/fleet3/crontab.bak-20261018`（corpus/artifacts 都在原位，不丢进度）。
+
+### 27.5 下一步
+
+唯一还没验证的是**真实飞书的收发往返**（长连接已确认建立，但没在飞书里真发一条消息看回复）。
+那需要主人在飞书里发一句话——代码侧没有可做的了。

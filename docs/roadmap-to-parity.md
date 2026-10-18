@@ -35,7 +35,7 @@
 | 链路 | 状态 | 证据 |
 |---|---|---|
 | **真模型往返** | ✅ **已跑通** | `probe-live-model.mjs` 对 `127.0.0.1:3065` + `deepseek-v4.1-flash` 返回合法 `tool_calls`（1845ms）；daemon 真跑任务 `done` 且 `fs.write succeeded` |
-| 真 Docker 容器 | ❌ 仍未验证 | 本机无 dockerd。任务里 `fs.list`/`shell.run` 的"成功"来自 stub 容器（`date` 返回 `(stub) ok`）|
+| **真 Docker 容器** | ✅ **已跑通**（2026-10-18） | `scripts/live-wsl-e2e.sh` 在 WSL 里 `DOTD_FLEET=docker` 跑通：任务 `done`、`fs.write` 在真容器里成功、`docker exec` 读回文件。dockerd 一直在 WSL 里（29.1.3），之前跑不动是 netfuzz 与容器争内存 |
 | 真实飞书 | 🟡 半验证 | daemon 日志确证"凭证校验通过 / 长连接已建立"，但没做真实收发往返 |
 
 **选模型这件事本身有坑**：同一个网关上 `hy3` 带 `tools` 时只回 `stop`、**不返回 tool_calls**；

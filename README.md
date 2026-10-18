@@ -52,7 +52,7 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 
 **阶段一 MVP，但不再只是 stub 演示。** 真实的 HTTP 模型传输、daemon 全链路、流式（含工具调用通道）、长命令心跳、FTS 中文检索、会话摘要，以及七个会丢数据/丢任务的缺陷，
 在这一批优化里被真测试证明过（详见 [`docs/optimization-2026-10-17.md`](docs/optimization-2026-10-17.md)）。
-**2026-10-18 更新**：**真模型往返已跑通**（tier1 `127.0.0.1:3065` + `deepseek-v4.1-flash`：probe 返回合法 `tool_calls`，daemon 真跑任务 `done` 且 `fs.write succeeded`）。**仍然没验证的**：真 Docker 容器、真实飞书收发往返（只确证了长连接建立）。
+**2026-10-18 更新**：**真模型往返已跑通**（tier1 `127.0.0.1:3065` + `deepseek-v4.1-flash`：probe 返回合法 `tool_calls`，daemon 真跑任务 `done` 且 `fs.write succeeded`）。**2026-10-18 再更新**：**真 Docker 容器也跑通了**——`scripts/live-wsl-e2e.sh` 在 WSL 里以 `DOTD_FLEET=docker` 起 daemon，任务 `done`、`fs.write` 在**真容器**里成功、`docker exec` 读回文件内容。**只剩真实飞书的收发往返**没验（长连接已建立）。
 
 > **关于真容器**：早期说"本机无 dockerd"是**错的**——dockerd 在 WSL 里（`29.1.3`），
 > `docker ps` 能看到 `dotd-dot-dot1` 容器与 `dotd/exec:1.49.1-0.1.0` 镜像，dotd 以前真跑过。
