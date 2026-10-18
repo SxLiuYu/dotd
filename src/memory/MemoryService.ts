@@ -696,7 +696,13 @@ export class MemoryServiceImpl implements MemoryService {
     if (norm === null) {
       // 形状非法（绝对路径、盘符、`..` 逃逸）：**拒**，不是放行。
       // 这是安全边界，执行面护栏同样会拒；两层都守，任一层漏了都不至于放行。
-      return { ok: false, error: 'HARD_LIMIT', warning: `非法 home 路径（不许绝对路径 / .. 逃逸）：${path}` };
+      // 措辞要**可操作**（2026-10-18 实测）：模型写 /dot/home/m2.txt 被拒，原来只说
+      // "不许绝对路径 / .. 逃逸" —— 但 /dot/home 正是家目录本身，模型据此以为路径不安全，
+      // 换了三个写法反复撞墙。真正的原因只是"要写相对路径"，那就直接这么告诉它。
+      const hint = path.startsWith('/') || /^[A-Za-z]:/.test(path)
+        ? `请改用 home 内的**相对路径**（去掉 /dot/home 前缀），例如 "m2.txt" 或 "notes/x.md"`
+        : `路径不能含 ".."：请改用 home 内相对路径`;
+      return { ok: false, error: 'HARD_LIMIT', warning: `home 路径不合规（${path}）。${hint}` };
     }
     if (!isMemoryPath(norm)) return { ok: true }; // 记忆层不管：交给执行面护栏
     const usage = await this.homeUsage(dotId, norm);

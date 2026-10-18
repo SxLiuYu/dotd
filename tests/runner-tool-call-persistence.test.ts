@@ -91,12 +91,16 @@ test('源码守卫：stepLlm 不得再只用「无 toolCalls 才落 assistant」
     src.includes('reportToolCalls'),
     '必须有把工具调用声明落进 thread 的方法（缺了它模型跨轮失忆）',
   );
-  assert.equal(
-    /if\s*\(\s*step\.toolCalls\.length\s*===\s*0\s*&&\s*step\.content\.length\s*>\s*0\s*\)\s*\{\s*\n\s*await\s+this\.reportAssistant/.test(
-      src,
-    ),
-    false,
-    '禁止回到「只有无工具调用的轮次才落 assistant」——那会让工具轮整轮不入 thread',
+  // 演进后的正确形态：**有调用时正文随声明一起落**（一条消息），无调用时才单独落。
+  // 关键不变量：任何一轮的正文都不能丢——要么随 tool_call 走（带 text），要么单独落。
+  assert.ok(
+    src.includes('ctx.currentTurnText'),
+    '必须记住本轮正文，供 tool_call 消息携带',
+  );
+  assert.match(
+    src,
+    /reportToolCalls\([\s\S]{0,200}?ctx\.currentTurnText/,
+    'tool_call 落库时必须带上本轮正文',
   );
   assert.ok(
     src.includes('parseToolCallContent'),
@@ -120,5 +124,31 @@ test('去重：thread 已有 assistant/tool_call 声明的调用，不得再追�
     /const withName = dispatched;\s*\n\s*if \(withName\.length > 0\)/.test(src),
     false,
     '禁止直接把 dispatched 全部当作待补声明——必须先过滤掉已声明的',
+  );
+});
+
+test('tool_call 行的 content 不得当作 assistant 正文回灌给模型', async () => {
+  // 现场（2026-10-18）：tool_call 行把调用声明 JSON 当 content 塞回上下文，
+  // 模型每轮都看到一段"它自己没写过的 JSON 冒充它说过的话"，从而误读自己的历史
+  // （实测：明明已改用相对路径成功，最后却汇报"绝对路径被接受了"）。
+  const { readFileSync } = await import('node:fs');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src = readFileSync(join(here, '..', 'src', 'runner', 'dot.ts'), 'utf8');
+
+  assert.match(
+    src,
+    /const out = \{ role: 'assistant' as const, content: parseToolCallText\(m\.content\) \}/,
+    'tool_call 投影的 content 必须是从 text 字段解析出的**正文**，不是声明 JSON',
+  );
+  assert.ok(
+    src.includes('function parseToolCallText'),
+    '必须有 parseToolCallText 从声明里取正文',
+  );
+  assert.equal(
+    /content: m\.content \} as ChatMessage & \{[^}]*tool_calls/.test(src),
+    false,
+    '禁止把 tool_call 的 content 当正文回灌',
   );
 });

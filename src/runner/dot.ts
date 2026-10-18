@@ -299,6 +299,12 @@ class RunContext {
   /** 已成功执行、尚未以全文回喂给模型的工具结果（callId → resultJson）。 */
   private readonly pendingResults = new Map<string, string>();
   /**
+   * 本轮 LLM 的正文（模型的思路）。工具调用落 thread 时要带上它，
+   * 否则重建后"思路"和"调用"断成两条消息，模型会丢失自己的推理结论
+   * （实测：明明已经改用相对路径成功，最后却汇报"绝对路径被接受了"）。
+   */
+  currentTurnText = '';
+  /**
    * 本轮工具调用（callId → 工具名）。有工具结果回喂时，必须紧跟一条 assistant 的
    * tool_calls 消息把它们"接住"：OpenAI 兼容协议里裸的 role=tool 会被网关拒
    * （`messages with role 'tool' must be a response to a preceding message with
@@ -1185,6 +1191,8 @@ export class DotRunner {
 
     const { step, tokens } = resp;
     this.cp.journal.endLlm(task.id, epoch, seq, digestOf(step.content));
+    // 记住本轮正文：工具调用落 thread 时要带上它（见 RunContext.currentTurnText）。
+    ctx.currentTurnText = step.content;
     ctx.feedLlm(step, tokens);
     // ⑩ 结果回报：assistant 轮入 thread。
     //
@@ -1197,7 +1205,9 @@ export class DotRunner {
     //   于是**每轮都从第一步重来**。实测一条 4 步任务跑成 729 步死循环仍未停。
     //
     // 判据改成"这一轮有任何内容就落"：有正文落正文，有调用落调用声明。
-    if (step.content.length > 0) {
+    // 有工具调用时，正文随调用声明一起落（一条消息，见 reportToolCalls 注释）；
+    // 没有调用的纯正文轮才单独落一条 assistant/text。
+    if (step.toolCalls.length === 0 && step.content.length > 0) {
       await this.reportAssistant(ctx, task, step.content);
     }
     if (step.toolCalls.length === 0 && step.content.length > 0) {
@@ -1571,7 +1581,11 @@ export class DotRunner {
     // 协议要求 role:tool 紧跟在一个带 tool_calls 的 assistant 之后；反过来就是"无主"。
     // 2026-10-18 实测：声明曾落在工具执行之后，导致 13/13 条 role:tool 全部无主，
     // 模型完全无视自己上一轮的结果，写-读死循环烧到 118 步。
-    await this.reportToolCalls(task, [{ id: callId, name: call.name, arguments: call.arguments }]);
+    await this.reportToolCalls(
+      task,
+      [{ id: callId, name: call.name, arguments: call.arguments }],
+      ctx.currentTurnText,
+    );
     journalIds?.push({ id: callId, name: call.name, arguments: call.arguments });
 
     // 接缝 G5：goalDigest 由 Runner 在 evaluate 前截取（≤800B）注入治理审查档
@@ -1770,6 +1784,8 @@ export class DotRunner {
   private async reportToolCalls(
     task: Task,
     calls: ReadonlyArray<{ id: string; name: string; arguments: string }>,
+    /** 本轮的 assistant 正文（模型的思路）。与调用声明一起落，重建时才能还原成一条消息。 */
+    text = '',
   ): Promise<void> {
     const threadId = this.threadIdOf(task);
     if (threadId === null) return;
@@ -1777,8 +1793,14 @@ export class DotRunner {
       await this.memory.appendMessage(threadId, {
         role: 'assistant',
         kind: 'tool_call',
+        // 形状：{ calls: [...], text?: '...' }。
+        // **text 必须存在这里**（2026-10-18 二次修正）：早先正文和声明是两条独立消息，
+        // 重建时变成两条 assistant —— 模型看到"我先解释一下"和"调用"断成两截，
+        // 容易丢失自己的推理结论（实测：反复退回已被否定的写法）。
+        // 也不能把声明 JSON 当正文塞回去（那更糟：模型看到一段自己没写过的 JSON）。
         content: JSON.stringify({
           calls: calls.map((c) => ({ call_id: c.id, name: c.name, arguments: c.arguments })),
+          ...(text.length > 0 ? { text } : {}),
         }),
         taskId: task.id,
       });
@@ -2300,7 +2322,14 @@ function toChatMessage(m: Message): ChatMessage {
     if (parsed.length > 0) withCalls.toolCalls = parsed;
   }
   if (m.kind === 'tool_call' && Array.isArray(withCalls.toolCalls) && withCalls.toolCalls.length > 0) {
-    const out = { role: 'assistant' as const, content: m.content } as ChatMessage & {
+    // **content 必须是空串，不能是那份 JSON**（2026-10-18 修）：
+    // tool_call 行的 content 是"调用声明"的序列化形式，不是给模型看的正文。
+    // 原来把它当 content 塞回去，模型每轮都看到
+    //   assistant: '{"calls":[{"call_id":"...","name":"fs.write",...}]}'
+    // —— 一段它自己没写过的 JSON 冒充"它说过的话"，导致它误读自己的历史
+    // （实测：明明改用相对路径成功了，最后却汇报"绝对路径被接受了"）。
+    // 正文本来就由另一条 assistant/text 行承载（reportAssistant 单独写）。
+    const out = { role: 'assistant' as const, content: parseToolCallText(m.content) } as ChatMessage & {
       tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
     };
     out.tool_calls = withCalls.toolCalls.map((c) => ({
@@ -2319,6 +2348,15 @@ function toChatMessage(m: Message): ChatMessage {
  * 内容形如 `{"calls":[{"call_id":"...","name":"fs.write","arguments":"{...}"}]}`。
  * 解析失败返回空数组——调用方据此退回"没有声明"的降级路径，不抛。
  */
+function parseToolCallText(content: string): string {
+  try {
+    const obj = JSON.parse(content) as { text?: unknown };
+    return typeof obj.text === 'string' ? obj.text : '';
+  } catch {
+    return '';
+  }
+}
+
 function parseToolCallContent(content: string): Array<{ id: string; name: string; arguments: string }> {
   try {
     const obj = JSON.parse(content) as { calls?: unknown };
