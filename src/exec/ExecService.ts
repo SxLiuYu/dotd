@@ -253,6 +253,13 @@ export interface ExecServiceDeps {
   clock?: () => number;
 }
 
+/**
+ * 宿主侧工具名单：这些工具由 daemon 直接执行（不经过容器），
+ * 所以容器返回的能力目录里天然没有它们 —— getCapabilities 必须把它们合并进去，
+ * 否则模型根本看不见（2026-10-18 实测：主人让设提醒，模型答"schedule.create 不在列表里"）。
+ */
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list']);
+
 export class ExecServiceImpl implements ExecService {
   readonly cfg: ExecConfig;
   readonly fleet: Fleet;
@@ -418,8 +425,54 @@ export class ExecServiceImpl implements ExecService {
    *  3. 校验失败（unknown_tool/deadline/路径护栏）→ 本地 error，不发送；
    *  4. 否则按 catalog mode 选端点派发，落 exec_calls。
    */
+  /**
+   * 宿主侧工具（2026-10-18）：这些工具**不在容器里跑**，由 daemon 直接执行。
+   *
+   * 为什么需要：定时任务、记忆回滚这类动作操作的是**控制面/宿主持久状态**，
+   * 容器只是个沙箱，让它去改 crontabs 表既越权也做不到。装配层把自己的处理器
+   * 注册进来，执行面对模型来说与普通工具无差别。
+   */
+  private readonly hostTools = new Map<
+    string,
+    (args: Record<string, unknown>) => Promise<{ ok: true; value: unknown } | { ok: false; code: string; message: string; retryable?: boolean }>
+  >();
+
+  /** 注册一个宿主侧工具（name 必须与能力目录一致）。 */
+  registerHostTool(
+    name: string,
+    handler: (
+      args: Record<string, unknown>,
+    ) => Promise<{ ok: true; value: unknown } | { ok: false; code: string; message: string; retryable?: boolean }>,
+  ): void {
+    this.hostTools.set(name, handler);
+  }
+
   async runTool(call: ExecToolCall): Promise<ExecToolResult> {
     const at = new Date().toISOString();
+
+    // ⓪ 宿主侧工具优先：不进容器、不占容器额度
+    const host = this.hostTools.get(call.tool);
+    if (host !== undefined) {
+      try {
+        const r = await host(call.args as Record<string, unknown>);
+        if (r.ok) {
+          return { call_id: call.call_id, status: 'ok', result: r.value, finished_at: at };
+        }
+        return {
+          call_id: call.call_id,
+          status: 'error',
+          error: { code: r.code, message: r.message, retryable: r.retryable ?? false },
+          finished_at: at,
+        };
+      } catch (cause) {
+        return {
+          call_id: call.call_id,
+          status: 'error',
+          error: { code: 'host_tool_error', message: String(cause), retryable: false },
+          finished_at: at,
+        };
+      }
+    }
 
     // ① 幂等重放：exec_calls 已有终态
     const seen = this.fleet.getCall(call.call_id);
@@ -970,8 +1023,17 @@ export class ExecServiceImpl implements ExecService {
       try {
         const remote = await this.runtime.capabilities(c.endpoint, token);
         if (remote.length > 0) {
-          this.capCache = remote;
-          return this.visibleCaps(remote);
+          // **宿主侧工具必须合并进来**（2026-10-18 实测）：容器目录里当然没有
+          // schedule.create/schedule.list（它们在 daemon 里跑），不合并的话模型
+          // 完全看不到这两个工具，主人说"每天 9 点提醒我"它只能答"工具不在列表里"。
+          // 去重：容器目录里若已经带了同名工具（未来容器 runtime 也认识它们时），
+          // 不要再追加一份——重复的工具名会让模型看到两个一样的函数。
+          const have = new Set(remote.map((c) => c.name));
+          const hostSide = CAPABILITY_CATALOG.filter(
+            (c) => HOST_SIDE_TOOLS.has(c.name) && !have.has(c.name),
+          );
+          this.capCache = [...remote, ...hostSide];
+          return this.visibleCaps(this.capCache);
         }
       } catch {
         // 回落宿主内置目录

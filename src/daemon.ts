@@ -86,6 +86,8 @@ import { loadMcpServers } from './exec/mcp-config.ts';
 import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
+import { createSchedule, listSchedules } from './control-plane/schedules.ts';
+import { CronExpressionParser } from 'cron-parser';
 import { createMemoryService } from './memory/MemoryService.ts';
 import { memoryWritePathsOfStep } from './memory/step-paths.ts';
 import type { MemoryServiceImpl } from './memory/MemoryService.ts';
@@ -822,6 +824,50 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     mcp: new McpClient(
       loadMcpServers(process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')),
     ),
+  });
+
+  // 宿主侧工具（2026-10-18）：定时任务的操作对象是控制面的 crontabs 表，
+  // 容器只是沙箱，不能也不该让容器去改它。注册到执行面后对模型与普通工具无差别。
+  const cronNext = (cron: string, from: number): number =>
+    CronExpressionParser.parse(cron, { currentDate: new Date(from) }).next().getTime();
+  exec.registerHostTool('schedule.create', async (args) => {
+    const r = createSchedule(
+      db,
+      {
+        title: typeof args['title'] === 'string' ? args['title'] : '',
+        prompt: typeof args['prompt'] === 'string' ? args['prompt'] : '',
+        cron: typeof args['cron'] === 'string' ? args['cron'] : '',
+        ...(typeof args['quiet_hours'] === 'string' ? { quietHours: args['quiet_hours'] } : {}),
+      },
+      cronNext,
+    );
+    if (!r.ok) return { ok: false, code: 'schedule_invalid', message: r.error ?? '创建失败' };
+    return {
+      ok: true,
+      value: {
+        id: r.schedule!.id,
+        title: r.schedule!.title,
+        cron: r.schedule!.cron,
+        next_fire_at: new Date(r.schedule!.nextFireAt).toISOString(),
+        note: '定时任务已创建，到点会自动以任务形式执行 prompt 里的事',
+      },
+    };
+  });
+  exec.registerHostTool('schedule.list', async () => {
+    const rows = listSchedules(db);
+    return {
+      ok: true,
+      value: {
+        count: rows.length,
+        schedules: rows.map((x) => ({
+          id: x.id,
+          title: x.title,
+          cron: x.cron,
+          next_fire_at: new Date(x.nextFireAt).toISOString(),
+          last_fire_status: x.lastFireStatus,
+        })),
+      },
+    };
   });
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);

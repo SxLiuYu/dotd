@@ -52,6 +52,15 @@ tools:
   - name: net.post
     tier: write_file                        # 对外 POST 有副作用：比 GET 高一档（GOV §2.2）
 
+  # ── 定时任务（2026-10-18，对标 OpenAI bot 的"每天 9 点提醒我"）──────────────
+  # 这两个是**宿主侧工具**：由 daemon 直接执行（改 crontabs 表），不进容器。
+  # 为什么 schedule.create 是 write_file 档：它会在控制面创建一条长期存在的调度记录，
+  # 到点自动触发任务 —— 属于"改了系统状态"，不是只读查询。
+  - name: schedule.create
+    tier: write_file
+  - name: schedule.list
+    tier: read
+
   # ── P2-1：外部工具网关（MCP）──────────────────────────────────────────────
   # 为什么是 dangerous 而不是 spend/write_file：
   #   spend 要求 spendParams.required（金额等固定字段），而 MCP 工具的参数是**任意**的，

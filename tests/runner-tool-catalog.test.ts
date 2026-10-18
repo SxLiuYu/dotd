@@ -55,10 +55,10 @@ const MAX_DESCRIPTION_CHARS = 2400;
 
 // ── 1. 词表覆盖 ─────────────────────────────────────────────────────────
 
-test('词表：11 个工具全部有说明书，且与契约词表逐名对齐（不多不少）', () => {
+test('词表：全部工具都有说明书，且与契约词表逐名对齐（不多不少）', () => {
   const documented = documentedToolNames();
   const contract = [...TOOL_NAMES].sort();
-  assert.equal(documented.length, contract.length, '说明书条数 = 契约词表条数（11）');
+  assert.equal(documented.length, contract.length, '说明书条数 = 契约词表条数');
   assert.deepEqual([...documented].sort(), contract, '说明书覆盖的工具名与契约词表一致');
   // 顺序也钉住：将来加工具时逼人先想清楚放哪一段。
   assert.deepEqual(
@@ -75,6 +75,8 @@ test('词表：11 个工具全部有说明书，且与契约词表逐名对齐�
       'browser.close',
       'net.get',
       'net.post',
+      'schedule.create',
+      'schedule.list',
     ],
   );
 });

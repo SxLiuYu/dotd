@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
 import { makeTempDataDir, sweepTempPaths } from './helpers.ts';
+import { TOOL_NAMES } from '../src/exec/protocol.ts';
 import type { TempDataDir } from './helpers.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
 import { McpClient } from '../src/exec/mcp-client.ts';
@@ -90,27 +91,19 @@ function mcpCall(id: string, server: string, tool: string, args: Record<string, 
   };
 }
 
-const ELEVEN = [
-  'browser.act',
-  'browser.close',
-  'browser.open',
-  'browser.snapshot',
-  'fs.list',
-  'fs.read',
-  'fs.stat',
-  'fs.write',
-  'net.get',
-  'net.post',
-  'shell.run',
-];
+// 工具面基线：从契约派生，而不是手抄——手抄会在加工具时静默过期
+// （2026-10-18 加 schedule.* 时就撞到了）。
+// 注意：宿主侧工具（schedule.*）**对模型可见**（getCapabilities 会列出来），
+// 只是执行时不进容器。所以基线必须包含它们。
+const ELEVEN = [...TOOL_NAMES].sort();
 
-test('默认关闭：未声明任何 MCP server → getCapabilities 里没有 mcp.call（工具面与改动前一致）', async () => {
+test('默认关闭：未声明任何 MCP server → getCapabilities 里没有 mcp.call（工具面不变）', async () => {
   const { exec } = makeExec(new McpClient([]));
   await exec.boot(['dot1']);
   const caps = await exec.getCapabilities('dot1');
   const names = caps.map((c) => c.name);
   assert.equal(names.includes('mcp.call'), false, '未声明 server 时，模型不得看到 mcp.call');
-  assert.deepEqual([...names].sort(), ELEVEN, '仍是那 11 名（逐字不变）');
+  assert.deepEqual(names.slice().sort(), ELEVEN, '仍是那批容器工具（逐字不变）');
 });
 
 test('默认关闭：未声明 server 时调 mcp.call 会明确报 mcp_not_configured（不是静默失败）', async () => {
@@ -134,7 +127,7 @@ test('声明 server 后：工具面多出 mcp.call，且 sideEffect=unknown（�
   const gw = caps.find((c) => c.name === 'mcp.call');
   assert.ok(gw !== undefined, '声明后模型应能看到 mcp.call');
   assert.equal(gw!.sideEffect, 'unknown', '外部工具行为未知 → 必须标 unknown');
-  assert.equal(caps.length, 12, '11 名契约 + 1 个网关');
+  assert.equal(caps.length, ELEVEN.length + 1, '全部工具 + 1 个网关');
 });
 
 test('端到端：mcp.call → 真 spawn scripts/mcp-echo-server.mjs → 结果回到调用方', async () => {

@@ -2244,3 +2244,65 @@ const msg = typeof parsed?.message === 'string' ? parsed.message : `HTTP ${res.s
    要让它开真实网页需要配置登录态。
 2. **更大的模型**：当前 primary 是 `glm-5.3-flash`（A/B 三轮选出，确认型任务中位 8 步）。
    如果希望更强的推理，可以试更大参数量的模型。
+
+---
+
+# 第二十七轮：对标 OpenAI bot —— 补齐定时任务（2026-10-18）
+
+目标更新为「达到 OpenAI bot 的功能和效果」。先做了一次**能力对标**（`docs/parity-gap.md`），
+再用真实请求验证哪些是"看文档以为没有、实际有"，哪些是"真没有"。
+
+## 121. 对标验证结果（真实请求，不是看代码猜）
+
+| 能力 | 结果 |
+|---|---|
+| ① 联网搜索 | ✅ **能** —— 它自己找到 Hacker News 并给了真实头条 |
+| ② 浏览器 | ⚠️ `browser.open` 被拒，但**自动降级 net.get 完成任务** |
+| ③ **定时任务** | ❌ **timeout —— 真的做不到** |
+| ④ 多模态（看图） | ❌ **timeout —— 真的做不到** |
+| ⑤ 文件处理（markdown 表格） | ✅ 完美 |
+
+**结论**：搜索能力其实已经有了（`net.get` 足够）；真正缺的是**定时任务**和**多模态**。
+
+## 122. 定时任务：引擎有、方向盘没有
+
+查下来讽刺得很：`crontabs` 表**早就存在**（含 cron、quiet_hours、skip_if_busy、catchup），
+调度器 `scanCrontabs` **也早就能扫描触发** —— 但**从来没有任何创建入口**。
+主人说"每天 9 点提醒我"，模型只能干瞪眼。
+
+### 实现（四处缺口一次补齐）
+
+| 层 | 做了什么 |
+|---|---|
+| `control-plane/schedules.ts` | create / list / remove，**先验 cron 再落库** |
+| 工具面 | 新增 `schedule.create` / `schedule.list`（+ 说明书 + 引导段） |
+| 执行面 | `registerHostTool` —— **宿主侧工具**机制：不进容器、由 daemon 直接执行 |
+| API / 治理 | `GET/POST /api/schedules`、`DELETE /api/schedules/:id`；`tools.yml` 登记档位 |
+
+### 三个真缺陷（做的时候撞出来的）
+
+1. **容器在跑时，宿主侧工具对模型不可见** —— `getCapabilities` 只取容器目录，
+   而容器当然不知道 `schedule.*`。模型答"schedule.create 不在列表里"（它没编造，这点很好）。
+   修法：容器目录 + 宿主侧工具**合并并去重**。
+2. **治理拒绝**：`deny: 工具未登记` —— `tools.yml` 没登记新工具。补上档位
+   （create = write_file，list = read）。
+3. **`removeSchedule` 幂等性**：对已停用的再停用会返回成功。单测抓到，改成 `WHERE enabled=1`。
+
+### 真实链路验证
+
+```
+schedule.create succeeded
+  → {"id":"ct_mvdzuj9aueicvswk","title":"早间天气提醒","cron":"30 8 * * *",
+     "next_fire_at":"2026-10-19T00:30:00.000Z"}
+
+模型回答：下次触发 2026-10-19（明天）早上 8:30（北京时间）
+          我没有重复创建（否则每天会收到两条一模一样的推送）
+
+crontabs 表：ct_mvdzuj9aueicvswk | 30 8 * * * | 早间天气提醒 | 下次: 2026/10/19 08:30:00
+```
+
+**"每天 8:30 提醒我查天气"这件事，现在真的能做了。**
+
+## 123. 本轮门禁
+
+`tsc` exit 0 · **`npm test` 1481/1481 全绿**（+6 条定时任务回归）· 真链路验证通过

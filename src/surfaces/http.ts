@@ -47,6 +47,8 @@ import type {
 import { ConfigError } from '../shared/errors.ts';
 import { DEFAULT_DOT_ID } from '../shared/ids.ts';
 import { LIMIT_ARCHIVE_BYTES } from '../memory/limits.ts';
+import { createSchedule, listSchedules, removeSchedule } from '../control-plane/schedules.ts';
+import { CronExpressionParser } from 'cron-parser';
 import type { HookConfig, SurfacesConfig } from './types.ts';
 import { createIngress, ingest, MAX_BODY_BYTES, normalizeHook, originAllowed } from './ingress.ts';
 import { handleFeishuCallback, maybeDecryptFeishuBody } from './feishu-inbound.ts';
@@ -93,6 +95,8 @@ export type Route =
   | 'logs'
   | 'memory_archive'
   | 'memory_restore'
+  | 'schedules'
+  | 'schedule_by_id'
   | 'static';
 
 export interface MatchResult {
@@ -126,6 +130,15 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   if (m === 'GET' && p === '/api/events') return { route: 'events', params: {} };
   // 记忆备份入口（2026-10-18）：.archive/ 有内容但原先只能手动 docker exec 恢复，
   // 等于"有能力、没入口"。这两条把路补上。
+  // 定时任务（2026-10-18）：crontabs 表与调度器早就有，缺创建入口。
+  if (p === '/api/schedules') {
+    if (m === 'GET') return { route: 'schedules', params: {} };
+    if (m === 'POST') return { route: 'schedules', params: {} };
+  }
+  {
+    const mm = /^\/api\/schedules\/([^/]+)$/.exec(p);
+    if (mm !== null && m === 'DELETE') return { route: 'schedule_by_id', params: { id: mm[1]! } };
+  }
   if (m === 'GET' && p === '/api/memory/archive') return { route: 'memory_archive', params: {} };
   if (m === 'POST' && p === '/api/memory/restore') return { route: 'memory_restore', params: {} };
   if (m === 'GET' && p === '/api/guard') return { route: 'guard', params: {} };
@@ -833,6 +846,57 @@ export function createHttpServer(deps: HttpDeps): Server {
        * "读路径待补"的说明——那是"承诺有了、路没通"。这里把路补上：
        * 直接读 SF 自己的拒绝审计表（`auth/origin/rate/schema/size/allowlist/parse`）。
        */
+      /**
+       * GET  /api/schedules        列出定时任务（?all=1 含已停用）
+       * POST /api/schedules        创建 {title, prompt, cron, quietHours?, catchup?}
+       */
+      case 'schedules': {
+        if (method === 'GET') {
+          const all = url.searchParams.get('all') === '1';
+          const rows = listSchedules(deps.db, { includeDisabled: all });
+          json(res, 200, {
+            schedules: rows.map((x) => ({ ...x, nextFireAt: new Date(x.nextFireAt).toISOString() })),
+            count: rows.length,
+          });
+          return;
+        }
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as Record<string, unknown>;
+        const r = createSchedule(
+          deps.db,
+          {
+            title: typeof b['title'] === 'string' ? b['title'] : '',
+            prompt: typeof b['prompt'] === 'string' ? b['prompt'] : '',
+            cron: typeof b['cron'] === 'string' ? b['cron'] : '',
+            ...(typeof b['quietHours'] === 'string' ? { quietHours: b['quietHours'] } : {}),
+            ...(b['catchup'] === 'skip' || b['catchup'] === 'latest' ? { catchup: b['catchup'] } : {}),
+            ...(typeof b['dotId'] === 'string' ? { dotId: b['dotId'] } : {}),
+          },
+          (cron, from) => CronExpressionParser.parse(cron, { currentDate: new Date(from) }).next().getTime(),
+        );
+        if (!r.ok) {
+          json(res, 400, { ok: false, error: r.error });
+          return;
+        }
+        json(res, 201, {
+          ok: true,
+          schedule: {
+            ...r.schedule!,
+            nextFireAt: new Date(r.schedule!.nextFireAt).toISOString(),
+          },
+        });
+        return;
+      }
+
+      /** DELETE /api/schedules/:id —— 停用（不硬删）。 */
+      case 'schedule_by_id': {
+        const id = match.params.id ?? '';
+        const r = removeSchedule(deps.db, decodeURIComponent(id));
+        json(res, r.ok ? 200 : 404, r);
+        return;
+      }
+
       /**
        * GET /api/memory/archive —— 列出 .archive/ 里的备份（按时间倒序）。
        *

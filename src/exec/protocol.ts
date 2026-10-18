@@ -201,6 +201,34 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     args_schema: obj({ url: str('http(s) URL'), body: str('请求体') }, ['url']),
     sideEffect: 'unknown',
   },
+  {
+    /**
+     * 宿主侧工具（不在容器里执行）：创建定时任务。
+     * 2026-10-18 对标 OpenAI bot 补齐 —— crontabs 表与调度器早就有，只缺创建入口。
+     */
+    name: 'schedule.create',
+    mode: 'sync',
+    max_deadline_ms: 10_000,
+    args_schema: obj(
+      {
+        title: str('这条定时任务的名字，如"早间天气"'),
+        prompt: str('到点要让 bot 去做的那件事（一句话任务描述）'),
+        cron: str('5 段 cron：分 时 日 月 周。例：0 9 * * * = 每天 9:00；0 */2 * * * = 每两小时'),
+        quiet_hours: str("安静时段，如 '23:00-07:30'；该时段内不触发（可选）"),
+      },
+      ['title', 'prompt', 'cron'],
+    ),
+    // 创建是幂等可重放的（同 title+cron 再建一条不会破坏既有数据）
+    sideEffect: 'replayable',
+  },
+  {
+    /** 宿主侧工具：列出已创建的定时任务。 */
+    name: 'schedule.list',
+    mode: 'sync',
+    max_deadline_ms: 10_000,
+    args_schema: obj({}, []),
+    sideEffect: 'safe',
+  },
 ];
 
 /**

@@ -109,10 +109,13 @@ const _driftProof: [
 // ═══════════════════════════════════════════════════════════════════
 
 test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sideEffect）', () => {
+  // 宿主侧工具（schedule.* 等）不进容器：它们由 daemon 直接执行，
+  // 容器能力目录里不该有。所以对比时只比"容器内工具"。
+  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list']);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),
-    [...HOST_TOOL_NAMES],
-    '工具词表必须与宿主一致',
+    [...HOST_TOOL_NAMES].filter((n) => !HOST_SIDE_ONLY.has(n)),
+    '容器工具词表必须与宿主的容器工具一致',
   );
   for (const mine of CAPABILITIES) {
     const host = CAPABILITY_CATALOG.find((c) => c.name === mine.name);
@@ -400,9 +403,11 @@ test('canonicalJson: 嵌套对象键排序，undefined 值键被滤除（与宿�
 // 5. 能力目录
 // ═══════════════════════════════════════════════════════════════════
 
-test('能力目录: 恰好 11 名，与契约 M5 词表一致', () => {
-  assert.equal(CAPABILITIES.length, 11);
-  assert.equal(new Set(CAPABILITIES.map((c) => c.name)).size, 11);
+test('能力目录: 容器内工具与契约词表一致（宿主侧工具不在其中）', () => {
+  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list']);
+  const hostToolsInContainer = [...TOOL_NAMES].filter((n) => HOST_SIDE_ONLY.has(n));
+  assert.equal(CAPABILITIES.length, TOOL_NAMES.length - hostToolsInContainer.length);
+  assert.equal(new Set(CAPABILITIES.map((c) => c.name)).size, CAPABILITIES.length);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),
     [...TOOL_NAMES],

@@ -256,6 +256,36 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       'net_tools_disabled / net_post_disabled（主人只开了 GET；**不要绕道**用 shell curl）、net_bad_url、net_blocked_host、' +
       'net_timeout、net_network_error。提交成功但对方报错时看 status 与 body，不要盲目重发。',
   },
+  {
+    name: 'schedule.create',
+    description:
+      '创建一个**定时任务**：到点后自动以一条新任务的形式执行你写的 prompt。' +
+      '主人说"每天 9 点提醒我……""每周一帮我汇总……""过两小时提醒我……"这类需求时用它。' +
+      '注意：它不是闹钟，到点是**真的去执行那件事**（比如去查天气、去读文件），然后通过飞书把结果告诉主人。' +
+      'cron 是 5 段（分 时 日 月 周），最短间隔 1 分钟。创建前先想清楚 prompt 写什么——那是将来无人值守时唯一的目标说明。',
+    params: {
+      title: '这条定时任务的名字，简短好认（如「早间天气」「周报汇总」）。',
+      prompt:
+        '到点要执行的那件事，写成一句完整任务描述。' +
+        '例：「查一下北京今天的天气，用一句话告诉我气温和是否需要带伞」。' +
+        '要写得让"将来只有这句话可用"的你也知道该干什么。',
+      cron:
+        '5 段 cron：分 时 日 月 周。常用例子：' +
+        '"0 9 * * *" = 每天 9:00；"30 8 * * 1-5" = 工作日 8:30；"0 */2 * * *" = 每两小时整点。',
+      quiet_hours: "可选。安静时段内不触发，形如 '23:00-07:30'。夜里不想被打扰就传。",
+    },
+    returns: '返回 JSON：id、title、cron、next_fire_at（下次触发时刻），以及一句确认说明。',
+    failures:
+      'schedule_invalid（cron 写错/段数不对/间隔太短）。**把 error 里的原话告诉主人**并请他确认时间，不要自己猜着重试。',
+  },
+  {
+    name: 'schedule.list',
+    description:
+      '列出已经创建的定时任务（含下次触发时间、上次触发结果）。主人问"我现在有哪些定时任务"时用它。',
+    params: {},
+    returns: '返回 JSON：count 与 schedules[]（每项含 id、title、cron、next_fire_at、last_fire_status）。',
+    failures: '一般不会失败；返回 count=0 说明还没建过。',
+  },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
@@ -391,6 +421,7 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
 3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
 4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
+6. 定时：schedule.create（建定时任务，主人说"每天/每周/待会儿提醒我"就用它）、schedule.list（看已有哪些）。cron 是 5 段（分 时 日 月 周）。
 通用约定：
 - 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
 - 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。
