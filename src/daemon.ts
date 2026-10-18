@@ -927,16 +927,29 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   cp.scheduler.start();
   log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard）');
 
-  // ⑪ Runner 循环（常驻）
+  // ⑪ Runner 循环（常驻，数量 = 并发额度）
+  //
+  // **每个消费者一个循环**（2026-10-18 修）：原来只起 1 个 DotRunner.start()，
+  // 于是 DOTD_MAX_RUNNING=2 时额度根本没被用上 —— 全量实测反复出现"并发度恒为 1"。
+  // 配置项承诺了并发能力，实现却只起一个消费协程，是名不副实。
+  // 默认额度 1 → 仍只起 1 个循环，行为与改动前逐字一致。
   const abort = new AbortController();
-  const runnerLoop = (async () => {
-    try {
-      await runner.start(abort.signal);
-    } catch (cause) {
-      log(`Runner 循环异常退出：${String(cause)}`);
-      appendOutbox(cfg.dataDir, `Runner 循环异常：${String(cause)}`);
-    }
-  })();
+  const consumers = Math.max(1, cpConcurrencyFromEnv().maxRunningTasks ?? 1);
+  const runnerLoops: Array<Promise<void>> = [];
+  for (let i = 0; i < consumers; i += 1) {
+    runnerLoops.push(
+      (async () => {
+        try {
+          await runner.start(abort.signal);
+        } catch (cause) {
+          log(`Runner 循环#${i} 异常退出：${String(cause)}`);
+          appendOutbox(cfg.dataDir, `Runner 循环异常：${String(cause)}`);
+        }
+      })(),
+    );
+  }
+  if (consumers > 1) log(`Runner 消费者已启动 ${consumers} 个（DOTD_MAX_RUNNING=${consumers}）`);
+  const runnerLoop = Promise.all(runnerLoops).then(() => undefined);
 
   // ⑫ 优雅退出（CP §2.1-4）
   let closing = false;

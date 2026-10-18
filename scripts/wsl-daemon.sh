@@ -55,5 +55,10 @@ export DOTD_MODEL_TRANSPORT=real-http
 # 主人要关：把下面这行注释掉，或改成 off。
 export DOTD_NET_TOOLS="${DOTD_NET_TOOLS:-get}"
 
+# 并发额度：默认 1（串行）。要做并发验证时用 DOTD_MAX_RUNNING=2 bash scripts/wsl-daemon.sh 起。
+# 注意：setsid 会丢掉调用方的环境，所以这里必须显式透传（2026-10-18 踩过：
+# 在外部 export 了 DOTD_MAX_RUNNING=2 却始终串行，因为变量没进来）。
+export DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-1}"
+
 echo "FLEET=$DOTD_FLEET HOME=$DOTD_HOME"
 node --import tsx src/daemon.ts

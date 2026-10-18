@@ -503,3 +503,12 @@ test('system prompt：有「别重复查同一个东西」的效率纪律', () =
     '必须有"不要重复查同一文件"的效率纪律',
   );
 });
+
+test('fs.write 说明里写清 MEMORY.md 的固定结构（防止往末尾乱追加）', () => {
+  // 现场（2026-10-18）：模型把"并发标记"直接追加到 MEMORY.md 末尾，
+  // 结果塞进了最后一个 '## Pointers' 段，把索引结构搞乱。
+  const src = readFileSync(new URL('../src/runner/tool-catalog.ts', import.meta.url), 'utf8');
+  assert.ok(src.includes('MEMORY.md 有固定结构'), '必须明确提示 MEMORY.md 有固定结构');
+  assert.ok(src.includes('## Current concerns'), '必须指明要记的事该追加到 Current concerns 段');
+  assert.ok(src.includes('## Pointers'), '必须说明 Pointers 只放路径条目');
+});

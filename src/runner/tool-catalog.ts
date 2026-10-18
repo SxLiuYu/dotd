@@ -93,7 +93,11 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     description:
       '把一段 UTF-8 文本整体写进 /dot/home 下的文件，**覆盖**同路径原有内容，父目录不存在会自动创建。' +
       '任务结束时把值得留到下次的东西写进 notes/ 或 manuals/，以及维护 MEMORY.md 索引，都靠它。' +
-      '注意它是覆盖不是追加：改已有文件要先 fs.read 出原文，在内存里改好再整篇写回（否则会丢内容）；只追加一行用 shell.run 的 `>>` 更省事。',
+      '注意它是覆盖不是追加：改已有文件要先 fs.read 出原文，在内存里改好再整篇写回（否则会丢内容）；只追加一行用 shell.run 的 `>>` 更省事。' +
+      '**MEMORY.md 有固定结构，别往末尾随便追加**（2026-10-18 实测：直接 append 会把内容塞进最后一个 \'## Pointers\' 段，把索引搞乱）：' +
+      '文件是 `# MEMORY (index)` / `updated: <ISO时间>` / `## Interests` / `## Current concerns` / `## Pointers` 五部分；' +
+      '要记的事追加到 **`## Current concerns` 段末尾**（写成 `- 一句话 → notes/xxx.md`）；' +
+      '`## Pointers` 只放指向 notes 的路径条目；同时把 `updated:` 改成当前时间。',
     params: {
       path: '目标文件路径，**写 home 内相对路径**（如 reports/weekly.md、notes/2026-10-18-review.md）。父目录不必先建，会自动创建。' +
         '别写 /dot/home/... 开头——记忆层只认相对路径，绝对路径会被当成非法路径拒掉。' +
