@@ -268,6 +268,10 @@ function goalDigestOf(goal: string): string {
  * timeout/超时这类参数只影响"等多久"，不影响"做什么"。把它们剔掉，
  * 判重才真正对齐"同一个动作做了几次"。
  */
+export function normalizeResultForRepeatForTest(value: unknown): string {
+  return normalizeResultForRepeat(value);
+}
+
 export function repeatSignatureForTest(argumentsJson: string): string {
   return repeatSignature(argumentsJson);
 }
@@ -280,10 +284,60 @@ function repeatSignature(argumentsJson: string): string {
     if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return argumentsJson;
     const entries = Object.entries(obj as Record<string, unknown>)
       .filter(([k]) => !IGNORED.has(k))
+      .map(([k, v]) => {
+        // **路径参数也要归一化**（2026-10-18 实测）：g1.txt 与 /dot/home/g1.txt 指向同一文件，
+        // 但原样比较是两个不同签名 → 护栏数不到重复。实测就是这样让同文件被写了 8 次。
+        if (k === 'path' && typeof v === 'string') {
+          const norm = v
+            .replace(/\\/g, '/')
+            .replace(/^\/dot\/home(?:\/|$)/, '')
+            .replace(/^\.\//, '');
+          return [k, norm] as [string, unknown];
+        }
+        return [k, v] as [string, unknown];
+      })
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     return JSON.stringify(entries);
   } catch {
     return argumentsJson;
+  }
+}
+
+/**
+ * 判"结果有没有变化"前先归一化：剔掉时间戳/耗时这类**每次都不一样、但不代表进展**的字段。
+ *
+ * 2026-10-18 实测：fs.write 的返回是 {path, size_bytes, written_at}，
+ * written_at 每次都变 → 两次结果字符串永不相等 → "同结果"判据形同虚设，
+ * 同参数 fs.write 调 4 次护栏都不动。
+ */
+function normalizeResultForRepeat(value: unknown): string {
+  const VOLATILE = new Set([
+    'written_at',
+    'writtenAt',
+    'at',
+    'ts',
+    'timestamp',
+    'wall_ms',
+    'wallMs',
+    'peak_mem_mb',
+    'peakMemMb',
+    'finished_at',
+    'finishedAt',
+    'started_at',
+    'startedAt',
+  ]);
+  try {
+    const text = JSON.stringify(value ?? null);
+    const obj = JSON.parse(text) as unknown;
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return text;
+    const clean: Record<string, unknown> = {};
+    const src = obj as Record<string, unknown>;
+    for (const k of Object.keys(src).sort()) {
+      if (!VOLATILE.has(k)) clean[k] = src[k];
+    }
+    return JSON.stringify(clean);
+  } catch {
+    return '';
   }
 }
 
@@ -1478,9 +1532,15 @@ export class DotRunner {
     // 同结果重复：第 2 次强令收尾，第 4 次直接返回 stop（跳过派发）。
     // **必须有 stop 出口**——只回喂注记会让模型"被提醒但照做"，无限循环
     // （2026-10-18 实测把单测挂在 300s 不动）。
+    // **注意时序**（2026-10-18 实测）：checkRepeat 在**派发前**执行，
+    // recordRepeatResult 在**派发后**执行。所以这里读到的是"上一轮结束时的状态"：
+    //   sameResultCount=1 → 上两次结果相同（已重复过一次）
+    //   sameResultCount=2 → 已连续三次结果相同
+    // 因此阈值要比"直觉次数"低 1。原先写 >=2/>=4 实际要求连续 3/5 次才动手，
+    // 实测同参数 fs.write 跑了 5 次护栏都没介入。
     const sameResult = rec.sameResultCount ?? 0;
-    if (sameResult >= 4) return 'stop';
-    if (sameResult >= 2) {
+    if (sameResult >= 3) return 'stop';
+    if (sameResult >= 1) {
       return {
         note:
           `【必须收尾】${call.name} 用完全相同的参数已经调用 ${rec.count} 次，` +
@@ -1525,7 +1585,11 @@ export class DotRunner {
     const rec = this.repeatGuard.get(taskId)?.get(key);
     if (rec === undefined) return;
     try {
-      const text = JSON.stringify(value ?? null);
+      // **时间戳类字段必须先剔掉**（2026-10-18 实测）：fs.write 每次返回的
+      // written_at 都不一样，于是"结果一字不差"永远不成立，sameResultCount 停在 1，
+      // 护栏永远不介入 —— 实测同参数 fs.write 调 4 次仍未触发。
+      // 这些字段只是"什么时候做的"，不改变"做成了什么"。
+      const text = normalizeResultForRepeat(value);
       const trimmed = text.length > 200 ? `${text.slice(0, 200)}…` : text;
       if (trimmed === rec.last) {
         rec.sameResultCount = (rec.sameResultCount ?? 1) + 1;

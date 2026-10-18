@@ -818,7 +818,13 @@ export interface ContextBundle {
 export interface MemoryWriteResult {
   ok: boolean;
   warning?: string;
-  error?: 'HARD_LIMIT' | 'NOTES_COUNT_LIMIT' | 'HOME_CAPACITY' | 'READONLY_PHASE';
+  error?:
+    | 'HARD_LIMIT'
+    | 'NOTES_COUNT_LIMIT'
+    | 'HOME_CAPACITY'
+    | 'READONLY_PHASE'
+    /** 路径越出 /dot/home（与执行面 fs.read 的 path_outside_home 同语义，2026-10-18 统一）。 */
+    | 'PATH_OUTSIDE_HOME';
 }
 
 /** MEM §5.1 CompactionJobSpec（经 §4.5 通道投递 = submit + payloadJson）。 */

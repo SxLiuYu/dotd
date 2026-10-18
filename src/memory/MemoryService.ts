@@ -702,7 +702,9 @@ export class MemoryServiceImpl implements MemoryService {
       const hint = path.startsWith('/') || /^[A-Za-z]:/.test(path)
         ? `请改用 home 内的**相对路径**（去掉 /dot/home 前缀），例如 "m2.txt" 或 "notes/x.md"`
         : `路径不能含 ".."：请改用 home 内相对路径`;
-      return { ok: false, error: 'HARD_LIMIT', warning: `home 路径不合规（${path}）。${hint}` };
+      // 越界用专门错误码（2026-10-18 统一）：原先报 HARD_LIMIT(限额) 会让模型以为是容量问题，
+      // 而执行面 fs.read 对同类情况报 path_outside_home —— 两边语义不同，模型学不到一致的规则。
+      return { ok: false, error: 'PATH_OUTSIDE_HOME', warning: `home 路径不合规（${path}）。${hint}` };
     }
     if (!isMemoryPath(norm)) return { ok: true }; // 记忆层不管：交给执行面护栏
     const usage = await this.homeUsage(dotId, norm);

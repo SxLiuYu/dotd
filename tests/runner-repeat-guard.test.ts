@@ -120,8 +120,10 @@ test("判据是「结果没变化」而非单纯次数：结果一致的重复�
 
   assert.match(src, /sameResultCount/, '必须统计"结果与上次相同"的次数');
   assert.match(src, /const sameResult = rec\.sameResultCount \?\? 0;/, '必须取同结果计数');
-  assert.match(src, /if \(sameResult >= 2\)/, '同结果第 2 次就要强令收尾');
-  assert.match(src, /if \(sameResult >= 4\) return 'stop';/, '同结果必须有 stop 出口（否则无限循环）');
+  // 时序：checkRepeat 在派发前跑，读到的 sameResultCount 是"上一轮结束时的状态"，
+  // 所以阈值要比直觉次数低 1：1 = 已连续两次同结果，3 = 已连续四次。
+  assert.match(src, /if \(sameResult >= 1\)/, '同结果第 2 次就要强令收尾');
+  assert.match(src, /if \(sameResult >= 3\) return 'stop';/, '同结果必须有 stop 出口（否则无限循环）');
   assert.ok(
     src.includes('结果没变化才是真打转'),
     '必须有这条判据的说明（否则后来人会把次数当唯一判据又踩一遍）',
