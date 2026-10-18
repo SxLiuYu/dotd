@@ -866,6 +866,12 @@ export class ExecServiceImpl implements ExecService {
     at: string,
   ): Promise<ExecToolResult> {
     this.fleet.failCall(call.call_id, 'transport_error');
+    // **把"容器挂了"翻译成人能看懂的诊断**（2026-10-18 实测）：
+    // 容器被 kill 时，Node 的原始异常只有一句 `fetch failed`，模型和主人看到它
+    // 会以为是"网络问题"，实际是容器不在了。这里补一次轻量探测，把真实原因写进 message。
+    const diagnosis = await this.diagnoseTransportFailure(call);
+    const message =
+      diagnosis === null ? errText(cause) : `${errText(cause)}（${diagnosis}）`;
     this.deps.bus.publish('exec.call.interrupted', {
       callId: call.call_id,
       dotId: call.dot_id,
@@ -878,12 +884,41 @@ export class ExecServiceImpl implements ExecService {
       status: 'error',
       error: {
         code: 'transport_error',
-        message: errText(cause),
+        message,
         retryable: true,
       },
       finished_at: at,
     };
     void mode;
+  }
+
+  /**
+   * 传输层失败后探测真实原因（只做一次轻量 GET，不阻塞主流程）。
+   * 返回一句给人看的中文诊断；探测本身失败就返回 null（不掩盖原始错误）。
+   */
+  private async diagnoseTransportFailure(call: ExecToolCall): Promise<string | null> {
+    try {
+      // 先看 fleet 自己的状态机（最便宜、最准确）：容器被 kill 后这里会变成 exited/lost。
+      const row = this.fleet.getContainer(call.dot_id);
+      if (row === null) return '容器记录不存在（可能已被删除）';
+      const live = row.state;
+      if (live === 'unhealthy' || live === 'lost' || live === 'removed' || live === 'absent') {
+        return `容器状态=${live}，执行器不可达`;
+      }
+      const endpoint = row.endpoint;
+      if (endpoint === null || endpoint === undefined || endpoint.length === 0) {
+        return '容器尚无可用端点（可能正在重建）';
+      }
+      // 状态机说正常，再探一次健康端点确认（1.5s 上限，不拖住主流程）。
+      const res = await fetch(endpoint.startsWith('http') ? endpoint : `http://${endpoint}`, {
+        signal: AbortSignal.timeout(1500),
+      }).catch(() => null);
+      if (res === null) return '容器的执行器无响应：容器可能已退出、被暂停或正在重建';
+      if (!res.ok) return `容器的执行器返回 HTTP ${res.status}`;
+      return null; // 端点正常 → 不是容器问题，保持原始错误
+    } catch {
+      return null;
+    }
   }
 
   /**
