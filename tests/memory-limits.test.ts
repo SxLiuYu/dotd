@@ -23,6 +23,7 @@ import { makeTempDataDir } from './helpers.ts';
 import type { TempDataDir } from './helpers.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { makeStubFsOpsBridge } from '../src/memory/fsops-stub.ts';
+import { isMemoryPath } from '../src/memory/limits.ts';
 import type { StubFsOpsBridge } from '../src/memory/fsops-stub.ts';
 import {
   LIMIT_MEMORY_MD,
@@ -455,3 +456,49 @@ describe('MemoryService.touchManualsLastUsed（§4.3 / §3.5 老化判据）', (
     assert.ok((row?.mtime_ms ?? 0) > 1000);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-10-18 真实模型端到端暴露的缺陷回归：
+// 记忆层写检查点曾经拦下**所有** home 路径，而不只是它该管的记忆路径。
+//
+// 现场：真实模型被要求写 notes/hello.md，连试 3 次 fs.write 全被拒
+// （"note 命名须为 YYYY-MM-DD-<slug>.md"），模型只能放弃任务。
+// 更糟的是写普通工作文件 reports/weekly.md 也会被拒
+// （"路径不在记忆规范内"），而工具说明书当时写的是"可写任意 home 内路径"。
+// ═══════════════════════════════════════════════════════════════════
+
+describe('beforeWrite 管辖范围：记忆层只管记忆路径，别拦普通工作文件', () => {
+  it('普通工作文件（非记忆规范）→ 放行，不被记忆规则拦', async () => {
+    for (const p of ['reports/weekly.md', 'work/data.txt', 'tmp/x.json', 'script.sh']) {
+      const r = await mem.beforeWrite('dot1', p, 'hello');
+      assert.equal(r.ok, true, `${p} 是普通工作文件，记忆层不该拦`);
+    }
+  });
+
+  it('记忆路径仍然受记忆规则管：notes 命名不合规范 → 拒，且错误说清规范', async () => {
+    const r = await mem.beforeWrite('dot1', 'notes/hello.md', 'x');
+    assert.equal(r.ok, false, 'notes/hello.md 不符合 YYYY-MM-DD-slug.md，必须拒');
+    assert.ok(r.warning !== undefined && r.warning.includes('YYYY-MM-DD'), '要告诉模型正确格式');
+  });
+
+  it('合法的 note 命名 → 放行', async () => {
+    const r = await mem.beforeWrite('dot1', 'notes/2026-10-18-model-e2e.md', 'x');
+    assert.equal(r.ok, true);
+  });
+
+  it('安全边界不放宽：绝对路径 / .. 逃逸 仍然拒', async () => {
+    for (const p of ['/dot/home/notes/a.md', '../evil.md', 'C:/x.md']) {
+      const r = await mem.beforeWrite('dot1', p, 'x');
+      assert.equal(r.ok, false, `${p} 必须拒（执行面同样的边界）`);
+    }
+  });
+
+  it('判据只有一份：isMemoryPath 与 beforeWrite 的分流一致', async () => {
+    // 记忆路径 → 走记忆规则（MEMORY.md 合法、notes 不合规的拒）
+    assert.equal(isMemoryPath('MEMORY.md'), true);
+    assert.equal(isMemoryPath('notes/2026-10-18-x.md'), true);
+    assert.equal(isMemoryPath('reports/weekly.md'), false);
+    assert.equal(isMemoryPath('.archive/old.md'), false);
+  });
+});
+

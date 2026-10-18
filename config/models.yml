@@ -23,13 +23,20 @@ endpoints:
     # 密钥同源不同值：config.json 的 api_key（wb2a… 37 位）≠ tokens.env 里旧的 sk-a…，
     # 故新增 WB2API_KEY 而不是复用 HY3_API_KEY（旧的留着，代理回来即可回退）。
     # 换供应商仍只改这一行 + key_env（契约 T3 的 base_url 可换性由 transport 层编解码保证）。
-    base_url: http://127.0.0.1:7863/v1
+    # 2026-10-18 主人切回 :3065（a2a 网关），并实测该网关上各模型的**工具调用能力不同**：
+    #   hy3             → finish_reason=stop，带 tools 时**不返回 tool_calls**（只出文本）
+    #   deepseek-v4.1-flash → finish_reason=tool_calls，arguments 是合法 JSON  ✅ 实测通过
+    # 主循环每轮都带 tools + tool_choice:auto，所以 primary 必须是真能调工具的模型，
+    # 否则工具永远不执行（任务看起来"做完"了但什么都没干）。light 轨只做事件匹配/摘要，
+    # 用便宜快的 flash 即可。
+    base_url: http://127.0.0.1:3065/v1
     api_key_env: WB2API_KEY
     models:
-      # 2026-10-16 实测：hy3 支持 tool_calls（finish_reason=tool_calls，arguments 合法 JSON），
-      # 带 reasoning_content；light 同模型（hy3 一套三个别名，见 /v1/models）。
-      primary: hy3
-      light:   hy3
+      primary: deepseek-v4.1-flash
+      light:   deepseek-v4.1-flash
+    # 模型级 fallback 链（语义见下方注释块）：主模型限流/5xx 时换同名族的下一个，
+    # 端点与凭据不换、熔断不结算。**只用实测能调工具的模型**，别把 hy3 放进 primary 链。
+    fallback_models: { primary: [glm-5.3-flash, Qwen3.8-Flash], light: [glm-5.3-flash] }
     # 2026-10-17：模型级 fallback 链（迁移自 PilotDeck runFallbackChain / RouterFallbackConfig）。
     #
     # 是什么：同一端点内再分一层——models[track] 先试，失败且故障是"模型级"

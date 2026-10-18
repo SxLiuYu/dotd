@@ -116,6 +116,34 @@ export function isReservedPath(path: HomeRelPath): boolean {
 }
 
 /**
+ * 记忆层**管辖范围**判定（写检查点 M6 的唯一判据）。
+ *
+ * 与"能不能写进 home"是两件事：
+ * - 本函数回答"这个路径属于长期记忆的组织范围吗"——只有 `MEMORY.md`、`notes/`、
+ *   `manuals/` 三处属于，它们有命名规范（notes 必须是 `YYYY-MM-DD-slug.md`）、
+ *   容量配额与软硬限。
+ * - `home` 下其余路径（工作文件、临时产物、脚本、`.archive/`、`.tmp/`）**不受记忆层
+ *   管辖**，它们的可写性由执行面护栏（必须留在 /dot/home 内、不许 `..` 逃逸、
+ *   不许碰保留前缀）决定。
+ *
+ * 为什么需要这一条：改之前写检查点对任意路径都跑记忆规则，于是写一个普通工作文件
+ * 会被"路径不在记忆规范内"拒掉——模型只能反复重试同一个写操作。
+ * 判据只在这里维护一份，`beforeWrite` 与测试都调它。
+ */
+export function isMemoryPath(path: HomeRelPath): boolean {
+  const norm = normalizeHomePath(path);
+  if (norm === null) return false;
+  if (isReservedPath(norm)) return false;
+  if (norm === HOME_INDEX_ROOT) return true;
+  if (norm.startsWith(HOME_NOTES_DIR) && norm.endsWith('.md')) {
+    const rest = norm.slice(HOME_NOTES_DIR.length);
+    return rest.length > 0 && !rest.includes('/');
+  }
+  if (norm.startsWith(HOME_MANUALS_DIR) && norm.endsWith('.md')) return true;
+  return false;
+}
+
+/**
  * §3.2 + §6.2 索引范围判定：仅 MEMORY.md、notes/*.md、manuals/**\/*.md 入活跃索引；
  * .archive/**、.tmp/**、.dotd/** 永不入索。
  */

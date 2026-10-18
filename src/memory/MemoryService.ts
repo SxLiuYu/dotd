@@ -50,6 +50,7 @@ import {
   isReservedPath,
   LIMIT_HOME_BYTES,
   normalizeHomePath,
+  isMemoryPath,
   SUMMARIZE_MESSAGE_THRESHOLD,
   SUMMARY_TOKEN_LIMIT,
   tokensOfText,
@@ -672,11 +673,32 @@ export class MemoryServiceImpl implements MemoryService {
     this.writeKv(`reminded:${taskId}`, String(t), t);
   }
 
+  /**
+   * 写前检查点（接缝 M6）。**只在路径落在记忆层管辖范围内时**才施加记忆规则。
+   *
+   * 记忆层的规范（§3.2/§6.2）有意只管三处：`MEMORY.md`、`notes/*.md`、`manuals/**`。
+   * 它管的是"长期记忆的组织方式"，不是"整个 home 能不能写"——`/dot/home` 下还有
+   * 工作文件、临时产物、脚本，那些该由执行面的沙箱护栏（路径必须留在 /dot/home 内）
+   * 负责，不该被"note 命名必须是 YYYY-MM-DD-slug.md"这种记忆规范拦下。
+   *
+   * 改之前这里对任意路径都跑 `checkFileLimits`，而它内部 `classifyHomeArea` 对规范外
+   * 路径返回 null → HARD_LIMIT。于是 `fs.write("work/report.txt")` 这类完全合法的
+   * 普通写文件会被拒，错误信息还是"路径不在记忆规范内"，模型只能反复重试。
+   * （2026-10-18 真实模型端到端时实测：模型连试 3 次 fs.write 都被拒，最后放弃任务。）
+   *
+   * 两层校验的分工：
+   * - 记忆层（这里）：**只在记忆范围内**管命名、容量、软硬限；
+   * - 执行面（`validateToolCall` / `checkHomePath`）：管路径必须留在 /dot/home 内、
+   *   不许 `..` 逃逸、不许碰保留前缀。那是真正的安全边界，与记忆规范无关。
+   */
   async beforeWrite(dotId: string, path: HomeRelPath, content: string): Promise<MemoryWriteResult> {
     const norm = normalizeHomePath(path);
     if (norm === null) {
-      return { ok: false, error: 'HARD_LIMIT', warning: `非法 home 相对路径：${path}` };
+      // 形状非法（绝对路径、盘符、`..` 逃逸）：**拒**，不是放行。
+      // 这是安全边界，执行面护栏同样会拒；两层都守，任一层漏了都不至于放行。
+      return { ok: false, error: 'HARD_LIMIT', warning: `非法 home 路径（不许绝对路径 / .. 逃逸）：${path}` };
     }
+    if (!isMemoryPath(norm)) return { ok: true }; // 记忆层不管：交给执行面护栏
     const usage = await this.homeUsage(dotId, norm);
     return checkFileLimits(norm, content, usage);
   }

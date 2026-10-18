@@ -80,7 +80,7 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '读取 /dot/home 下的一个文本文件，原样返回全文。任务一开始就应该用它读 MEMORY.md（系统已注入一份，被截断或需要看原文件时再读）；读笔记、读上次留下的手册、核对文件内容都用它。' +
       '只能读文本，不要用它读二进制；一次只能读一个文件，要遍历目录先 fs.list。它不返回"第几行到第几行"，大文件请用 shell.run 配合 head/sed 截取。',
     params: {
-      path: '要读的文件路径。写 home 内相对路径即可（如 MEMORY.md、notes/2026-10-15-x.md），也可写完整的 /dot/home/... 绝对路径；两种都会被解析到同一个文件。',
+      path: '要读的文件路径，写 home 内相对路径（如 MEMORY.md、notes/2026-10-15-x.md、reports/a.txt）。不要写 /dot/home/... 开头的绝对路径。',
     },
     returns:
       '返回值是 JSON：path（home 内相对路径）、size_bytes、content（UTF-8 全文）、truncated（恒为 false，超 4MB 直接报错而不是截断）。',
@@ -95,7 +95,10 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '任务结束时把值得留到下次的东西写进 notes/ 或 manuals/，以及维护 MEMORY.md 索引，都靠它。' +
       '注意它是覆盖不是追加：改已有文件要先 fs.read 出原文，在内存里改好再整篇写回（否则会丢内容）；只追加一行用 shell.run 的 `>>` 更省事。',
     params: {
-      path: '目标文件路径（home 内相对路径或 /dot/home/... 绝对路径）。父目录不必先建，会自动创建。',
+      path: '目标文件路径，**写 home 内相对路径**（如 reports/weekly.md、notes/2026-10-18-review.md）。父目录不必先建，会自动创建。' +
+        '别写 /dot/home/... 开头——记忆层只认相对路径，绝对路径会被当成非法路径拒掉。' +
+        '**notes/ 下的文件名有硬规范**：必须是 YYYY-MM-DD-短横线-slug.md（例：notes/2026-10-18-model-e2e.md），否则会被拒；' +
+        '其它目录（reports/、tmp/、work/ 等）没有命名要求。被拒时读 warning 里的原因，按它改路径再写一次。',
       content: '要写入的完整 UTF-8 文本。必须是整篇文件的最终内容，不是"要追加的那段"。',
     },
     returns: '返回值是 JSON：path（home 内相对路径）、size_bytes（写入字节数）、written_at（ISO 时间）。',
@@ -111,7 +114,7 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '读文件前不确定路径、不确定笔记放在哪、想看看上次留下了什么，先 fs.list 再动手，比盲猜路径省一整轮。' +
       '它只列目录，不读内容；最多递归 4 层，单次最多返回 2000 条（超了 truncated=true）。',
     params: {
-      path: '要枚举的目录。列整个 home 根就写 /dot/home（或直接写 /dot/home）。',
+      path: '要枚举的目录，写 home 内相对路径；列整个家目录就写 .（一个点）。不要写 /dot/home 绝对路径。',
       depth: '递归深度，整数 1–4，缺省 1 = 只看这一层。目录不深时直接用 2，省一次调用。',
     },
     returns:
@@ -125,7 +128,7 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '两种情况用它：① 写之前先确认文件存在不存在（决定走 fs.write 新建还是先 fs.read 再覆盖）；② 判断记忆/笔记是不是过期了（mtime）。' +
       '要内容就 fs.read，fs.stat 只给元信息。',
     params: {
-      path: '要查的路径（home 内相对路径或 /dot/home/... 绝对路径），文件或目录都可以。',
+      path: '要查的路径，写 home 内相对路径（文件或目录都可以）。不要写 /dot/home/... 绝对路径。',
     },
     returns: '返回值是 JSON：path、type（file|dir）、size_bytes、mtime（ISO 时间）、mode（Unix 权限位数字）。',
     failures: 'not_a_file（路径根本不存在）、路径类错误同 fs.read。',
