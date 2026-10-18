@@ -102,6 +102,13 @@ const NOTE_EXEMPT_RE = /^(\d{4}-\d{2}-digest\.md|_.*\.md)$/;
 export function normalizeHomePath(path: HomeRelPath): HomeRelPath | null {
   if (typeof path !== 'string' || path.length === 0) return null;
   let p = path.replace(/\\/g, '/');
+  // **家目录前缀不是逃逸**（2026-10-18 修）：原来一律拒绝绝对路径，
+  // 但 fs.read 却接受 /dot/home/x（自动规范化）—— 一读一写两种行为，
+  // 模型必然学到错的经验：读成功了就以为写也行，于是反复用绝对路径写、被拒、再试。
+  // 这里把家目录前缀**连同其后的斜杠**一起剥掉；其余绝对路径（/etc、/root、C:）仍然拒。
+  // `home` 后面必须紧跟 `/` 或结尾，否则 `/dot/homework/x` 会被误剥成 `work/x`。
+  p = p.replace(/^\/dot\/home(?:\/|$)/, '');
+  p = p.replace(/^dot\/home(?:\/|$)/, '');
   if (p.startsWith('/') || /^[a-zA-Z]:/.test(p)) return null;
   p = p.replace(/^\.\//, '');
   p = p.replace(/\/{2,}/g, '/');
