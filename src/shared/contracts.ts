@@ -539,6 +539,15 @@ export interface ChatMessage {
   content: string;
   tool_call_id?: string;
   name?: string;
+  /**
+   * 多模态附件（2026-10-18）：随本条消息下发给模型的图片。
+   *
+   * 为什么另开字段而不是把 content 改成联合类型：content 在**上百处**被当字符串用
+   * （上下文投影、摘要、plan 注记、测试断言），改联合类型会引发大面积改动与回归风险。
+   * 另开可选字段对既有代码零影响；传输层发请求时再拼成 OpenAI 的
+   * `content: [{type:'text'},{type:'image_url'}]` 形状。
+   */
+  images?: Array<{ url: string; mimeType?: string }>;
 }
 export interface ChatResponse {
   content: string;
@@ -781,6 +790,8 @@ export interface Message {
   eventId?: string;
   tokenEst: number;
   createdAt: number;
+  /** 多模态附件（运行期挂载，不落库）：见 ChatMessage.images 的说明。 */
+  images?: Array<{ url: string; mimeType?: string }>;
 }
 
 /**

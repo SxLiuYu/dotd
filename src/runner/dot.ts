@@ -369,6 +369,12 @@ class RunContext {
    * （实测：明明已经改用相对路径成功，最后却汇报"绝对路径被接受了"）。
    */
   currentTurnText = '';
+
+  /**
+   * 本任务的图片附件（2026-10-18 多模态）。任务开始时从 goal 里解析出路径并读成 data URL，
+   * 之后每轮请求都带上——这样模型是**真的在"看"图**，而不是自己写脚本解析像素。
+   */
+  taskImages: Array<{ url: string; mimeType?: string }> = [];
   /**
    * 本轮工具调用（callId → 工具名）。有工具结果回喂时，必须紧跟一条 assistant 的
    * tool_calls 消息把它们"接住"：OpenAI 兼容协议里裸的 role=tool 会被网关拒
@@ -842,6 +848,9 @@ export class DotRunner {
    */
   private readonly readSizes = new Map<string, number>();
 
+  /** 本任务从目标里解析出的图片（data URL），每轮请求都带上。 */
+  private cachedGoalImages: Array<{ url: string; mimeType?: string }> = [];
+
   private readonly repeatGuard = new Map<string, Map<string, { count: number; last: string; sameResultCount?: number }>>();
   /** 连续被护栏跳过派发的轮数（按任务 ID）；超过 REPEAT_MAX_SKIPS 就真的收口（防死循环）。 */
   private readonly repeatSkipsByTask = new Map<string, number>();
@@ -967,6 +976,10 @@ export class DotRunner {
     this.readSizes.clear();
     // 注意：**不清空** repeatGuard —— 计数按 taskId 分桶、跨 run_epoch 保留（见字段注释）。
     this.log(`runner: 领任务 ${task.id}（epoch=${epoch} resume_from_seq=${task.resumeFromSeq ?? '-'}）`);
+
+    // 多模态：任务目标里若提到 home 内的图片文件（飞书图片走这条路），
+    // 读成 data URL 缓存起来，供每轮 buildMessages 挂到消息上。
+    this.cachedGoalImages = await this.loadGoalImages(task);
 
     // ⑤ 会话绑定（S5：修旧稿只读不写）
     let session = task;
@@ -1229,9 +1242,17 @@ export class DotRunner {
     const tools = await this.toolSpecs();
     // 先问"能不能流式"，再定请求体：`stream` 标记只在确实走流式时才出现（complete 请求逐字不变）。
     const useStream = this.useStream();
+    // 多模态：在**投影之后**的 ChatMessage 数组上挂图片。
+    // 2026-10-19 修：早先挂到 ctx.messages（那时历史还没从 thread 重建完，数组是空的），
+    // find 找不到 user 消息 → 图片静默丢失 → 模型只能自己写脚本解像素。
+    const wireMessages = messages.map(toChatMessage);
+    const withImages =
+      this.cachedGoalImages.length === 0
+        ? wireMessages
+        : attachImagesToLastUser(wireMessages, this.cachedGoalImages);
     const req: RouteRequest = {
       track: 'primary',
-      messages: messages.map(toChatMessage),
+      messages: withImages,
       tools,
       tool_choice: 'auto',
       attemptId: callId, // 契约 J1：attemptId = journal 步 callId
@@ -1957,6 +1978,48 @@ export class DotRunner {
     }
   }
 
+  /**
+   * 从任务目标里解析 home 内的图片路径并读成 data URL（2026-10-18 多模态）。
+   *
+   * 为什么需要：飞书图片被下载到 home 后，目标里写的是**路径**。若只给文本，
+   * 模型只能自己写脚本解析像素——纯色图能凑合，真实截图根本没法看。
+   * 而模型本身是有视觉能力的（实测 glm/Qwen/deepseek 都能认色），缺的只是"把图发给它"。
+   *
+   * 读法：用 shell.run 执行 base64（fs.read 只取文本，二进制会被破坏）。
+   * 失败静默返回空数组——图片读不到不该让任务起不来，模型仍可用其他手段。
+   */
+  private async loadGoalImages(task: Task): Promise<Array<{ url: string; mimeType?: string }>> {
+    // 只在目标里出现 media/ 路径时才尝试（避免每个任务都跑一次 shell）
+    const m = /media\/[A-Za-z0-9_.-]+\.(?:png|jpg|jpeg|gif|webp)/i.exec(task.goal);
+    if (m === null) return [];
+    const rel = m[0];
+    try {
+      const r = await this.exec.runTool({
+        call_id: `img-load-${Date.now()}`,
+        task_id: task.id,
+        dot_id: task.dotId,
+        issued_at: new Date().toISOString(),
+        tool: 'shell.run',
+        args: { cmd: `base64 -w0 '${rel}'`, timeout_ms: 15000 },
+        deadline_ms: 20_000,
+      });
+      if (r.status !== 'ok') return [];
+      const stdout = (r.result as { stdout?: unknown } | null)?.stdout;
+      if (typeof stdout !== 'string' || stdout.length === 0) return [];
+      const ext = rel.split('.').pop()?.toLowerCase() ?? 'png';
+      const mime =
+        ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+        : ext === 'gif' ? 'image/gif'
+        : ext === 'webp' ? 'image/webp'
+        : 'image/png';
+      this.log(`runner: 已加载任务图片 ${rel}（${stdout.length} 字节 base64）→ 随请求下发给模型`);
+      return [{ url: `data:${mime};base64,${stdout.trim()}`, mimeType: mime }];
+    } catch (err) {
+      this.log(`runner: 读取任务图片失败 ${rel}：${errText(err)}`);
+      return [];
+    }
+  }
+
   /** 当前任务的 threadId（ctx 持有 runTask 绑定的那份；未绑则 null）。 */
   private threadIdOf(task: Task): string | null {
     return task.threadId ?? task.sessionId ?? null;
@@ -2451,6 +2514,28 @@ function identityOf(args: Record<string, unknown>): string | undefined {
  *   但缺了它，后面的 role=tool 在网关看来就是"无主"的。
  * - 其余（text / task_start / memory_note …）按 m.role 原样投影。
  */
+/**
+ * 把图片挂到消息数组里**最后一条 user 消息**上（2026-10-19）。
+ *
+ * 为什么单独抽出来：原实现挂到 ctx.messages（那时还没装填完），图片静默丢失。
+ * 这里对**已经组装好的数组**操作，并且只在没有 images 时才挂（不覆盖已有的）。
+ * 返回新数组，不改原对象——避免缓存被污染到下一轮。
+ */
+function attachImagesToLastUser(
+  messages: ChatMessage[],
+  images: Array<{ url: string; mimeType?: string }>,
+): ChatMessage[] {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m !== undefined && m.role === 'user') {
+      const out = [...messages];
+      out[i] = { ...m, images };
+      return out;
+    }
+  }
+  return messages;
+}
+
 function toChatMessage(m: Message): ChatMessage {
   if (m.kind === 'tool_result') {
     const out: ChatMessage = { role: 'tool', content: m.content };
@@ -2487,7 +2572,14 @@ function toChatMessage(m: Message): ChatMessage {
     }));
     return out;
   }
-  return { role: m.role, content: m.content };
+  // **必须带上 images**（2026-10-19 实测）：原来这里只返回 role+content，
+  // 把多模态附件整条丢掉 —— 日志显示"已加载任务图片"，但模型收到的仍是纯文本，
+  // 于是它只能自己写 python 解 PNG 像素（能认纯色块，真实截图完全没法看）。
+  return {
+    role: m.role,
+    content: m.content,
+    ...(m.images === undefined ? {} : { images: m.images }),
+  };
 }
 
 /**

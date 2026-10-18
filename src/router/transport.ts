@@ -19,7 +19,7 @@ import { get as httpGet, request as httpRequest } from 'node:http';
 import { get as httpsGet, request as httpsRequest } from 'node:https';
 import { URL } from 'node:url';
 import type { IncomingMessage } from 'node:http';
-import type { ChatResponse, EndpointDef, FailureKind, StreamToolCallDelta, Track } from '../shared/contracts.ts';
+import type { ChatMessage, ChatResponse, EndpointDef, FailureKind, StreamToolCallDelta, Track } from '../shared/contracts.ts';
 import type {
   ChatCall,
   ChatChunk,
@@ -643,6 +643,30 @@ function toStreamToolCallDeltas(
   return out;
 }
 
+/**
+ * 把带 `images` 的消息拼成 OpenAI 多模态形状（2026-10-18）。
+ *
+ * 没有 images 的消息**逐字原样返回**（零行为变化）；有的话 content 变成片段数组：
+ *   [{type:'text', text}, {type:'image_url', image_url:{url}}]
+ *
+ * 为什么在这里做而不是上层：这是唯一一处"消息 → 线上 JSON"的收口，
+ * 改一处即可覆盖 complete/stream 两条路径。
+ */
+export function toWireMessages(messages: ChatMessage[]): unknown[] {
+  return messages.map((m) => {
+    const imgs = m.images;
+    if (imgs === undefined || imgs.length === 0) return m;
+    const { images: _omit, ...rest } = m;
+    return {
+      ...rest,
+      content: [
+        { type: 'text', text: m.content },
+        ...imgs.map((i) => ({ type: 'image_url', image_url: { url: i.url } })),
+      ],
+    };
+  });
+}
+
 export class HttpTransport implements ModelTransport {
   async chat(call: ChatCall): Promise<ChatOutcome> {
     const key = apiKeyFor(call.endpoint);
@@ -653,7 +677,7 @@ export class HttpTransport implements ModelTransport {
       headers,
       body: JSON.stringify({
         model: call.model,
-        messages: call.messages,
+        messages: toWireMessages(call.messages),
         ...(mapped.wire !== undefined ? { tools: mapped.wire } : {}),
         ...(call.tool_choice !== undefined ? { tool_choice: call.tool_choice } : {}),
         ...(call.maxTokens !== undefined ? { max_tokens: call.maxTokens } : {}),
@@ -686,7 +710,7 @@ export class HttpTransport implements ModelTransport {
         headers,
         body: JSON.stringify({
           model: call.model,
-          messages: call.messages,
+          messages: toWireMessages(call.messages),
           ...(mapped.wire !== undefined ? { tools: mapped.wire } : {}),
           ...(call.tool_choice !== undefined ? { tool_choice: call.tool_choice } : {}),
           ...(call.maxTokens !== undefined ? { max_tokens: call.maxTokens } : {}),
