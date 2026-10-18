@@ -102,9 +102,13 @@ async function api<T>(
       return { ok: false, kind: 'parse', status: res.status, message: text.slice(0, 200) };
     }
     if (!res.ok) {
-      const msg = typeof (parsed as { message?: unknown } | null)?.message === 'string'
-        ? (parsed as { message: string }).message
-        : `HTTP ${res.status}`;
+      // 服务端错误体有两种形状：{error, message}（如 memory/restore）与 {message}。
+      // 2026-10-18 实测：只读 message 时，返回 {ok:false,error:"..."} 的端点会退化成
+      // 干巴巴的 "HTTP 400"，用户不知道到底哪儿错了。两个字段都看。
+      const p2 = parsed as { message?: unknown; error?: unknown } | null;
+      const fromMsg = typeof p2?.message === 'string' && p2.message.length > 0 ? p2.message : null;
+      const fromErr = typeof p2?.error === 'string' && p2.error.length > 0 ? p2.error : null;
+      const msg = fromMsg ?? fromErr ?? `HTTP ${res.status}`;
       return { ok: false, kind: 'http', status: res.status, message: msg };
     }
     return { ok: true, status: res.status, body: parsed as T };
@@ -221,6 +225,71 @@ export function buildCli(opts: CliOptions = {}): Command {
       const r = await api('POST', '/api/messages', { text: text.join(' '), dotId: dot() }, o);
       if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
       emit(o, render(r.body, o.json === true));
+    });
+
+  // ── 记忆备份（2026-10-18）：.archive/ 的查询与回滚 ────────────────────────
+  //
+  // 背景：fs.write 覆盖前会把旧版本归档，但恢复原先只能 `docker exec cp`——
+  // 等于"有能力、没入口"。这两条命令把它变成一句 CLI。
+  const mem = program.command('memory').description('记忆备份：查看历史版本 / 回滚');
+
+  mem
+    .command('archive')
+    .description('列出 .archive/ 里的历史版本（按时间倒序）')
+    .option('-p, --path <path>', '只看某个文件的备份（如 MEMORY.md）')
+    .option('-l, --limit <n>', '条数上限（默认 20）', '20')
+    .action(async (opts: { path?: string; limit?: string }) => {
+      const o = merged();
+      const qs = new URLSearchParams();
+      if (opts.path !== undefined) qs.set('path', opts.path);
+      qs.set('limit', String(Math.max(1, Math.min(500, Number(opts.limit) || 20))));
+      const r = await api<{ items: Array<{ name: string; archivedAt: string; originalPath: string; sizeBytes: number }> }>(
+        'GET', `/api/memory/archive?${qs.toString()}`, undefined, o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      const items = r.body.items ?? [];
+      if (o.json === true) {
+        emit(o, JSON.stringify(items, null, 2));
+        return;
+      }
+      if (items.length === 0) {
+        console.log(opts.path === undefined ? '（还没有任何备份）' : `（${opts.path} 没有备份）`);
+        return;
+      }
+      console.log(`共 ${items.length} 份备份：`);
+      for (const it of items) {
+        console.log(`  ${it.archivedAt}  ${it.originalPath}  (${it.sizeBytes}B)`);
+        console.log(`     ${it.name}`);
+      }
+      console.log('');
+      console.log('回滚：dotd memory restore <上面对应的文件名>');
+    });
+
+  mem
+    .command('restore <archive>')
+    .description('把某个历史版本写回原文件（当前版本也会被归档，可再回滚）')
+    .action(async (archive: string) => {
+      const o = merged();
+      const r = await api<{ ok: boolean; restoredTo?: string; error?: string }>(
+        'POST', '/api/memory/restore', { archive }, o,
+      );
+      if (!r.ok) {
+        // 400 时服务端会带 {ok:false, error:"..."}，把它显示出来而不是只给 HTTP 400
+        // （2026-10-18 实测：只显示 "HTTP 400" 让人不知道到底哪儿错了）。
+        const why = (r as unknown as { body?: { error?: string } }).body?.error;
+        return fail(o, why === undefined ? r.message : `回滚失败：${why}`, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      }
+      const body = r.body ?? { ok: false };
+      if (o.json === true) {
+        emit(o, JSON.stringify(body, null, 2));
+        return;
+      }
+      if (body.ok === true) {
+        console.log(`✅ 已回滚：${body.restoredTo}（原版本已归档，如需撤销可再 restore 回去）`);
+        return;
+      }
+      console.error(`❌ 回滚失败：${body.error ?? '未知原因'}`);
+      process.exitCode = 1;
     });
 
   program

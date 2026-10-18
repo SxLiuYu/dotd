@@ -2132,3 +2132,54 @@ POST /api/memory/restore {"archive":"2026-10-18T14-29-18-370Z__MEMORY.md"}
 ## 114. 本轮门禁
 
 `tsc` exit 0 · **`npm test` 1470/1470 全绿**（+3 条路由/解析回归）· API 端到端验证通过
+
+---
+
+# 第二十五轮：CLI 入口 + 一个影响所有命令的错误显示缺陷（2026-10-18）
+
+## 115. `dotd memory archive|restore`
+
+```
+$ dotd memory archive
+共 10 份备份：
+  2026-10-18T14-44-59-297Z  MEMORY.md  (1016B)
+     2026-10-18T14-44-59-297Z__MEMORY.md
+  …
+
+$ dotd memory archive --path MEMORY.md --limit 3
+共 3 份备份：
+  2026-10-18T14-44-59-297Z  MEMORY.md  (1016B)
+  …
+
+$ dotd memory restore 2026-10-18T14-29-18-370Z__MEMORY.md
+✅ 已回滚：MEMORY.md（原版本已归档，如需撤销可再 restore 回去）
+```
+
+支持 `--json`（脚本里能用）、`--path` 过滤、失败退码 1。
+
+## 116. 顺带挖出：CLI 的错误信息被吃掉了一半
+
+上一条命令报错时只显示 **`HTTP 400`**，没有任何原因。查下来是 `cli.ts` 的 `api()` 助手：
+
+```ts
+const msg = typeof parsed?.message === 'string' ? parsed.message : `HTTP ${res.status}`;
+```
+
+**它只读 `message` 字段**。而服务端的错误体有两种形状：
+- `{ error, message }`（memory/restore 等）
+- `{ message }`（大多数旧端点）
+
+凡是返回 `{error:"..."}` 的端点，在 CLI 里全部退化成干巴巴的 `HTTP 4xx`。
+
+**修法**：两个字段都读。修完效果：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 备份不存在 | `HTTP 400` | **`读不到该归档`** |
+| 归档名目录穿越 | `HTTP 400` | **`非法的归档名`** |
+
+这个修复**影响所有 CLI 命令**——不只是 memory 组。
+
+## 117. 本轮门禁
+
+`tsc` exit 0 · **`npm test` 1474/1474 全绿**（+4 条 CLI 回归）· CLI 真实环境验证通过
