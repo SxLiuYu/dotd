@@ -52,7 +52,13 @@ npm run dotd    →   node --import tsx src/surfaces/cli.ts  （package.json:14�
 
 **阶段一 MVP，但不再只是 stub 演示。** 真实的 HTTP 模型传输、daemon 全链路、流式（含工具调用通道）、长命令心跳、FTS 中文检索、会话摘要，以及七个会丢数据/丢任务的缺陷，
 在这一批优化里被真测试证明过（详见 [`docs/optimization-2026-10-17.md`](docs/optimization-2026-10-17.md)）。
-**2026-10-18 更新**：**真模型往返已跑通**（tier1 `127.0.0.1:3065` + `deepseek-v4.1-flash`：probe 返回合法 `tool_calls`，daemon 真跑任务 `done` 且 `fs.write succeeded`）。**仍然没验证的**：真 Docker 容器（本机无 dockerd，任务里的工具执行仍走 stub）、真实飞书收发往返（只确证了长连接建立）。
+**2026-10-18 更新**：**真模型往返已跑通**（tier1 `127.0.0.1:3065` + `deepseek-v4.1-flash`：probe 返回合法 `tool_calls`，daemon 真跑任务 `done` 且 `fs.write succeeded`）。**仍然没验证的**：真 Docker 容器、真实飞书收发往返（只确证了长连接建立）。
+
+> **关于真容器**：早期说"本机无 dockerd"是**错的**——dockerd 在 WSL 里（`29.1.3`），
+> `docker ps` 能看到 `dotd-dot-dot1` 容器与 `dotd/exec:1.49.1-0.1.0` 镜像，dotd 以前真跑过。
+> 现在跑不动的原因是 **WSL 内存**：`.wslconfig` 限 24GB，而 netfuzz 的 fuzz 集群常驻约 20GB，
+> `MemAvailable` 只剩 4GB，连 `wsl.exe -e echo` 都会 `WSL_E_SERVICE_STOPPED`。
+> 想验证真容器，先腾出内存，然后跑 `scripts/live-wsl-e2e.sh`（见下）。
 
 ### 门禁实测（三轮优化结束时实跑，Node v24.13.0 / npm 11.9.0，原生 Windows）
 
@@ -336,11 +342,25 @@ bash scripts/wsl-fleet-prep.sh       # ② rsync 仓库到 ~/dotd + npm install
 npx tsx scripts/wsl-fleet-boot.mts   # 真容器 boot + fsOps 写文件 + docker exec 读回
 ```
 
+**一条命令跑完整验证（推荐）**：
+
+```bash
+# Windows 侧：把模型服务暴露给 WSL（13065 -> 127.0.0.1:3065）
+node --import tsx scripts/win-relay.mts
+
+# WSL 侧
+bash scripts/live-wsl-e2e.sh
+```
+
+它做七件事并**逐项检查前置条件**：docker / node → 凭据与端点（自动把 tier1 指向 relay）→
+`DOTD_FLEET=docker` 起 daemon → 提交真任务 → 等终态 → **真容器证据**（`docker ps` 看容器、
+`docker exec` 读回模型写的文件）→ 汇总。**内存不够会直接拒绝跑并说明原因**，不让你对着超时猜。
+
 **不需要单独「构建镜像」一步**：`src/exec/image.ts:ensureImage()` 在 daemon boot 时发现镜像缺失就会自动构建（`fleet.ts:387-392` 的 boot 序列：ping → **ensureImage** → ensureNetwork → netguard → reconcile）。`scripts/wsl-build-image.mts` 只是"想单独预热/预检镜像"时的便捷脚本，不是安装必经步骤。
 
 只有一件事需要你自己确认：**2GB 基座镜像要不要预拉**。`docker build` 时也会自动拉，但如果你想先把这 2GB 下完再起 daemon，跑一次 `bash scripts/wsl-pull-image.sh`（`setup` 只报告这条命令，不会替你拉）。
 
-WSL 部署时，Windows 侧的 loopback 模型服务需要 `scripts/win-relay.mts` 转发（WSL2 NAT 下，WSL 里的 127.0.0.1 是独立命名空间，够不着 Windows 的 loopback），启动器 `scripts/start-relay.ps1`。该脚本目前只转两条：`:13065`→`127.0.0.1:3065`、`:18001`→`127.0.0.1:8001`（`scripts/win-relay.mts:3-4,69-70`）。**注意 tier1 的现役端口没被转发**：`:3065` 那一端的 Agent2API 代理已停用，tier1 现行代理是 `:7863` 的 workbuddy2api（`config/models.yml:19-21`），而 `scripts/` 里没有任何 `7863` 的转发规则。在 WSL 里跑 primary 轨之前，需要自己给 `win-relay.mts` 的 `rules` 数组补一条 `{ listenPort: 13066, targetPort: 7863 }` 并把 `config/models.yml` 里 tier1 的 `base_url` 改成转发后的地址（`setup` 会检测并提示这条缺口——转发哪个端口取决于你的模型服务，脚本猜不出来，所以它只报告不代劳）。原生 Windows 部署不需要 relay。
+WSL 部署时，Windows 侧的 loopback 模型服务需要 `scripts/win-relay.mts` 转发（WSL2 NAT 下，WSL 里的 127.0.0.1 是独立命名空间，够不着 Windows 的 loopback），启动器 `scripts/start-relay.ps1`。该脚本转两条：`:13065`→`127.0.0.1:3065`、`:18001`→`127.0.0.1:8001`（`scripts/win-relay.mts`）。**当前 tier1 是 `127.0.0.1:3065`，正好被 `13065` 覆盖**，所以 WSL 里把 `config/models.yml` 的 `base_url` 改成 `http://<WSL 默认网关>:13065/v1` 即可（`scripts/live-wsl-e2e.sh` 会自动做这一步）。若你换回 `:7863` 那类未被转发的端口，需自己给 `win-relay.mts` 的 `rules` 补一条，`setup` 会检测并提示这条缺口。原生 Windows 部署不需要 relay。
 
 ---
 

@@ -799,5 +799,55 @@ steps: 1:llm=succeeded | 2:tool:fs.write=succeeded | 3:llm=succeeded | 4:llm=suc
 **真实飞书：🟡 半验证。** daemon 启动日志显示"飞书凭证校验通过""飞书长连接已建立"，
 但**没有做一次真实的收发往返**（那需要主人那边确认收到了消息）。
 
-**下一步就一件事**：在一台有 docker 的 Linux/WSL 机器上 `DOTD_FLEET=docker` 起一次，
-看真实容器里 `fs.write` / `shell.run` / `browser.*` 是否成立。那是唯一还没跨过的门槛。
+**下一步就一件事**：在一台有 docker 的 Linux/WSL 机器上 `DOTD_FLEET=docker` 起一次。
+
+### 27.1 我为什么当时没能启动真容器（现场记录，2026-10-18 上午）
+
+我先前的判断"本机无 dockerd"是**错的**——我只看了原生 Windows，没查 WSL。实际：
+
+```
+wsl -l -v          → Ubuntu-24.04  Running
+wsl docker version → 29.1.3          ← dockerd 活着
+wsl docker ps -a   → dotd-dot-dot1   Exited (255) 12 hours ago
+                     probe-x         dotd/exec:1.49.1-0.1.0
+```
+
+也就是说 **dotd 的容器以前真的在 WSL 里跑过**，镜像 `dotd/exec:1.49.1-0.1.0` 也在。
+
+但这次跑不动，根因是**内存**，不是配置：
+
+| 观测 | 值 |
+|---|---|
+| WSL 内存上限（`.wslconfig`） | `memory=24GB` |
+| netfuzz fuzz 集群 RSS | ~20GB（十几个 libFuzzer，各 `-rss_limit_mb=2048`、`-max_total_time=43200` 即 12 小时） |
+| WSL 内 `MemAvailable` | **4GB** |
+| `vmmem` 进程占用 | **23.7GB** |
+
+在这个状态下，连 `wsl.exe -e echo ok` 都要 **54 秒**然后报 `WSL_E_SERVICE_STOPPED`。
+`.wslconfig` 的注释自己记着这台机器历史上多次因内存耗尽被 Windows 杀掉 vmmem——
+"each time wiping the whole fleet"。**fuzz 集群与 dotd 容器不能同时跑，这是硬约束。**
+
+按主人指示把 fuzz 进程 `renice 19` + `ionice -c3` 之后，CPU 优先级问题解决了，
+但**内存问题解决不了**（nice 不释放 RSS），所以真容器验证仍然跑不动。
+
+### 27.2 为此交付的东西：`scripts/live-wsl-e2e.sh`
+
+一条命令在 WSL 里跑完整验证，**前置条件逐项检查并给出可执行的下一步**（不满足就明确告诉你缺什么）：
+
+```bash
+# 在 Windows 侧先起 relay（WSL 的 127.0.0.1 够不着 Windows 的模型服务）
+node --import tsx scripts/win-relay.mts     # 13065 -> 127.0.0.1:3065
+
+# 在 WSL 里
+bash scripts/live-wsl-e2e.sh
+```
+
+七步：前置检查（docker / node / **MemAvailable ≥ 3GB**）→ 凭据与端点（自动把 tier1 指向 relay）
+→ `DOTD_FLEET=docker` 起 daemon → 提交真任务 → 等终态 → **真容器证据**（`docker ps` 看容器、
+`docker exec` 读回模型写的文件）→ 汇总。退出码 0 = 端到端通过。
+
+特别地，它会在内存不足时**直接拒绝跑并说明原因**，而不是让你对着一个超时去猜——
+这正是这轮踩的坑。
+
+**下一步就一件事**：停掉 netfuzz（或调大 `.wslconfig` 的 memory 后 `wsl --shutdown`），
+然后跑 `bash scripts/live-wsl-e2e.sh`。
