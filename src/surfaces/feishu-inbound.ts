@@ -53,6 +53,8 @@ export type FeishuInboundDecision =
       eventId: string;
       chatId: string;
       text: string;
+      /** 图片消息才有：飞书 image_key（本体需另外下载，见 feishu-media.ts）。 */
+      imageKey?: string;
       raw: RawInbound;
     }
   /** 其余合法事件：落事件流 ack（202），不建任务。 */
@@ -143,9 +145,32 @@ export function classifyFeishuInbound(
     if (!ownerSet.has(chatId)) {
       return { kind: 'reject', reason: 'allowlist', detail: `chat_id ${chatId} 非主人会话` };
     }
+    // 图片消息（2026-10-18 多模态）：content 里只有 image_key，本体要另外下载。
+    // 文本为空但有 image_key → 仍然建任务，由 handleFeishuCallback 负责下载并合成描述。
+    let imageKey: string | null = null;
+    if (msgType === 'image') {
+      try {
+        const parsed = JSON.parse(String(message['content'] ?? '{}')) as { image_key?: unknown };
+        if (typeof parsed.image_key === 'string' && parsed.image_key.length > 0) imageKey = parsed.image_key;
+      } catch {
+        imageKey = null;
+      }
+      if (imageKey !== null) {
+        return {
+          kind: 'message',
+          dedupKey,
+          eventId,
+          chatId,
+          text: text.length > 0 ? text : '（主人发来一张图片）',
+          imageKey,
+          raw: { source: 'http', dotId, text, payload: obj, dedupKey, actor: `feishu:${chatId}` },
+        };
+      }
+    }
     if (text.length === 0 || (msgType.length > 0 && msgType !== 'text')) {
       // 空文本/非文本消息：ack 不建任务、不进事件管线（防 §6 匹配器误建任务）
-      return { kind: 'ignore', reason: 'non_text', detail: msgType.length > 0 ? `消息类型 ${msgType} 非文本` : '文本为空', eventId };
+      const why = msgType === 'image' ? '图片消息但取不到 image_key' : msgType.length > 0 ? `消息类型 ${msgType} 非文本` : '文本为空';
+      return { kind: 'ignore', reason: 'non_text', detail: why, eventId };
     }
     const raw: RawInbound = {
       source: 'http',
@@ -198,6 +223,15 @@ export interface FeishuInboundDeps {
   dotId?: string;
   /** 长连接（WSClient）路径置 true：来源由 app 凭据证明，跳过 token 校验。 */
   trustedTransport?: boolean;
+  /**
+   * 图片下载器（2026-10-18 多模态）。不注入 = 图片消息按纯文本处理（行为与改动前一致）。
+   * 装配层传 feishu-media.ts 的实现。
+   */
+  media?: {
+    downloadImage(
+      imageKey: string,
+    ): Promise<{ ok: true; media: { path: string; sizeBytes: number; contentType: string } } | { ok: false; error: string }>;
+  };
 }
 
 /**
@@ -251,14 +285,30 @@ export async function handleFeishuCallback(
       if (!claimFeishuMessage(deps.db, decision.dedupKey, decision.raw.actor, Date.now())) {
         return { httpStatus: 200, body: { dup: true } };
       }
+      // **图片消息**（2026-10-18 多模态）：先把图下载到 home 卷，再把路径写进任务目标。
+      // 下载失败也要建任务——把失败原因如实告诉模型/主人，不能静默当没收到图。
+      let goalText = decision.text;
+      if (decision.imageKey !== undefined && deps.media !== undefined) {
+        const dl = await deps.media.downloadImage(decision.imageKey);
+        if (dl.ok) {
+          goalText =
+            `${decision.text}\n\n【附件】主人发来一张图片，已保存到 home 内的 \`${dl.media.path}\`` +
+            `（${dl.media.sizeBytes} 字节，${dl.media.contentType}）。` +
+            `可用 fs.stat / fs.read 确认它存在；如需识别图片内容，请据此文件作答。`;
+        } else {
+          goalText =
+            `${decision.text}\n\n【附件获取失败】主人发来一张图片，但下载失败：${dl.error}。` +
+            `请如实告诉主人"图没拿到"以及原因，不要凭空描述图片内容。`;
+        }
+      }
       // 与 /api/messages 相同的任务链（契约 S-1），channel 换 'feishu'
       const threadId = await deps.mem.openThread(decision.raw.dotId, 'feishu', {
         externalRef: `feishu:${decision.chatId}`,
       });
-      await deps.mem.appendMessage(threadId, { role: 'user', kind: 'text', content: decision.text });
+      await deps.mem.appendMessage(threadId, { role: 'user', kind: 'text', content: goalText });
       const task = deps.cp.submit({
         title: decision.text.slice(0, 60),
-        goal: decision.text,
+        goal: goalText,
         priority: 1,
         dotId: decision.raw.dotId,
         threadId,

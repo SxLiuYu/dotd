@@ -87,6 +87,7 @@ import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
 import { createSchedule, listSchedules } from './control-plane/schedules.ts';
+import type { ExecToolCall, ExecToolResult } from './shared/contracts.ts';
 import { CronExpressionParser } from 'cron-parser';
 import { createMemoryService } from './memory/MemoryService.ts';
 import { memoryWritePathsOfStep } from './memory/step-paths.ts';
@@ -289,6 +290,81 @@ async function restoreMemoryArchiveViaExec(
   } catch (cause) {
     return { ok: false, error: String(cause) };
   }
+}
+
+/**
+ * 飞书图片下载器（2026-10-18 多模态）。
+ *
+ * 为什么下载走执行面而不是宿主直写：home 卷挂在**容器**里，宿主没有它的路径。
+ * 所以流程是「宿主取 token 下载 → base64 交给容器的 fs.write 落盘」。
+ *
+ * 失败不抛：入站路径上抛错会让主人看到"消息被拒"，而真相只是"图没拿到"。
+ * 交给 handleFeishuCallback 把失败原因写进任务目标，让模型如实转告。
+ */
+function makeFeishuMedia(
+  getExec: () => { runTool: (call: ExecToolCall) => Promise<ExecToolResult> },
+  cfg: { appId: string; appSecret: string },
+): {
+  downloadImage(
+    imageKey: string,
+  ): Promise<{ ok: true; media: { path: string; sizeBytes: number; contentType: string } } | { ok: false; error: string }>;
+} {
+  return {
+    async downloadImage(imageKey) {
+      try {
+        // ① 取 tenant_access_token（与 channels.ts 同源逻辑，2h 有效；这里每次现取，量小）
+        const tokRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const tokJson = (await tokRes.json()) as { code?: number; tenant_access_token?: string };
+        if (tokJson.code !== 0 || typeof tokJson.tenant_access_token !== 'string') {
+          return { ok: false, error: `取飞书 token 失败（code=${tokJson.code ?? '?'}）` };
+        }
+        // ② 下载图片本体
+        const imgRes = await fetch(
+          `https://open.feishu.cn/open-apis/im/v1/images/${encodeURIComponent(imageKey)}`,
+          { headers: { authorization: `Bearer ${tokJson.tenant_access_token}` }, signal: AbortSignal.timeout(20_000) },
+        );
+        if (!imgRes.ok) return { ok: false, error: `下载图片失败：HTTP ${imgRes.status}` };
+        const ct = imgRes.headers.get('content-type') ?? '';
+        const buf = Buffer.from(await imgRes.arrayBuffer());
+        if (buf.byteLength === 0) return { ok: false, error: '下载到的图片为空' };
+        if (buf.byteLength > 12 * 1024 * 1024) return { ok: false, error: `图片过大（${buf.byteLength} 字节）` };
+        if (ct.includes('application/json')) {
+          return { ok: false, error: `飞书返回错误：${buf.toString('utf8').slice(0, 160)}` };
+        }
+        // ③ 按魔数定扩展名
+        const ext =
+          buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 ? 'png'
+          : buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 ? 'jpg'
+          : buf.length >= 6 && buf.subarray(0, 3).toString('ascii') === 'GIF' ? 'gif'
+          : buf.length >= 12 && buf.subarray(8, 12).toString('ascii') === 'WEBP' ? 'webp'
+          : null;
+        if (ext === null) return { ok: false, error: `不认识的图片格式（content-type=${ct || '空'}）` };
+        // ④ 交给容器写进 home 卷
+        const rel = `media/${imageKey.replace(/[^A-Za-z0-9_-]/g, '_')}.${ext}`;
+        const w = await getExec().runTool({
+          call_id: `feishu-img-${Date.now()}`,
+          task_id: 'feishu-inbound-media',
+          dot_id: 'dot1',
+          issued_at: new Date().toISOString(),
+          tool: 'fs.write',
+          args: { path: rel, content_base64: buf.toString('base64') },
+          deadline_ms: 30_000,
+        });
+        if (w.status !== 'ok') {
+          const m = (w.error as { message?: string } | null)?.message ?? '写入失败';
+          return { ok: false, error: `图片保存失败：${m}` };
+        }
+        return { ok: true, media: { path: rel, sizeBytes: buf.byteLength, contentType: ct } };
+      } catch (cause) {
+        return { ok: false, error: String(cause) };
+      }
+    },
+  };
 }
 
 export function cpConcurrencyFromEnv(): Partial<{
@@ -991,6 +1067,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           bus,
           cfg: surfCfg.feishu,
           log,
+          // 图片下载器（2026-10-18 多模态）：飞书图片只有 image_key，本体要另取。
+          // 落盘位置是**容器内**的 /dot/home（宿主不直接持有 home 卷），
+          // 所以下载走容器的 fs.write 工具更合适——见下方 media 实现。
+          media: makeFeishuMedia(() => exec, { appId: surfCfg.feishu.appId, appSecret: surfCfg.feishu.appSecret }),
         })
       : null;
 

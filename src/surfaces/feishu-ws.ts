@@ -33,6 +33,12 @@ export interface FeishuWsDeps {
   dotId?: string;
   /** daemon 日志通道（[dotd] 前缀已在外面拼好）。 */
   log(msg: string): void;
+  /** 图片下载器（2026-10-18 多模态）；不注入 = 图片按纯文本处理。 */
+  media?: {
+    downloadImage(
+      imageKey: string,
+    ): Promise<{ ok: true; media: { path: string; sizeBytes: number; contentType: string } } | { ok: false; error: string }>;
+  };
 }
 
 /**
@@ -96,6 +102,7 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
         cfg: deps.cfg,
         dotId,
         trustedTransport: true,
+        ...(deps.media === undefined ? {} : { media: deps.media }),
       });
       if ('error' in out.body) {
         deps.log(`飞书长连接事件被拒（${out.body.error}）：${out.body.message}`);
