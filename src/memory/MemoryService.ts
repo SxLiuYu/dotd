@@ -309,12 +309,17 @@ export class MemoryServiceImpl implements MemoryService {
       // 真正打一次（虚表存在但索引损坏时，MATCH 会抛错；这里用 count 轻量探活）
       this.db.prepare('SELECT count(*) AS c FROM mem_messages_fts').get();
       this.ftsAvailable = true;
-      // 首次可用时做一次"索引是否落后于消息表"的对账（迁移回填 / 旁路写入兜底）。
-      // 只在探测那一次做，不进入热路径。
-      if (!this.ftsBackfilled) {
-        this.ftsBackfilled = true;
-        this.ensureMessageFts();
-      }
+      // **不要在这里做全量对账**（2026-10-19 实测改）。
+      //
+      // 原来这里有一句 `if (!this.ftsBackfilled) { this.ftsBackfilled = true; this.ensureMessageFts(); }`
+      // —— 注释写的是"不进入热路径"，但它**就在热路径上**：ftsProbe 由 syncMessageFts 调，
+      // 而 syncMessageFts 在 appendMessage 里，appendMessage 在 POST /api/messages 的处理里。
+      //
+      // 实测代价：冷启动后第一次发消息，ensureMessageFts→resyncMessageFts 要全量重灌
+      // 5349 条消息的索引 —— **appendMessage 耗时 15884 ms**，主人看到的就是"第一句话要等 15 秒"。
+      //
+      // 对账改由装配层在**启动阶段**调 `ensureMessageFts()` 完成（daemon.ts）。
+      // 这里只保留轻量探活：索引缺失/损坏时降级到 LIKE 检索，不影响写路径。
     } catch {
       this.ftsAvailable = false;
     }

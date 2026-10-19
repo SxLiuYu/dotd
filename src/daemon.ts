@@ -1294,6 +1294,18 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   cp.scheduler.start();
   log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention / exec.healthcheck）');
 
+  // **FTS 全量对账放在启动期**（2026-10-19 实测改）。
+  // 原来这一步藏在 MemoryService.ftsProbe() 里，由 appendMessage 首次触发 ——
+  // 也就是**主人发第一条消息时**才做全量重灌索引（5349 条 → appendMessage 耗时 15884 ms）。
+  // 挪到这里：启动时一次性做完，用户请求不再承担这笔开销。
+  // 失败不影响启动（检索会自动降级到 LIKE）。
+  try {
+    const n = memory.ensureMessageFts();
+    if (n > 0) log(`[memory] FTS 索引已对账（重灌 ${n} 条）`);
+  } catch (err) {
+    log(`[memory] FTS 对账失败（检索将降级 LIKE）：${String(err)}`);
+  }
+
   // ⑪ Runner 循环（常驻，数量 = 并发额度）
   //
   // **每个消费者一个循环**（2026-10-18 修）：原来只起 1 个 DotRunner.start()，

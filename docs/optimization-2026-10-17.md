@@ -4999,3 +4999,89 @@ runner: 领任务 tk_mvetq2cdz0emfe   ← 第 4 个（我的测试排这儿）
 ## 350. 本轮门禁
 
 默认并发 1 → 3 · 三条消息并行实测（总耗时 -55%）· `tsc` exit 0 · **`npm test` 1550/1550**
+
+---
+
+# 第七十一轮：第一句话为什么要等 15 秒（2026-10-19）
+
+## 351. 上轮改并发没解决冷启动
+
+并发 1→3 之后重测冷启动：**首次响应仍然 19.4 秒**。而重启前队列是**空的**，
+所以不是任务积压。
+
+## 352. 分层计时，一路追到底
+
+先测 daemon 启动：`/api/health` 首次 200 只要 **2.6 秒** —— 启动没问题。
+
+再测提交接口：`curl POST /api/messages` 用了 **15.51 秒**。
+
+然后逐层计时记忆操作：
+
+```
+openThread:           4.6 ms
+appendMessage:    15884.8 ms   ← 就是它
+buildContextBundle:  21.8 ms
+```
+
+## 353. 根因：一句"不进入热路径"的注释，它就在热路径上
+
+```ts
+private ftsProbe(): boolean {
+  ...
+  // 首次可用时做一次"索引是否落后于消息表"的对账。
+  // **只在探测那一次做，不进入热路径。**      ← 注释这么写
+  if (!this.ftsBackfilled) {
+    this.ftsBackfilled = true;
+    this.ensureMessageFts();                  ← 但它在这里
+  }
+}
+```
+
+调用链是：
+
+```
+POST /api/messages → appendMessage → syncMessageFts → ftsProbe → ensureMessageFts → resyncMessageFts
+```
+
+冷启动后第一次写消息，就会**全量重灌 5349 条消息的全文索引** —— 15.9 秒。
+
+## 354. 修法：把对账挪到启动期
+
+- `ftsProbe` 只保留轻量探活（表在不在、能不能 count）
+- `daemon.ts` 在 scheduler 启动后显式调 `memory.ensureMessageFts()`
+
+## 355. 实测
+
+```
+修复前: curl POST /api/messages = 15.51 秒
+修复后: curl POST /api/messages = 0.05 秒      ← 快了约 300 倍
+
+连续 5 次: 0.026 / 0.027 / 0.026 / 0.026 / 0.027 秒（稳定）
+
+appendMessage: 15884 ms → 16.8 ms              ← 快了 945 倍
+```
+
+## 356. 这轮的教训
+
+**注释里写"不在热路径上"不等于真的不在。** 判断热路径的唯一可靠方法是
+**从用户入口倒着追调用链**，而不是看某一层自己的注释。
+
+这已经是第三次了：
+- 第 65 轮："由重试兜底" —— 根本没有重试
+- 第 66 轮："缓存" —— 没有失效路径
+- 第 71 轮："不进入热路径" —— 就在热路径上
+
+**代码注释里的承诺，必须用实测验证。**
+
+## 357. 行为变更带来的测试更新
+
+`memory-fts.test.ts` 里原来断言"新实例首次探测即自动回填"——这正是我改掉的行为。
+改成：
+- 显式 `ensureMessageFts()` 能补齐（正向）
+- **`appendMessage` 不许做全量对账**（反向，带实测耗时断言 `< 2000ms`）
+- 且 `inSync` 保持 false（说明热路径确实没顺手补索引）
+
+## 358. 本轮门禁
+
+POST 15.51s → 0.026s · appendMessage 15884ms → 16.8ms ·
+**`npm test` 1553/1553**（+2 条热路径守卫，1 条旧断言已改写）

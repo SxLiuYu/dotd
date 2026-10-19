@@ -165,18 +165,41 @@ describe('① 迁移：fts 表存在、user_version=130、已有消息可回填'
     assert.equal(mem.ensureMessageFts(), 0, '已同步时 ensureMessageFts 是 no-op');
   });
 
-  test('首次探测时的自动对账：新实例遇到"索引落后"会自己补上', async () => {
-    // 模拟带老数据的库：写入消息（走双写）→ 清空索引 → 换一个新 MemoryService 实例，
-    // 它的首次 ftsProbe() 会做一次性对账，把落后的索引补齐（迁移后首次启动的真实路径）。
+  // 2026-10-19 行为变更：自动对账**不再挂在首次 ftsProbe() 上**，
+  // 因为那条路径在 appendMessage 的热路径里（实测冷启动首写要 15.9 秒）。
+  // 现在对账由装配层在启动期显式调 ensureMessageFts()。
+  test('显式对账：索引落后时 ensureMessageFts() 能补齐', async () => {
+    // 模拟带老数据的库：写入消息（走双写）→ 清空索引 → 显式对账把它补回来。
     const t = await thread();
     await mem.appendMessage(t, { role: 'user', kind: 'text', content: '自动对账要能救回的会议记录' });
     tmp.db.exec("INSERT INTO mem_messages_fts(mem_messages_fts) VALUES('delete-all')");
     assert.equal(mem.ftsStatus().indexed, 0);
 
     const fresh = new MemoryServiceImpl({ db: tmp.db });
+    // 启动期该做的就是这一句（daemon.ts 在 scheduler 启动后调用）
+    const n = fresh.ensureMessageFts();
+    assert.ok(n > 0, 'ensureMessageFts 应真的重灌了索引');
+
     const hits = await fresh.searchMessages('会议', { limit: 5 });
-    assert.equal(hits.length, 1, '新实例首次探测即自动回填，检索立刻可用');
+    assert.equal(hits.length, 1, '对账后检索立刻可用');
     assert.equal(fresh.ftsStatus().inSync, true);
+  });
+
+  test('写消息的热路径不做全量对账（冷启动首次发消息不该等）', async () => {
+    const t = await thread();
+    await mem.appendMessage(t, { role: 'user', kind: 'text', content: '热路径不该触发重灌' });
+    tmp.db.exec("INSERT INTO mem_messages_fts(mem_messages_fts) VALUES('delete-all')");
+
+    const fresh = new MemoryServiceImpl({ db: tmp.db });
+    const t0 = process.hrtime.bigint();
+    await fresh.appendMessage(await fresh.openThread('dot1', 'web'), {
+      role: 'user',
+      kind: 'text',
+      content: '这一条不该等 15 秒',
+    });
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(ms < 2000, `appendMessage 不该做全量对账（实测 ${ms.toFixed(0)}ms，修复前 15884ms）`);
+    assert.equal(fresh.ftsStatus().inSync, false, '热路径不会顺带把索引补好 —— 这是有意的');
   });
 
   test('建库模板（db/template.ts）同样建出可检索的库——迁移包与模板一致性', async () => {
