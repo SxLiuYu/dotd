@@ -252,6 +252,88 @@ export class Fleet {
       .run(dockerId, endpoint, new Date().toISOString(), row.id);
   }
 
+  /**
+   * **按 docker 实况校正容器记录**（2026-10-20 修，S6 判据内的真缺陷）。
+   *
+   * 现场：容器工具全部返回 `container_not_ready（容器状态 unhealthy 不可派发）`，
+   * 模型连续重试 3 次全失败，最后把 DSML 标签原样吐给主人。
+   * 查下去发现 `containers.endpoint` 还是 `172.18.0.3:9223`，
+   * 而容器真实 IP 已经是 `172.21.0.2` —— **Docker 网络重排把 IP 换了**。
+   *
+   * 死锁是这样形成的：
+   *   ① `ExecService.probeHealth` 拿**库里的 endpoint** 发 HTTP 探活 → 打不到 → 失败；
+   *   ② 连续 3 次失败 → `ready → unhealthy`；
+   *   ③ `periodicHealthCheck` 想恢复，但它**又用同一个旧 endpoint 探活** → 还是失败；
+   *   ④ `wakeForDispatch` 只认 suspended/idle/stopped/idle_stop_requested，
+   *      **unhealthy 不在名单里** → 永远不会被唤醒。
+   * 于是「探活失败 → 判 unhealthy → 靠探活恢复 → 探活还失败」成了闭环，
+   * 除了人工改库 / 重启 daemon，没有出口。这正是 S6「连续 7 天无人工干预」的硬伤：
+   * 只要 Docker 重排一次 IP，容器能力就永久报废，而判据会看到"进程没重启、没句柄泄漏"，
+   * 一路绿灯 —— 直到探针成功率掉下来才发现，那时已经白跑了。
+   *
+   * 修法：探活失败时**不要只信库里的 endpoint**，直接问 docker 要实况：
+   *   · 原 container id 还在跑 → 读它现在的 IP，endpoint 不一致就写回；
+   *   · 原 id 已不存在（被重建过） → 按 label `dotd.dot=<dotId>` 重新发现。
+   * 返回校正后的 endpoint（拿不到返回 null，调用方按失败处理）。
+   *
+   * 注意：**只改记录，不重启容器** —— 重启是 watchdog/recreate 的职责（职责分开）。
+   */
+  async resyncEndpointFromDocker(dotId: string): Promise<string | null> {
+    const row = this.getContainer(dotId);
+    if (row === null) return null;
+
+    const readIp = async (id: string): Promise<string | null> => {
+      try {
+        const ip = await this.deps.backend.containerIp(id);
+        return ip !== null && ip.length > 0 ? ip : null;
+      } catch {
+        return null;
+      }
+    };
+    const toEndpoint = (ip: string): string => {
+      // 端口沿用记录里的（容器内 runtime 端口由镜像固定，IP 变端口不变）
+      let port = 9223;
+      if (row.endpoint !== null) {
+        const m = /:(\d+)$/.exec(row.endpoint);
+        if (m !== null) port = Number(m[1]);
+      }
+      return `http://${ip}:${port}`;
+    };
+
+    // ① 原 id 还在：直接读当前 IP
+    if (row.docker_container_id !== null) {
+      const ip = await readIp(row.docker_container_id);
+      if (ip !== null) {
+        const ep = toEndpoint(ip);
+        if (ep !== row.endpoint) {
+          this.db
+            .prepare('UPDATE containers SET endpoint = ?, updated_at = ? WHERE id = ?')
+            .run(ep, new Date().toISOString(), row.id);
+        }
+        return ep;
+      }
+    }
+
+    // ② 原 id 不在了（被重建/被删）：按 label 重新发现
+    let list: import('./types.ts').DockerContainerListItem[];
+    try {
+      list = await this.deps.backend.listManagedContainers();
+    } catch {
+      return null;
+    }
+    const mine = list.filter((c) => c.Labels['dotd.dot'] === dotId && c.State === 'running');
+    // 多个时取 Id 最大的（与 getContainer 的 `ORDER BY id DESC` 同向：最新建的优先）
+    const pick = mine.slice().sort((a, b) => (a.Id < b.Id ? 1 : -1))[0];
+    if (pick === undefined) return null;
+    const ip = await readIp(pick.Id);
+    if (ip === null) return null;
+    const ep = toEndpoint(ip);
+    this.db
+      .prepare('UPDATE containers SET docker_container_id = ?, endpoint = ?, updated_at = ? WHERE id = ?')
+      .run(pick.Id, ep, new Date().toISOString(), row.id);
+    return ep;
+  }
+
   setTokenHash(dotId: string, hash: string | null): void {
     const row = this.getContainer(dotId);
     if (row === null) return;

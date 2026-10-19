@@ -1414,7 +1414,18 @@ export class ExecServiceImpl implements ExecService {
     const row = this.fleet.getContainer(dotId);
     const token = await this.fleet.currentToken(dotId);
     if (row?.endpoint == null || token === null) return false;
-    return this.probeHealthRaw(row.endpoint, token);
+    if (await this.probeHealthRaw(row.endpoint, token)) return true;
+
+    // **探活失败不一定是容器坏了，也可能只是库里 endpoint 过期**（2026-10-20 修）。
+    // 现场：Docker 网络重排把容器 IP 从 172.18.0.3 换到 172.21.0.2，
+    // `containers.endpoint` 没跟着变 → 探活永远打不到 → 连续 3 次判 unhealthy →
+    // 而恢复路径**又用同一个旧 endpoint 探活**，于是自我恢复成了死循环，
+    // 所有容器工具永久返回 container_not_ready。见 fleet.resyncEndpointFromDocker 注释。
+    // 这里先按 docker 实况校正记录，再重试一次：容器是真的好的，就应当恢复。
+    const synced = await this.fleet.resyncEndpointFromDocker(dotId);
+    if (synced === null || synced === row.endpoint) return false;
+    console.error(`[exec] 容器 endpoint 已按 docker 实况校正：${row.endpoint} → ${synced}`);
+    return this.probeHealthRaw(synced, token);
   }
 
   private async probeHealthRaw(endpoint: string, token: string): Promise<boolean> {

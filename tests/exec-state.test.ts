@@ -569,3 +569,84 @@ test('getDotStatus / getContainerStats：字段齐全，hasInflightCall 判据�
     t.cleanup();
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// ㉑ endpoint 过期自愈（2026-10-20 修，S6 判据内的真缺陷）
+// ═══════════════════════════════════════════════════════════════════
+//
+// 现场（真实 7 天窗口第 5 小时）：容器工具全部返回
+//   container_not_ready（容器状态 unhealthy 不可派发（需 ready））
+// 模型连续重试 3 次全失败，最后把 DSML 标签原样吐给主人。
+//
+// 查下去：containers.endpoint = http://172.18.0.3:9223，
+// 而容器真实 IP 已经是 172.21.0.2 —— Docker 网络重排换了 IP，记录没跟着变。
+// 死锁：
+//   ① probeHealth 拿**库里的 endpoint** 探活 → 打不到 → 失败；
+//   ② 连续 3 次失败 → ready → unhealthy；
+//   ③ periodicHealthCheck 想恢复，**又用同一个旧 endpoint 探活** → 还是失败；
+//   ④ wakeForDispatch 只认 suspended/idle/stopped/idle_stop_requested，
+//      **unhealthy 不在名单** → 永远不唤醒。
+// 于是「探活失败→判 unhealthy→靠探活恢复→探活还失败」成闭环，没有出口。
+// 这正是 S6「连续 7 天无人工干预」的硬伤：Docker 重排一次 IP 就报废容器能力，
+// 而判据只看到"进程没重启、没句柄泄漏"，一路绿灯。
+//
+// 修法：探活失败时直接问 docker 要实况，把 endpoint 校正回来再重试。
+test('endpoint 过期：docker 实况 IP 变了，resyncEndpointFromDocker 要能纠正', async () => {
+  const t = makeTempDataDir();
+  try {
+    const svc = new ExecServiceImpl({ db: t.db, bus: t.bus, cfg: { tokenDir: t.root } });
+    await svc.boot(['dot-a']);
+    const row0 = svc.fleet.getContainer('dot-a');
+    assert.ok(row0 != null);
+    const goodEp = row0.endpoint;
+    assert.ok(goodEp !== null && goodEp !== undefined);
+
+    // 造一个 seed 容器，其 id/labels 与库里不同（模拟"容器被重建"）
+    const backend = (svc.fleet as unknown as { deps: { backend: import('../src/exec/fleet.ts').StubBackend } }).deps.backend;
+    backend.seedContainer({ id: 'docker-real-1', state: 'running', labels: { 'dotd.dot': 'dot-a', 'dotd.managed': '1' } });
+
+    // 把库里的 endpoint 改成一个打不到的旧 IP（模拟 Docker 换 IP）
+    t.db.prepare('UPDATE containers SET endpoint=?, docker_container_id=? WHERE dot_id=?')
+      .run('http://10.99.99.99:9223', 'stub-gone-999', 'dot-a');
+
+    const synced = await svc.fleet.resyncEndpointFromDocker('dot-a');
+    assert.ok(synced !== null, 'docker 里容器还在跑，必须能重新发现并给出新 endpoint');
+    assert.ok(synced.startsWith('http://172.18.'), '新 endpoint 应来自 docker 实况 IP：' + String(synced));
+    assert.notEqual(synced, 'http://10.99.99.99:9223', '不能原样返回那个打不到的旧 endpoint');
+
+    // 必须落库（否则下次探活又用旧值）
+    const row1 = svc.fleet.getContainer('dot-a');
+    assert.equal(row1?.endpoint, synced);
+    assert.notEqual(row1?.docker_container_id, 'stub-gone-999', '那个 id 在 docker 里不存在，必须换掉');
+    // 注意：**不能断言一定选 docker-real-1**。boot() 自己也建了一个 running 容器，
+    // 两者都带 dotd.dot=dot-a，"多个候选选哪个"是排序策略（取 Id 最大），
+    // 不是这条判据要守的东西。这里只守"必须换成 docker 里真实存在的一个"。
+    const be2 = (svc.fleet as unknown as { deps: { backend: import('../src/exec/fleet.ts').StubBackend } }).deps.backend;
+    const all = await be2.listManagedContainers();
+    assert.ok(all.some((c) => c.Id === row1?.docker_container_id),
+      '落库的 container id 必须在 docker 实况里找得到：' + String(row1?.docker_container_id));
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('endpoint 过期：容器真的没了时返回 null（不许编一个地址出来）', async () => {
+  const t = makeTempDataDir();
+  try {
+    const svc = new ExecServiceImpl({ db: t.db, bus: t.bus, cfg: { tokenDir: t.root } });
+    await svc.boot(['dot-a']);
+    // boot() 会真的建一个容器：要先把它从 docker 侧删掉，
+    // 否则"容器还在"是事实，函数返回非 null 反而是对的。
+    const be = (svc.fleet as unknown as { deps: { backend: import('../src/exec/fleet.ts').StubBackend } }).deps.backend;
+    const bootedId = svc.fleet.getContainer('dot-a')?.docker_container_id;
+    assert.ok(bootedId != null);
+    await be.removeContainer(bootedId);
+    // 库里指向一个不存在的容器，docker 里也没有任何 dot-a 的容器
+    t.db.prepare('UPDATE containers SET endpoint=?, docker_container_id=? WHERE dot_id=?')
+      .run('http://10.99.99.99:9223', 'stub-gone-999', 'dot-a');
+    const synced = await svc.fleet.resyncEndpointFromDocker('dot-a');
+    assert.equal(synced, null, '容器不在时必须如实返回 null，不能假装修好了');
+  } finally {
+    t.cleanup();
+  }
+});
