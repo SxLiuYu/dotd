@@ -46,7 +46,11 @@ tools:
       # net.post 的管控（实测 curl POST 拿到 HTTP 200）。同理 nc/telnet/ssh 等也是通路。
       # 加这一批的代价：正常的"用 curl 抓个网页"会走审批。这是有意的 ——
       # 想抓网页请用 net.get（read 档，直接放行），shell 里的网络命令一律当危险动作。
-      whenContains: ["rm ", "sudo ", "docker ", "> /dev/", "curl ", "wget ", "nc ", "telnet ", "ssh ", "scp ", "ftp "]
+      # 匹配对象是**整个 JSON 参数**（gate.ts upgradeHit: JSON.stringify(params) 子串命中），
+      # 所以 /`https://` 这种"URL 形态"词能一网打尽所有出网写法（curl/wget/python urllib/
+      # git clone/node fetch…），比穷举命令名可靠得多。2026-10-19 实测：
+      # 只列 curl/wget 时，`python3 -c "import urllib.request; urlopen('https://…')"` 直接绕过。
+      whenContains: ["rm ", "sudo ", "docker ", "> /dev/", "http://", "https://", "ftp://", "ssh://", "rmdir", "unlink", "shred", "truncate", "curl ", "wget ", "nc ", "ncat", "telnet ", "ssh ", "scp ", "rsync "]
   - name: browser.open
     tier: read                              # 只导航不交互
   - name: browser.act                       # click/type/submit 合并为一个动作工具
