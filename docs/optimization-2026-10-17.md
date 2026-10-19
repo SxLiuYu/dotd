@@ -5085,3 +5085,94 @@ appendMessage: 15884 ms → 16.8 ms              ← 快了 945 倍
 
 POST 15.51s → 0.026s · appendMessage 15884ms → 16.8ms ·
 **`npm test` 1553/1553**（+2 条热路径守卫，1 条旧断言已改写）
+
+---
+
+# 第七十二轮：模型网关 relay 根本没有在跑（2026-10-19）
+
+## 359. 从"冷启动 13 秒"追到一个更严重的问题
+
+上轮把 FTS 从热路径挪走后，POST 只要 0.026 秒。但任务执行仍要 13 秒，继续追。
+
+先重启测冷启动，结果任务状态是 `paused`：
+
+```
+status: paused
+stop_reason: circuit_open
+last_error: TransportError: connect ECONNREFUSED 172.17.48.1:13065
+```
+
+**模型网关连不上。**
+
+## 360. 但网关容器是健康的
+
+```
+gpt-load 容器: Up About an hour (healthy)
+端口映射: 1455, 3001, 51121, 54545     ← 没有 13065
+13065 监听: 无
+```
+
+架构是：`dotd → 172.17.48.1:13065（Windows relay）→ 3065（gpt-load）`。
+**Windows 侧那个 relay 进程不见了。**
+
+```
+Windows 侧 13065: 无监听
+relay 进程:       没有
+```
+
+跑 `scripts/start-dotd-stack.ps1` 拉起来后：
+
+```
+Windows 13065 监听: ✅
+从 WSL 探网关:    HTTP 200 ✅
+新任务:          done ✅
+```
+
+## 361. 但这暴露了第二个缺口
+
+网关修好后新任务正常，**之前因熔断暂停的那个任务却永远卡着**。
+
+查三方状态：
+
+```
+熔断器(broker): closed    ← 已经恢复
+router mode:    NORMAL    ← 从头到尾没变过
+任务:            paused    ← 卡死
+```
+
+`CP` 只订阅了 `router.mode_changed`，判据是：
+
+```ts
+if (!degraded(ev.payload.from) || degraded(ev.payload.to)) return;
+// from 必须是 TOTAL_OUTAGE/EMERGENCY/RESTRICTED 才恢复
+```
+
+但**端点级熔断恢复时 router mode 不会变**（它还停在 NORMAL），
+所以这个事件永远不触发 —— 任务只能靠主人手动 resume。
+
+修复：同时订阅 `router.breaker_changed`，任一端点转到 `closed` 就唤醒。
+
+## 362. 一个还没查完的疑点
+
+实测发现：**breaker 一直是 `closed`，任务却因 `circuit_open` 暂停了。**
+
+说明暂停逻辑可能在"全部端点不可达（AllEndpointsDownError）"时误标成了
+`circuit_open` —— 而熔断器本身根本没打开。这两件事应该分开：
+- **熔断**（breaker open）：端点级故障，有 backoff
+- **全端点不可达**：配置/网关层问题，应该给更明确的 stop_reason
+
+这个疑点没查完，留到下一轮。
+
+## 363. 一个操作事故
+
+为了复现"熔断恢复"，我用 `iptables` 阻断网关端口做实验，
+**把 WSL 弄进了 `E_ILLEGAL_STATE_CHANGE` 状态**，连 `wsl --shutdown` 都不响应，
+需要人工重启。
+
+教训：**破坏性实验不该在生产运行环境上做**。这个场景完全可以用
+单元测试或直接构造事件来验证，代价小得多。
+
+## 364. 本轮门禁
+
+网关链路恢复（HTTP 200）· 新任务正常 done · 遗留暂停任务已清理 ·
+**`npm test` 1553/1553** · `breaker_changed` 订阅已加（含 shutdown 注销）

@@ -232,6 +232,29 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
   // 旧稿缺失此接线：熔断暂停的任务除主人手动 resume 外永远卡在 paused。
   // RouterMode 词表：NORMAL/LOCAL_FALLBACK/EMERGENCY/RESTRICTED/TOTAL_OUTAGE。
   // 判据：to 不是 TOTAL_OUTAGE 且 from 是 TOTAL_OUTAGE/EMERGENCY/RESTRICTED → 恢复。
+  // **端点级熔断恢复也要唤醒暂停任务**（2026-10-19 实测补）。
+  //
+  // 上面的 mode_changed 订阅只在 **router mode** 从降级态（TOTAL_OUTAGE/EMERGENCY/
+  // RESTRICTED）恢复时才触发。但实测发现一种常见情况它覆盖不到：
+  //
+  //   模型网关短暂不可达 → **端点熔断**（breaker open）→ 任务 paused(circuit_open)
+  //   → 网关恢复 → breaker 自己转 closed
+  //   → **router mode 从头到尾都是 NORMAL**，mode_changed 根本没发
+  //   → 任务永远卡在 paused，只有主人手动 resume
+  //
+  // 现场：gpt-load 网关端口没起来，一个任务 paused；网关修好后新任务正常，
+  // 那个旧任务一直卡着。查库发现 breaker 已 closed、mode 一直 NORMAL。
+  //
+  // 修法：同时订阅端点级事件，任一端点转 closed 就尝试唤醒。
+  // resumeCircuitOpenTasks 内部幂等（没东西可恢复就是空操作），重复调用无害。
+  const offBreakerChanged = bus.on<{ endpointId: string; track: string; from: string; to: string }>(
+    'router.breaker_changed',
+    (ev) => {
+      if (ev.payload.to !== 'closed') return;
+      queue.resumeCircuitOpenTasks();
+    },
+  );
+
   const offModeChanged = bus.on<{ from: string; to: string }>('router.mode_changed', (ev) => {
     const degraded = (m: string): boolean =>
       m === 'TOTAL_OUTAGE' || m === 'EMERGENCY' || m === 'RESTRICTED';
@@ -386,6 +409,7 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     },
     shutdown(): void {
       offModeChanged();
+      offBreakerChanged();
       scheduler.stop();
       db.prepare(
         `INSERT INTO resource_events(ts, level, kind, detail) VALUES(?, 'normal', 'watchdog', ?)`,
