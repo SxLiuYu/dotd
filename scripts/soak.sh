@@ -43,7 +43,15 @@ do_sample() {
   # 2026-10-19 实测就踩到了 —— 采样 3 个点算出"RSS 增长 -32.1MB"，看着很好，
   # 其实是中途 daemon 被重启过，拿"新进程的小内存"减"旧进程的大内存"，
   # 毫无意义。只有同一个 daemon 生命周期内的首尾差才是"增长"。
-  proc_start=$(stat -c %Y "/proc/$pid" 2>/dev/null || echo 0)
+  # **进程启动时刻不能用 `stat -c %Y /proc/$pid`**（2026-10-19 修，真缺陷）：
+  # 那是 /proc/<pid> **目录的 mtime**，进程一新增 fd/线程就会变。
+  # 现场：报出"生命周期数 2"但两段的 pid 都是 1303 —— 同一个进程被算成两次重启，
+  # 于是凭空冒出一条"无自愈记录，疑似人工干预"，把报告搞成假警报。
+  # 正确做法：/proc/stat 的 btime（开机时刻）+ /proc/<pid>/stat 第 22 字段（启动后 tick 数）。
+  proc_start=$(awk -v pid="$pid" '
+    BEGIN{ while((getline l < "/proc/stat")>0) if(l ~ /^btime/){ split(l,a," "); bt=a[2]; break } close("/proc/stat") }
+    { n=split($0,f," "); print bt + int(f[22]/100) }' "/proc/$pid/stat" 2>/dev/null | head -1)
+  proc_start=${proc_start:-0}
   node -e '
 const fs=require("fs");
 const o={ts:Number(process.argv[1]),alive:true,rss_kb:Number(process.argv[2]),
