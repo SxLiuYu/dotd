@@ -139,6 +139,17 @@ fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
 
 do_probe() {
   local tid st t0 ok=0 ts
+  # **"没测到" 和 "测到失败" 不能都写成空串**（2026-10-20 修）。
+  #
+  # 现场：7 个任务 status=done、答案也对，但主人什么都没收到 ——
+  # 因为任务全过程只有 tool_call、没有一句 kind='text' 的正文，
+  # lastAssistantText() 返回 null，出站被静默跳过（feishu-outbound.ts L257）。
+  # 而 probe 这边：OUT_OK 只在"进了 done 分支并查过出站表"时才赋值，
+  # 没进分支就从未定义 → 落盘时写成空字符串 `"out":""`。
+  # 结果：**"根本没检查" 和 "检查了但没发出去" 在数据里长得一模一样**，
+  # 事后分不清是该查"模型没给正文"还是"飞书没发出去"。
+  # 所以先把两个子判据显式初始化为 "?"（未测），测到了再写 0/1。
+  local OUT_OK="?" WS_OK="?"
   ts=$(date +%s)
   set -a; . ./_tokens_src.env 2>/dev/null; set +a
   local base=http://127.0.0.1:7788
@@ -1153,9 +1164,14 @@ if(passRate!==null){
     const noWs=bad.filter(p=>p.ws!==undefined && String(p.ws)==="0").length;
     // 既没送达也没入站：归为"飞书这条链路整个没通"，单列一桶
     const bothDown=bad.filter(p=>String(p.out)==="0" && String(p.ws)==="0").length;
-    const noChannelOnly=bad.filter(p=>p.out!==undefined && String(p.out)!=="0" &&
-                                       p.ws!==undefined && String(p.ws)!=="0").length;
-    const noChannel=bad.filter(p=>!p.out || !p.ws).length;
+    // **"未测到" 现在有两种写法**（2026-10-20）：老数据是空串 `""`，
+    // 新数据是 `"?"`（明确表示"任务没走到出站检查"）。两者都算"没测到"。
+    // 原来只判 `!p.out`，而 `"?"` 是真值 → 加上 ? 之后这条归因会**静默归零**，
+    // 报告会变成"0 次没拿到完整子判据"，把真问题洗白。
+    const notTested=(v)=>v===undefined || v===null || v==="" || v==="?";
+    const noChannelOnly=bad.filter(p=>!notTested(p.out) && String(p.out)!=="0" &&
+                                       !notTested(p.ws) && String(p.ws)!=="0").length;
+    const noChannel=bad.filter(p=>notTested(p.out) || notTested(p.ws)).length;
     c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败，可重叠计数：`+
            `${noOut} 次飞书出站未送达 / ${noWs} 次飞书入站长连接不在 / `+
            `${noChannel} 次探针没拿到完整子判据 / ${noChannelOnly} 次出站入站都正常但答案不对）`+
