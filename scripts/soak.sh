@@ -449,6 +449,32 @@ const maxFd=all.length? Math.max(...all.map(s=>s.fd)) : 0;
 const maxFdCur=Math.max(...S.map(s=>s.fd));
 const passRate=probesVerified.length? probesVerified.filter(p=>p.ok).length/probesVerified.length : null;
 
+// **耗时必须有判据**（2026-10-19 补，真缺口）：
+// `secs` 从第 1 轮就写进每一条 probe 记录了，但**从来没有判据用它**——
+// 采集了却没人看，等于没采。合成数据实测：32 次探针全部成功，
+// 耗时从 5 秒一路爬到 115 秒（探针超时是 120 秒），
+// 报告全绿、exit 0。可真实情况是"用户每次要等两分钟，基本没法用"。
+// "成功率不掉"最容易被**性能衰减**骗过去：活儿还是干对了，只是慢到没法用。
+// 这和前几轮的"平均值盖住末尾/盖住中间"是**同一个病的第四张脸**：
+// 只问"对不对"，不问"多久"。
+// 阈值怎么定：
+//   · 单次上限 90 秒（探针死线 120 秒，留 30 秒余量；超过 90 秒说明接近超时边缘，
+//     真实用户早就走了）
+//   · 末尾 4 次耗时中位 ≤ 45 秒（不只看"有没有极慢的一次"，
+//     而是看"现在是不是整体变慢了"——和 tailOk 同口径，防止"最后几天系统性地慢下来"）
+//   · 全程耗时中位 ≤ 45 秒（防止"一直很慢但从没超过 90 秒"这种慢性退化）
+const probeSecs=probesVerified.map(p=>Number(p.secs)||0).filter(s=>s>0);
+const medSecs=probeSecs.length? (()=>{const a=probeSecs.slice().sort((x,y)=>x-y);const n=a.length;
+  return n%2? a[(n-1)/2] : (a[n/2-1]+a[n/2])/2;})() : null;
+const maxSecs=probeSecs.length? Math.max(...probeSecs) : null;
+const tailSecs=probesVerified.slice().sort((a,b)=>a.ts-b.ts).slice(-TAIL_PROBES)
+  .map(p=>Number(p.secs)||0).filter(s=>s>0);
+const tailMedSecs=tailSecs.length? (()=>{const a=tailSecs.slice().sort((x,y)=>x-y);const n=a.length;
+  return n%2? a[(n-1)/2] : (a[n/2-1]+a[n/2])/2;})() : null;
+const SLOW_MAX=90, SLOW_MED=45;
+const secsOk=!(days>=7 && probeSecs.length>0 &&
+  (maxSecs>SLOW_MAX || (medSecs!==null&&medSecs>SLOW_MED) || (tailMedSecs!==null&&tailMedSecs>SLOW_MED)));
+
 // **容器可用性**（2026-10-19 补）：`container_up` 一直在采，却从来没被任何判据用过 ——
 // 也就是说容器可以停一整天，而 S6 照样"通过"。probe 每 6 小时才跑一次，
 // 中间最多 6 小时是盲区，靠 probe 兜不住，必须用每个 sample 点的 container_up 判断。
@@ -818,6 +844,9 @@ if(days>=7 && tailProbes.length>=4){
     : `❌ **末尾 ${tailProbes.length} 次探针成功率只有 ${(tailPassRate*100).toFixed(0)}%**（判据 ≥75%）：`+
       `总平均 ${(passRate*100).toFixed(0)}% 掩盖了下降趋势 —— 判据要的是"不掉"，不是"平均还行"`);
 }
+if(probeSecs.length)
+  console.log(`探针耗时：中位 ${medSecs.toFixed(0)}s，最慢 ${maxSecs}s，末尾 4 次中位 `+
+              `${tailMedSecs===null?"—":tailMedSecs.toFixed(0)+"s"}（判据：单次 ≤${SLOW_MAX}s、中位 ≤${SLOW_MED}s）`);
 if(passRate!==null){
   if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
   else {
@@ -844,6 +873,10 @@ if(passRate!==null){
            (bothDown? `；其中 ${bothDown} 次两条链路同时不通` : ""));
   }
 }
+if(!secsOk)
+  c.push(`❌ **探针太慢**：最慢 ${maxSecs}s（上限 ${SLOW_MAX}s）、全程中位 ${medSecs===null?"—":medSecs.toFixed(0)+"s"}、`+
+         `末尾中位 ${tailMedSecs===null?"—":tailMedSecs.toFixed(0)+"s"}（上限 ${SLOW_MED}s） —— `+
+         `活儿还是干对了，但**慢到没法用**。"成功率不掉"不等于"还能用"`);
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
 if(days>=7 && contTailRate!==null){
   c.push(contTailOk
@@ -897,7 +930,7 @@ console.log("\n判定：" + c.join("；"));
 // 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk;
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
