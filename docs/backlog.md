@@ -9,3 +9,5 @@
 | 2026-10-19 | S1 基线 | `tests/temp-cleanup.test.ts` 在 Linux(WSL) 下失败：断言"连接未关的目录应删不掉"，但 Linux 允许删除已打开目录 | 仅 WSL 环境跑测试时红，Windows 全绿；生产跑在 WSL 但该测试不参与运行 | 改为按平台跳过断言，或换成真正的"删不掉"场景（如只读挂载点） |
 
 | 2026-10-19 | S2 | 工具清单注入：`exec.runTool('tool.list')` 在容器内 ToolStore 能列出 word-count（直接 node 跑返回 1 项），但经 daemon 链路拿到空。日志只打出"发现 0 个"，说明工具调用成功了但结果结构不匹配，或调用根本没发生 | 模型感知不到已造工具，S2"可复用"判据未达标 | 待查：① 加原始返回结构日志定位；② 或改走 memory 桥（需给 MemoryServiceApi 加 listHomeDir/readHomeFile） |
+
+| 2026-10-19 | S2 | 工具清单已注入上下文（诊断确认 len=130），但模型回答"我上下文里没有工具清单"且仍用 shell.run 手写 | 复用行为未达成；模型对注入的 system 段不敏感 | 可尝试：① 把清单并入运行手册末尾（模型对首条 system 更敏感）；② 或改成 user 消息；③ 或明确要求 tasks 里带"先查工具有没有现成的" |

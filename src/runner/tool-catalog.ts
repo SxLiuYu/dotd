@@ -502,7 +502,8 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
    7. 造工具：tool.create / tool.list / tool.invoke。
-      干重复性的活之前先 tool.list 看有没有现成的 —— 有就 tool.invoke 复用；没有且以后还会用到，就 tool.create 造一个。
+      **写脚本前先看有没有「你已有的自造工具」**：对口就 tool.invoke，别重写。
+      没对口但以后会重复 → tool.create 造一个。
 通用约定：
 - 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
 - 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。

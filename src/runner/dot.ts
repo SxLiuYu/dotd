@@ -634,6 +634,16 @@ class RunContext {
     return ids;
   }
 
+  /**
+   * 自造工具清单（S2，2026-10-19）。
+   *
+   * **必须做成类字段而不是 ctx.push()**：buildMessages 是自己重新组装 out 数组的，
+   * 不会把 this.messages 里的 system 消息带出去（planNote 同理）。
+   * 2026-10-19 踩坑：先写成 ctx.push，日志显示"发现 1 个工具"，但模型回答
+   * "我上下文里没有工具清单" —— 注入的内容压根没进请求体。
+   */
+  toolInventoryNote: string | null = null;
+
   /** 任务目标：恒为最后一条 user 消息（§4.1 事件任务没有历史对话时它是唯一输入）。 */
   buildMessages(bundle: {
     memoryMd: string;
@@ -691,7 +701,21 @@ class RunContext {
       });
     }
 
-    // 历史裁剪（2026-10-19 实测发现）：原来无条件把整个会话历史全量塞进去。
+    // ②c 自造工具清单（S2）：放在 plan 之后、历史之前 —— 属于"开工前该知道的事实"。
+    if (this.toolInventoryNote !== null) {
+      out.push({
+        id: 'sys:tool-inventory',
+        threadId: '',
+        seq: 0,
+        role: 'system',
+        kind: 'text',
+        content: this.toolInventoryNote,
+        tokenEst: Math.ceil(this.toolInventoryNote.length / 3.5),
+        createdAt: 0,
+      });
+    }
+
+    // 历史裁剪（2026-10-19 实测发现）：原来无条件把整个会话历史塞进去。
     // 现场：一个线程累积到 461 条消息，其中 460 条是历史 tool_result（只有 2 条真实
     // 用户消息），每次调用都装载 prompt=28035 tokens —— 绝大部分是早已作废的工具输出。
     //
@@ -1049,39 +1073,33 @@ export class DotRunner {
 
     // **自造工具清单注入**（S2，2026-10-19）。
     //
-    // 为什么不做成"提示词让模型记得查 tool.list"：实测不行 —— 让它在同类任务上
-    // 复用之前造的工具，它直接 shell.run 手写了一遍，压根没想起去查。
-    // 提示词是"指望它想起来"，注入是"每次开局就摆在眼前"。
-    //
-    // 代价：每任务一次工具列表查询（本地读目录，毫秒级）+ 几十 token。
-    // 收益：造过的工具不会白造 —— 这是 S2 "能力可积累" 成立的关键。
-    // 工具数为 0 时不产出任何内容（不影响没造过工具的场景）。
+    // 目标：让"造过的工具"在每次任务开头就摆在模型眼前，而不是指望它想起来去 tool.list。
+    // 实测证明提示词不够 —— 同类任务它直接 shell.run 手写了一遍，压根没想起去查。
     let toolInventory: string | null = null;
     try {
-      const caps = await this.getCapabilities();
-      if (caps.some((c) => c.name === 'tool.list')) {
-        const r = await this.exec.runTool({
-          call_id: `inventory_${task.id}`,
-          dot_id: session.dotId,
-          task_id: task.id,
-          tool: 'tool.list',
-          args: {},
-          deadline_ms: 60_000,
-        } as never);
-        const payload = (r as { result?: { tools?: Array<Record<string, unknown>> } }).result;
-        const tools = Array.isArray(payload?.tools) ? payload.tools : [];
-        const usable = tools.filter(
-          (x) => typeof x['name'] === 'string' && typeof x['description'] === 'string' && String(x['description']).length > 0,
-        );
-        if (usable.length > 0) {
-          toolInventory =
-            '# 你已有的自造工具\n' +
-            usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
-            '\n\n（这些是以前造的，能直接 tool.invoke 用 —— 别重写一遍。）';
-        }
+      // 复用 toolCall()：它负责补 issued_at 等必需字段。
+      // 2026-10-19 踩坑：手写对象漏了 issued_at，容器回 400「字段 issued_at 必须是非空字符串」，
+      // 而外层只看到 "发现 0 个工具" —— 症状完全看不出是字段缺失。
+      const r = await this.exec.runTool(
+        toolCall(task, `inventory_${task.id}`, 'tool.list', {}, 60_000),
+      );
+      // 诊断（2026-10-19：这条链路查了两小时没定位，先把原始结构打出来）
+      const raw = JSON.stringify(r).slice(0, 400);
+      this.log(`runner: tool.list 原始返回 ${task.id}：${raw}`);
+      const payload = (r as { result?: { tools?: Array<Record<string, unknown>> } }).result;
+      const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+      const usable = tools.filter(
+        (x) => typeof x['name'] === 'string' && typeof x['description'] === 'string' && String(x['description']).length > 0,
+      );
+      this.log(`runner: 工具清单 ${task.id}：发现 ${usable.length} 个自造工具`);
+      if (usable.length > 0) {
+        toolInventory =
+          '# 你已有的自造工具\n' +
+          usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
+          '\n\n（这些是以前造的，能直接 tool.invoke 用 —— 别重写一遍。）';
       }
-    } catch {
-      // 清单注入是增强项，失败不影响主流程
+    } catch (err) {
+      this.log(`runner: 工具清单注入失败 ${task.id}：${err instanceof Error ? err.message : String(err)}`);
     }
 
     // ⑤/§7.3 重建顺序：buildSessionReplay（LLM 全文）→ tool_result 全文覆盖 → journal.tail → 提示
@@ -1121,16 +1139,9 @@ export class DotRunner {
     // **把自造工具清单推入上下文**（S2）。放在历史之后、当前提示之前：
     // 它是"这次开工前该知道的事实"，位置比历史更靠近当前请求。
     if (toolInventory !== null) {
-      ctx.push({
-        id: 'sys:tool-inventory',
-        threadId: session.threadId ?? '',
-        seq: 0,
-        role: 'system',
-        kind: 'text',
-        content: toolInventory,
-        tokenEst: Math.ceil(toolInventory.length / 3.5),
-        createdAt: 0,
-      });
+      // 注意：这里**不能** ctx.push() —— buildMessages 自己组装 out 数组，
+      // 不读 this.messages 里的 system 消息。必须赋给字段（见 RunContext.toolInventoryNote）。
+      ctx.toolInventoryNote = toolInventory;
     }
     // CP §5.3 恢复注记（merge/注入）与 §7.3 第 4 步 openStepNotes 首条：
     // 两个方法在 Journal 实现里存在（journal.ts:256/276），但 CP §8 契约面
