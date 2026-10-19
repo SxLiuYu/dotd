@@ -578,6 +578,42 @@ export function buildCli(opts: CliOptions = {}): Command {
     });
 
   program
+    .command('container')
+    .description('容器状态与重置（GET /api/container；--reset 清隔离状态）')
+    .option('--reset', '重置为 ready 并清零 recreate_count（容器被 quarantined 时用）')
+    .action(async (opts: { reset?: boolean }) => {
+      const o = merged();
+      if (opts.reset === true) {
+        const r = await api<{ ok?: boolean; note?: string; error?: string }>(
+          'POST',
+          '/api/container/reset',
+          {},
+          o,
+        );
+        if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+        emit(o, r.body.note ?? '已重置');
+        return;
+      }
+      const r = await api<{
+        container?: {
+          dotId: string;
+          state: string;
+          dockerId: string | null;
+          recreateCount: number;
+          lastHealthAt: string | null;
+          hint?: string;
+        };
+        error?: string;
+      }>('GET', '/api/container', undefined, o);
+      if (!r.ok) return fail(o, r.kind === 'unreachable' ? 'daemon 不可达' : r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      const c = r.body.container;
+      if (c === undefined) return fail(o, r.body.error ?? 'daemon 回的 /api/container 不是预期形状', 1);
+      emit(o, `dot=${c.dotId}  状态=${c.state}  24h 重建次数=${c.recreateCount}`);
+      emit(o, `docker=${c.dockerId ?? '-'}  最近健康=${c.lastHealthAt ?? '-'}`);
+      if (c.hint !== undefined) emit(o, `提示：${c.hint}`);
+    });
+
+  program
     .command('sos-test')
     .description('求救通道自检（GET /api/channels：如实报每个通道的当前可用性、投递顺序与最近台账）')
     .action(async () => {

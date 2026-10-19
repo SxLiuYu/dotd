@@ -3148,3 +3148,54 @@ SELECT state, recreate_count FROM containers WHERE dot_id='dot1';
 ## 193. 本轮门禁
 
 连续压测 **12/12**，平均 6.6s · `npm test` 1509/1509 · 探针心跳正常 · 容器 ready
+
+---
+
+# 第四十二轮：容器隔离状态的查询与重置入口（2026-10-19）
+
+## 194. 上轮留下的运维痛点
+
+上轮发现"容器被 quarantined 导致 4 个任务失败"，排查方式是**手写 SQL 查表**：
+
+```sql
+SELECT state, recreate_count FROM containers WHERE dot_id='dot1';
+```
+
+这对主人不公平——报错信息是"模型说容器有问题"，而真相是 `recreate_count > 3/24h`
+触发了保护。**没有任何入口能让人看到这件事。**
+
+## 195. 加两个入口
+
+| 入口 | 作用 |
+|---|---|
+| `GET /api/container` | 看状态；隔离时**直接给出提示和解决办法** |
+| `POST /api/container/reset` | 确认容器正常后重置为 ready、清零计数 |
+| `dotd container [--reset]` | 上面的 CLI 包装 |
+
+隔离时的输出长这样：
+
+```
+dot=dot1  状态=quarantined  24h 重建次数=5
+docker=f1277794...  最近健康=...
+提示：容器被隔离（24h 内重建超过 3 次）。确认容器本身正常后，POST /api/container/reset 重置。
+```
+
+## 196. 中途撞了一个低级错误
+
+插 CLI 命令时把 `sos-test` 的命令链写断了 —— `npm test` 立刻报 4 条失败（sos-test 相关）。
+原因是 `.command('container')` 那条链以 `})` 结尾后直接接 `.command('sos-test')`，
+少了 `program`。**这正是回归测试该发挥作用的地方**，立刻就抓到了。
+
+## 197. 实测
+
+```
+正常:      状态=ready  重建次数=0
+模拟隔离:  状态=quarantined  重建次数=5   ← 提示正确出现
+--reset:   已重置为 ready 并清零
+确认:      状态=ready  重建次数=0
+```
+
+## 198. 本轮门禁
+
+`dotd container` / `--reset` 实测通过 · **`npm test` 1512/1512**（+3 条路由守卫）·
+`sos-test` 未受影响（命令链已修）

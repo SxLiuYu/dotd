@@ -97,6 +97,7 @@ export type Route =
   | 'memory_restore'
   | 'schedules'
   | 'schedule_by_id'
+  | 'container'
   | 'static';
 
 export interface MatchResult {
@@ -130,6 +131,12 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   if (m === 'GET' && p === '/api/events') return { route: 'events', params: {} };
   // 记忆备份入口（2026-10-18）：.archive/ 有内容但原先只能手动 docker exec 恢复，
   // 等于"有能力、没入口"。这两条把路补上。
+  // 容器状态（2026-10-19）：quarantined 是 recreate_count>3/24h 的**保护机制**，
+  // 但隔离后所有依赖容器的任务都会失败，且现象是"模型说容器有问题"——不好排查。
+  // 这里给一个查询/重置入口。
+  if (m === 'GET' && p === '/api/container') return { route: 'container', params: {} };
+  if (m === 'POST' && p === '/api/container/reset') return { route: 'container', params: { action: 'reset' } };
+
   // 定时任务（2026-10-18）：crontabs 表与调度器早就有，缺创建入口。
   if (p === '/api/schedules') {
     if (m === 'GET') return { route: 'schedules', params: {} };
@@ -846,6 +853,48 @@ export function createHttpServer(deps: HttpDeps): Server {
        * "读路径待补"的说明——那是"承诺有了、路没通"。这里把路补上：
        * 直接读 SF 自己的拒绝审计表（`auth/origin/rate/schema/size/allowlist/parse`）。
        */
+      /**
+       * GET  /api/container               容器状态（state/recreate_count/最近健康）
+       * POST /api/container/reset         重置为 ready 并清零 recreate_count
+       *
+       * 为什么需要重置入口：recreate_count > 3/24h 会触发 quarantined（§4.1 保护），
+       * 但隔离后**所有依赖容器的任务都失败**，而报错是"模型说容器有问题"——
+       * 主人和排查者都不容易联想到这是主动保护。2026-10-19 实测：一天内为重建镜像
+       * 反复 recreate 7 次，直接把自己锁死。
+       */
+      case 'container': {
+        const row = deps.db
+          .prepare('SELECT dot_id, state, docker_container_id, recreate_count, last_health_at, updated_at FROM containers WHERE dot_id = ?')
+          .get(DEFAULT_DOT_ID) as Record<string, unknown> | undefined;
+        if (row === undefined) {
+          json(res, 404, { ok: false, error: '没有该 dot 的容器记录（可能还没 boot 过）' });
+          return;
+        }
+        if (match.params.action !== 'reset') {
+          json(res, 200, {
+            ok: true,
+            container: {
+              dotId: row['dot_id'],
+              state: row['state'],
+              dockerId: row['docker_container_id'],
+              recreateCount: row['recreate_count'],
+              lastHealthAt: row['last_health_at'],
+              updatedAt: row['updated_at'],
+              hint:
+                row['state'] === 'quarantined'
+                  ? '容器被隔离（24h 内重建超过 3 次）。确认容器本身正常后，POST /api/container/reset 重置。'
+                  : undefined,
+            },
+          });
+          return;
+        }
+        deps.db
+          .prepare('UPDATE containers SET state = ?, recreate_count = 0, updated_at = ? WHERE dot_id = ?')
+          .run('ready', now().toISOString(), DEFAULT_DOT_ID);
+        json(res, 200, { ok: true, reset: true, note: '已重置为 ready 并清零 recreate_count' });
+        return;
+      }
+
       /**
        * GET  /api/schedules        列出定时任务（?all=1 含已停用）
        * POST /api/schedules        创建 {title, prompt, cron, quietHours?, catchup?}
