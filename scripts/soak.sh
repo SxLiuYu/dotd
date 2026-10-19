@@ -661,8 +661,24 @@ const maxGapHours = maxGap/3600;
 // 这正是"报告在撒谎"里最危险的一种：数据本身都是真的，结论却已经过期。
 // 判据：最后一个样本距现在不得超过 3 个采样周期（cron 30 分钟 → 90 分钟），
 // 超过就说明观测早已停止，无论历史跨度多长都不能算通过。
+// **stale 要看"有没有人在看"，不是"有没有看到一个活的 daemon"**（2026-10-20 修）。
+//
+// 第 45 轮已经把 gap 和采样密度从 `all` 改成 `observed`（含 alive=false），
+// 但 **stale 漏改，还在用 `last`（= all 的最后一条，已排除 alive=false）**。
+// 现场：造「7 天窗口、最后 3 小时 daemon 挂了」的数据（cron 每 30 分钟照跑、
+// 每次都记 alive=false），report 打出：
+//   ❌ **观测已停止**：最后一个样本在 3.00h 前（超过 1.5h 即视为没在看）
+// 这句话是**错的** —— 有人一直在看，看到的全是"daemon 不在"。
+// 观测是连续的，只是观测到了坏。这正是第 45 轮区分过的那件事，我又混了一次。
+//
+// 危害不只是措辞：看到"观测已停止"，第一反应是查 cron 为什么不跑，
+// 而真正的原因（daemon 挂了）藏在另一条判据里，排查方向被带偏。
+//
+// 改法：用 observed（含 alive=false）的最后一条。cron 真停了时
+// observed 的最后一条同样会陈旧，所以"报就停"这个能力一点没丢。
 const STALE_LIMIT=5400;
-const staleness=nowSec-last.ts;
+const lastObserved=observed.length? observed[observed.length-1] : last;
+const staleness=nowSec-lastObserved.ts;
 const stale=staleness>STALE_LIMIT;
 // **用中位数比，不用单点比**（2026-10-19 修）。
 // 踩到的现场：报告显示"句柄增长 +3 → ❌"，但那 37 是压测高峰的瞬时值；
