@@ -774,12 +774,26 @@ if(passRate!==null){
   if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
   else {
     // 失败要能归因：答错 vs 飞书没发出去
-    const bad=probes.filter(p=>!p.ok);
-    const noOut=bad.filter(p=>p.out!==undefined && String(p.out)!=="1").length;
-    const noWs=bad.filter(p=>p.ws!==undefined && String(p.ws)!=="1").length;
-    const other=bad.length-noOut-noWs;
-    c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败：`+
-           `${noOut} 次飞书未送达 / ${noWs} 次飞书入站长连接不在 / ${other} 次未答对或未完成）`);
+    // **原来的减法归因是错的**（2026-10-19 修）：
+    //   other = bad.length - noOut - noWs
+    // 一次探针可以**同时**失败于多个子判据（任务没完成 → out 空、ws 空、答案也不对），
+    // 于是 noOut 和 noWs 会各自重复计入，other 变成负数。
+    // 实测输出过"4 次失败：4 次飞书未送达 / 4 次飞书入站长连接不在 / **-4** 次未答对或未完成"。
+    // 一个负数出现，说明这套归因在骗人 —— 宁可分成互斥桶，也不要靠减法。
+    // 第二个错：bad 取的是 probes（含未验证的旧格式探针），
+    // 而 passRate 的分母是 probesVerified —— 两个口径混用，归因数加起来对不上。
+    const bad=probesVerified.filter(p=>!p.ok);
+    const noOut=bad.filter(p=>p.out!==undefined && String(p.out)==="0").length;
+    const noWs=bad.filter(p=>p.ws!==undefined && String(p.ws)==="0").length;
+    // 既没送达也没入站：归为"飞书这条链路整个没通"，单列一桶
+    const bothDown=bad.filter(p=>String(p.out)==="0" && String(p.ws)==="0").length;
+    const noChannelOnly=bad.filter(p=>p.out!==undefined && String(p.out)!=="0" &&
+                                       p.ws!==undefined && String(p.ws)!=="0").length;
+    const noChannel=bad.filter(p=>!p.out || !p.ws).length;
+    c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败，可重叠计数：`+
+           `${noOut} 次飞书出站未送达 / ${noWs} 次飞书入站长连接不在 / `+
+           `${noChannel} 次探针没拿到完整子判据 / ${noChannelOnly} 次出站入站都正常但答案不对）`+
+           (bothDown? `；其中 ${bothDown} 次两条链路同时不通` : ""));
   }
 }
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
