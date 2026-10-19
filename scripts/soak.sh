@@ -752,6 +752,23 @@ const sampleRate=expectSamples>0? all.length/expectSamples : null;
 // 判据：实际密度 ≥ 设计值的 70%。留 30% 余量给 cron 抖动、
 // 单次脚本失败、机器短暂繁忙 —— 但不可能容忍一半样本缺失。
 const SAMPLE_RATE_LIMIT=0.7;
+// **采样密度不能只有下限**（2026-10-20 补，真缺陷）。
+//
+// 上面那条只说「别太少」。但 S6 的字面判据是「**无人工干预**」——
+// 而「太多」正是人工干预唯一的指纹：cron 是 `*/30`，一天 48 次，
+// 多出来的每一次都是**有人手动跑了 `sample`**。
+//
+// 合成实测：7 天塞 3363 个点（设计的 10 倍）→
+//   `采样密度：3363 次 / 应 336 次 = 1000%（判据 ≥70%）` → `✅` → **exit 0**。
+// 也就是「每分钟都有人在手动采样」被判成了「密度达标」。
+//
+// 这不是理论问题：**真窗口里已经发生了** —— 11 个采样点里 6 个不是 cron 来的
+// （19:58:33 / 20:58:54 / 20:59:40 / 21:03:43，秒数都不是 :00/:01），
+// 那是我自己调试时踩出来的。判据一条都没响。
+//
+// 上限取 150%：正常 cron 偶尔补采、重跑同一次，不至于超过 1.5 倍；
+// 超过就是「有人在跑它」。
+const SAMPLE_RATE_MAX=1.5;
 // **"连续"不能只靠加起来够 7 天**（2026-10-19 修，措辞在撒谎）：
 // 原来只把断档扣掉，于是"8 天跨度里有 24 小时没观测"仍会打印
 // "✅ 已满 7 天且**观测连续**" —— 累计是够 7 天了，但"连续"这个词是假的：
@@ -1860,7 +1877,25 @@ if(medSegRate!==null && !segCanFail){
          `RSS 阶梯式涨（涨一级→持平→再涨）时短窗口斜率天然为正。总量看上面的"全窗口峰值增长"`);
 }
 if(sampleRate!==null){
-  c.push(sampleRate>=SAMPLE_RATE_LIMIT
+  // 先判"太多"，再判"太少" —— 太多是更强的信号（一定是人）。
+  // **窗口太短时这条没有意义**（2026-10-20 当场自纠）：
+  // 刚开新窗口就采一个点，`expectSamples = hours*2 ≈ 0.03`，
+  // 密度算成 **180000%**，新判据立刻喊「有人手动跑了 sample」——
+  // 它说的其实是「这是这个窗口的第一个点」。
+  // 与 `days>=7` 前缀同一个道理：判据要有「还没到判的时候」这个状态。
+  // 4 小时给 ≤30% 的统计抖动留余量（cron 抖动 + 首点）。
+  // **窗口太短时连"✅"都不能打**（2026-10-20 当场自纠第二遍）：
+  // 刚开窗口采一个点 → 密度 22500%，渲染成 `✅ 采样密度 ≥70%（22500%）`。
+  // 退出码是对的（有前缀挡住），但**措辞在撒谎**：那个 ✅ 什么也没证明。
+  // 这正是「判据的话和它的意思要一致」——一个荒唐的数字前面不该有勾。
+  if(days<7/6){
+    c.push(`⏳ 采样密度 ${(sampleRate*100).toFixed(0)}%（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
+      `窗口还太短，这条还没到判的时候`);
+  }else if(sampleRate>SAMPLE_RATE_MAX){
+    c.push(`❌ **采样密度 ${(sampleRate*100).toFixed(0)}%**（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
+      `设计是每 30 分钟一次，多出来的每一次都是**有人手动跑了 sample** —— `+
+      `而判据要的是「无人工干预」。这条比「太少」更硬：少了可能是机器抖动，多了只能是人。`);
+  }else c.push(sampleRate>=SAMPLE_RATE_LIMIT
     ? `✅ 采样密度 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%（${(sampleRate*100).toFixed(0)}%）`
     : `❌ **采样密度只有 ${(sampleRate*100).toFixed(0)}%**（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
       `空档虽都在容忍内，但大部分时间没在观测`);
@@ -1947,7 +1982,7 @@ const verdictOk = Boolean(!negativeSpan && !stale && !hasGap && days>=7 && cover
   && (medSegFdRate===null||fdSegTooMany===0)
   && relayRateOk && relayDownOk && relayCoverOk
   && httpRateOk && httpDownOk && httpCoverOk
-  && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
+  && (sampleRate===null||sampleRate>1.0/6? (sampleRate>=SAMPLE_RATE_LIMIT && sampleRate<=SAMPLE_RATE_MAX) : true)
   && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
   // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
   // 说明脚本在执行途中死了（语法错 / 被 kill / 磁盘满），那次采样丢了。
@@ -2026,7 +2061,7 @@ try{
   const limits={rssMb:50,peakGrowthMb:PEAK_GROWTH_LIMIT,fdPeak:FD_PEAK_LIMIT,fdSegRate:SEG_FD_RATE_LIMIT,
     segRate:SEG_RATE_LIMIT,contOkRate:CONT_OK_RATE_LIMIT,contDownSec:CONT_DOWN_LIMIT_SEC,
     relayRate:RELAY_RATE_LIMIT,httpRate:HTTP_RATE_LIMIT,coverRate:COVER_RATE_LIMIT,
-    probeRate:PROBE_RATE_LIMIT,sampleRate:SAMPLE_RATE_LIMIT,deadHours:DEAD_HOURS_LIMIT,staleSec:STALE_LIMIT};
+    probeRate:PROBE_RATE_LIMIT,sampleRate:SAMPLE_RATE_LIMIT,sampleRateMax:SAMPLE_RATE_MAX,deadHours:DEAD_HOURS_LIMIT,staleSec:STALE_LIMIT};
   // **窗口起止必须落盘**（2026-10-20 补，真缺陷）。
   //
   // 前几轮把「数据 md5」「尺子 md5」「阈值」都记了，但**没记窗口是哪一段**。
