@@ -216,7 +216,24 @@ try{
     try{ lines.push(JSON.parse(ln)); }catch{ badLines++; }
   }
 }catch{}
-const probes=lines.filter(x=>x.kind==="probe");
+// **探针也必须去重**（2026-10-19 补）：第 12 轮我给**样本**做了去重
+// （同一 (ts,proc_start,pid) 只算一次），但 `probes` 一直是 `lines.filter` 直取，
+// **一行都没去掉**。同一个坑换了个地方。
+// 合成数据实测：真实只跑了 8 次探针（8 天应 32 次 = 25%），
+// 但每行被写进文件 4 遍（重复写入 / 复制粘贴 / 重跑补写）→ 文件里 32 行 →
+// 报告打印"探针密度 32/32 = 100%（判据 ≥70%）"、成功率 100%。
+// 密度判据被自己的重复行骗过去了。
+// 去重键取 (ts, taskId)：同一次探针被重复写入时这两者都相同；
+// 而两次真的探针不可能落在同一秒且拿到同一个 taskId。
+const seenProbeKey=new Set();
+let dupProbes=0;
+const probesRaw=lines.filter(x=>x.kind==="probe");
+const probes=[];
+for(const x of probesRaw){
+  const k=String(x.ts)+"|"+String(x.taskId||"");
+  if(seenProbeKey.has(k)){ dupProbes++; continue; }
+  seenProbeKey.add(k); probes.push(x);
+}
 // **"已验飞书"的探针单列**（2026-10-19 补，真缺口）：
 // 早期版本的探针只发 HTTP、查 daemon 有没有回话，**根本没验飞书送达**，
 // 记录里没有 out/ws 字段，但 ok=true。
@@ -727,6 +744,7 @@ if(deadSampleCount>0)
               `约 ${deadSampleHours.toFixed(1)} 小时服务不可用；这些点不计入观测覆盖`);
 if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入被打断），已跳过，其余样本正常计入`);
 if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
+if(dupProbes>0) console.log(`⚠ 文件里有 ${dupProbes} 行重复探针（同一时刻同一 taskId），已去重，**不计入密度和成功率**`);
 // **负跨度是结构性错误，必须报出来**（2026-10-19 补）。
 // 排序修好之后理论上不会再出现，但万一将来又有别的地方引入乱序，
 // 打印一个负数当"跨度"就是在骗人 —— 宁可明确报警。
