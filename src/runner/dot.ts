@@ -1777,10 +1777,18 @@ export class DotRunner {
     }
   }
 
-  /** 任务真正终态时清空该任务的护栏状态（避免内存与跨任务误伤）。 */
+  /**
+   * 任务真正终态时清空该任务的护栏状态（避免内存与跨任务误伤）。
+   *
+   * **toolCallCounts 也要清**（2026-10-19 审计发现）：它按 taskId 累积
+   * （`Map<taskId, Map<toolName, count>>`），但此前只有 set 没有 delete ——
+   * 每个任务留一条永不释放，daemon 长期运行内存会一路涨。
+   * 同一处还有 repeatGuard / repeatSkipsByTask，三者生命周期一致，一起清。
+   */
   private resetRepeatGuard(taskId: string): void {
     this.repeatGuard.delete(taskId);
     this.repeatSkipsByTask.delete(taskId);
+    this.toolCallCounts.delete(taskId);
   }
 
 

@@ -4761,3 +4761,59 @@ invalidateToken(dotId: string): void {
 
 状态稳定 90s 不跳 · 任务正常执行 · **`npm test` 1537/1537**（+2 条守卫：
 invalidateToken 存在且真的 delete、探活失败路径会清缓存重探）
+
+---
+
+# 第六十七轮：系统审计所有缓存的生命周期（2026-10-19）
+
+## 332. 顺着"缓存失效"这条线做全面审计
+
+前两轮修了 token 缓存没有失效路径的问题。这轮把所有 `Map` 形态的缓存列出来，
+逐个看**有没有对应的 delete/clear**：
+
+```
+src/runner/dot.ts      pendingResults / pendingCalls / callArgs  ✅ 有 delete
+src/runner/dot.ts      repeatGuard / repeatSkipsByTask           ✅ resetRepeatGuard 里清
+src/runner/dot.ts      toolCallCounts                            ❌ 只有 set，从不 delete
+src/surfaces/sse.ts    subscribers                               ✅ 有 clear/delete
+src/surfaces/ingress.ts buckets / badRun                          ✅ 有 FIXED 窗口清理
+src/exec/ExecService   lanes / inflight / hostTools               ✅ 有清理
+```
+
+**只抓到一处：`toolCallCounts`。**
+
+## 333. 但实际影响比想象的小
+
+查 daemon 内存构成：
+
+```
+RSS: 199 MB
+  RssAnon: 141 MB（JS 堆 + 代码）
+  RssFile:  62 MB（共享库）
+文件句柄: 35 个   ← 无泄漏
+SQLite 连接: 3 个  ← 正常
+任务数: 524
+```
+
+524 个任务对应的 `toolCallCounts` 条目其实很小。**这个泄漏性质上是真泄漏
+（随任务数单调增长），但量级远没有到造成问题的程度。**
+
+我还是修了——因为三个缓存的**生命周期完全一致**（都在
+`resetRepeatGuard` 这个"任务终态清理"点），漏一个没有理由，而且
+"现在不重要"不等于"以后不重要"。
+
+## 334. 审计的结论也值得记
+
+这轮**没找到大问题**，但这不是白跑：
+
+- 句柄无泄漏（35 个，稳定）
+- SQLite 连接正常（3 个）
+- 内存构成合理（141MB 堆 + 62MB 共享库）
+- 只有一处真泄漏，且量级很小
+
+**"审计后没发现问题"也是有效结论** —— 它把"不知道有没有问题"变成了"查过了，没有"。
+
+## 335. 本轮门禁
+
+`toolCallCounts` 已随任务终态释放 · 内存/句柄审计无其它异常 ·
+**`npm test` 1539/1539**（+2 条守卫：三组缓存都要清、按 taskId 声明的缓存不许漏）
