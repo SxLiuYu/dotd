@@ -1293,7 +1293,7 @@ console.log(`全窗口 RSS：基线 ${baseRss.toFixed(1)}MB（最前 ${baseN} �
 if(segRates.length){
   const ev = segEvidence==="long" ? `按 ${longRates.length} 段 ≥2h 的中位数`
            : segEvidence==="multi" ? `${segRates.length} 段都不足 2h，但段数够多，按全部段的中位数`
-           : `**证据不足**：只有 ${segRates.length} 段、且都不到 2 小时`;
+           : `**证据不足**：只有 ${segRates.length} 段、去掉每段预热后都不到 2 小时`;
   console.log(`各生命周期内 RSS 爬升速率：${medSegRate===null?"现在还判断不了":medSegRate.toFixed(2)+"MB/h"}（${ev}；`+
               `全部 ${segRates.length} 段中位 ${medSegRateRaw===null?"n/a":medSegRateRaw.toFixed(2)}MB/h，最大 ${segRates.length?maxSegRate.toFixed(2):"n/a"}MB/h —— 最大值仅参考，预热会偏高）`);
 }
@@ -1619,7 +1619,25 @@ if(sampleRate!==null){
 // 中位会被另外两段拉回 0，报告说"无明显爬升"。理由与 RSS 完全一致 ——
 // 泄漏是"跑得越久漏得越多"，一个生命周期在漏就是真在漏。
 const fdSegTooMany = segFdRates.filter(r=>r>=SEG_FD_RATE_LIMIT).length;
-if(medSegFdRate!==null){
+// **句柄侧必须和 RSS 侧用同一套证据门槛**（2026-10-20 修，又一处"同生不同命"）。
+//
+// 现场：真窗口只有 1 段、去预热后 1.04 小时。RSS 侧老实说
+//   「⚠ 现在还判断不了（证据不足：只有 1 段、且都不到 2 小时）」，
+// 句柄侧却在同一份数据上写
+//   「✅ 各生命周期内句柄无明显爬升（中位 0.00个/h、最高 0.00个/h）」。
+//
+// 一份证据、两个结论 —— 而且恰好是"一个说判断不了、一个说没事"。
+// 第 14 轮那个坑（零证据被当成合格）在句柄侧原样复发：
+// `medSegFdRate` 只要不是 null 就往下判，完全不看证据够不够。
+//
+// 修：让句柄侧复用 RSS 的 `segEvidence`（long / multi / insufficient）。
+// 证据不足时同样打印 ⏳ 并说明原因，不进退出码。
+// 注意"不进退出码"本身是对的（`medSegFdRate===null||fdSegTooMany===0`），
+// 但**报告不能说 ✅** —— 说 ✅ 就是在替证据不足背书。
+if(segEvidence==="insufficient"){
+  c.push(`⚠ **句柄段内爬升：证据不足，现在不判定**（只有 ${segFdRates.length} 段、去掉每段预热后都不到 2 小时；`+
+         `实测中位 ${(medSegFdRate===null?0:medSegFdRate).toFixed(2)}个/h=参考值）`);
+}else if(medSegFdRate!==null){
   c.push(fdSegTooMany===0
     ? `✅ 各生命周期内句柄无明显爬升（中位 ${medSegFdRate.toFixed(2)}个/h、最高 ${(maxSegFdRate===null?0:maxSegFdRate).toFixed(2)}个/h）`
     : `❌ **${fdSegTooMany}/${segFdRates.length} 段在漏句柄**（最高 ${(maxSegFdRate===null?0:maxSegFdRate).toFixed(2)}个/h ≥${SEG_FD_RATE_LIMIT}，中位 ${medSegFdRate.toFixed(2)}个/h）：`+
