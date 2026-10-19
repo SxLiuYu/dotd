@@ -162,10 +162,21 @@ for(let i=1;i<sorted.length;i++){
   if(g>GAP_LIMIT) deadTotal+=g-GAP_LIMIT;   // 超出容忍的部分算"没在看"
 }
 const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
-const rss0=S[0].rss_kb/1024, rssN=S[S.length-1].rss_kb/1024;
+// **用中位数比，不用单点比**（2026-10-19 修）。
+// 踩到的现场：报告显示"句柄增长 +3 → ❌"，但那 37 是压测高峰的瞬时值；
+// 密集采样 120 秒实测 fd 一直是 34、RSS 一直 222MB。
+// 单点首尾差对噪声极敏感：只要高峰恰好落在最后一个采样点，就会误判成泄漏；
+// 反过来高峰落在开头，则会把泄漏掩盖掉。7 天尺度上单点噪声更多，必须用稳健统计。
+// 做法：取前 10% 样本的中位数当基线、后 10% 的中位数当终值（至少各 1 个点）。
+const med=(arr)=>{const a=arr.slice().sort((x,y)=>x-y);const n=a.length;
+  return n%2? a[(n-1)/2] : (a[n/2-1]+a[n/2])/2;};
+const tailN=Math.max(1, Math.round(S.length*0.1));
+const headS=S.slice(0, tailN), tailS=S.slice(S.length-tailN);
+const rss0=med(headS.map(s=>s.rss_kb))/1024, rssN=med(tailS.map(s=>s.rss_kb))/1024;
 const growth=rssN-rss0;
-const fdGrowth=S[S.length-1].fd-S[0].fd;
-const thGrowth=S[S.length-1].threads-S[0].threads;
+const fd0=med(headS.map(s=>s.fd)), fdN=med(tailS.map(s=>s.fd));
+const fdGrowth=fdN-fd0;
+const thGrowth=med(tailS.map(s=>s.threads))-med(headS.map(s=>s.threads));
 const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
 const maxFd=Math.max(...S.map(s=>s.fd));
 const passRate=probes.length? probes.filter(p=>p.ok).length/probes.length : null;
@@ -235,10 +246,11 @@ if(lifetimes>1){
   }
 }
 console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
-console.log(`RSS: 起 ${rss0.toFixed(1)}MB → 末 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
-console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期）`);
-console.log(`句柄: 起 ${S[0].fd} → 末 ${S[S.length-1].fd}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），峰值 ${maxFd}`);
-console.log(`线程: 起 ${S[0].threads} → 末 ${S[S.length-1].threads}（增长 ${thGrowth>=0?"+":""}${thGrowth}）`);
+console.log(`RSS: 首段中位 ${rss0.toFixed(1)}MB → 末段中位 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
+console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点峰值不参与判据）`);
+console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），单点峰值 ${maxFd}`);
+console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}）`);
+console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
 console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
 
 const c=[];
