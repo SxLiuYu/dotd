@@ -1,4 +1,4 @@
-﻿# Backlog —— 判据外问题登记
+# Backlog —— 判据外问题登记
 
 > 规则（见目标）：每一步只做判据内的事；发现判据外的问题**记在这里，不当场修**。
 > 避免在细节里打转。
@@ -13,3 +13,6 @@
 | 2026-10-19 | S2 | 工具清单已注入上下文（诊断确认 len=130），但模型回答"我上下文里没有工具清单"且仍用 shell.run 手写 | 复用行为未达成；模型对注入的 system 段不敏感 | 可尝试：① 把清单并入运行手册末尾（模型对首条 system 更敏感）；② 或改成 user 消息；③ 或明确要求 tasks 里带"先查工具有没有现成的" |
 
 | 2026-10-19 | S2(b) | **根因定位**：模型可见的 tools 是 `[..., tool.invoke]`（一个泛用工具），而自造工具 `word-count` 只是注入文本里的**数据**。模型必须自己完成"看到文字 → 想到要用 tool.invoke(name=word-count)"这一步间接映射。实测 3 个模型（deepseek/glm/agnes）全部失败 | S2(b) 无法通过提示词达成 | **正确解法**：把自造工具**动态注册成独立工具**（名字直接是 word-count，有独立 args_schema），模型就能像调 fs.read 一样直接选它。这是架构级改动，需改 toolSpecs() 动态生成 |
+| 2026-10-19 | S1 复核 | **两份代码树分叉**：`/root/dotd`（WSL，daemon 实际运行）不是 git 仓库，其 yaml@2 迁移、`dynamicToolSpecs()`、TOOL-REUSE-GUARD 等改动从未提交；commit a16b001 的标题声称做了 yaml@2，但该提交里没有这个改动 | 每次同步都在丢改动；D: 侧 typecheck 直接失败（`dot.ts` 没 export `matchToolForGoal`，而引用它的测试已提交） | 已修（137cc0b）：WSL 在制品全部拉回 git，`npm i` 补 yaml，补 export，两侧 7 文件 md5 一致。**后续改动必须落在 D: 再同步到 WSL** |
+
+| 2026-10-19 | S2(b) 阻塞 | 动态注册只做了"暴露"、没做"执行路由"：模型照着新清单直接调 `word-count`，会先在 `src/exec/protocol.ts:427 validateToolCall → findCapability()` 被判 `unknown_tool`，再过 `src/governance/gate.ts:326 lookupTool()` 被判"工具未登记"（config/tools.yml 没有它） | 该改动当前会让行为**比改之前更糟**（模型被引导去调一个必然被拒的工具）；S2(b) 因此过不了 | 必须补"动态工具名 → tool.invoke"映射，共 4 处：① protocol.ts 参数校验词表 ② gate.ts 治理白名单 ③ ExecService 派发 ④ 容器 execute 分支 |
