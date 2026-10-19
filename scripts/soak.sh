@@ -910,6 +910,40 @@ const contOkDownOk=maxContOkDownSec<=CONT_DOWN_LIMIT_SEC;
 const contOkSamples=contOkPts.length;
 // 没有数据时**既不能说好也不能说坏**，要显式说"判断不了"
 const contOkUnknown=contOkSamples===0;
+
+// ── **网关（relay）也得有判据，不能只拿它做归因**（2026-10-20 补，第⑤类完整复发）
+//
+// 第 63 轮给 sample 加了 relay_up（每 30 分钟一个 TCP 探测），用来把
+// "网关断了"从"答案不对"里摘出来。但那只影响**措辞**，不影响**判定**：
+// 合成数据实测 —— 7 天窗口、网关断 6 小时、探针恰好全躲过去 →
+// 报告全绿、exit 0、**一次都没提到 relay**。
+//
+// 这就是第⑤类（采集了却没用）最标准的形态：字段加了、归因用了、**判据没有**。
+// 等于"我知道它坏过，但我不打算因为这件事判红"。
+//
+// 为什么必须判：网关断了 = **主人发的每条消息都到不了模型**，
+// 哪怕 daemon 活着、容器活着、RSS 平稳。这比"容器不可执行"更彻底 ——
+// 容器坏了至少还有模型能回一句"容器不可用"，网关断了连这句都发不出去。
+//
+// 口径**照抄容器那三条**（同 2 小时容忍，理由一样：重启/网络抖动会短暂断一下，
+// 不该判红；但连续 2 小时以上就是故障）：连通率 ≥95%、最长连续断开 ≤2h、
+// 没有 relay_up 字段时"判断不了"（不打勾也不判死）。
+const relayPts=all.filter(s=>s.relay_up!==undefined);
+const relayRate=relayPts.length? relayPts.filter(s=>Number(s.relay_up)===1).length/relayPts.length : null;
+let maxRelayDownSec=0, curRelayDownStart=null;
+for(const s of all){
+  if(s.relay_up===undefined) continue;
+  if(Number(s.relay_up)!==1){
+    if(curRelayDownStart===null) curRelayDownStart=s.ts;
+    maxRelayDownSec=Math.max(maxRelayDownSec, s.ts-curRelayDownStart+1800);
+  } else curRelayDownStart=null;
+}
+const RELAY_RATE_LIMIT=0.95;
+// 与容器同口径：没满 7 天不算"率"（样本太少），但**最长连续断开任何时候都算**
+const relayRateOk=!(days>=7 && relayRate!==null && relayRate<RELAY_RATE_LIMIT);
+const relayDownOk=maxRelayDownSec<=CONT_DOWN_LIMIT_SEC;
+const relaySamples=relayPts.length;
+const relayUnknown=relaySamples===0;
 // 这 7 天里**有没有能力采** container_ok：看有没有 container_up。
 // 两者在同一处采集逻辑里相邻写入，有 up 就说明那次采集跑了。
 // 全窗口连 up 都没有 → 老数据，指标压根不存在，不追究。
@@ -1615,6 +1649,20 @@ c.push(contDownOk
       ? `✅ 容器最长连续不可执行 ${(maxContOkDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
       : `❌ **容器最长连续不可执行 ${(maxContOkDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）`);
   }
+
+// 网关三条（与容器同口径）。**没有字段时说"判断不了"，不打勾也不判死。**
+if(relayUnknown){
+  c.push(`⚠ **网关连通性：这段时间的采样里没有 \`relay_up\` 字段，这条判断不了**（既不算通过也不算失败）`);
+}else{
+  c.push(!relayRateOk
+    ? `❌ **网关连通率 ${(relayRate*100).toFixed(1)}%**（${relaySamples} 点，<95%）：主人发的消息有一段到不了模型`
+    : (days>=7
+        ? `✅ 网关连通率 ${(relayRate*100).toFixed(1)}%（${relaySamples} 点）`
+        : `⏳ 网关连通率 ${(relayRate*100).toFixed(1)}%（${relaySamples} 点）：窗口未满 7 天，这条还没到判的时候`));
+  c.push(relayDownOk
+    ? `✅ 网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
+    : `❌ **网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）：这段时间主人发什么都不通`);
+}
 c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
   : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
@@ -1761,6 +1809,7 @@ process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && g
   && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
   && passOk && (medSegRate===null||segRates.length<2||segTooMany===0)
   && (medSegFdRate===null||fdSegTooMany===0)
+  && relayRateOk && relayDownOk
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
   && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
   // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
