@@ -4308,3 +4308,72 @@ echo hello             → done，正常放行                 ✅ 清白的命�
 
 词表 20 项全部加载成功（已核对实际值）· python/curl 出网进审批 · 本地命令放行 ·
 `tsc` exit 0 · **`npm test` 1521/1521**
+
+---
+
+# 第六十轮：配置对、但模型看不到（2026-10-19）
+
+## 294. 从"验证实际加载值"延伸出的全面核对
+
+上轮踩了"文件写对、解析出来不对"的坑。这轮把所有配置的实际加载值打印出来核对：
+
+```
+工具数: 16      加载警告: 无
+whenContains: 文件 20 项 / 加载 20 项  ✅ 完全一致
+```
+
+配置层没问题。但这张表让一个新问题浮出水面：
+
+```
+schedule.remove   write_file   ← 模型能不经审批删定时任务
+```
+
+## 295. 实测：模型说它根本没有这个工具
+
+让模型"停用定时任务 ct_mvdzuj9aueicvswk"，它只调了 `schedule.list`，然后回答：
+
+> 我拿到的工具清单里只有 `create`、`list`，没有 `remove`。
+
+**能力目录里有、治理登记了、处理器也注册了 —— 但模型看不到。**
+
+根因在 `ExecService.ts`：
+
+```ts
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list']);
+```
+
+**这个手工维护的白名单漏了 `schedule.remove`。** 而 `getCapabilities` 是
+"容器返回的目录 + 白名单里的宿主侧工具"合并 —— 白名单漏一个，就等于这个工具不存在。
+
+这和第 27 轮那个坑是同一个：**加宿主侧工具要改三个地方，漏一个就静默失效。**
+
+## 296. 修法 + 守卫
+
+补进白名单，并加三条守卫测试：
+
+1. 所有 `schedule.*` 工具都必须在 `HOST_SIDE_TOOLS` 里
+2. 白名单里每一项都必须真的被 `registerHostTool` 注册（否则"看得到但调不通"）
+3. 容器侧工具（`fs.*`/`shell.*`）不得混进白名单（会合并出重复项）
+
+## 297. 实测
+
+```
+工具调用: schedule.list succeeded → schedule.remove succeeded
+目标: 早间天气提醒 enabled=0  ✅ 已停用
+```
+
+## 298. 顺带澄清一个"不是问题"的
+
+`net.post` 也是 `write_file` 档，看着像缺口。实测：
+
+```
+{"code":"net_post_disabled","message":"DOTD_NET_TOOLS=get 只放开只读的 net.get..."}
+```
+
+**它被环境变量挡在治理之前** —— 双层防护，这个设计是稳的。模型还准确复述了原因
+并给出三个选项（改环境变量 / 不用 POST / 换方案）。
+
+## 299. 本轮门禁
+
+`schedule.remove` 已对模型可见且实测生效 · **`npm test` 1524/1524**（+3 条白名单守卫）·
+配置加载值与文件逐项一致

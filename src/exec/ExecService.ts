@@ -258,7 +258,7 @@ export interface ExecServiceDeps {
  * 所以容器返回的能力目录里天然没有它们 —— getCapabilities 必须把它们合并进去，
  * 否则模型根本看不见（2026-10-18 实测：主人让设提醒，模型答"schedule.create 不在列表里"）。
  */
-const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list']);
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove']);
 
 export class ExecServiceImpl implements ExecService {
   readonly cfg: ExecConfig;
