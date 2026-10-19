@@ -462,7 +462,20 @@ function parseLog(path, label){
 }
 const wdLines=parseLog(WD,"watchdog").concat(parseLog(BOOTLOG,"boot"));
 // watchdog 的"已恢复"、boot 的"daemon 就绪"都算自动恢复。
-const healed=wdLines.filter(w=>w.text.includes("已恢复")||w.text.includes("daemon 就绪"));
+// **不是所有"已恢复"都算 daemon 自愈**（2026-10-19 修，真缺口）：
+// watchdog 会写七种带"已恢复"的行：daemon / relay / 容器 / docker，
+// 另外还有"daemon 重启失败""relay 重启失败"这些**失败**行也含同样的字。
+// 原来只要行里出现"已恢复"就认作 daemon 自愈 —— 实测：
+// 只写一行"relay 已恢复"（daemon 根本没人管），也判"全部是 watchdog 自愈"
+// 并 exit 0。"无人工干预"被一个不相干子系统的恢复日志顶替了。
+// 必须**逐项匹配 daemon 自己**：
+//   · watchdog: "daemon 已恢复"
+//   · boot:     "daemon 就绪"
+// 且要排除含"失败"的行。
+const healedDaemon=(txt)=>
+  /daemon\s*已恢复/.test(txt) ||
+  (/daemon\s*就绪/.test(txt) && !/失败/.test(txt));
+const healed=wdLines.filter(w=>healedDaemon(w.text));
 const restartRows=[];
 for(let i=1;i<LIFE.length;i++){
   const prev=LIFE[i-1], cur2=LIFE[i];
