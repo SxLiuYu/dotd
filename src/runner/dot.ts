@@ -1104,7 +1104,12 @@ export class DotRunner {
           usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
           '\n' +
           '\n**规则**：\n' +
-          '1. 上面有能干这活的 → 必须用 tool.invoke(name, args) 调它，**不要**用 shell.run 重写一遍；\n' +
+          // 2026-10-19 实测踩坑：动态工具已注册成**独立工具**（名字就是 word-count，
+          // 参数直接是 manifest.params），但清单还写着"用 tool.invoke(name, args) 调它"，
+          // 于是模型把参数包成 {name:'word-count', args:{text}} 发给 word-count 本身，
+          // 造成一层多余嵌套。措辞必须与"它现在是一个独立工具"的事实一致。
+          '1. 上面有能干这活的 → **直接调用那个工具**（它的名字就是工具名，参数按该工具的参数填），' +
+          '**不要**用 shell.run 重写一遍；\n' +
           '2. 没有但以后还会重复 → 用 tool.create 造一个（造完记得也 invoke 一次自测）；\n' +
           '3. 只有一次性临时活、上面也没有对口的，才直接用 shell.run。';
       }
@@ -2006,9 +2011,30 @@ export class DotRunner {
     //   · journal 记的也是 tool.invoke → 审批恢复（resumePendingStep）能按
     //     final_params_json 正确重放，不会去执行一个不存在的工具名。
     const isDynamicTool = this.dynamicToolNames.has(call.name);
+    // 兜底（2026-10-19 实测）：模型的旧习惯是把参数包成 {name:'<它自己>', args:{...}}
+    // ——因为早先清单教它用 tool.invoke(name,args)。现在它是一等工具，那层包裹是多余的，
+    // 直接原样透传会让工具收到两个它不认识的参数。判定要严格，避免误伤真有 name/args 参数的工具：
+    // 只认"键恰好是 name+args、name 等于该工具名、args 是普通对象"这一种形状。
+    const dynamicArgs: Record<string, unknown> = (() => {
+      if (!isDynamicTool) return args;
+      const keys = Object.keys(args).sort();
+      const wrapped =
+        keys.length === 2 &&
+        keys[0] === 'args' &&
+        keys[1] === 'name' &&
+        args['name'] === call.name &&
+        args['args'] !== null &&
+        typeof args['args'] === 'object' &&
+        !Array.isArray(args['args']);
+      if (wrapped) {
+        this.log(`runner: 动态工具 ${call.name} 收到多余包裹 {name,args}，已自动拆开`);
+        return args['args'] as Record<string, unknown>;
+      }
+      return args;
+    })();
     const execTool = isDynamicTool ? 'tool.invoke' : call.name;
     const execArgs: Record<string, unknown> = isDynamicTool
-      ? { name: call.name, args }
+      ? { name: call.name, args: dynamicArgs }
       : args;
 
     // S1：sideEffect 词表唯一事实源 = exec.getCapabilities；未声明按 unknown

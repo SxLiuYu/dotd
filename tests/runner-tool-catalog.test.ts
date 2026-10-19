@@ -679,3 +679,86 @@ test('运行时：动态工具（word-count）被翻译成 tool.invoke 派发，
     '模型给的参数必须原样透传给 tool.invoke',
   );
 });
+
+test('动态工具：模型若仍按旧习惯把参数包成 {name,args}，自动拆开（不多传一层）', async () => {
+  // 2026-10-19 真实回归：清单还写着"用 tool.invoke(name,args) 调它"，于是模型给
+  // word-count 本身发 {name:'word-count', args:{text}}，造成多一层嵌套。
+  const transport = makeStubTransport([
+    {
+      content: '',
+      toolCalls: [
+        { id: 'call_w2', name: 'word-count', arguments: '{"name":"word-count","args":{"text":"你好 world"}}' },
+      ],
+      usage: { promptTokens: 10, completionTokens: 5 },
+    },
+    { content: '好了。', usage: { promptTokens: 10, completionTokens: 5 } },
+  ]);
+
+  const execCalls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  const execApi = {
+    runTool: async (call: { call_id: string; tool: string; args: Record<string, unknown> }) => {
+      execCalls.push({ tool: call.tool, args: call.args });
+      if (call.tool === 'tool.list') {
+        return {
+          call_id: call.call_id,
+          status: 'ok' as const,
+          result: { tools: [{ name: 'word-count', description: '统计中文字符数与英文单词数', params: { text: '文本' } }] },
+        };
+      }
+      return { call_id: call.call_id, status: 'ok' as const, result: { ok: true } };
+    },
+    getCapabilities: async () => CAPS,
+    reconcileCall: async () => 'unknown' as const,
+    getCallResult: async () => null,
+    cancelTool: async () => {},
+  };
+
+  let seq = 0;
+  const task = {
+    id: 'tk_dyn_2', dotId: 'dot1', title: 't', goal: '统计中文字符数',
+    status: 'running' as const, runEpoch: 1, threadId: 'thr2', sessionId: 'thr2',
+    resumeFromSeq: null, budgetTokens: undefined,
+  };
+  const cp = {
+    pop: () => (seq === 0 ? (seq += 1, task) : null),
+    bindSession: () => {}, getTask: () => task,
+    journal: {
+      beginLlm: () => ({ seq: (seq += 1), callId: `c_llm_${seq}` }),
+      endLlm: () => {},
+      beginTool: () => ({ seq: (seq += 1), callId: `c_tool_${seq}` }),
+      endTool: () => {}, skipStep: () => {}, markPending: () => {},
+      resumeStep: () => ({ callId: '' }), tail: () => [], getStepByCallId: () => null,
+    },
+    setAwaitingApproval: () => {}, heartbeat: () => ({ aborted: false, overBudget: false }),
+    finish: () => {}, failTask: () => {}, pauseByReason: () => {},
+  };
+  const memoryApi = {
+    openThread: async () => 'thr2', appendMessage: async () => ({ id: 'm', seq: 1 }),
+    appendSystemMessage: async () => ({ id: 'm', seq: 0 }),
+    buildContextBundle: async () => ({ memoryMd: '', manualExcerpts: [], summary: null }),
+    buildSessionReplay: async () => [], beforeWrite: async () => ({ ok: true }),
+    sealTask: async () => {}, readFileNotes: async () => [],
+  };
+
+  const runner = new DotRunner(
+    {
+      cp: cp as unknown as ConstructorParameters<typeof DotRunner>[0]['cp'],
+      router: { complete: (r: RouteRequest): Promise<RouteResult> => transport.complete(r), emergencyActive: false } as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+      exec: execApi as unknown as ConstructorParameters<typeof DotRunner>[0]['exec'],
+      memory: memoryApi as unknown as ConstructorParameters<typeof DotRunner>[0]['memory'],
+      governance: {
+        evaluate: async () => ({ kind: 'allow', decisionId: 'd', brief: null }),
+        claim: async () => ({ ok: true }),
+        forceApproval: async () => ({ approvalId: 0 }),
+      } as unknown as ConstructorParameters<typeof DotRunner>[0]['governance'],
+    },
+    { dotId: 'dot1' },
+  );
+
+  await runner.runNext();
+  const invoked = execCalls.filter((c) => c.tool === 'tool.invoke');
+  assert.equal(invoked.length, 1);
+  assert.equal(invoked[0]!.args['name'], 'word-count');
+  // 关键：透传给工具的必须是模型原本给 word-count 的参数，不是再包一层的 {name,args}
+  assert.deepEqual(invoked[0]!.args['args'], { text: '你好 world' }, '必须拆掉多余包裹，只透传真实参数');
+});
