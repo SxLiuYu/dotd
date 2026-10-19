@@ -655,9 +655,17 @@ const contDownOk=maxContDownSec<=CONT_DOWN_LIMIT_SEC;
 // 所以补 `container_ok`（每 30 分钟一个点，直接拿库里 endpoint 打 /healthz，
 // 11 毫秒、不过模型）。判据口径与 container_up 对齐：全程占比 ≥95%，
 // 且末尾 12 点（6 小时）在线率 ≥75%，且最长连续"不可干活"≤2h。
-const contOkRate=all.length? all.filter(s=>Number(s.container_ok)===1).length/all.length : null;
+// 分母必须是**采过这个字段的点**，不能是 all.length（2026-10-20 自己抓到）：
+// 现场 report 打出"容器可执行率 66.7%（2 点）"——实际 3 个采样点、2 个带字段。
+// 第 1 个点是加字段之前采的，它没有 container_ok，**不是失败，是"当时还没这个指标"**。
+// 拿 all.length 当分母 = 把"指标不存在"算成"指标坏了"，这是第⑥类 bug
+// （样本没测它声称要测的东西）。虽然 7 天后 334/336 会自愈到 99.4%，
+// 但那是靠样本多冲淡的，不是判据说对了话。
+const contOkPts=all.filter(s=>s.container_ok!==undefined);
+const contOkRate=contOkPts.length? contOkPts.filter(s=>Number(s.container_ok)===1).length/contOkPts.length : null;
 const contOkDown=all.filter(s=>Number(s.container_ok)!==1);
-const contOkTailRate=contTail.length? contTail.filter(s=>Number(s.container_ok)===1).length/contTail.length : null;
+const contOkTailPts=contTail.filter(s=>s.container_ok!==undefined);
+const contOkTailRate=contOkTailPts.length? contOkTailPts.filter(s=>Number(s.container_ok)===1).length/contOkTailPts.length : null;
 const contOkTailOk=!(days>=7 && contOkTailRate!==null && contOkTailRate<0.75);
 let maxContOkDownSec=0, curOkDownStart=null;
 for(const s of all){
@@ -672,7 +680,7 @@ const CONT_OK_RATE_LIMIT=0.95;
 const contOkRateOk=!(days>=7 && contOkRate!==null && contOkRate<CONT_OK_RATE_LIMIT);
 const contOkRatePending=!(days>=7);   // 没满 7 天：既不能打 ✅ 也不能打 ❌
 const contOkDownOk=maxContOkDownSec<=CONT_DOWN_LIMIT_SEC;
-const contOkSamples=all.filter(s=>s.container_ok!==undefined).length;
+const contOkSamples=contOkPts.length;
 // 没有数据时**既不能说好也不能说坏**，要显式说"判断不了"
 const contOkUnknown=contOkSamples===0;
 
