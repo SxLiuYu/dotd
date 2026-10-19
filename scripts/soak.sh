@@ -1990,7 +1990,22 @@ try{
   const vp=process.env.SOAK_VERDICT || String(soakPath).replace(/[^/]+$/,"")+"soak-verdict.jsonl";
   let md5="?";
   try{ md5=require("node:child_process").execSync(`md5sum ${JSON.stringify(soakPath)} 2>/dev/null | cut -c1-32`,{encoding:"utf8"}).trim()||"?"; }catch(e){}
-  const row={at:new Date().toISOString(),exit:verdictOk?0:1,soak:soakPath,md5,
+  // **exit 必须有原因**（2026-10-20 补）。
+  //
+  // 第一版审计行只写了 `exit:1`，没有别的。事后翻到三天前那行，
+  // **完全不知道是 RSS 涨了、成功率掉了、还是容器挂了**。
+  // 这与第 61 轮那条「空数据只 exit 1 不说原因」是同一个病的不同层面：
+  // 那次是**终端**不说，这次是**落盘**不说。
+  // 而且终端里已经算好的「哪条红」就在 `c[]` 里 —— 不记下来等于白算一遍。
+  //
+  // 口径：只收 `c[]` 里以 ❌ 开头的那几条（去掉 markdown 加粗的星号），
+  // 每条截到 80 字，最多 12 条 —— 审计行要能被人一眼读完，
+  // 而不是变成一段不可读的长 JSON。
+  const failures=c
+    .filter(x=>x.startsWith("❌"))
+    .map(x=>x.replace(/\*\*/g,"").slice(0,80))
+    .slice(0,12);
+  const row={at:new Date().toISOString(),exit:verdictOk?0:1,failures,soak:soakPath,md5,
     records:all.length,observedDays:Number(coveredDays.toFixed(3)),spanDays:Number(days.toFixed(3)),
     rssGrowthMb:Number(growth.toFixed(1)),fdGrowth,maxFdPeak:maxFd,
     passRate:passRate===null?null:Number((passRate*100).toFixed(1)),probes:probesVerified.length,
