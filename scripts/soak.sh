@@ -1482,11 +1482,26 @@ const BASE_WINDOW_SEC=7200;
 // `peakIdx` 保持**索引**语义（下面 L1368 用它取 all[peakIdx].ts）—— 改成对象会炸：
 // `TypeError: Cannot read properties of undefined (reading 'ts')`。
 // 另给一个 `peakPt` 表达"峰值那个点"，两者都从筛过的 rssPts 算。
-const peakIdx=all.findIndex(s=>s===rssPts.reduce((m,x)=>(x.rss_kb>m.rss_kb?x:m), rssPts[0]));
-const baseEndTs=Math.min(all[0].ts+BASE_WINDOW_SEC, all[peakIdx].ts);
+// **一个样本都没有 rss_kb 时 `findIndex` 返回 -1**（2026-10-20 修，会炸）。
+//
+// `rssPts` 是筛过 `rssOk` 的点。如果整份数据里 `rss_kb` 一个都没有
+// （老格式、或采集侧一直在失败），`rssPts` 是空数组，
+// `rssPts.reduce(..., rssPts[0])` 得到 `undefined`，`findIndex` 返回 **-1**，
+// 然后 `all[-1].ts` → `TypeError: Cannot read properties of undefined (reading 'ts')`。
+//
+// 实测：造一份只有 ts/alive/pid/proc_start 的裸夹具 →
+//   `exit 2` + `❌ report 脚本自身出错（上面是堆栈）—— 这不是"数据不达标"，是判据坏了，必须修`
+// 那句护栏本身是对的（R44 的成果），但它拦下的应该是**我写错代码**，
+// 不该拦下**数据缺字段** —— 后者是正常输入，判据该判红并说明缺什么。
+//
+// 这与第 76 轮「修了 RSS 没修 fd」是同一类：`rssOk` 筛出来了，
+// 但**没筛的那一半代码还在裸用下标**。
+const peakPt=rssPts.length? rssPts.reduce((m,x)=>(x.rss_kb>m.rss_kb?x:m), rssPts[0]) : null;
+const peakIdx=peakPt? all.indexOf(peakPt) : -1;
+const baseEndTs=(peakIdx>=0? Math.min(all[0].ts+BASE_WINDOW_SEC, all[peakIdx].ts) : all[0].ts+BASE_WINDOW_SEC);
 const baseSet=all.filter(s=>s.ts<=baseEndTs);
 const baseN=Math.max(1, baseSet.length);
-const baseRss=med(rssPts.filter(s=>s.ts<=all[peakIdx].ts).slice(0,baseN).map(s=>s.rss_kb))/1024;
+const baseRss=peakIdx>=0? med(rssPts.filter(s=>s.ts<=all[peakIdx].ts).slice(0,baseN).map(s=>s.rss_kb))/1024 : 0;
 const peakGrowth=peakRss-baseRss;
 const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
 
@@ -1608,11 +1623,44 @@ if(segRates.length){
   console.log(`各生命周期内 RSS 爬升速率：${medSegRate===null?"现在还判断不了":medSegRate.toFixed(2)+"MB/h"}（${ev}；`+
               `全部 ${segRates.length} 段中位 ${medSegRateRaw===null?"n/a":medSegRateRaw.toFixed(2)}MB/h，最大 ${segRates.length?maxSegRate.toFixed(2):"n/a"}MB/h —— 最大值仅参考，预热会偏高）`);
 }
-if(segFdRates.length) console.log(`各生命周期内句柄爬升速率：中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}，最大 ${maxSegFdRate.toFixed(3)}个/h`);
+// **同一份证据不能有两个说法**（2026-10-20 修，第 55 轮的复发）。
+//
+// 真窗口实测，同一份数据（1 段、去预热后 1.04 小时）：
+//   正文：`各生命周期内句柄爬升速率：中位 0.000个/h，最大 0.000个/h`
+//   判定：`⚠ 句柄段内爬升：证据不足，现在不判定（只有 1 段…）`
+// RSS 侧那行在同样的数据上老实说「现在还判断不了（证据不足…）」，
+// 而句柄侧正文打出一个 `0.000个/h` —— 一个**没有状态标记的数字**，
+// 读者会读成「爬升速率 0，没问题」，而判定行说的是「我没法判」。
+//
+// 这比打错更难发现：数字是对的（1 段里确实没爬），但**它不该以这种形式出现**。
+// 一条判据在证据不足时，正文就不该给出一个看起来像结论的数字。
+// 复用 RSS 侧的 `segEvidence`，口径完全一致。
+if(segFdRates.length){
+  if(segEvidence==="insufficient"){
+    console.log(`各生命周期内句柄爬升速率：现在还判断不了（**证据不足**：只有 ${LIFE.length} 段、`+
+      `去掉每段预热后都不到 2 小时；实测中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}=参考值）`);
+  }else{
+    console.log(`各生命周期内句柄爬升速率：中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}，最大 ${maxSegFdRate===null?"n/a":maxSegFdRate.toFixed(3)+"个/h"}`+
+      `（${segEvidence==="long"?longRates.length+" 段 ≥2h 的中位":segRates.length+" 段都不足 2h，按全部段中位"}）`);
+  }
+}
 // 线程数不参与 S6 判定（S6 的四条判据是：连续 7 天无人工干预 / RSS 增幅 / 成功率 / 句柄）。
 // 但原来这行只打印一个"+15"却不给结论，读起来像"检查过了、没问题"——
 // 实测线程从 11 涨到 31 时它照打不误、exit 仍为 0。明确标成参照值，不制造错觉。
-console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}，**仅供参考，不参与 S6 判定**）`);
+// **模板写漏了两个占位符**（2026-10-20 修）。
+//
+// 这行一直是 `线程: 首段中位 → 末段中位（增长 +0…）` ——
+// 中间那两个数**从来没打印出来过**，因为模板里根本没写 `${th0}` 和 `${thN}`。
+// 真窗口实测：数据里 `threads` 三个点全是 11，报告却显示空白，
+// 读者会以为「采集没拿到线程数」。
+//
+// 这类错很难被注意到，因为它的表现是「少了一段字」，而不是报错。
+// 回归里也没有任何断言检查这两个数出现过 —— 一条判据如果连自己的输出都不完整，
+// 它后面无论说什么都不可复查。
+const th0=med(headS.filter(thOk).map(s=>s.threads));
+const thN=med(tailS.filter(thOk).map(s=>s.threads));
+console.log(`线程: 首段中位 ${th0===null||th0===undefined?"n/a":th0} → 末段中位 ${thN===null||thN===undefined?"n/a":thN}`+
+  `（增长 ${thGrowth>=0?"+":""}${thGrowth}，**仅供参考，不参与 S6 判定**）`);
 console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
 if(probesLegacy>0)
   console.log(`⚠ ${probesLegacy} 条旧格式探针没验过飞书送达（无 out/ws 字段），不计入成功率`);
