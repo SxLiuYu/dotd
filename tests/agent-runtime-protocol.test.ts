@@ -419,9 +419,13 @@ test('能力目录: 容器内工具与契约词表一致（宿主侧工具不在
 
 test('能力目录: mode 归属 = fs.* 为 sync，其余 async（EX §5.2 判据句）', () => {
   const sync = CAPABILITIES.filter((c) => c.mode === 'sync').map((c) => c.name);
-  assert.deepEqual(sync, ['fs.read', 'fs.write', 'fs.list', 'fs.stat', 'fs.remove']);
+  assert.deepEqual(sync, ['fs.read', 'fs.write', 'fs.list', 'fs.stat', 'fs.remove', 'tool.list', 'tool.create', 'tool.invoke']);
   for (const c of CAPABILITIES) {
-    if (!c.name.startsWith('fs.')) assert.equal(c.mode, 'async', c.name);
+    // sync 判据（2026-10-19 更新）：fs.*（纯本地文件操作）与 tool.*（本地工具存取/子进程，
+    // 不走跨机排队）都是 sync；其余 shell/browser/net 是 async（可能长跑、要占 job 槽位）。
+    const syncFamily = c.name.startsWith('fs.') || c.name.startsWith('tool.');
+    if (syncFamily) assert.equal(c.mode, 'sync', c.name);
+    else assert.equal(c.mode, 'async', c.name);
     // sync 一律压在 60s 硬顶内
     if (c.mode === 'sync') assert.ok(c.max_deadline_ms <= SYNC_MAX_DEADLINE_MS, c.name);
   }
@@ -442,6 +446,9 @@ test('能力目录: sideEffect 档位（契约 J2：未声明按 unknown）', ()
     'browser.close': 'safe',
     'net.get': 'safe',
     'net.post': 'unknown',
+    'tool.list': 'safe',
+    'tool.create': 'unknown',
+    'tool.invoke': 'unknown',
   };
   for (const c of CAPABILITIES) {
     assert.equal(c.sideEffect, expect[c.name], `${c.name} sideEffect`);

@@ -79,6 +79,9 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
       'schedule.create',
       'schedule.remove',
       'schedule.list',
+      'tool.list',
+      'tool.create',
+      'tool.invoke',
     ],
   );
 });

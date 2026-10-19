@@ -684,7 +684,7 @@ test('端点表: /capabilities 列出模型面工具 + sideEffect', async (t) =>
 
   const r = await req(env.base, 'GET', '/capabilities');
   const caps = r.body.capabilities as Array<{ name: string; mode: string; sideEffect?: string }>;
-  assert.deepEqual(caps.map((c) => c.name).sort(), ['browser.act', 'browser.close', 'browser.open', 'browser.snapshot', 'fs.list', 'fs.read', 'fs.remove', 'fs.stat', 'fs.write', 'net.get', 'net.post', 'shell.run']);
+  assert.deepEqual(caps.map((c) => c.name).sort(), ['browser.act', 'browser.close', 'browser.open', 'browser.snapshot', 'fs.list', 'fs.read', 'fs.remove', 'fs.stat', 'fs.write', 'net.get', 'net.post', 'shell.run', 'tool.create', 'tool.invoke', 'tool.list']);
   const fsRead = caps.find((c) => c.name === 'fs.read');
   assert.equal(fsRead?.mode, 'sync');
   assert.equal(fsRead?.sideEffect, 'safe');

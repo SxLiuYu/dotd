@@ -744,7 +744,11 @@ export type ToolName =
   | 'browser.snapshot'
   | 'browser.close'
   | 'net.get'
-  | 'net.post';
+  | 'net.post'
+  // S2（2026-10-19）：自造工具 —— 让 dotd 把写过的脚本沉淀下来复用
+  | 'tool.list'
+  | 'tool.create'
+  | 'tool.invoke';
 
 /**
  * 契约外工具的**网关名**（P2-1）。

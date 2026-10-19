@@ -95,6 +95,23 @@ tools:
   - name: mcp.call
     tier: dangerous
 
+  # ── 自造工具（S2，2026-10-19）────────────────────────────────────────
+  # 让 dotd 把写过的脚本沉淀成可复用工具，不再"写完就丢"。
+  #
+  # 档位理由：
+  #  - tool.list  read：只读目录，无副作用
+  #  - tool.create dangerous：**写一个可执行文件**，下次还会自动跑它。
+  #    这等价于"让 AI 往系统里种代码"，必须主人点头（GOV 五档里 dangerous=人工审批）。
+  #  - tool.invoke dangerous：执行一个**之前生成的、现在没人看过的**脚本。
+  #    主人批准的是"造"的那一刻，不是"每次跑"——所以跑也要批。
+  #    如果以后发现太繁琐，可降为 write_file + 首次执行审批，但**默认从严**。
+  - name: tool.list
+    tier: read
+  - name: tool.create
+    tier: dangerous
+  - name: tool.invoke
+    tier: dangerous
+
 # ── spend 档条目（结构定型，§9.3：花钱一律人工审批）──────────────────────────
 # GOV §2.3 校验细则：tier == "spend" 的条目必须带 spendParams（缺则加载失败）。
 # 阶段一工具词表（§9.1/M5）无 spend 档工具；购物走 browser.act 由 review 承接。

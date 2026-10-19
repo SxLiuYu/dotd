@@ -35,7 +35,10 @@ export type ToolName =
   | 'browser.snapshot'
   | 'browser.close'
   | 'net.get'
-  | 'net.post';
+  | 'net.post'
+  | 'tool.list'
+  | 'tool.create'
+  | 'tool.invoke';
 
 export const TOOL_NAMES: readonly ToolName[] = [
   'fs.read',
@@ -50,6 +53,10 @@ export const TOOL_NAMES: readonly ToolName[] = [
   'browser.close',
   'net.get',
   'net.post',
+  // S2（2026-10-19）：自造工具
+  'tool.list',
+  'tool.create',
+  'tool.invoke',
 ];
 
 /** EX §5.2：派发端点判据，由工具属性声明，不由时长猜测。 */
@@ -301,6 +308,55 @@ export const CAPABILITIES: readonly Capability[] = [
         url: { type: 'string', minLength: 1 },
         body: { type: 'string' },
         headers: { type: 'object' },
+      },
+      additionalProperties: false,
+    },
+    sideEffect: 'unknown',
+  },
+  {
+    /**
+     * 自造工具（S2，2026-10-19）：让 dotd 把写过的脚本沉淀成可复用工具。
+     *
+     * 三个都是 sync：
+     *  - tool.list 只读目录
+     *  - tool.create 写文件 + chmod（受宿主 30s deadline 约束）
+     *  - tool.invoke 起子进程跑脚本（受宿主 60s deadline 约束）
+     */
+    name: 'tool.list',
+    mode: 'sync',
+    max_deadline_ms: SYNC_MAX_DEADLINE_MS,
+    args_schema: { type: 'object', required: [], properties: {}, additionalProperties: false },
+    sideEffect: 'safe',
+  },
+  {
+    name: 'tool.create',
+    mode: 'sync',
+    max_deadline_ms: SYNC_MAX_DEADLINE_MS,
+    args_schema: {
+      type: 'object',
+      required: ['name', 'description', 'script'],
+      properties: {
+        name: { type: 'string', minLength: 2, maxLength: 40 },
+        description: { type: 'string', minLength: 1 },
+        script: { type: 'string', minLength: 1 },
+        entry: { type: 'string' },
+        params: { type: 'object' },
+        returns: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+    sideEffect: 'unknown',
+  },
+  {
+    name: 'tool.invoke',
+    mode: 'sync',
+    max_deadline_ms: SYNC_MAX_DEADLINE_MS,
+    args_schema: {
+      type: 'object',
+      required: ['name'],
+      properties: {
+        name: { type: 'string', minLength: 1 },
+        args: { type: 'object' },
       },
       additionalProperties: false,
     },

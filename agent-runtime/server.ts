@@ -44,6 +44,7 @@ import {
 } from './protocol.ts';
 import { Ledger } from './ledger.ts';
 import { FsTools } from './fs.ts';
+import { ToolStore } from './tools.ts';
 import { ShellTools, type SpawnAdapter } from './shell.ts';
 import { BrowserHolder, MAX_PAGES_PER_CTX, identityHash, browserCrashed, isPersistentIdentity } from './browser.ts';
 import { XvfbManager, type XvfbSpawn } from './xvhfd.ts';
@@ -140,6 +141,8 @@ interface JobEntry {
 export class AgentRuntime {
   readonly ledger: Ledger;
   readonly fs: FsTools;
+  /** 自造工具（S2）：tools/ 目录下的可复用脚本 */
+  readonly toolStore: ToolStore;
   readonly shell: ShellTools;
   readonly browser: BrowserHolder;
   readonly xvfb: XvfbManager;
@@ -186,6 +189,7 @@ export class AgentRuntime {
     this.ledger = new Ledger({ filePath: ledgerPath });
 
     this.fs = cfg.fsTools ?? new FsTools();
+    this.toolStore = new ToolStore({ homeRoot: cfg.homeRoot ?? "/dot/home" });
     this.shell =
       cfg.shellTools ??
       new ShellTools({
@@ -629,6 +633,28 @@ export class AgentRuntime {
         return this.fs.list(call.call_id, call.args);
       case 'fs.stat':
         return this.fs.stat(call.call_id, call.args);
+      case 'tool.list':
+        return okResult(call.call_id, { tools: this.toolStore.list() });
+      case 'tool.create': {
+        const r = this.toolStore.create({
+          name: String(call.args.name ?? ''),
+          description: String(call.args.description ?? ''),
+          params: (call.args.params ?? {}) as Record<string, string>,
+          entry: String(call.args.entry ?? 'run.sh'),
+          returns: call.args.returns === undefined ? undefined : String(call.args.returns),
+          script: String(call.args.script ?? ''),
+        });
+        if (!r.ok) return errorResult(call.call_id, 'tool_create_invalid', r.error, false);
+        return okResult(call.call_id, { manifest: r.manifest, path: r.path });
+      }
+      case 'tool.invoke': {
+        const r = await this.toolStore.invoke(
+          String(call.args.name ?? ''),
+          (call.args.args ?? {}) as Record<string, unknown>,
+        );
+        if ('error' in r) return errorResult(call.call_id, 'tool_not_found', r.error, false);
+        return okResult(call.call_id, r);
+      }
       case 'fs.remove':
         return this.fs.remove(call.call_id, call.args);
       case 'shell.run':

@@ -267,6 +267,66 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     ),
     sideEffect: 'replayable',
   },
+  {
+    /**
+     * 自造工具（S2，2026-10-19）：列出 tools/ 目录下已被造出来的工具。
+     *
+     * 为什么需要：之前 dotd 只有 15 个写死的工具，遇到"每周抓一次招聘信息"
+     * 这类活每次都得重写脚本、写完就丢 —— **能力不会积累**。
+     * 对标 OpenAI bot，这是硬差距。
+     */
+    name: 'tool.list',
+    mode: 'sync',
+    max_deadline_ms: 10_000,
+    args_schema: obj({}, []),
+    sideEffect: 'safe',
+  },
+  {
+    /**
+     * 自造工具：把一段脚本落盘成可复用工具。
+     *
+     * 约定（刻意做得笨拙但可靠）：
+     *  - 工具从 **argv[1] 读一个 JSON** 拿参数（不走环境变量/stdin，避免 bash 转义地狱）；
+     *  - 结果打到 stdout，exit 0 表示成功；
+     *  - 按 entry 扩展名选解释器（.sh→bash / .py→python3 / .mjs→node）。
+     */
+    name: 'tool.create',
+    mode: 'sync',
+    // 2026-10-19：原来写 30_000，模型按默认节奏传了更长的 deadline → deadline_too_long，
+    // 工具直接调不通（与 fs.remove 那次同一个坑）。sync 一律给到硬顶 60s。
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        name: str('工具名：小写字母开头，只含小写字母/数字/连字符，2-40 字符'),
+        description: str('这个工具干什么 —— 模型以后靠它决定何时复用，要写具体'),
+        script: str('实现代码。从 argv[1] 读 JSON 参数，结果打到 stdout，exit 0 表示成功'),
+        entry: str('入口文件名，默认 run.sh；按扩展名选解释器'),
+        params: str('参数说明 JSON（可选），形如 {"url":"要抓的网址"}'),
+        returns: str('返回什么（可选，一句话）'),
+      },
+      ['name', 'description', 'script'],
+    ),
+    sideEffect: 'unknown',
+  },
+  {
+    /**
+     * 自造工具：调用一个已造好的工具。
+     *
+     * 参数作为 JSON 走 argv[1]：实测经过 bash -c 时，带引号/换行/中文的内容
+     * 只有 argv 是可靠的（环境变量与 stdin 都会被 shell 咬）。
+     */
+    name: 'tool.invoke',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        name: str('要调用的工具名（从 tool.list 拿）'),
+        args: str('传给工具的参数 JSON 对象，会作为 argv[1] 传入'),
+      },
+      ['name'],
+    ),
+    sideEffect: 'unknown',
+  },
 ];
 
 /**

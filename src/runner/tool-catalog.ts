@@ -318,6 +318,48 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     returns: '返回 JSON：count 与 schedules[]（每项含 id、title、cron、next_fire_at、last_fire_status）。',
     failures: '一般不会失败；返回 count=0 说明还没建过。',
   },
+  {
+    name: 'tool.list',
+    description:
+      '列出**你已经造出来的工具**。开始一个复杂、可能重复的活之前先看一眼 —— ' +
+      '如果之前造过类似的工具，直接 tool.invoke 复用，不要重复造。',
+    params: {},
+    returns: '返回 JSON：tools[]，每项含 name、description、params（参数说明）、entry、returns。' +
+      '带 broken 字段的表示这个工具坏了（manifest 损坏或入口文件缺失），别用。',
+    failures: '一般不会失败；tools=[] 表示还没造过工具。',
+  },
+  {
+    name: 'tool.create',
+    description:
+      '**造一个新工具**：把一段脚本存成可复用的工具，以后同类活直接调用。' +
+      '什么时候用：主人交代一个"以后还会重复做"的活（每周抓某个网站、批量处理某类文件、' +
+      '固定格式的数据转换），而现有工具做不了 —— 这时应该造工具而不是每次重写脚本。' +
+      '什么时候不用：一次性的临时活，直接用 shell.run 跑完就行，不必沉淀。' +
+      '脚本约定：从 argv[1] 读一个 JSON 拿参数；结果打到 stdout；exit 0 = 成功。',
+    params: {
+      name: '工具名：小写字母开头，只含小写字母/数字/连字符，2-40 字符（如 fetch-jobs）。',
+      description: '这个工具干什么 —— 以后靠这句话决定何时复用，要写具体（别写"处理数据"，写"从某招聘网站抓前端岗位并按城市分组"）。',
+      script: '实现代码。从 argv[1] 读 JSON 参数，结果打 stdout，exit 0 表示成功。',
+      entry: '入口文件名，默认 run.sh；按扩展名选解释器（.sh→bash / .py→python3 / .mjs→node）。',
+      params: '参数说明 JSON（可选），形如 {"url":"要抓的网址"} —— 帮助以后的你正确调用。',
+      returns: '返回什么（可选，一句话）。',
+    },
+    returns: '返回 JSON：manifest（工具定义）与 path（落盘位置）。同名已存在时覆盖，旧版本自动进 .archive/。',
+    failures: 'tool_create_invalid（名字不合法 / description 或 script 为空 / entry 带路径）。' +
+      '注意：这个操作需要主人审批一次。',
+  },
+  {
+    name: 'tool.invoke',
+    description:
+      '**调用一个你已经造好的工具**。开始活之前先 tool.list 看看有没有能用的，有就直接复用。',
+    params: {
+      name: '要调用的工具名（从 tool.list 拿）。',
+      args: '传给工具的参数 JSON 对象，会原样作为 argv[1] 传进去。',
+    },
+    returns: '返回 JSON：ok、exitCode、stdout、stderr、truncated（输出超 32KB 被截断）、elapsedMs。',
+    failures: 'tool_not_found（没这个工具，先用 tool.list 确认）、超时（默认 60s）。' +
+      '工具有 stderr 且 exitCode≠0 时，把 stderr 原样告诉主人，别自己编原因。',
+  },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
@@ -449,7 +491,7 @@ export const NET_SEARCH_GUIDE = `联网查资料的判据（没有内置搜索�
  */
 export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额外接了自己的工具，见各自说明）：
 1. 看盘：fs.list（目录）→ fs.stat（在不在/多大）→ fs.read（读文本）。这是绝大多数任务的第一步。
-2. 写盘：fs.write（覆盖整篇，改文件前必须先 fs.read 出原文再整篇写回）。任务收尾写记忆用它。
+2. 写盘：fs.write（覆盖整篇；改文件前必须先 fs.read 原文再整篇写回）。
    删除：fs.remove（先归档再删，可恢复；目录只删空的）。
 3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
    **读文档也用 shell.run**（不要用 fs.read——它只能读纯文本，二进制会被破坏）：
@@ -459,6 +501,7 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
 4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
+   7. 造工具：tool.create / tool.list / tool.invoke。重复性的活先造工具、下次复用；一次性活用 shell.run。
 通用约定：
 - 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
 - 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。
