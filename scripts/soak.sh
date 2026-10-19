@@ -288,6 +288,25 @@ const expectProbes=days*PROBE_PER_DAY;
 const probeRate=expectProbes>0? probesVerified.length/expectProbes : null;
 const PROBE_RATE_LIMIT=0.7;
 const probeDensityOk=!(days>=7 && (probeRate===null || probeRate<PROBE_RATE_LIMIT));
+
+// **密度够 ≠ 覆盖够**（2026-10-19 补，真缺口）：
+// 判据要的是"成功率**不掉**"，那是整个 7 天里都要有证据的事。
+// 但如果 28 个探针全挤在**头 56 分钟**内跑完、之后 8 天一个没测，
+// 总数照样够（密度 174%）、成功率照样 100% → exit 0。
+// 实际上后 8 天"掉没掉"完全没测过。
+// 补一条：**每个自然日都要有探针**。7 天窗口就查 7 个自然日，
+// 允许最多 1 天缺席（真机偶发 cron 抖动），但不能整段没测。
+// 按**窗口起点算起**的每 24 小时切一段（不是 UTC 自然日）。
+// 踩过坑：第一版用 UTC 自然日，窗口跨 9 个自然日，
+// 于是"探针全在头 56 分钟"也报"覆盖 9/9 天" —— 判据自己说谎。
+// 以 first.ts 为第 0 段的起点，第 i 段 = [first+i*86400, first+(i+1)*86400)。
+const probeSegOf=(ts)=>Math.floor((ts-first.ts)/86400);
+const probeSegs=new Set(probesVerified.map(p=>probeSegOf(p.ts)));
+const allSegList=[];
+for(let i=0; i*86400<=nowSec-first.ts; i++) allSegList.push(i);
+const coveredProbeDays=allSegList.filter(i=>probeSegs.has(i)).length;
+const PROBE_DAY_MISS_ALLOWED=1;
+const probeCoverageOk=!(days>=7 && coveredProbeDays < allSegList.length-PROBE_DAY_MISS_ALLOWED);
 const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际跨度"
 
 // **连续性**（2026-10-19 补）：只看"首尾跨了 7 天"是不够的 ——
@@ -613,6 +632,12 @@ if(days>=7){
     : `❌ **探针密度只有 ${probeRate===null?"0":(probeRate*100).toFixed(0)}%**（已验飞书 ${probesVerified.length} 次 / 应 ${Math.round(expectProbes)} 次）：`+
       `"成功率不掉"需要真的测过，不能靠"一次都没测"来满足`);
 }
+if(days>=7){
+  c.push(probeCoverageOk
+    ? `✅ 探针覆盖 ${coveredProbeDays}/${allSegList.length} 段（按窗口起点每 24h 一段，允许缺 ${PROBE_DAY_MISS_ALLOWED} 段）`
+    : `❌ **探针只覆盖了 ${coveredProbeDays}/${allSegList.length} 段**：`+
+      `"成功率不掉"要在整个窗口都有证据，不能只在开头测一批就算完`);
+}
 if(passRate!==null){
   if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
   else {
@@ -655,7 +680,7 @@ console.log("\n判定：" + c.join("；"));
 // 退出码却还是 0，脚本层面会当成通过。合成数据实测：28 次探针全后半失败、
 // 总成功率 50%，exit 仍是 0。这等于 S6 最容易退化的那条判据没有约束力。
 // 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95)
