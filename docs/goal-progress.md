@@ -109,7 +109,20 @@
   - 验证 cron **确实自主触发**：样本时间戳落在 19:30:01 / 20:00:01（对齐 :00/:30 整分钟），
     不是我手工跑的；`sample` 与 `probe` 两条路径都在 `env -i`（极简 PATH）下验过能工作
     （S5 踩过"手工能跑、cron 静默失败"的坑，这里提前验掉）。
-  - 已写 7 天计时起点 `docs/acceptance/soak-day0.txt` = **2026-10-19 20:09:04**。
+  - 已写 7 天计时起点 `docs/acceptance/soak-day0.txt`，**当前值 2026-10-19 20:17:57**。
+    （起点先后被我自己改动/验证重启了两次，每次重设；见下方"断电重建实测"。）
+  - **断电重建实测（这是 S6 最该担心的场景）**：S6 要求"连续 7 天无人工干预"，
+    但 Windows 随时可能重启。若重启后需要人手动拉起来，7 天窗口就是假的。
+    实测：`wsl --shutdown` 整机停掉（`wsl -l -v` → `Stopped`），**然后完全不手动干预**，
+    等 Windows 计划任务 `WSL-KeepAlive`（每 2 分钟）自己触发 ——
+    20:16:43 计划任务运行（Last Result: 0）→ WSL 变 Running →
+    `/var/log/dotd-boot.log` 记录「docker 就绪 / relay 就绪 / daemon 就绪（4s）」→
+    HTTP 200、容器 Up。**全程无人动手。**
+    同时 watchdog 也独立干了活：20:15:01 日志「自愈:尝试重启 daemon → 已恢复(6s)」。
+  - 顺带查清两个历史顾虑：① `HKCU\...\Run` 里**没有** dotd 条目
+    （之前看到的 `dotd-stack.cmd` 是 `Format-List` 输出的视觉错觉，实际值名里没有它，
+    对应文件也不存在）；② 那台机器上还有个**旧的** `/root/wsl-watchdog.sh`，
+    只管 gpt-load / workbuddy2api / netfuzz，**不碰 dotd**，与新 watchdog 无冲突。
   - **验证"到第 7 天它会判对吗"**（不然只能等满 7 天，判错了也发现太晚）：给 `soak.sh`
     加了 `SOAK=` 覆盖，用合成数据跑 6 个场景，判据双向都咬得住 ——
     A 满 7 天/RSS+20MB/fd+0 → **exit 0 通过**；E RSS+49MB（边界内）→ exit 0；
