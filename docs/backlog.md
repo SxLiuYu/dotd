@@ -82,3 +82,7 @@
 若要修，正确方向是看"段内是否出现过持平区间"而不是纯斜率——
 但这属于判据调优，需要先有足够长的真实数据（至少 24~48h）再定阈值。
 **当前不动**，继续观察真实窗口。
+
+| 2026-10-20 | S6 窗口期审计 | `soak.sh` 的 `sample` 采了 `db_kb` 与 `threads`，但 `db_kb` **从未进入任何判据**（`threads` 只在报告里标"仅供参考"）。审计时确认这是**有意的、合理的设计**，不是缺陷：实测 DB 速率 184.57 KB/小时 = 4.4 MB/天，7 天窗口只增长 30.3 MB（17.4MB → 47.2MB），占 892GB 可用盘的 **0.005%**，不会成为风险 | 无（DB 不是 7 天运行期的真实风险） | 不改。若将来 DB 速率显著上升（例如引入 event 表全量保留），再把 `db_kb` 升级为判据（建议阈值：7 天增长 < 500MB） |
+
+| 2026-10-20 | S6 窗口期审计 | **系统性核对"判据链完整性"**：一次性检查 13 个 `*Ok` 判据变量是否都真的影响 `process.exit`。结果：`contDownOk`/`contOkDownOk`/`contOkRateOk`/`contOkTailOk`/`contTailOk`/`passOk` 直接进 `process.exit`；`deadOk`/`failRunOk`/`probeCoverageOk`/`probeDensityOk`/`secsOk`/`slotOk`/`tailOk` 经 `passOk` 汇入。**13/13 全部有归属，无遗漏** | 无（判据链完整） | 这条审计本身留作下次改动后的复查清单：**加判据后必须确认它进了 `process.exit`**，否则等于没写（第⑩类 bug） |
