@@ -2906,3 +2906,68 @@ Wsl/Service/CreateInstance/E_ILLEGAL_STATE_CHANGE
 
 镜像重建后挂载从 12 → 4 · 卷 173 → 45 · daemon/飞书/容器全部正常 · 端到端 `VERIFY-OK` ·
 `tsc` exit 0 · `npm test` 1499/1501（2 条新增 Dockerfile 守卫）
+
+---
+
+# 第三十八轮：补上 WSL 卡死的监控盲区（2026-10-19）
+
+## 173. 盲区在哪
+
+前几轮建的 watchdog 跑在 **WSL 里面**。而 2026-10-19 实测过一次 WSL 整体卡死
+（`docker volume prune` 后进入 `Compacting` 状态，卡了十几分钟）：
+
+> WSL 挂了 → 里面的 watchdog 也挂了 → **没有任何人报警**。
+
+这是结构性的：只有 WSL **之外**的进程才能发现"WSL 没了"。
+
+## 174. Windows 侧探针（`scripts/dotd-probe.ps1`）
+
+独立进程，只做三件事：
+
+| 步骤 | 动作 |
+|---|---|
+| ① | 探测 7788 端口 |
+| ② | 连续 3 次失败 → **先自愈**，修不好再发飞书 |
+| ③ | 自愈分两种：WSL 活着 → 调 `dotd-boot.sh`；WSL 死了 → `wsl --shutdown` 后重启 |
+
+告警里会写清楚**原因判断**（"WSL 整体无响应" vs "WSL 活着但 daemon 起不来"），
+并注明"这是 Windows 侧探针发出的"——收到这条就说明 WSL 内 watchdog 已经指望不上了。
+
+## 175. 写的时候踩了一个很典型的 PowerShell 坑
+
+第一版探针测试时"停掉 daemon 仍然静默通过"。根因在 `Test-Port`：
+
+```powershell
+try {
+  $ok = $task.Wait(3000)
+  $connected = $client.Connected     # ConnectAsync 抛异常时这行走不到
+  return ($ok -and $connected)
+} catch { return $false }
+```
+
+异常时 `$connected` 还是 `$null`，`$ok -and $null` 得到 **`$null`**，而调用方
+`if ($daemonOk)` 把 `$null` 当**真** → 故障被静默吞掉。
+
+**这和"探针永远通过"是同一类错误**，只是藏在 PowerShell 的真值语义里。
+修法：每个出口显式 `return [bool]`，并加 `finally` 关连接。
+
+## 176. 实测（真停真起）
+
+常驻模式下停掉 daemon：
+
+```
+10:06:13  daemon unreachable (attempt 1)
+10:06:30  daemon unreachable (attempt 2)
+10:06:47  daemon unreachable (attempt 3)
+10:06:47  self-heal: restarting daemon
+10:06:52  self-heal OK (0s)     ← 5 秒修好
+```
+
+## 177. 自启动
+
+启动文件夹新增 `dotd-probe.cmd`（`-LoopSeconds 60`），与原有的 `dotd-stack.cmd` 并存。
+
+## 178. 本轮门禁
+
+探针实测通过（检测 + 自愈）· **`npm test` 1505/1505**（+4 条探针静态守卫，
+含"每个 return 必须显式布尔"——已验证植入 bug 时会失败）· daemon/飞书/容器正常
