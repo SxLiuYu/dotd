@@ -29,7 +29,7 @@ endpoints:
     # 主循环每轮都带 tools + tool_choice:auto，所以 primary 必须是真能调工具的模型，
     # 否则工具永远不执行（任务看起来"做完"了但什么都没干）。light 轨只做事件匹配/摘要，
     # 用便宜快的 flash 即可。
-    base_url: http://127.0.0.1:3065/v1
+    base_url: http://172.17.48.1:13065/v1
     api_key_env: WB2API_KEY
     models:
       # 2026-10-18 跨模型 A/B（三轮重复，同一批用例）选出：
@@ -38,7 +38,7 @@ endpoints:
       #   deepseek-v4.1-flash 确认型任务中位 14 步（原来用的）
       # 三者答案正确率都是 3/3。glm 在简单任务上 4-6 步，与 deepseek 的 4 步接近。
       # light 保持 deepseek-v4.1-flash：只做事件匹配/摘要，便宜即可。
-      primary: glm-5.3-flash
+      primary: deepseek-v4.1-flash
       light:   deepseek-v4.1-flash
     # 模型级 fallback 链（语义见下方注释块）：主模型限流/5xx 时换同名族的下一个，
     # 端点与凭据不换、熔断不结算。**只用实测能调工具的模型**，别把 hy3 放进 primary 链。
