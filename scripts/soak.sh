@@ -365,7 +365,10 @@ console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点�
 console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），单点峰值 ${maxFd}`);
 if(segRates.length) console.log(`各生命周期内 RSS 爬升速率：中位 ${medSegRate===null?"n/a":medSegRate.toFixed(2)+"MB/h"}，最大 ${maxSegRate.toFixed(2)}MB/h（${segRates.length} 段够长可算；最大值仅参考，新生进程预热会偏高）`);
 if(segFdRates.length) console.log(`各生命周期内句柄爬升速率：中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}，最大 ${maxSegFdRate.toFixed(3)}个/h`);
-console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}）`);
+// 线程数不参与 S6 判定（S6 的四条判据是：连续 7 天无人工干预 / RSS 增幅 / 成功率 / 句柄）。
+// 但原来这行只打印一个"+15"却不给结论，读起来像"检查过了、没问题"——
+// 实测线程从 11 涨到 31 时它照打不误、exit 仍为 0。明确标成参照值，不制造错觉。
+console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}，**仅供参考，不参与 S6 判定**）`);
 console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
 console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
 console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"%"}` +
