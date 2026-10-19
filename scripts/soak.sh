@@ -109,6 +109,20 @@ const S=sameLifetime.length?sameLifetime:all;
 
 const first=all[0], last=all[all.length-1];
 const hours=(last.ts-first.ts)/3600, days=hours/24;
+
+// **连续性**（2026-10-19 补）：只看"首尾跨了 7 天"是不够的 ——
+// 采样器如果在中间死了 3 天，首尾照样跨 7 天，报告会给出一个虚假的"连续 7 天"。
+// 真实的 7×24 里，cron 每 30 分钟一个点，正常间隔 1800s；
+// 窗口内若出现远超此值的空档，说明那段没在观测，必须扣掉。
+const sorted=all.slice().sort((a,b)=>a.ts-b.ts);
+const GAP_LIMIT=5400;                  // 90 分钟：容忍 cron 抖动/一次漏跑
+let maxGap=0, deadTotal=0;
+for(let i=1;i<sorted.length;i++){
+  const g=sorted[i].ts-sorted[i-1].ts;
+  if(g>maxGap) maxGap=g;
+  if(g>GAP_LIMIT) deadTotal+=g-GAP_LIMIT;   // 超出容忍的部分算"没在看"
+}
+const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
 const rss0=S[0].rss_kb/1024, rssN=S[S.length-1].rss_kb/1024;
 const growth=rssN-rss0;
 const fdGrowth=S[S.length-1].fd-S[0].fd;
@@ -130,6 +144,7 @@ const LIFE=[...lifeMap.values()].sort((a,b)=>a.first-b.first);
 
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，跨度 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天）`);
+console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
 if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
 if(lifetimes>1){
@@ -147,13 +162,20 @@ console.log(`线程: 起 ${S[0].threads} → 末 ${S[S.length-1].threads}（增�
 console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
 
 const c=[];
-if(days>=7) c.push("✅ 已满 7 天"); else c.push(`❌ 未满 7 天（还差 ${(7-days).toFixed(2)} 天）`);
+if(days>=7 && coveredDays>=7){
+  c.push("✅ 已满 7 天且观测连续");
+} else if(days>=7){
+  c.push(`❌ 首尾跨 ${days.toFixed(2)} 天，但**观测有断档**：扣除断档后只有 ${coveredDays.toFixed(2)} 天`+
+         `（最长空档 ${(maxGap/3600).toFixed(2)}h，超过 ${(GAP_LIMIT/3600).toFixed(1)}h 的部分累计 ${(deadTotal/3600).toFixed(2)}h）`);
+} else {
+  c.push(`❌ 未满 7 天（还差 ${(7-days).toFixed(2)} 天）`);
+}
 c.push(growth<50? "✅ RSS 增长 <50MB" : `❌ RSS 增长 ${growth.toFixed(1)}MB ≥50MB`);
 c.push(fdGrowth<=2? "✅ 无明显句柄泄漏" : `❌ 句柄增长 ${fdGrowth}`);
 if(lifetimes>1) c.push(`⚠ 期间重启过 ${lifetimes-1} 次（"连续 7 天"需说明原因：自愈不算人工干预，但要如实记录）`);
 if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
 console.log("\n判定：" + c.join("；"));
-process.exit(days>=7 && growth<50 && fdGrowth<=2 ? 0 : 1);'
+process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
