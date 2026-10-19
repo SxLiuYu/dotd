@@ -9,8 +9,17 @@ $FailThreshold = 3
 $CooldownSec = 1800
 
 function Write-Log([string]$msg) {
+    # 用 [IO.File]::AppendAllText 而不是 Add-Content：
+    # 2026-10-19 实测踩坑 —— 计划任务每分钟拉起一个探针，Add-Content 在并发时
+    # 会因文件被占用抛异常，而异常发生在函数内**静默中断了整个 Invoke-Check**，
+    # 表现为"心跳日志从来没出现过、但检查逻辑看起来在跑"。
+    # AppendAllText 用 FileShare.ReadWrite，不会互相踩。
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $msg"
-    Add-Content -Path $LogPath -Value $line -Encoding UTF8
+    try {
+        [System.IO.File]::AppendAllText($LogPath, $line + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        # 日志写失败不能影响检查本身
+    }
     Write-Host $line
 }
 
@@ -18,7 +27,7 @@ function Test-Port([int]$port, [int]$timeoutMs = 3000) {
     # 注意：必须保证**所有路径都返回布尔值**。2026-10-19 实测踩坑：
     # ConnectAsync 抛异常时走进 catch，但若在 try 内先算 $connected 再 return，
     # 异常发生时 $connected 仍未赋值（$null），`$ok -and $null` 得到 $null，
-    # 调用方 `if ($daemonOk)` 会把 $null 当作**真** —— 于是探针在故障时静默通过。
+    # 调用方 `if ($probeOk)` 会把 $null 当作**真** —— 于是探针在故障时静默通过。
     # 现在显式在每个出口给 [bool]。
     $client = $null
     try {
@@ -114,6 +123,10 @@ function Invoke-Check {
     } catch { $wslAlive = $false }
 
     if ($daemonOk) {
+        # 心跳：健康时也要留痕。否则"在正常运行"和"进程假死"从日志上无法区分
+        # ——2026-10-19 实测过这个困惑：探针在跑，但日志停在几小时前，看不出死活。
+        # 只做轻量记录（一行），60 秒一次不会撑爆日志。
+        Write-Log "  heartbeat ok (wslAlive=$wslAlive)"
         $cnt = Get-Counter2 'daemon'
         if ((Get-State2 'daemon') -eq 'alerting') {
             $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'

@@ -73,3 +73,26 @@ test('探针从 WSL 外读凭据，WSL 挂了时读不到应有兜底', () => {
     '读不到凭据时要有明确的日志分支（不然 WSL 挂了会静默）',
   );
 });
+
+test('探针文件必须是 CRLF 换行（PowerShell 5 解析纯 LF 会静默丢函数体）', () => {
+  // 现场（2026-10-19）：探针用纯 LF 写入后，`Write-Log "heartbeat ..."` 那行
+  // 在函数里被静默跳过 —— 日志永远看不到心跳，但检查逻辑"看起来在跑"。
+  // 根因是 PowerShell 5 的 -File 解析器对纯 LF 的 .ps1 有缺陷。
+  // 这条断言把换行符钉住，防止编辑器/工具再次写回 LF。
+  const raw = readFileSync(join(here, '..', 'scripts', 'dotd-probe.ps1'));
+  const crlf = (raw.toString('binary').match(/\r\n/g) ?? []).length;
+  const lfOnly = (raw.toString('binary').match(/(?<!\r)\n/g) ?? []).length;
+  assert.ok(crlf > 0, '探针 .ps1 必须是 CRLF 换行');
+  assert.equal(lfOnly, 0, `不允许出现裸 LF（发现 ${lfOnly} 处）`);
+});
+
+test('探针健康时要写心跳（否则无法区分"在跑"和"假死"）', () => {
+  assert.ok(/heartbeat ok/.test(src), '健康分支应写 heartbeat 日志');
+});
+
+test('Write-Log 用 AppendAllText 而不是 Add-Content（并发拉取时不被文件锁打断）', () => {
+  // 计划任务每分钟拉起一个探针；Add-Content 并发时会因文件占用抛异常，
+  // 而异常发生在函数内会**静默中断整个 Invoke-Check**。
+  assert.ok(/AppendAllText/.test(src), 'Write-Log 应使用 [IO.File]::AppendAllText');
+  assert.ok(/catch\s*\{[\s\S]{0,200}?\}/.test(src.slice(src.indexOf('function Write-Log'), src.indexOf('function Write-Log') + 900)), 'Write-Log 内要有 try/catch 兜底');
+});
