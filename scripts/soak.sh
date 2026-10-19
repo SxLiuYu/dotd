@@ -238,6 +238,26 @@ const TAIL_PROBES=4;
 const tailProbes=probesVerified.slice().sort((a,b)=>a.ts-b.ts).slice(-TAIL_PROBES);
 const tailPassRate=tailProbes.length? tailProbes.filter(p=>p.ok).length/tailProbes.length : null;
 
+// **探针必须覆盖四条能力路径**（2026-10-19 补，真缺口，也是最根本的一次）：
+// 探针按 slot 轮换四种任务：
+//   0 纯存活（"回复 OK"）  1 纯推理（350-405）  2 读文件  3 容器执行（6^12）
+// 轮换指针是 `prev_n % 4`，理论上会轮遍。但**判据从来没检查过实际覆盖**：
+// 合成数据实测 32 次探针**全部 slot=0**（只证明进程还活着），
+// 容器执行/文件读取/纯推理三条路径 7 天零覆盖，报告全绿、exit 0。
+// 这是最根本的一种"没测就当合格"：
+//   只证明"进程没死"，却当成"活儿还能干"。
+// 为什么现实中真会发生：轮换指针是"已有 probe 记录数 % 4"，
+// 只要有人认为往文件里补几条 probe 记录、或者 probe 中途失败没写记录，
+// 指针就会错位并**卡在同一个 slot 上**，而报告不会有任何提示。
+// 判据：7 天窗口内，每条路径至少被成功测到 1 次。
+// 不全覆盖不等于系统坏了，但等于"这条路径 7 天没有被验证过"——
+// 那就不能声称"成功率不掉"，因为分母里根本没有它。
+const SLOT_NAMES=["纯存活","纯推理","读文件","容器执行"];
+const slotSeen={};
+for(const p of probesVerified) if(p.ok) slotSeen[String(p.slot)]=(slotSeen[String(p.slot)]||0)+1;
+const slotMissing=[0,1,2,3].filter(s=>!slotSeen[String(s)]);
+// slotOk 定义在 failRunOk 旁边（那里 days 已算出来），否则 TDZ。
+
 // **连续失败时长**（2026-10-19 补，第三次平均值的病根，也是最深的一次）：
 // 总成功率是"整体还行吗"，末尾成功率是"现在还好吗"，
 // 但**两者都挡不住"中间坏了一大段"**。
@@ -364,6 +384,9 @@ const probeCoverageOk=!(days>=7 && coveredProbeDays < allSegList.length-PROBE_DA
 const tailOk = !(days>=7 && tailProbes.length>=4 && tailPassRate<0.75);
 // 连续失败判定（这里 days 已算好）
 const failRunOk = !(days>=7 && maxFailRun>FAIL_RUN_LIMIT);
+// slotOk 必须放在这里：它要用 days，而 days 在下面才算出来。
+// 放到 slotSeen 旁边会 TDZ —— 这次被 exit 2 立刻抓到（`Cannot access 'days'`）。
+const slotOk=!(days>=7 && probesVerified.length>0 && slotMissing.length>0);
 
 // **daemon 不在跑的时长要进入判定**（2026-10-19 补，真缺口）：
 // 上一版只把 alive=false 打印出来当提醒，不参与判定 ——
@@ -873,6 +896,15 @@ if(passRate!==null){
            (bothDown? `；其中 ${bothDown} 次两条链路同时不通` : ""));
   }
 }
+{
+  const dist=[0,1,2,3].map(s=>`${SLOT_NAMES[s]} ${slotSeen[String(s)]||0}`).join(" / ");
+  if(probesVerified.length) console.log(`探针能力覆盖：${dist}`+(slotMissing.length?`　**未覆盖：${slotMissing.map(s=>SLOT_NAMES[s]).join("、")}**`:""));
+}
+if(!slotOk)
+  c.push(`❌ **探针有 ${slotMissing.length} 条能力路径 7 天没测过**：`+
+         `${slotMissing.map(s=>SLOT_NAMES[s]).join("、")} —— `+
+         `只证明了"进程还活着"，没证明"这些活儿还干得动"。`+
+         `成功率的分母里根本没有这几条路径`);
 if(!secsOk)
   c.push(`❌ **探针太慢**：最慢 ${maxSecs}s（上限 ${SLOW_MAX}s）、全程中位 ${medSecs===null?"—":medSecs.toFixed(0)+"s"}、`+
          `末尾中位 ${tailMedSecs===null?"—":tailMedSecs.toFixed(0)+"s"}（上限 ${SLOW_MED}s） —— `+
@@ -930,7 +962,7 @@ console.log("\n判定：" + c.join("；"));
 // 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk;
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
