@@ -294,6 +294,41 @@ for(let i=1;i<LIFE.length;i++){
 }
 const unattended=restartRows.filter(r=>!r.healed);
 
+// **重启会把 RSS 增长"洗白"，必须单独看**（2026-10-19 修，真缺陷）：
+// RSS 判据只比较"当前生命周期"的首末中位数（因为跨重启相减毫无意义）。
+// 但如果内存以每小时 12MB 的速度漏、而 watchdog 每 2 小时自愈重启一次，
+// 每个生命周期最多只涨 24MB —— 判据看到 +18MB，判定 ✅，exit 0。
+// 合成数据实测：8 天里 96 次重启、若从不重启会漏 2GB，报告却全绿。
+// 也就是说"重启"可以无限次地把泄漏截断，让这条判据彻底失效。
+// 修法：不看"生命周期内涨了多少"，而看**每个生命周期内是不是都在涨**——
+// 健康的进程重启后应该稳定，不该每段都单调爬升。
+// 用"段内增长率"的**中位数**（MB/小时）判断：稳定进程应接近 0。
+const segRates=[];
+for(const L of LIFE){
+  // **必须用 all，不能用 S**（2026-10-19 修，真缺陷）：
+  // S 是"当前生命周期"的子集，拿它按 L.key 过滤，除当前这一段外**全部为空** ——
+  // 于是 96 次重启的合成数据只算出 1 段，中位数实际只取了一个样本。
+  // 判据碰巧还抓到了这个例子（因为那 1 段正好在爬），但换成
+  // "只有早期几段在爬、当前段平稳"就会漏掉，等于判据又变成看运气。
+  const seg=all.filter(s=>String(s.proc_start)+":"+String(s.pid)===L.key);
+  if(seg.length<4) continue;                     // 太短算不准
+  const n2=Math.max(1,Math.round(seg.length*0.1));
+  const r0=med(seg.slice(0,n2).map(s=>s.rss_kb))/1024;
+  const r1=med(seg.slice(seg.length-n2).map(s=>s.rss_kb))/1024;
+  const h=(seg[seg.length-1].ts-seg[0].ts)/3600;
+  if(h>=0.5) segRates.push((r1-r0)/h);
+}
+const medSegRate=segRates.length? med(segRates) : null;
+// 为什么用中位数而不是最大值：**新起的 node 进程本来就会先爬后平**
+// （V8/JIT 预热、懒加载、连接池建满），这是正常现象不是泄漏。
+// 用"最大值"会把每次重启后的预热判成泄漏 —— 而重启恰恰是我们要允许的自愈行为。
+// 中位数才能区分"每段都在爬（真泄漏）"和"第一段爬完就平（预热）"。
+// 最大值仅作参考打印，不参与判定。
+const maxSegRate=segRates.length? Math.max(...segRates) : null;
+// 判据：生命周期内中位增长率 < 2MB/h。7 天 = 168h，2MB/h 就是 ~336MB，
+// 远超 50MB —— 所以这个阈值不宽松，是专门用来抓"靠重启洗白"的泄漏。
+const SEG_RATE_LIMIT=2;
+
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
@@ -318,6 +353,7 @@ console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
 console.log(`RSS: 首段中位 ${rss0.toFixed(1)}MB → 末段中位 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
 console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点峰值不参与判据）`);
 console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），单点峰值 ${maxFd}`);
+if(segRates.length) console.log(`各生命周期内 RSS 爬升速率：中位 ${medSegRate===null?"n/a":medSegRate.toFixed(2)+"MB/h"}，最大 ${maxSegRate.toFixed(2)}MB/h（${segRates.length} 段够长可算；最大值仅参考，新生进程预热会偏高）`);
 console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}）`);
 console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
 console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
@@ -350,6 +386,12 @@ if(unattended.length){
 }
 if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
+if(medSegRate!==null){
+  c.push(medSegRate<SEG_RATE_LIMIT
+    ? `✅ 各生命周期内无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h）`
+    : `❌ **每个生命周期内都在爬升**（中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
+      `重启只是把泄漏截断，不是没漏`);
+}
 console.log("\n判定：" + c.join("；"));
 // **成功率必须参与退出码**（2026-10-19 修，真缺陷）：
 // 原来这一行只算了 days/coveredDays/growth/fdGrowth/unattended/contRate，
@@ -360,7 +402,7 @@ console.log("\n判定：" + c.join("；"));
 const passOk = passRate===null || passRate>=0.95;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && unattended.length===0 && (contRate===null||contRate>=0.95)
-  && passOk ? 0 : 1);'
+  && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT) ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
