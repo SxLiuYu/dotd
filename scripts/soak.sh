@@ -136,6 +136,24 @@ process.stdout.write(r && r.endpoint ? r.endpoint : ""); db.close();' 2>/dev/nul
       [ "$code" = "200" ] && cont_ok=1
     fi
   fi
+  # **网关（relay）通不通也必须采样**（2026-10-20 修，归因缺一环）。
+  #
+  # 第 58 轮修了"容器坏了赖模型"，靠的是把失败探针的时刻与 container_ok 对齐。
+  # 但**通道还有一段没采**：模型服务在 Windows 上，WSL 里通过 win-relay
+  # （172.17.48.1:13065）出去。这条链断了，探针必然全失败 ——
+  # 而 sample 里既没有 relay 字段，contBadAt 自然无法归因，
+  # 报告就会写「出站入站都正常、容器也好但**答案不对**」。
+  # 模型根本没被问到，却被判成答错。
+  #
+  # 合成数据实测（7 天窗口、容器全程好、relay 断 14 小时）：
+  #   3 次探针失败 → 报告「3 次出站入站都正常、容器也好但答案不对」，exit 1。
+  # 归因完全错误，方向指向模型，真相在网关。
+  #
+  # 这里只做一个 TCP 连通性探测（3 秒超时，不过模型、不进队列）：
+  relay_ok=0
+  if timeout 3 bash -c 'exec 3<>/dev/tcp/172.17.48.1/13065' 2>/dev/null; then
+    relay_ok=1
+  fi
   # **记录 daemon 身份**（进程启动时刻 + pid）。没有这个，RSS 判据是假的：
   # 2026-10-19 实测就踩到了 —— 采样 3 个点算出"RSS 增长 -32.1MB"，看着很好，
   # 其实是中途 daemon 被重启过，拿"新进程的小内存"减"旧进程的大内存"，
@@ -155,9 +173,10 @@ const o={ts:Number(process.argv[1]),alive:true,rss_kb:Number(process.argv[2]),
   fd:Number(process.argv[3]),threads:Number(process.argv[4]),
   container_up:Number(process.argv[5]),db_kb:Number(process.argv[6]),
   pid:Number(process.argv[7]),proc_start:Number(process.argv[8]),
-  container_ok:Number(process.argv[9])};
+  container_ok:Number(process.argv[9]),
+  relay_up:Number(process.argv[10])};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}"
+    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}" "${relay_ok:-0}"
   printf '%s ok ts=%s\n' "$(date +%s)" "$ts" >>"$HB" 2>/dev/null || true
   echo "sample: rss=${rss_kb}KB fd=$fd threads=$n_threads container_up=$cont container_ok=$cont_ok db=${db_kb}KB pid=$pid"
 }
@@ -1482,14 +1501,36 @@ if(passRate!==null){
       const near=all.filter(s=>Math.abs(s.ts-p.ts)<=3600);
       return near.some(s=>String(s.container_ok)==="0" || String(s.container_up)==="0");
     };
+    // **"答案不对"的第三种误判：网关断了，模型根本没被问到**（2026-10-20 修）。
+    //
+    // 第 58 轮只对齐了容器，因为当时只有一个环境字段可对齐。
+    // 但通道还有一段：模型在 Windows 上，WSL 通过 win-relay(172.17.48.1:13065) 出去。
+    // 这条链断掉 → 探针必然全失败，而 out/ws 都是 1、容器也好 → 落进 answerWrong，
+    // 报告写「出站入站都正常、容器也好但答案不对」。
+    // 合成数据实测：7 天窗口 relay 断 14 小时 → 「3 次…但答案不对」，exit 1。归因整个错。
+    //
+    // 现在 sample 每 30 分钟记 relay_up，这里一样按"探针时刻前后 1 小时"对齐。
+    // **注意：老样本没有 relay_up 字段**（undefined），不能当成 0 处理 ——
+    // 那会把 7 天前的历史失败全部错怪到网关上。只有明确记到 0 才算网关背锅。
+    const relayBadAt=(p)=>{
+      const near=all.filter(s=>Math.abs(s.ts-p.ts)<=3600 && s.relay_up!==undefined);
+      return near.some(s=>String(s.relay_up)==="0");
+    };
     const contBad=bad.filter(p=>contBadAt(p)).length;
-    const answerWrong=noChannelOnly-contBad;
+    const relayBad=bad.filter(p=>relayBadAt(p) && !contBadAt(p)).length;
+    const answerWrong=noChannelOnly-contBad-relayBad;
+    // 采样里有没有 relay_up 字段？没有就说明这段时间没人看网关，
+    // 那"答案不对"这个结论就缺一环证据，得在报告里说明。
+    const relaySeen=all.some(s=>s.relay_up!==undefined);
     c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败，可重叠计数：`+
            `${noOut} 次飞书出站未送达 / ${noWs} 次飞书入站长连接不在 / `+
            (unfinished? `**${unfinished} 次探针任务 120 秒内没跑完**（status 停在 queued/running）/ `:"")+
            (testedButNoChannel>0? `${testedButNoChannel} 次跑完了却没拿到完整子判据 / `:"")+
            (contBad? `**${contBad} 次当时容器不可用**（答案拿不到，不是模型笨）/ `:"")+
-           (answerWrong>0? `${answerWrong} 次出站入站都正常、容器也好但答案不对`:"")+
+           (relayBad? `**${relayBad} 次当时网关不通**（请求根本没到模型，不是模型答错）/ `:"")+
+           (answerWrong>0? `${answerWrong} 次出站入站都正常、容器`+
+             `${relaySeen?"和网关":""}也好但答案不对`+
+             `${relaySeen?"":"（注意：这段时间采样里**没有 relay_up 字段**，网关状况其实没人看，这一条结论缺一环证据）"}`:"")+
            (bothDown? `；其中 ${bothDown} 次两条链路同时不通` : ""));
   }
 }
