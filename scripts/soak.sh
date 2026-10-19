@@ -411,6 +411,29 @@ const maxSegRate=segRates.length? Math.max(...segRates) : null;
 // 远超 50MB —— 所以这个阈值不宽松，是专门用来抓"靠重启洗白"的泄漏。
 const SEG_RATE_LIMIT=2;
 
+// **两条判据都拦不住"慢慢漏、末尾重启一次"**（2026-10-19 补，真缺口）：
+//   · "当前生命周期首末差"：末尾重启后末段是新进程，差值只有 +1.8MB
+//   · "每段爬升速率中位"：1.15MB/h 恰好低于 2MB/h 阈值
+// 合成数据实测：daemon 从 200MB 爬到 400MB（**漏 200MB**），最后 2 小时重启一次
+// → 报告全绿、exit 0。
+// 根子在于"2MB/h × 168h = 336MB"与判据"增幅 <50MB"自相矛盾 ——
+// 速率阈值放得太宽，把总量漏掉了。
+// 补一条直读判据原文的量：**全窗口峰值增长** = 全窗口最高点 − 窗口开始时的基线。
+// 不管中间重启几次，内存最高到过多少是真实的。
+// 基线取"最前 10% 样本的中位数"而不是单点，避开启动瞬间的抖动与预热。
+const peakRss=Math.max(...all.map(s=>s.rss_kb))/1024;
+// 基线要贴近**窗口开始**，不能取"前 10%"（7 天里那是 0.8 天）。
+// 用前 10% 的中位数会在持续增长时把基线抬高，判据实际要漏到 ~52.6MB 才报，
+// 与判据原文的 50MB 不符（实测 +49/50/51 都通过、+60 才失败）。
+// 改为取"最前 2 小时内"的样本中位（30 分钟一次即 4 个），仍能抗噪，
+// 但偏差只有 2h/168h ≈ 1.2%，不会被增长拉高。
+const BASE_WINDOW_SEC=7200;
+const baseSet=all.filter(s=>s.ts<=all[0].ts+BASE_WINDOW_SEC);
+const baseN=Math.max(1,Math.min(baseSet.length, all.length));
+const baseRss=med(all.slice(0,baseN).map(s=>s.rss_kb))/1024;
+const peakGrowth=peakRss-baseRss;
+const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
+
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
@@ -437,6 +460,8 @@ console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
 console.log(`RSS: 首段中位 ${rss0.toFixed(1)}MB → 末段中位 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
 console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点峰值不参与判据）`);
 console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），单点峰值 ${maxFd}`);
+console.log(`全窗口 RSS：基线 ${baseRss.toFixed(1)}MB（最前 ${baseN} 个样本中位）→ 最高 ${peakRss.toFixed(1)}MB，`+
+            `峰值增长 ${peakGrowth>=0?"+":""}${peakGrowth.toFixed(1)}MB（判据 < +${PEAK_GROWTH_LIMIT}MB，与重启无关）`);
 if(segRates.length) console.log(`各生命周期内 RSS 爬升速率：中位 ${medSegRate===null?"n/a":medSegRate.toFixed(2)+"MB/h"}，最大 ${maxSegRate.toFixed(2)}MB/h（${segRates.length} 段够长可算；最大值仅参考，新生进程预热会偏高）`);
 if(segFdRates.length) console.log(`各生命周期内句柄爬升速率：中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}，最大 ${maxSegFdRate.toFixed(3)}个/h`);
 // 线程数不参与 S6 判定（S6 的四条判据是：连续 7 天无人工干预 / RSS 增幅 / 成功率 / 句柄）。
@@ -491,6 +516,10 @@ if(passRate!==null){
   }
 }
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
+c.push(peakGrowth<PEAK_GROWTH_LIMIT
+  ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
+  : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
+    `基线 ${baseRss.toFixed(1)}MB → 最高 ${peakRss.toFixed(1)}MB（与期间重启几次无关）`);
 if(medSegRate!==null){
   c.push(medSegRate<SEG_RATE_LIMIT
     ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h）`
@@ -521,7 +550,8 @@ process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGr
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
-  && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT) ? 0 : 1);'
+  && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
+  && peakGrowth<PEAK_GROWTH_LIMIT ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
