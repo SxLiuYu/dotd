@@ -105,6 +105,28 @@ const REPEAT_SOFT_LIMIT = 2;
 const REPEAT_HARD_LIMIT = 4;
 
 /**
+ * 同一文件被"整篇重写"多少次就认定在打转（2026-10-19 实测缺陷）。
+ *
+ * 现场：主人说"在文件最后再加一行 S3-DELTA"。模型读了文件，然后把整篇内容
+ * 连同新行一起 `fs.write` 回去 —— 内容从 4 行变 5 行。下一轮它又觉得"我再加一行"，
+ * 于是 5 行变 6 行……实测把一个 4 行文件加到 **22 行**，烧掉 43 次工具调用 / 82 秒。
+ *
+ * 为什么原有守卫全都没拦住：
+ *   - 重复守卫按「工具 + 参数签名」判重，而每次 `fs.write` 的 content 都在变长，
+ *     签名永不相等 → 计数永远是 1；
+ *   - 「结果是否相同」也失效：`size_bytes` 每次都变；
+ *   - 「同一工具调用次数」阈值也没到（fs.write 夹杂着 fs.read）。
+ * 这三条判据都建立在"参数或结果不变"上，而这类打转恰恰是**每次都在变**的。
+ *
+ * 所以补一条专门的判据：**同一路径 + 新内容是旧内容的延长（前缀关系）**。
+ * 这精确描述了"想追加、于是整篇重写"，且不会误伤：
+ *   - 写不同文件 → 路径不同，不受影响；
+ *   - 改了中间内容再写回 → 不是前缀关系，不受影响；
+ *   - 写完发现问题、修正 → 只有 1~2 次，低于阈值。
+ */
+const SAME_PATH_REWRITE_LIMIT = 3;
+
+/**
  * 护栏连续"跳过派发"的最大轮数。超过就由产品侧收口。
  *
  * 为什么需要它：护栏的机制是"跳过本次派发 → 下一轮 LLM 在没有工具可调时给结论"。
@@ -927,6 +949,13 @@ export class DotRunner {
    * 每一步单看都是"新调用"，守卫完全沉默。这里用"同一工具的总调用次数"兜底。
    */
   private readonly toolCallCounts = new Map<string, Map<string, number>>();
+
+  /**
+   * 每任务 × 每路径的「整篇重写」追踪（2026-10-19）：记住上一次写进去的内容，
+   * 用来判断下一次写入是不是"在旧内容尾巴上又接了一段"。
+   * 见 {@link SAME_PATH_REWRITE_LIMIT} 的现场说明。
+   */
+  private readonly rewritesByPath = new Map<string, Map<string, { content: string; count: number }>>();
 
   private running = false;
 
@@ -1892,6 +1921,11 @@ export class DotRunner {
     //   sameResultCount=2 → 已连续三次结果相同
     // 因此阈值要比"直觉次数"低 1。原先写 >=2/>=4 实际要求连续 3/5 次才动手，
     // 实测同参数 fs.write 跑了 5 次护栏都没介入。
+    // **同路径整篇重写**（2026-10-19 实测缺陷，见 SAME_PATH_REWRITE_LIMIT）。
+    // 放在"同结果"判据之前：这类打转的结果每次都变，走不到下面那些分支。
+    const rewriteNote = this.checkSamePathRewrite(call, taskId);
+    if (rewriteNote !== null) return rewriteNote;
+
     const sameResult = rec.sameResultCount ?? 0;
     if (sameResult >= 3) return 'stop';
     if (sameResult >= 1) {
@@ -1929,6 +1963,63 @@ export class DotRunner {
     };
   }
 
+  /**
+   * 检测"想追加，于是把整篇内容重写一遍"造成的打转（2026-10-19 实测缺陷）。
+   *
+   * 判据：同一路径、且**新内容以旧内容为前缀**（即在旧尾巴上又接了一段）。
+   * 这正是"再加一行"被实现成"读全文 → 拼一行 → 整篇写回"的特征。
+   *
+   * 返回 null 表示没问题；返回 note 表示给出强令收尾的注记。
+   * 注意：这里**不立刻 stop**，先给一次明确指令；只有累计超过阈值才硬停，
+   * 避免误伤"确实要连续追加两三条"的合法场景（阈值 3）。
+   */
+  private checkSamePathRewrite(
+    call: { name: string; arguments: string },
+    taskId: string,
+  ): { note: string } | 'stop' | null {
+    if (call.name !== 'fs.write') return null;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(call.arguments);
+    } catch {
+      return null;
+    }
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    const rec0 = obj as Record<string, unknown>;
+    const rawPath = rec0['path'];
+    const rawContent = rec0['content'];
+    if (typeof rawPath !== 'string' || typeof rawContent !== 'string') return null;
+    // 路径归一化，与 repeatSignature 的做法保持一致（g1.txt ≡ /dot/home/g1.txt）
+    const path = rawPath
+      .replace(/\\/g, '/')
+      .replace(/^\/dot\/home(?:\/|$)/, '')
+      .replace(/^\.\//, '');
+
+    let perPath = this.rewritesByPath.get(taskId);
+    if (perPath === undefined) {
+      perPath = new Map();
+      this.rewritesByPath.set(taskId, perPath);
+    }
+    const prev = perPath.get(path);
+    let count = 1;
+    if (prev !== undefined) {
+      // 前缀关系：新内容 = 旧内容 + 后续追加的一段
+      const isAppendStyle = rawContent.length > prev.content.length && rawContent.startsWith(prev.content);
+      count = isAppendStyle ? prev.count + 1 : 1;
+    }
+    perPath.set(path, { content: rawContent, count });
+
+    if (count < SAME_PATH_REWRITE_LIMIT) return null;
+
+    if (count >= SAME_PATH_REWRITE_LIMIT + 2) return 'stop';
+    return {
+      note:
+        `【必须收尾】你正在反复把 \`${path}\` 的**整篇内容**重写一遍来"追加"：` +
+        `已经连续 ${count} 次，每次都在上一次的末尾又接了一段，文件越来越长。` +
+        `**停止再写这个文件。** 你要加的那一行，第一次写入时就已经加进去了；` +
+        `再写一次只会变成重复的两行。现在直接停止调用工具，用一句话告诉主人结果。`,
+    };
+  }
   /** 派发后回填该调用的结果摘要，供下一次重复时的注记引用（让模型看到真实结果）。 */
   private recordRepeatResult(
     taskId: string,
@@ -1969,6 +2060,7 @@ export class DotRunner {
     this.repeatGuard.delete(taskId);
     this.repeatSkipsByTask.delete(taskId);
     this.toolCallCounts.delete(taskId);
+    this.rewritesByPath.delete(taskId);
   }
 
 

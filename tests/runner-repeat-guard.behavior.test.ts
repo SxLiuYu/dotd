@@ -149,3 +149,132 @@ test('崩溃恢复：护栏计数按 taskId 保留，run_epoch+1 后仍然生效
   // ③ 终态才清理
   assert.match(src, /this\.resetRepeatGuard\(session\.id\)/, '任务终态时应清理该任务的护栏状态');
 });
+
+/**
+ * 「想追加，于是整篇重写」的打转（2026-10-19 实测缺陷）。
+ *
+ * 现场：主人说"在文件最后再加一行 S3-DELTA"。模型的实现是
+ * 「读全文 → 末尾拼一行 → fs.write 整篇写回」。下一轮它又觉得该"再加一行"，
+ * 于是继续 4 行→5 行→6 行……实测把一个 4 行文件写到 **22 行**，
+ * 烧掉 43 次工具调用 / 82 秒。
+ *
+ * 为什么原有三道护栏全都没拦住：它们都建立在"参数或结果不变"上——
+ *   重复守卫按「工具+参数签名」判重 → content 每次都在变长，签名永不相等；
+ *   「结果是否相同」→ size_bytes 每次都变；
+ *   「同一工具调用次数」→ fs.write 夹杂 fs.read，阈值没到。
+ * 而这类打转的特征恰恰是**每次都在变**，所以必须单独加一条判据。
+ *
+ * 这里用一个"每次都把上次内容再追加一行"的模型桩，验证：
+ *   ① 护栏会介入（日志里出现"整篇内容"字样）；
+ *   ② 任务最终能收口（不会无限写下去）；
+ *   ③ 工具调用次数有界。
+ */
+test('行为：反复"整篇重写"来追加同一文件时，护栏会拦住并收口', async () => {
+  const tmp = makeTempDataDir();
+  try {
+    let stepCount = 0;
+    const notes: string[] = [];
+    const writes: string[] = [];
+    const task = {
+      id: 'tk_append_loop',
+      dotId: 'dot1',
+      runEpoch: 1,
+      threadId: 'thr_a',
+      title: 't',
+      goal: 'g',
+      budgetTokens: 100000,
+      resumeFromSeq: null,
+    };
+
+    // 模型桩：每次都在上一次的 content 后面再接一行，模拟"整篇重写式追加"
+    let content = 'L1\nL2\nL3\n';
+    const appendLoopRouter = {
+      async complete(): Promise<RouteResult> {
+        content += 'S3-DELTA\n';
+        writes.push(content);
+        return {
+          response: {
+            content: '',
+            toolCalls: [
+              {
+                id: `call_${writes.length}`,
+                name: 'fs.write',
+                arguments: JSON.stringify({ path: 'reports/t.txt', content }),
+              },
+            ],
+          },
+          meta: { endpointId: 'stub', model: 'stub', tier: 1, degraded: false, tried: [] },
+          usage: { promptTokens: 1, completionTokens: 1 },
+        } as unknown as RouteResult;
+      },
+    };
+
+    const cp = {
+      pop: () => null,
+      getTask: () => task,
+      bindSession: () => {},
+      finish: () => {},
+      failTask: () => {},
+      pauseByReason: () => {},
+      setAwaitingApproval: () => {},
+      heartbeat: () => ({ aborted: false, overBudget: false }),
+      journal: {
+        beginLlm: () => ({ seq: ++stepCount, callId: `llm_${stepCount}` }),
+        endLlm: () => {},
+        beginTool: () => ({ seq: ++stepCount, callId: `tool_${stepCount}` }),
+        endTool: () => {},
+        skipStep: () => {},
+        markPending: () => {},
+        resumeStep: () => ({ callId: '' }),
+        tail: () => [],
+        getStepByCallId: () => null,
+      },
+    } as unknown as ControlPlane;
+
+    const runner = new DotRunner(
+      {
+        cp,
+        router: appendLoopRouter as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+        exec: {
+          runTool: async (c: { call_id: string }) => ({ call_id: c.call_id, status: 'ok', result: { size_bytes: 1 } }),
+          getCapabilities: async () => [
+            { name: 'fs.write', mode: 'sync', max_deadline_ms: 60000, args_schema: {}, sideEffect: 'write' },
+          ],
+          reconcileCall: async () => 'unknown',
+          getCallResult: async () => null,
+          cancelTool: async () => {},
+        } as unknown as ConstructorParameters<typeof DotRunner>[0]['exec'],
+        memory: {
+          openThread: async () => 'thr_a',
+          appendMessage: async () => ({ id: 'm', seq: 1 }),
+          appendSystemMessage: async () => ({ id: 'm', seq: 1 }),
+          buildContextBundle: async () => ({ memoryMd: '', manualExcerpts: [], summary: null }),
+          buildSessionReplay: async () => [],
+          beforeWrite: async () => ({ ok: true }),
+          sealTask: async () => {},
+        } as unknown as MemoryServiceApi,
+        governance: {
+          evaluate: async () => ({ kind: 'allow' as const, decisionId: 'd' }),
+          claim: async () => ({ ok: false }),
+          forceApproval: async () => ({ approvalId: 0 }),
+        } as unknown as GovernanceApi,
+      },
+      { idlePollMs: 5, log: (m: string) => notes.push(m) },
+    );
+
+    const out = await (
+      runner as unknown as { runTask: (t: unknown) => Promise<{ status: string }> }
+    ).runTask(task);
+
+    assert.equal(out.status, 'done', `应能收口成 done，实际 ${out.status}`);
+    // ① 护栏必须介入：没有它这里会一路写到几十行
+    assert.ok(
+      notes.some((n) => n.includes('整篇内容') || n.includes('原地打转')),
+      `应记录"整篇重写"护栏的触发，实际日志：${notes.slice(-6).join(' | ')}`,
+    );
+    // ② 写入次数有界（阈值 3，加 2 次硬停余量，再留一点余裕）
+    assert.ok(writes.length < 12, `整篇重写次数应有界，实际写入了 ${writes.length} 次`);
+  } finally {
+    tmp.cleanup();
+  }
+});
