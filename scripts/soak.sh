@@ -125,6 +125,23 @@ process.stdout.write(m ? String(m.content) : ""); db.close();' "$tid")
         else
           ok=0
         fi
+        # **还要确认它真的发到飞书了**（2026-10-19 补）：
+        # 这个项目的目标原话是"在**飞书**里替你实际干活的助手"，但原来 probe
+        # 只核对库里的回答内容 —— 也就是说飞书 token 过期/权限被收回时，
+        # 任务照样 done、答案照样对，而用户**一个字都收不到**，probe 依然报 ok=1。
+        # 出站写入发生在任务 done 之后约 0.6s，所以要等一小会儿再看，别立刻判失败。
+        local out_ok=0 tries=0
+        while [ $tries -lt 10 ]; do
+          out_ok=$(node --disable-warning=ExperimentalWarning -e '
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.env.HOME + "/.dotd/dotd.db", { readOnly: true });
+const r = db.prepare("SELECT ok FROM surf_outbound_log WHERE dedup_key=? ORDER BY id DESC LIMIT 1").get(process.argv[1]);
+process.stdout.write(r ? String(r.ok) : ""); db.close();' "$tid")
+          [ "$out_ok" = "1" ] && break
+          tries=$((tries+1)); sleep 1
+        done
+        [ "$out_ok" = "1" ] || ok=0
+        OUT_OK=$out_ok
         # 记下这轮到底考了什么，报告里能看出覆盖
         PROBE_SLOT=$slot; PROBE_WANT=$want
         break
@@ -140,7 +157,7 @@ const o={ts:Number(process.argv[1]),kind:"probe",ok:process.argv[2]==="1",
   slot:process.argv[6],want:process.argv[7]};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
     "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}"
-  echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} secs=$(( $(date +%s) - t0 ))"
+  echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} 飞书出站=${OUT_OK:-?} secs=$(( $(date +%s) - t0 ))"
 }
 
 do_report() {
