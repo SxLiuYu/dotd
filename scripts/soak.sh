@@ -116,8 +116,23 @@ do_sample() {
   # 判据侧只统计真正有值的点。这与第 66/67 轮那两条判据是同一个规矩：
   # **"没测到"不等于"测到 0"**。
   rss_kb=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null | head -1)
+  # **fd / threads 读不到时也不能写 0**（2026-10-20 修，与 rss_kb 同一个病根）。
+  #
+  # 上面 RSS 那次（第 68 轮）的注释说得很清楚了，但**只修了 RSS 一个字段**。
+  # 而 `ls /proc/$pid/fd 2>/dev/null | wc -l` 在 `ls` 失败时输出 **0** ——
+  # 「0 个句柄」是一个**有效的小值**，判据会当成真实数据。
+  #
+  # 合成实测：fd 27→45 真泄漏（+18，峰值增长 18 < 门槛 20），
+  # 末尾 20 点因为 ls 失败写 0 → 报告打印
+  #   `✅ 无明显句柄泄漏` / `✅ 全窗口句柄峰值增长 17 < 20` / `exit 0`，
+  # 而 `句柄: 首段中位 28 → 末段中位 0` 这行**自己就写着 0**，没人看。
+  # 真泄漏被判成交付合格。
+  #
+  # 修法与 RSS 完全一致：**读不到就不写这个字段**，判据侧只统计有值的点。
   n_threads=$(ls "/proc/$pid/task" 2>/dev/null | wc -l)
+  [ "$n_threads" = "0" ] && n_threads=""     # 0 个线程不可能是活的 node
   fd=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
+  [ "$fd" = "0" ] && fd=""                  # 0 个句柄不可能是活的 node
   cont=$(docker ps --filter name=dotd-dot-dot1 --format '{{.Status}}' 2>/dev/null | grep -c Up || true)
   db_kb=$(stat -c '%s' "$HOME/.dotd/dotd.db" 2>/dev/null | awk '{print int($1/1024)}')
   # **容器"能干活"和"在跑"是两回事**（2026-10-20 修，S6 判据内的致命盲区）。
@@ -206,7 +221,9 @@ process.stdout.write(r && r.endpoint ? r.endpoint : ""); db.close();' 2>/dev/nul
 const fs=require("fs");
 const o={ts:Number(process.argv[1]),alive:true,
   ...(process.argv[2]!==""?{rss_kb:Number(process.argv[2])}:{}),
-  fd:Number(process.argv[3]),threads:Number(process.argv[4]),
+  // 与 rss_kb 同一套：空串 → **不写这个字段**，而不是写成 0。
+  ...(process.argv[3]!==""?{fd:Number(process.argv[3])}:{}),
+  ...(process.argv[4]!==""?{threads:Number(process.argv[4])}:{}),
   container_up:Number(process.argv[5]),db_kb:Number(process.argv[6]),
   pid:Number(process.argv[7]),proc_start:Number(process.argv[8]),
   container_ok:Number(process.argv[9]),
@@ -585,6 +602,20 @@ const sameLifetime=all.filter(s=>s.proc_start===cur.proc_start && s.pid===cur.pi
 // 造成本轮第三次 TDZ（`Cannot access 'rssOk' before initialization`）。
 // 三次都是同一个原因：1900 行单文件、变量散落，靠人工找位置。
 const rssOk=(s)=>typeof s.rss_kb==="number" && s.rss_kb>0;
+// **`fd` 和 `threads` 也要同一套过滤**（2026-10-20 补，第 68 轮的复发）。
+//
+// 第 68 轮把 `rss_kb` 的读取改成「读不到就不写字段」，判据侧用 `rssOk` 筛；
+// 但 **`fd`/`threads` 没跟着改** —— `ls ... | wc -l` 失败时写的是 0，
+// 而 0 在判据里是**有效的小值**：
+//   · 落在末段 → 句柄增长算成 -27（"在释放"）→ `✅ 无明显句柄泄漏`
+//   · 落在峰值 → 把真泄漏的峰值削平
+// 合成实测：fd 27→45 真泄漏（+18 < 峰值门槛 20），末 20 点写 0 → **exit 0**，
+// 而报告里那行 `句柄: 首段中位 28 → 末段中位 0` 自己就写着 0。
+//
+// `typeof===number` 挡不住采集侧写的 0，所以这里额外要求 >0：
+// 一个活着的 node 进程不可能只有 0 个句柄、0 个线程。
+const fdOk=(s)=>typeof s.fd==="number" && s.fd>0;
+const thOk=(s)=>typeof s.threads==="number" && s.threads>0;
 const rssPts=all.filter(rssOk);
 const rssSkipped=all.length-rssPts.length;
 const S=sameLifetime.length?sameLifetime:all;
@@ -855,15 +886,15 @@ const tailN=Math.max(1, Math.round(S.length*0.1));
 const headS=S.slice(0, tailN), tailS=S.slice(S.length-tailN);
 const rss0=med(headS.filter(rssOk).map(s=>s.rss_kb))/1024, rssN=med(tailS.filter(rssOk).map(s=>s.rss_kb))/1024;
 const growth=rssN-rss0;
-const fd0=med(headS.map(s=>s.fd)), fdN=med(tailS.map(s=>s.fd));
+const fd0=med(headS.filter(fdOk).map(s=>s.fd)), fdN=med(tailS.filter(fdOk).map(s=>s.fd));
 const fdGrowth=fdN-fd0;
-const thGrowth=med(tailS.map(s=>s.threads))-med(headS.map(s=>s.threads));
+const thGrowth=med(tailS.filter(thOk).map(s=>s.threads))-med(headS.filter(thOk).map(s=>s.threads));
 const maxRss=S.filter(rssOk).length? Math.max(...S.filter(rssOk).map(s=>s.rss_kb))/1024 : 0;
 // **fd 峰值必须看全窗口**（2026-10-19 修）：原来 `maxFd` 只从当前生命周期 `S` 取，
 // 重启后就只剩新进程的低值 —— 实测 fd 从 34 爬到 64、末尾重启一次，
 // 打印"单点峰值 34"（真实峰值 64），数字本身就是错的。
-const maxFd=all.length? Math.max(...all.map(s=>s.fd)) : 0;
-const maxFdCur=Math.max(...S.map(s=>s.fd));
+const maxFd=all.filter(fdOk).length? Math.max(...all.filter(fdOk).map(s=>s.fd)) : 0;
+const maxFdCur=S.filter(fdOk).length? Math.max(...S.filter(fdOk).map(s=>s.fd)) : 0;
 const passRate=probesVerified.length? probesVerified.filter(p=>!probeFailed(p)).length/probesVerified.length : null;
 
 // **耗时必须有判据**（2026-10-19 补，真缺口）：
@@ -1316,8 +1347,8 @@ for(const L of LIFE){
   const n2=Math.max(1,Math.round(body.length*0.34));
   const r0=med(body.slice(0,n2).filter(rssOk).map(s=>s.rss_kb))/1024;
   const r1=med(body.slice(body.length-n2).filter(rssOk).map(s=>s.rss_kb))/1024;
-  const f0=med(body.slice(0,n2).map(s=>s.fd));
-  const f1=med(body.slice(body.length-n2).map(s=>s.fd));
+  const f0=med(body.slice(0,n2).filter(fdOk).map(s=>s.fd));
+  const f1=med(body.slice(body.length-n2).filter(fdOk).map(s=>s.fd));
   const h=(body[body.length-1].ts-body[0].ts)/3600;
   if(h>=0.25){
     segRates.push((r1-r0)/h); segFdRates.push((f1-f0)/h);
@@ -1489,10 +1520,10 @@ console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点�
 // 与 RSS 的"全窗口峰值"同理，基线也**不能取在峰值之后**（2026-10-20 同一处修复）。
 // fd 的真实序列是稳稳的 27，偶尔被瞬间负载顶到 30+；若基线窗口吃下全部样本，
 // 基线就会落在峰值附近，把"瞬时尖峰"报成"泄漏"，或反过来把真泄漏洗白。
-const fdPeakIdx=all.reduce((m,s,k)=>s.fd>all[m].fd?k:m, 0);
+const fdPeakIdx=all.reduce((m,s,k)=>fdOk(s)&&(!fdOk(all[m])||s.fd>all[m].fd)?k:m, 0);
 const fdBaseEndTs=Math.min(all[0].ts+BASE_WINDOW_SEC, all[fdPeakIdx].ts);
 const fdBaseN=Math.max(1, all.filter(s=>s.ts<=fdBaseEndTs).length);
-const fdBase=med(all.slice(0,fdBaseN).map(s=>s.fd));
+const fdBase=med(all.slice(0,fdBaseN).filter(fdOk).map(s=>s.fd));
 const fdPeakGrowth=maxFd-fdBase;
 // 阈值不能照抄 RSS 的 50（2026-10-19）：50MB 内存对 daemon 未必严重，
 // 但 50 个文件句柄是**大量**泄漏 —— 进程默认上限通常 1024 左右，
