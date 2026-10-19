@@ -307,7 +307,17 @@ const total=lines.length, pass=lines.filter(r=>r.pass).length;
 const rate=total? (pass/total*100):0;
 for (const r of lines) console.log((r.pass?"✔":"✖"), r.id.padEnd(16), String(r.secs+"s").padStart(5), r.name);
 console.log("");
-console.log(`合计 ${pass}/${total} 通过 = ${rate.toFixed(1)}%   判据：≥95%（≥19/20）`);
-const need=Math.ceil(total*0.95);
-console.log(rate>=95 ? "结论：✅ 达标" : `结论：❌ 未达标（还需 ${need-pass} 条）`);
-process.exit(rate>=95?0:1);'
+// **"只跑 1 条且成功" 曾经会算出 100% 然后判达标**（2026-10-20 修，真缺陷）。
+// 判据写的是"20 条里 ≥19 条通过"，分母被写成"实际跑了几条"，
+// 于是 `acceptance.sh calc`（只跑算术一条）会打印 "1/1 = 100% ✅ 达标"。
+// 这是第⑨类（标签会撒谎）：判据要求的是**覆盖面**，不是**通过率**。
+// 修成三态，和 recovery.sh 同一个口径：
+//   · 跑了 20 条且 ≥19 过 → ✅ 达标 exit 0
+//   · 跑了 n<20 条且全过 → ⏳ 已跑的 n 条全过，但覆盖面不够，exit 3
+//   · 通过率 <95% → ❌ 未达标 exit 1
+const EXPECT_TOTAL=20;
+console.log(`合计 ${pass}/${total} 通过 = ${rate.toFixed(1)}%` + (total<EXPECT_TOTAL?`   本次只跑了 ${total}/${EXPECT_TOTAL} 条（覆盖面不够）`:`   判据：≥95%（≥19/20）`));
+if(rate<95){ console.log(`结论：❌ 未达标（还需 ${Math.ceil(total*0.95)-pass} 条）`); process.exit(1); }
+if(total<EXPECT_TOTAL){ console.log(`结论：⏳ 已跑的 ${total} 条全过，但只覆盖 ${total}/${EXPECT_TOTAL} —— 这不等于通过`); process.exit(3); }
+console.log("结论：✅ 达标");
+process.exit(0);'

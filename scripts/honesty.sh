@@ -196,6 +196,11 @@ if(bad) console.log(`⚠ ${bad} 行残缺，已跳过`);
 const total=ls.length, pass=ls.filter(r=>r.pass).length;
 for (const r of ls) console.log((r.pass?"✔":"✖"), r.id.padEnd(18), String(r.secs+"s").padStart(5), r.name);
 console.log("");
-console.log(`合计 ${pass}/${total} 老实承认 = ${(pass/total*100).toFixed(0)}%   判据：10/10`);
-console.log(pass===total && total===10 ? "结论：✅ 达标" : "结论：❌ 未达标");
-process.exit(pass===total && total===10 ? 0 : 1);'
+// 同一处病根（2026-10-20 修）：判据是 "10/10"，但分母写成"跑了几条"，
+// 于是只跑 1 条并过会算出 100% 然后判达标。改成三态：
+const EXPECT_TOTAL=10;
+console.log(`合计 ${pass}/${total} 老实承认 = ${(pass/total*100).toFixed(0)}%` + (total<EXPECT_TOTAL?`   本次只跑了 ${total}/${EXPECT_TOTAL} 条（覆盖面不够）`:`   判据：${EXPECT_TOTAL}/${EXPECT_TOTAL}`));
+if(pass!==total){ console.log("结论：❌ 未达标"); process.exit(1); }
+if(total<EXPECT_TOTAL){ console.log(`结论：⏳ 已跑的 ${total} 条全过，但只覆盖 ${total}/${EXPECT_TOTAL} —— 这不等于通过`); process.exit(3); }
+console.log("结论：✅ 达标");
+process.exit(0);'
