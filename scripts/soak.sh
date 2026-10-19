@@ -188,6 +188,14 @@ for(let i=1;i<sorted.length;i++){
   if(g>GAP_LIMIT) deadTotal+=g-GAP_LIMIT;   // 超出容忍的部分算"没在看"
 }
 const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
+// **"连续"不能只靠加起来够 7 天**（2026-10-19 修，措辞在撒谎）：
+// 原来只把断档扣掉，于是"8 天跨度里有 24 小时没观测"仍会打印
+// "✅ 已满 7 天且**观测连续**" —— 累计是够 7 天了，但"连续"这个词是假的：
+// 那 24 小时里发生了什么我们完全不知道，也无法排除人工干预。
+// S6 的字面判据是"连续 7 天"，所以只要出现一处超过容忍值的断档，
+// 就不能声称连续 —— 必须重来。短抖动（cron 漏跑一次，<90 分钟）仍可容忍。
+const hasGap = deadTotal > 0;
+const maxGapHours = maxGap/3600;
 
 // **"现在还在采样吗"**（2026-10-19 修，真缺陷）：
 // 上面的 coveredDays 只量"样本首尾之间的跨度扣断档"，完全不看**末尾之后**。
@@ -305,11 +313,13 @@ if(stale){
   // 否则读者会先看到"✅ 已满 7 天"而下结论。
   c.push(`❌ **观测已停止**：最后一个样本在 ${(staleness/3600).toFixed(2)}h 前`+
          `（超过 ${(STALE_LIMIT/3600).toFixed(1)}h 即视为没在看）`);
-} else if(days>=7 && coveredDays>=7){
-  c.push("✅ 已满 7 天且观测连续");
+} else if(hasGap){
+  // 只要有超容忍断档，无论累计观测多久都不能说"连续" —— 那段是盲区。
+  c.push(`❌ **观测不连续**：最长空档 ${maxGapHours.toFixed(2)}h（容忍 ${(GAP_LIMIT/3600).toFixed(1)}h），`+
+         `累计未观测 ${(deadTotal/3600).toFixed(2)}h；`+
+         `已观测 ${coveredDays.toFixed(2)} 天 / 需连续 7 天`);
 } else if(days>=7){
-  c.push(`❌ 首尾跨 ${days.toFixed(2)} 天，但**观测有断档**：扣除断档后只有 ${coveredDays.toFixed(2)} 天`+
-         `（最长空档 ${(maxGap/3600).toFixed(2)}h，超过 ${(GAP_LIMIT/3600).toFixed(1)}h 的部分累计 ${(deadTotal/3600).toFixed(2)}h）`);
+  c.push("✅ 已满 7 天且观测连续（无超容忍断档）");
 } else {
   c.push(`❌ 未满 7 天（还差 ${(7-days).toFixed(2)} 天）`);
 }
@@ -331,7 +341,7 @@ console.log("\n判定：" + c.join("；"));
 // 总成功率 50%，exit 仍是 0。这等于 S6 最容易退化的那条判据没有约束力。
 // 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
 const passOk = passRate===null || passRate>=0.95;
-process.exit(!stale && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
+process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk ? 0 : 1);'
 }
