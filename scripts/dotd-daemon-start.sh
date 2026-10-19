@@ -13,7 +13,11 @@ if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; then
   exit 0
 fi
 
-rm -f /tmp/dotd-wsl.log
+# **不要在这里 rm 日志**（2026-10-19 修，真缺陷）：
+# 这行无条件执行，而 daemon 若已在跑（上面 L11-14 会直接 exit 0），
+# 就把**正在被写入**的日志删成了 "(deleted)" —— 进程 fd 仍指着它，
+# 后续日志全进黑洞且磁盘空间不释放。现场实测：stdout → "/tmp/dotd-wsl.log (deleted)"。
+# 日志的新建/归档由 wsl-daemon.sh 在真正启动那一刻处理。
 
 # nohup + setsid + 重定向全部三个流 + & ：标准的三重保险
 nohup setsid bash scripts/wsl-daemon.sh </dev/null >/var/log/dotd-daemon-boot.log 2>&1 &

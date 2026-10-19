@@ -12,6 +12,10 @@ set -uo pipefail
 cd "$HOME/dotd" || exit 1
 
 LOG=/tmp/dotd-wsl.log
+# 启动时把上一份日志**归档**而不是直接丢掉（2026-10-19）：
+# 崩溃重启后最想看的就是"上一次是怎么死的"，`: > $LOG` 会把它抹掉。
+# 只留最近一份，避免长期运行时无限堆积。
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.prev" 2>/dev/null || true
 : > "$LOG"
 exec >>"$LOG" 2>&1
 echo "===== 启动 $(date '+%F %T') ====="

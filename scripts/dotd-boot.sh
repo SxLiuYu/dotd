@@ -67,7 +67,12 @@ else
 fi
 
 echo "启动 dotd daemon…"
-rm -f /tmp/dotd-wsl.log
+# **不要在这里 rm 日志**（2026-10-19 修，真缺陷）：
+# daemon 已经在运行时，这行会把**正在被写入的**日志删掉 ——
+# 进程的 fd 仍指向它，文件变成 "(deleted)"，后续日志全进黑洞，
+# 磁盘空间也不释放。现场实测：daemon pid=1303 的 stdout 是
+# "/tmp/dotd-wsl.log (deleted)"，7 天 soak 期间将完全无法事后排查。
+# 日志轮转交给 wsl-daemon.sh 自己在**启动那一刻**做（那时确实该新建）。
 # setsid：脱离 [boot] 的会话，否则脚本退出时 daemon 被一起回收
 DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-3}" bash scripts/dotd-daemon-start.sh
 echo "  已交由 dotd-daemon-start.sh（它自己等端口并打印结果）"
