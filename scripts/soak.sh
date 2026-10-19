@@ -191,8 +191,19 @@ fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
 do_report() {
   node -e '
 const fs=require("fs");
-let lines=[];
-try{lines=fs.readFileSync(process.env.SOAK,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);}catch{}
+// **一行坏 JSON 不能毁掉 7 天的数据**（2026-10-19 修，真缺陷）：
+// 原来整个文件一次性 map(JSON.parse)，只要有一行残缺（进程被 kill、
+// 断电、磁盘写一半）就抛错，被外层 catch 吞掉 → lines 为空 →
+// 报告打印"还没有可用于判据的样本"，看上去像"你还没开始"，实际 384 条好样本
+// 就躺在文件里。7 天要追加 336 次，中途被打断是现实概率事件。
+// 改为逐行解析：坏行跳过并**数出来**，报告里明说跳了几条 —— 不静默。
+let lines=[], badLines=0;
+try{
+  for(const ln of fs.readFileSync(process.env.SOAK,"utf8").split("\n")){
+    if(!ln.trim()) continue;
+    try{ lines.push(JSON.parse(ln)); }catch{ badLines++; }
+  }
+}catch{}
 const probes=lines.filter(x=>x.kind==="probe");
 // 修复前采的样本没有 pid/proc_start 字段（那时还没记录身份），
 // 它们无法参与"生命周期"判断，单独算一类，不混进来算增长。
@@ -435,6 +446,7 @@ const peakGrowth=peakRss-baseRss;
 const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
 
 console.log("== S6 长期运行现状 ==");
+if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入被打断），已跳过，其余样本正常计入`);
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
 if(days>=7) console.log(`探针密度：${probes.length} 次 / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
