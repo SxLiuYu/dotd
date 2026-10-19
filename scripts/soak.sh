@@ -530,7 +530,19 @@ const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际
 // 采样器如果在中间死了 3 天，首尾照样跨 7 天，报告会给出一个虚假的"连续 7 天"。
 // 真实的 7×24 里，cron 每 30 分钟一个点，正常间隔 1800s；
 // 窗口内若出现远超此值的空档，说明那段没在观测，必须扣掉。
-const sorted=all.slice().sort((a,b)=>a.ts-b.ts);
+// **算空档要用「所有采样点」，含 alive=false 的**（2026-10-20 修，真误报）。
+// 现场：造「7 天里 daemon 停 1.9 小时」的数据 —— 没超 2h 阈值，
+// 却被判 `❌ 观测不连续：最长空档 2.50h` 而失败。
+// 原因：alive=false 的采样行没有 pid/proc_start，被 `all` 过滤掉了，
+// 于是那 1.9 小时在时间轴上**凭空变成一个空档**。
+// 但那段时间 cron 每 30 分钟都在正常跑、都记了 alive=false ——
+// **观测是连续的，只是观测到了"坏"**。
+// "观测不连续" 和 "服务不连续" 是两件事，判据不能混为一谈：
+// 前者说明 cron 没在跑（没人看），后者说明 daemon 挂了（看到了坏）。
+// 后者已由 deadTotal / DEAD_HOURS_LIMIT 单独判，这里只管前者。
+// 所以空档和采样密度都改用 `observed`（含 alive=false）。
+const observed=lines.filter(x=>x.kind!=="probe").slice().sort((a,b)=>a.ts-b.ts);
+const sorted=observed;
 const GAP_LIMIT=5400;                  // 90 分钟：容忍 cron 抖动/一次漏跑
 let maxGap=0, deadTotal=0;
 for(let i=1;i<sorted.length;i++){
