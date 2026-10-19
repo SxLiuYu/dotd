@@ -2537,3 +2537,61 @@ win-relay 就绪，0s 后自退（设 RELAY_TTL_MS=0 常跑）
 ## 142. 本轮门禁
 
 完整开机模拟通过 · daemon/飞书/熔断/容器全部正常 · `tsc` exit 0 · `npm test` 1496/1496
+
+---
+
+# 第三十二轮：watchdog 从"只会报警"变成"会自己动手"（2026-10-19）
+
+## 143. 缺口：告警不等于恢复
+
+上一轮的 watchdog 发现问题只会发飞书。想象一下半夜 3 点：
+
+```
+⚠️ dotd 异常：模型端点不可达（win-relay 13065）
+```
+
+主人被吵醒，还得自己起床敲命令重启 —— 而这故障**一条命令就能修**。
+
+## 144. 加入自愈：先修，修不好再喊人
+
+三个修复器，都在检查失败时**优先尝试**：
+
+| 故障 | 自愈动作 |
+|---|---|
+| daemon 不可达 | `dotd-daemon-start.sh` 重启 |
+| docker 不可用 | `systemctl reset-failed` + `start` |
+| relay 不可达 | 用 `powershell.exe` 跨到 Windows 侧重启（带 `RELAY_TTL_MS=0`）|
+
+修复失败才走原来的告警路径；告警阈值/冷却逻辑不变。
+
+## 145. 实测（不是看代码，是真停真起）
+
+**relay 自愈：**
+```
+停掉 Windows 侧 relay 进程
+08:55:02 自愈:尝试在 Windows 侧重启 relay
+08:55:05 自愈:relay 已恢复(2s)
+模型接口: HTTP 200  ✅
+```
+
+**daemon 自愈：**
+```
+pkill daemon
+08:55:19 自愈:尝试重启 daemon
+08:55:23 自愈:daemon 已恢复(4s)  ✅
+```
+
+## 146. 一个低级但真实的失误
+
+第一次测自愈**失败**了 —— 日志里只有"失败"，没有任何"自愈:"。
+
+原因：我把改动写进了 `/root/dotd/scripts/dotd-watchdog.sh`，
+但 cron 执行的是 `/usr/local/bin/dotd-watchdog.sh`。**装了一份旧文件。**
+
+这和上一轮"验证开机没走真实路径"是同一类错误：
+**改完要确认"跑的那份是不是改的那份"**。这次在测试脚本开头加了一步
+`grep -q repair_relay /usr/local/bin/...` 自检，才定位到。
+
+## 147. 本轮门禁
+
+relay/daemon 自愈实测通过（2s / 4s）· `npm test` 1496/1496 · 服务全部 NORMAL

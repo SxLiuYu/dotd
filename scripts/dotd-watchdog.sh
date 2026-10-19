@@ -104,6 +104,60 @@ check() {
   fi
 }
 
+
+# ───────────────────────────────────────────────────────────────────────────
+# 自愈（2026-10-19）：检查失败时**先尝试修**，修不好再告警。
+#
+# 为什么需要：原来 watchdog 只发飞书通知，主人半夜收到"模型端点不可达"，
+# 还得自己起床重启 —— 而这类故障（relay 进程没了）一条命令就能修好。
+#
+# 所有修复动作都**尽力而为**：失败只记日志，不中断后续检查。
+# ───────────────────────────────────────────────────────────────────────────
+
+repair_daemon() {
+  logline "自愈:尝试重启 daemon"
+  cd /root/dotd || return 1
+  DOTD_MAX_RUNNING=1 setsid bash scripts/dotd-daemon-start.sh </dev/null >/dev/null 2>&1 &
+  local i
+  for i in $(seq 1 30); do
+    sleep 2
+    timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null && { logline "自愈:daemon 已恢复($((i*2))s)"; return 0; }
+  done
+  logline "自愈:daemon 重启失败"
+  return 1
+}
+
+repair_docker() {
+  logline "自愈:尝试 systemctl start docker"
+  systemctl reset-failed docker.service 2>/dev/null || true
+  systemctl start docker.service 2>/dev/null || true
+  local i
+  for i in $(seq 1 20); do
+    sleep 2
+    docker info >/dev/null 2>&1 && { logline "自愈:docker 已恢复($((i*2))s)"; return 0; }
+  done
+  logline "自愈:docker 启动失败"
+  return 1
+}
+
+repair_relay() {
+  # relay 在 Windows 侧，用 powershell.exe 调过去
+  if ! command -v powershell.exe >/dev/null 2>&1; then
+    logline "自愈:没有 powershell.exe,无法重启 Windows 侧 relay"
+    return 1
+  fi
+  logline "自愈:尝试在 Windows 侧重启 relay"
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "\$env:RELAY_TTL_MS='0'; Start-Process -FilePath 'node' -ArgumentList '--import','tsx','scripts/win-relay.mts' -WorkingDirectory 'D:\toagi\dotd' -WindowStyle Hidden" >/dev/null 2>&1
+  local gw i
+  gw=$(ip route | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
+  for i in $(seq 1 15); do
+    sleep 2
+    timeout 3 bash -c "exec 3<>/dev/tcp/$gw/13065" 2>/dev/null && { logline "自愈:relay 已恢复($((i*2))s)"; return 0; }
+  done
+  logline "自愈:relay 重启失败(可能 agent2api 也挂了,需人工处理)"
+  return 1
+}
+
 c_daemon()    { timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; }
 c_docker()    { docker info >/dev/null 2>&1; }
 c_container() { docker ps --filter name=dotd-dot-dot1 --format '{{.Status}}' 2>/dev/null | grep -q 'Up'; }
@@ -112,7 +166,10 @@ c_relay() {
   [ -n "$gw" ] && timeout 5 bash -c "exec 3<>/dev/tcp/$gw/13065" 2>/dev/null
 }
 
+if ! c_daemon; then repair_daemon || true; fi
 check daemon    "dotd daemon 不可达（127.0.0.1:7788）"                        c_daemon
+if ! c_docker; then repair_docker || true; fi
 check docker    "docker 守护进程不可用"                                        c_docker
 check container "dotd 容器不在运行"                                            c_container
+if ! c_relay; then repair_relay || true; fi
 check relay     "模型端点不可达（win-relay 13065）—— agent2api/relay 可能没起"  c_relay
