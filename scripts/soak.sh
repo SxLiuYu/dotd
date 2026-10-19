@@ -474,6 +474,7 @@ for(const s of all){
   else curDownStart=null;
 }
 const CONT_DOWN_LIMIT_SEC=2*3600;   // 和"服务不可用≤2h"同一个口径
+
 const contDownOk=maxContDownSec<=CONT_DOWN_LIMIT_SEC;
 
 // 生命周期 = 一个 daemon 进程从生到死。>1 说明期间重启过 ——
@@ -515,6 +516,37 @@ function parseLog(path, label){
   return out;
 }
 const wdLines=parseLog(WD,"watchdog").concat(parseLog(BOOTLOG,"boot"));
+
+// **容器掉线也要能归因**（2026-10-19 补，和 daemon 归因对齐）：
+// daemon 重启我做了归因（找不到自愈记录 = 疑似人工干预），
+// 但容器掉线只判了"离线多久"，**没判是谁弄好的**。
+// 于是"watchdog 自愈（docker start）"和"我手动 docker start"长得一模一样。
+// 判据是"**无人工干预**"，容器这一半不能免检。
+// 归因口径：掉线结束前后 ±15 分钟内，watchdog/boot 日志里要有
+// "容器已恢复" / "daemon 已恢复" / "daemon 就绪"（容器恢复常伴随 daemon 就绪）。
+// **位置要求**：必须在 wdLines 之后算，否则 TDZ（我踩了一次，exit 2 立刻报出来）。
+
+const contDownSpans=[];
+{
+  let start=null;
+  for(const s of all){
+    if(Number(s.container_up)!==1){ if(start===null) start=s.ts; }
+    else if(start!==null){ contDownSpans.push({start,end:s.ts}); start=null; }
+  }
+  if(start!==null) contDownSpans.push({start,end:all[all.length-1].ts});
+}
+// 归因窗口必须**覆盖整段掉线区间**，而不只是结束点：
+// 自愈可能在掉线中的任何时刻发生（watchdog 每 2 分钟跑一次，容器一挂就被拉起来，
+// 下一个采样点看到的就是"已经回来了"）。我第一版只查 sp.end ±15 分钟，
+// 而自愈记录写在 sp.start 附近 → 全判成"无自愈记录"，把正常自愈误杀成"人工干预"。
+// 现在：窗口 = 掉线开始前 15 分钟 到 掉线结束后 15 分钟。
+const healInSpan=(sp, re)=>
+  wdLines.some(w=>w.ts>=sp.start-900 && w.ts<=sp.end+900 && re.test(w.text) && !/失败/.test(w.text));
+const contRows=contDownSpans
+  .filter(sp=>(sp.end-sp.start)>=1800)      // 至少一个采样周期才算一次"掉线"
+  .map(sp=>({...sp, secs:sp.end-sp.start,
+             healed: healInSpan(sp, /容器已恢复|daemon\s*已恢复|daemon\s*就绪/)}));
+const contUnattended=contRows.filter(r=>!r.healed);
 // watchdog 的"已恢复"、boot 的"daemon 就绪"都算自动恢复。
 // **不是所有"已恢复"都算 daemon 自愈**（2026-10-19 修，真缺口）：
 // watchdog 会写七种带"已恢复"的行：daemon / relay / 容器 / docker，
@@ -819,6 +851,16 @@ if(days>=7 && contTailRate!==null){
     : `❌ **末尾 ${contTail.length} 个采样点容器在线率只有 ${(contTailRate*100).toFixed(0)}%**（判据 ≥75%）：`+
       `全窗口平均 ${(contRate*100).toFixed(1)}% 掩盖了最近坏掉 —— 交付出去的成品此刻不能用`);
 }
+if(contRows.length)
+  c.push(contUnattended.length===0
+    ? `✅ 容器掉线 ${contRows.length} 次，全部有自愈记录（watchdog 自己拉回来的）`
+    : `❌ **有 ${contUnattended.length} 次容器掉线找不到自愈记录**：`+
+      contUnattended.map(r=>`${new Date(r.start*1000).toISOString().slice(5,16)}（${(r.secs/60).toFixed(0)}分钟）`).join("、")+
+      ` —— 容器不是你手动拉回来的才算"无人工干预"`);
+if(contRows.length)
+  for(const r of contRows)
+    console.log(`    ${r.healed?"✔":"✘"} 容器掉线 ${new Date(r.start*1000).toISOString().slice(5,16)} `+
+                `持续 ${(r.secs/60).toFixed(0)} 分钟 ${r.healed?"（watchdog 自愈）":"（**无自愈记录**）"}`);
 c.push(contDownOk
   ? `✅ 容器最长连续离线 ${(maxContDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h，与"服务不可用"同口径）`
   : `❌ **容器最长连续离线 ${(maxContDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）`);
@@ -858,7 +900,7 @@ console.log("\n判定：" + c.join("；"));
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk;
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
-  && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk
+  && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
