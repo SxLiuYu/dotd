@@ -29,6 +29,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { ApprovalView } from '../shared/contracts.ts';
 import type { EventBus } from '../shared/bus.ts';
+import { renderQuarantineNotice } from '../governance/review.ts';
 
 /** 只需要 sendText 的能力面（真 FeishuGateway 满足；测试注 fake）。 */
 export interface FeishuSendPort {
@@ -40,6 +41,11 @@ export interface FeishuOutboundDeps {
   bus: EventBus;
   gateway: FeishuSendPort;
   log(msg: string): void;
+  /**
+   * 不绑定 thread 的系统级通知（隔离、异常）发到哪（2026-10-19）。
+   * 取 surfaces.feishu.owner_chat_id 的第一个；未配置则跳过这类通知。
+   */
+  fallbackChatId?: string | null;
 }
 
 /** 飞书纯文本消息实际上限很宽，但长报告截到这里，避免整篇刷屏。 */
@@ -199,6 +205,32 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
   const unsubscribeApproval = deps.bus.on<ApprovalView>('approval:created', (ev) => {
     const view = ev.payload;
     void claimAndSend(`approval:${view.id}`, () => approvalText(view));
+  });
+
+  /**
+   * **Dot 被隔离时通知主人**（2026-10-19 实测发现：这个事件一个订阅者都没有）。
+   *
+   * 现场：容器因 recreate_count>3/24h 被隔离后，**所有依赖容器的任务都失败**，
+   * 而主人从飞书那边只会看到"任务莫名其妙失败"，完全不知道发生了什么。
+   * 事件 governance:quarantine 早就发了，但没有任何人订阅——典型的"接线漏了"。
+   */
+  const unsubscribeQuarantine = deps.bus.on<{
+    dotId: string;
+    decisionId: string;
+    approvalId: number | null;
+    reason: string;
+  }>('governance:quarantine', (ev) => {
+    const q = ev.payload;
+    void claimAndSend(`quarantine:${q.dotId}:${q.decisionId}`, async () => {
+      // 隔离通知发给主人默认会话（它不绑定某个 thread，走配置里的 owner chat）
+      const chatId = deps.fallbackChatId ?? null;
+      if (chatId === null) {
+        deps.log(`隔离通知跳过：未配置 fallback chat（dot=${q.dotId}）`);
+        return null;
+      }
+      const text = renderQuarantineNotice(q.dotId, q.decisionId, q.reason);
+      return { chatId, text: `${text}\n\n（这条由系统主动发出：dot 已暂停，需要人工复核后解除）` };
+    });
   });
 
   /** task.state 的文案（含发送目标解析）；不需要发时返回 null。 */

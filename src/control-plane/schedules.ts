@@ -19,6 +19,7 @@
  */
 
 import type { DatabaseSync } from 'node:sqlite';
+import { newCrontabId } from '../shared/ids.ts';
 
 /** 一条定时任务（对外形状）。 */
 export interface ScheduleRow {
@@ -63,11 +64,10 @@ export interface CreateScheduleResult {
 /** 算下一次触发时刻的注入点（调度器已有同一实现在用，测试可替换）。 */
 export type CronNextFn = (cron: string, fromMs: number) => number;
 
-function newScheduleId(): string {
-  // 与 crontabs.id 约定一致：'ct_'+nanoid（这里用时间+随机，够用且无依赖）
-  const rand = Math.random().toString(36).slice(2, 10);
-  return `ct_${Date.now().toString(36)}${rand}`;
-}
+// 删掉本地的 newScheduleId：shared/ids.ts 里已经有 newCrontabId()（'ct_'+ULID）。
+// 2026-10-19 全仓库扫"零调用方"时发现它没人用——因为这里另写了一份 Math.random 版本。
+// ULID 的好处是**单调递增可排序**，而 Date.now+random 不是（同毫秒内顺序随机），
+// 列表按 id 排时会乱序，审计时也不好对应时间。
 
 const MIN_INTERVAL_MS = 60_000; // 最快每分钟一次
 
@@ -113,7 +113,7 @@ export function createSchedule(
     return { ok: false, error: `quietHours 形状应为 '23:00-07:30'，收到 ${quiet}` };
   }
 
-  const id = newScheduleId();
+  const id = newCrontabId();
   db.prepare(
     `INSERT INTO crontabs
        (id, dot_id, title, prompt, cron, enabled, next_fire, skip_if_busy, quiet_hours, catchup)

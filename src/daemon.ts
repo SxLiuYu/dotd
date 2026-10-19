@@ -1164,7 +1164,15 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // 触发 publish 时本订阅已就位）；发送失败只落日志，不影响任务落库。
   const stopFeishuOutbound =
     surfCfg.feishu.appId.length > 0 && surfCfg.feishu.appSecret.length > 0
-      ? startFeishuOutbound({ db, bus, gateway: feishuGw, log })
+      ? startFeishuOutbound({
+          db,
+          bus,
+          gateway: feishuGw,
+          log,
+          // 系统级通知（如 dot 被隔离）发到主人默认会话的第一个 chat
+          fallbackChatId:
+            surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0] ?? null,
+        })
       : null;
 
   // ⑨ Runner 常驻协程（CP §12：pop 循环；AbortSignal 让位）
