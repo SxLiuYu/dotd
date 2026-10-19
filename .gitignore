@@ -55,6 +55,10 @@ scripts/tmp-*
 # 导致采样丢失 + 出现无身份的历史混合样本（2026-10-19 实际踩到）。
 docs/acceptance/soak.jsonl
 docs/acceptance/soak-stress.jsonl
+# soak-heartbeat.log 记录**每次 sample 运行的结局**（start/ok/skip probe-running/
+# skip same-second/dead daemon）。没有它，soak.jsonl 里"没记录"无法区分
+# "cron 没跑"和"脚本被我改坏了"—— 2026-10-20 实测丢过一次（03:30:01）。
+docs/acceptance/soak-heartbeat.log
 # acceptance.sh 每次运行会把上一轮结果归档成带时间戳的文件。
 # 那是执行痕迹、不是交付物，不该进版本库堆着；需要追溯时留在 WSL 上即可。
 docs/acceptance/results.*.jsonl

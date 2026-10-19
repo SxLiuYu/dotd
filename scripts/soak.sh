@@ -43,6 +43,26 @@ PID_DAEMON() { pgrep -f 'src/daemon.ts' | head -1; }
 
 do_sample() {
   local pid rss_kb fd n_threads cont db_kb ts
+  # **每次 sample 运行都要留痕，不管结局是什么**（2026-10-20 补，S6 真缺口）。
+  #
+  # 现场：syslog 明确记录 03:30:01 cron 跑了 `soak.sh sample`，
+  # 但 soak.jsonl 里没有那一条。查下去是我当时正在反复改写 soak.sh，
+  # 脚本短暂处于语法错误状态，cron 的输出被 `>/dev/null 2>&1` 吞掉 ——
+  # **什么都没留下**。
+  #
+  # soak.jsonl 现在只有"有记录"和"没记录"两种状态，没记录时无法区分：
+  #   ① cron 没跑（机器挂了 / cron 服务停了）
+  #   ② 脚本语法错了（我改坏的）
+  #   ③ probe 正在跑（主动跳过）
+  #   ④ 同一秒重跑（主动跳过）
+  # 而 ② 恰恰是 7 天窗口里最可能发生的一种 —— 是我自己的操作造成的。
+  # 采样密度判据（≥70%）能兜住"丢太多"，但兜不住"为什么丢"，
+  # 而"为什么"决定了这次算不算人工干预。
+  #
+  # 所以**无条件先登记一行心跳**，再去做事。文件很小（每次一行约 60 字节，
+  # 7 天 336 行 ≈ 20KB），report 时能对出"cron 跑了但没采到"的具体原因。
+  local HB="${SOAK_HB:-$(dirname "$SOAK")/soak-heartbeat.log}"
+  printf '%s start pid=%s\n' "$(date +%s)" "$" >>"$HB" 2>/dev/null || true
   # **probe 正在跑的时候不要采样**（2026-10-20 修，真缺陷）。
   # 现场：soak.jsonl 里出现 fd=31，而 daemon 静息一直是 27。
   # 查下去是我手工跑 probe 时，cron 的 sample 恰好也在跑 ——
@@ -55,6 +75,7 @@ do_sample() {
   #   ② 这里再加一道保险：真撞上了就**跳过这次采样**（宁缺不脏）。
   #      缺口由采样密度判据兜底（≥70%，跳过 28 次 / 336 次 = 8.3%，仍在阈值内）。
   if pgrep -f "soak\.sh probe" >/dev/null 2>&1; then
+    printf '%s skip probe-running\n' "$(date +%s)" >>"$HB" 2>/dev/null || true
     echo "sample: skip（probe 正在跑，采到的 fd/RSS 会是它的瞬时负载）"
     return 0
   fi
@@ -67,6 +88,7 @@ do_sample() {
     local last_ts
     last_ts=$(tail -1 "$SOAK" 2>/dev/null | grep -o '"ts":[0-9]*' | head -1 | cut -d: -f2)
     if [ "$last_ts" = "$ts" ]; then
+      printf '%s skip same-second\n' "$(date +%s)" >>"$HB" 2>/dev/null || true
       echo "sample: 同一秒已有记录（ts=$ts），跳过避免重复"
       return 0
     fi
@@ -74,6 +96,7 @@ do_sample() {
   pid=$(PID_DAEMON)
   if [ -z "$pid" ]; then
     node -e 'const fs=require("fs");fs.appendFileSync(process.env.SOAK, JSON.stringify({ts:Number(process.argv[1]),alive:false})+"\n")' "$ts"
+    printf '%s dead daemon\n' "$(date +%s)" >>"$HB" 2>/dev/null || true
     echo "daemon 不在跑（已记录 alive=false）"
     return 0
   fi
@@ -134,6 +157,7 @@ const o={ts:Number(process.argv[1]),alive:true,rss_kb:Number(process.argv[2]),
   container_ok:Number(process.argv[9])};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
     "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}"
+  printf '%s ok ts=%s\n' "$(date +%s)" "$ts" >>"$HB" 2>/dev/null || true
   echo "sample: rss=${rss_kb}KB fd=$fd threads=$n_threads container_up=$cont container_ok=$cont_ok db=${db_kb}KB pid=$pid"
 }
 
@@ -1068,6 +1092,42 @@ if(deadSampleCount>0)
   console.log(`⚠ 有 ${deadSampleCount} 个采样点记录到 **daemon 不在跑**（alive=false），`+
               `约 ${deadSampleHours.toFixed(1)} 小时服务不可用；这些点不计入观测覆盖`);
 if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入被打断），已跳过，其余样本正常计入`);
+// **心跳对账：把"没记录"归因出来**（2026-10-20 补，S6 真缺口）。
+//
+// 现场：syslog 明确记录 03:30:01 cron 跑了 soak.sh sample，
+// 但 soak.jsonl 里没有那一条 —— 我当时正在反复改写 soak.sh。
+// 这种缺口在 soak.jsonl 里和"cron 没跑"长得一模一样，
+// 而两者的含义完全不同：后者是环境故障，前者**是我自己的操作**。
+//
+// 心跳文件每行一次 sample 运行及其结局，所以能对出：
+//   start 但无后续        → 脚本中途崩了（语法错、被 kill）
+//   skip probe-running    → 故意跳过，正常
+//   skip same-second      → 故意跳过，正常
+//   dead daemon           → 已记 alive=false，正常
+//   ok                    → 正常落盘
+// 只报**异常**的那类（start 无后续），正常的跳过不吵。
+const HB=process.env.SOAK_HB||((process.env.SOAK||"").replace(/[^/]*$/,"")+"soak-heartbeat.log");
+let hbLines=[];
+try{ hbLines=fs.readFileSync(HB,"utf8").split("\n").filter(Boolean); }catch{}
+const hbOutcome=new Map();   // start 行 -> 结局（null = 还没结局）
+const hbKeys=[];            // 保持顺序
+for(const l of hbLines){
+  const m=l.match(/^(\d+) (start|ok|skip|dead)\b\s*(.*)$/);
+  if(!m) continue;
+  const ts=Number(m[1]), kind=m[2], rest=m[3]||"";
+  if(kind==="start"){ const k=ts+":"+(rest.match(/pid=(\d+)/)||[])[1]; hbOutcome.set(k,null); hbKeys.push(k); }
+  else { for(const k of hbKeys) if(hbOutcome.get(k)===null){ hbOutcome.set(k, kind+(rest?" "+rest:"")); break; } }
+}
+const hbStarts=hbOutcome.size;
+const hbVals=[...hbOutcome.values()];
+const hbHung=hbVals.filter(v=>v===null).length;
+const hbSkip=hbVals.filter(v=>v&&v.startsWith("skip")).length;
+const hbDead=hbVals.filter(v=>v&&v.startsWith("dead")).length;
+const hbOk=hbVals.filter(v=>v&&v.startsWith("ok")).length;
+if(hbStarts>0){
+  console.log(`心跳：${hbStarts} 次 sample 运行 —— ok ${hbOk} / skip ${hbSkip} / dead ${hbDead}`+
+    (hbHung?` / **start 后无结局 ${hbHung}**`:``));
+}
 if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
 if(dupProbes>0) console.log(`⚠ 文件里有 ${dupProbes} 行重复探针（同一时刻同一 taskId），已去重，**不计入密度和成功率**`);
 // **负跨度是结构性错误，必须报出来**（2026-10-19 补）。
@@ -1439,7 +1499,12 @@ process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && 
   && passOk && (medSegRate===null||segRates.length<2||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
-  && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture ? 0 : 1);'
+  && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
+  // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
+  // 说明脚本在执行途中死了（语法错 / 被 kill / 磁盘满），那次采样丢了。
+  // 一两次可以容忍（和采样密度的 30% 余量对齐），超过 3 次就必须说出来 ——
+  // 连续崩溃会让 7 天窗口悄悄少掉一整天数据，而 soak.jsonl 上只显示"稀疏"。
+  && hbHung<=3 ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
