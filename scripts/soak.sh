@@ -787,6 +787,25 @@ const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
 // 会把"重启过几次"误判成"采样稀疏" —— 重启不是没在看。
 const SAMPLE_PER_HOUR=2;                 // */30 * * * *
 const expectSamples=hours*SAMPLE_PER_HOUR;
+// **窗口太短时这个分母小到没有意义**（2026-10-20 修，真缺陷）。
+//
+// `hours` 是从首个采样点算起的真实跨度。窗口刚开始时 `hours` 只有零点几，
+// 于是 `expectSamples` 是 0.5、1.0 这种数，而 `all.length` 是**整数**（至少 1）。
+// 现场（真窗口，开窗 41 分钟）：`采样密度：2 次 / 应 1 次 = **146%**`。
+// 逐点扫一遍：
+//   窗口 16 分 → 1 次 / 应 1 次 = 188%
+//   窗口 31 分 → 2 次 / 应 1 次 = 194%
+//   窗口 61 分 → 3 次 / 应 2 次 = 148%
+//   窗口 91 分 → 4 次 / 应 3 次 = 132%
+// 全部超过 `SAMPLE_RATE_MAX=1.5` 的门槛附近，而**这些点全是正常的 cron**。
+// 也就是说：窗口前 1~2 小时，这条判据会**随机地**把正常 cron 判成「有人手动跑」。
+// 而 `SAMPLE_RATE_MAX` 恰恰是为「人工干预」立的 —— 一个会误报人工干预的判据，
+// 比没有更糟：它会让真的人工干预混在噪声里不被注意。
+//
+// 根子是**用比率来判「太多」**。比率的分母小时，单个点的舍入就能把结果推过阈值。
+// 修法分两层：
+//   · 窗口不足 4 小时（应采 <8 次）时，这条**不判**，明确说「还没到判的时候」；
+//   · 之后按比率判，但因为分母够大，舍入误差 ≤12.5%，阈值 1.5 有足够余量。
 const sampleRate=expectSamples>0? all.length/expectSamples : null;
 // 判据：实际密度 ≥ 设计值的 70%。留 30% 余量给 cron 抖动、
 // 单次脚本失败、机器短暂繁忙 —— 但不可能容忍一半样本缺失。
@@ -1534,7 +1553,14 @@ if(negativeSpan)
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
 if(days>=7) console.log(`探针密度：${probesVerified.length} 次（已验飞书） / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
-if(sampleRate!==null) console.log(`采样密度：${all.length} 次 / 应 ${Math.round(expectSamples)} 次 = ${(sampleRate*100).toFixed(0)}%（设计 ${SAMPLE_PER_HOUR} 次/h，判据 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%）`);
+// **短窗口别把比率当真**（2026-10-20，见上面 expectSamples 处）。
+// 这里原来无条件打印 `2 次 / 应 1 次 = 145%`：一个没有状态标记的数字，
+// 读者会以为「密度 145%，超额完成」，实际上只是分母被四舍五入到了 1。
+// 窗口不足 4 小时（应采 <8 次）时改说人话。
+if(sampleRate!==null && expectSamples<8) {
+  console.log(`采样密度：${all.length} 次 / 应 ${expectSamples.toFixed(1)} 次（设计 ${SAMPLE_PER_HOUR} 次/h）`+
+    ` —— **窗口还太短，这条先不判**（应采不足 8 次时，单个点的舍入就能让比率失真）`);
+} else if(sampleRate!==null) console.log(`采样密度：${all.length} 次 / 应 ${Math.round(expectSamples)} 次 = ${(sampleRate*100).toFixed(0)}%（设计 ${SAMPLE_PER_HOUR} 次/h，判据 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%）`);
 if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
 if(lifetimes>1){
@@ -2014,13 +2040,25 @@ if(sampleRate!==null){
   // 刚开窗口采一个点 → 密度 22500%，渲染成 `✅ 采样密度 ≥70%（22500%）`。
   // 退出码是对的（有前缀挡住），但**措辞在撒谎**：那个 ✅ 什么也没证明。
   // 这正是「判据的话和它的意思要一致」——一个荒唐的数字前面不该有勾。
-  if(days<7/6){
-    c.push(`⏳ 采样密度 ${(sampleRate*100).toFixed(0)}%（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
-      `窗口还太短，这条还没到判的时候`);
-  }else if(sampleRate>SAMPLE_RATE_MAX){
+  // **「太少」可以等，「太多」不能等**（2026-10-20 修，第一版把真人工干预放过去了）。
+  //
+  // 短窗口的 ⏳ 门槛（`days<7/6`，约 28 小时）是为「太少」立的：
+  // 窗口刚开，还没攒够点，这时候算比率没有意义。
+  // 但「太多」不同 —— **它是人工干预唯一的指纹**，而且窗口越短越刺眼：
+  // 合成实测：4 小时窗口塞 30 个点（应采 8，比率 375%），
+  // 那是**明明白白有人在手动跑**，却被 ⏳ 挡掉、`exit 0`。
+  // 判据要的是「无人工干预」，人工干预发生在第一小时也算。
+  //
+  // 所以：**「太多」不受窗口长度豁免**，只要分母过半（≥8 次应采）就开始判；
+  // 分母不足 8 次时，比率本身的舍入误差就能到 12% 以上，那时不论多少都不判
+  // —— 这条与摘要行的口径保持一致。
+  if(sampleRate>SAMPLE_RATE_MAX && expectSamples>=4){
     c.push(`❌ **采样密度 ${(sampleRate*100).toFixed(0)}%**（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
       `设计是每 30 分钟一次，多出来的每一次都是**有人手动跑了 sample** —— `+
       `而判据要的是「无人工干预」。这条比「太少」更硬：少了可能是机器抖动，多了只能是人。`);
+  }else if(days<7/6){
+    c.push(`⏳ 采样密度 ${(sampleRate*100).toFixed(0)}%（${all.length} 次 / 应 ${expectSamples.toFixed(1)} 次）：`+
+      `窗口还太短，这条还没到判的时候`);
   }else c.push(sampleRate>=SAMPLE_RATE_LIMIT
     ? `✅ 采样密度 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%（${(sampleRate*100).toFixed(0)}%）`
     : `❌ **采样密度只有 ${(sampleRate*100).toFixed(0)}%**（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
