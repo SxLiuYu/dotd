@@ -154,6 +154,27 @@ process.stdout.write(r && r.endpoint ? r.endpoint : ""); db.close();' 2>/dev/nul
   if timeout 3 bash -c 'exec 3<>/dev/tcp/172.17.48.1/13065' 2>/dev/null; then
     relay_ok=1
   fi
+  # **daemon"进程在"和"服务能用"是两件事**（2026-10-20 补，第 33 轮的同一个病根）。
+  #
+  # 第 33 轮发现：容器 `Up 6 hours`、daemon 活着、RSS/句柄全正常，
+  # 但所有容器工具持续 5 小时返回 container_not_ready，而报告全绿。
+  # 修法是加 `container_ok`（直接打 daemon 会用的那个 endpoint）。
+  #
+  # 但那个修法**只管了容器，没管 daemon 自己**：
+  # `alive` 只判断 `PID_DAEMON` 能不能找到进程 —— 死锁、事件循环卡住、
+  # busy-loop、SQLite 锁住，这些情况下进程好好的、RSS 正常、句柄正常，
+  # **但 HTTP 一个都不回**。主人发的消息全部石沉大海。
+  #
+  # 合成数据实测（7 天、进程全程 alive=true、中间 10 小时 HTTP 打不通）：
+  #   报告全绿 exit 0，**一次都没提到 http**。
+  # 因为 sample 里根本没有这个字段 —— 又是第⑤类的反面（没采集所以无法判定）。
+  #
+  # 这里打 `/api/health`（3 秒超时，不过模型、不进队列）。
+  # 用 127.0.0.1 而不是 0.0.0.0：要测的就是"本机能不能用"，
+  # 绑到哪个网卡是 daemon 自己的事，不该由采样器猜。
+  http_ok=0
+  http_code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${DOTD_HTTP_PORT:-7788}/api/health" 2>/dev/null)
+  [ "$http_code" = "200" ] && http_ok=1
   # **记录 daemon 身份**（进程启动时刻 + pid）。没有这个，RSS 判据是假的：
   # 2026-10-19 实测就踩到了 —— 采样 3 个点算出"RSS 增长 -32.1MB"，看着很好，
   # 其实是中途 daemon 被重启过，拿"新进程的小内存"减"旧进程的大内存"，
@@ -174,9 +195,10 @@ const o={ts:Number(process.argv[1]),alive:true,rss_kb:Number(process.argv[2]),
   container_up:Number(process.argv[5]),db_kb:Number(process.argv[6]),
   pid:Number(process.argv[7]),proc_start:Number(process.argv[8]),
   container_ok:Number(process.argv[9]),
-  relay_up:Number(process.argv[10])};
+  relay_up:Number(process.argv[10]),
+  http_ok:Number(process.argv[11])};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}" "${relay_ok:-0}"
+    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}" "${relay_ok:-0}" "${http_ok:-0}"
   printf '%s ok ts=%s\n' "$(date +%s)" "$ts" >>"$HB" 2>/dev/null || true
   echo "sample: rss=${rss_kb}KB fd=$fd threads=$n_threads container_up=$cont container_ok=$cont_ok db=${db_kb}KB pid=$pid"
 }
@@ -944,6 +966,34 @@ const relayRateOk=!(days>=7 && relayRate!==null && relayRate<RELAY_RATE_LIMIT);
 const relayDownOk=maxRelayDownSec<=CONT_DOWN_LIMIT_SEC;
 const relaySamples=relayPts.length;
 const relayUnknown=relaySamples===0;
+
+// ── **daemon 服务本身也得有判据**（2026-10-20 补，第 33 轮的同一个病根）
+//
+// 第 33 轮修了"容器活着但干不了活"，加 `container_ok` 直接打 endpoint。
+// 但那个修法**只管了容器，没管 daemon 自己**：`alive` 只判断进程在不在。
+// 死锁、事件循环卡住、busy-loop、SQLite 锁住 —— 进程好好的、RSS 正常、句柄正常，
+// **但 HTTP 一个都不回**，主人发的消息全部石沉大海。
+//
+// 合成数据实测（7 天、进程全程 alive=true、中间 10 小时 HTTP 打不通）：
+//   报告全绿 exit 0、一次都没提到 http。因为 sample 里根本没这个字段。
+//
+// 口径与容器/网关完全一致（同一个 2 小时容忍）：
+//   可达率 ≥95%、最长连续不可达 ≤2h、无字段时"判断不了"。
+const httpPts=all.filter(s=>s.http_ok!==undefined);
+const httpRate=httpPts.length? httpPts.filter(s=>Number(s.http_ok)===1).length/httpPts.length : null;
+let maxHttpDownSec=0, curHttpDownStart=null;
+for(const s of all){
+  if(s.http_ok===undefined) continue;
+  if(Number(s.http_ok)!==1){
+    if(curHttpDownStart===null) curHttpDownStart=s.ts;
+    maxHttpDownSec=Math.max(maxHttpDownSec, s.ts-curHttpDownStart+1800);
+  } else curHttpDownStart=null;
+}
+const HTTP_RATE_LIMIT=0.95;
+const httpRateOk=!(days>=7 && httpRate!==null && httpRate<HTTP_RATE_LIMIT);
+const httpDownOk=maxHttpDownSec<=CONT_DOWN_LIMIT_SEC;
+const httpSamples=httpPts.length;
+const httpUnknown=httpSamples===0;
 // 这 7 天里**有没有能力采** container_ok：看有没有 container_up。
 // 两者在同一处采集逻辑里相邻写入，有 up 就说明那次采集跑了。
 // 全窗口连 up 都没有 → 老数据，指标压根不存在，不追究。
@@ -1663,6 +1713,21 @@ if(relayUnknown){
     ? `✅ 网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
     : `❌ **网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）：这段时间主人发什么都不通`);
 }
+
+// daemon 可达性三条（与容器/网关同口径）。**没有字段时说"判断不了"，不打勾也不判死。**
+if(httpUnknown){
+  c.push(`⚠ **daemon 可达性：这段时间的采样里没有 \`http_ok\` 字段，这条判断不了**（既不算通过也不算失败）`);
+}else{
+  c.push(!httpRateOk
+    ? `❌ **daemon 可达率 ${(httpRate*100).toFixed(1)}%**（${httpSamples} 点，<95%）：进程在，但请求进不去`
+    : (days>=7
+        ? `✅ daemon 可达率 ${(httpRate*100).toFixed(1)}%（${httpSamples} 点）`
+        : `⏳ daemon 可达率 ${(httpRate*100).toFixed(1)}%（${httpSamples} 点）：窗口未满 7 天，这条还没到判的时候`));
+  c.push(httpDownOk
+    ? `✅ daemon 最长连续不可达 ${(maxHttpDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
+    : `❌ **daemon 最长连续不可达 ${(maxHttpDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）：`+
+      `这段时间进程在但服务不回，主人发什么都不通`);
+}
 c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
   : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
@@ -1810,6 +1875,7 @@ process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && g
   && passOk && (medSegRate===null||segRates.length<2||segTooMany===0)
   && (medSegFdRate===null||fdSegTooMany===0)
   && relayRateOk && relayDownOk
+  && httpRateOk && httpDownOk
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
   && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
   // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
