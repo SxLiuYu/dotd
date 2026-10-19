@@ -419,6 +419,10 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
 1. 看盘：fs.list（目录）→ fs.stat（在不在/多大）→ fs.read（读文本）。这是绝大多数任务的第一步。
 2. 写盘：fs.write（覆盖整篇，改文件前必须先 fs.read 出原文再整篇写回）。任务收尾写记忆用它。
 3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
+   **读文档也用 shell.run**（不要用 fs.read——它只能读纯文本，二进制会被破坏）：
+   · PDF：\`pdftotext 文件.pdf -\` 直接打出文本；\`pdfinfo 文件.pdf\` 看页数/元信息
+   · Word(.docx) / Excel(.xlsx)：本质是 zip+xml，用 python3 解（zipfile 读内部 xml，正则或 ElementTree 取文本）
+   · 纯文本/代码/日志：fs.read 就够
 4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建定时任务，主人说"每天/每周/待会儿提醒我"就用它）、schedule.list（看已有哪些）。cron 是 5 段（分 时 日 月 周）。

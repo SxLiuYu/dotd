@@ -7,8 +7,11 @@ ARG PW_VERSION=1.49.1
 FROM mcr.microsoft.com/playwright:v${PW_VERSION}-noble
 
 # headed 模式依赖：官方镜像不自带 Xvfb（agent-runtime 启动时自行 spawn :99，非 init 进程）
+# poppler-utils：pdftotext / pdfinfo —— **PDF 是最常见的文档格式**，容器里原本只有 python，
+#   没有它就读不了 PDF（2026-10-19 实测：PyPDF2/pypdf 也都没有）。装 poppler 比装 python 库
+#   轻得多（约 10MB），且 pdftotext 的文本质量更好。
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends xvfb bash \
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb bash poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # agent-runtime 源码由宿主 daemon 打包进构建上下文（§3.2）
