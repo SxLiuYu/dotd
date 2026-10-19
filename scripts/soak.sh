@@ -233,6 +233,24 @@ for(let i=1;i<sorted.length;i++){
   if(g>GAP_LIMIT) deadTotal+=g-GAP_LIMIT;   // 超出容忍的部分算"没在看"
 }
 const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
+
+// **空档判据只管"单个空档"，管不了"整体稀疏"**（2026-10-19 补，真缺口）：
+// GAP_LIMIT 只看连续两个样本之间是否超过 90 分钟。
+// 如果 cron 变成每 85 分钟才跑一次（或者大部分跑失败了、偶尔成功一次），
+// 每个空档都在容忍内 → 报告打印"✅ 观测连续"，exit 0。
+// 合成数据实测：7.2 天只采了 129 次（设计应为 345 次，仅 37%），
+// 而报告说"已满 7 天且观测连续" —— 一半以上的时间根本没在看，
+// 期间发生过的内存峰值、容器宕机、句柄飙升全都没有样本。
+// 所以还要看**实际采样密度**：SAMPLE_PER_HOUR 是 cron 的设计值（每 30 分钟一次）。
+// **必须用 all**：hours 是整个观测窗口（涵盖所有生命周期），
+// 而 S 只是"当前生命周期"的样本。拿 S.length 去比 hours 密度，
+// 会把"重启过几次"误判成"采样稀疏" —— 重启不是没在看。
+const SAMPLE_PER_HOUR=2;                 // */30 * * * *
+const expectSamples=hours*SAMPLE_PER_HOUR;
+const sampleRate=expectSamples>0? all.length/expectSamples : null;
+// 判据：实际密度 ≥ 设计值的 70%。留 30% 余量给 cron 抖动、
+// 单次脚本失败、机器短暂繁忙 —— 但不可能容忍一半样本缺失。
+const SAMPLE_RATE_LIMIT=0.7;
 // **"连续"不能只靠加起来够 7 天**（2026-10-19 修，措辞在撒谎）：
 // 原来只把断档扣掉，于是"8 天跨度里有 24 小时没观测"仍会打印
 // "✅ 已满 7 天且**观测连续**" —— 累计是够 7 天了，但"连续"这个词是假的：
@@ -383,6 +401,7 @@ const SEG_RATE_LIMIT=2;
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
+if(sampleRate!==null) console.log(`采样密度：${all.length} 次 / 应 ${Math.round(expectSamples)} 次 = ${(sampleRate*100).toFixed(0)}%（设计 ${SAMPLE_PER_HOUR} 次/h，判据 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%）`);
 if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
 if(lifetimes>1){
@@ -458,6 +477,12 @@ if(medSegRate!==null){
     : `❌ **每个生命周期内 RSS 都在爬升**（中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
       `重启只是把泄漏截断，不是没漏`);
 }
+if(sampleRate!==null){
+  c.push(sampleRate>=SAMPLE_RATE_LIMIT
+    ? `✅ 采样密度 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%（${(sampleRate*100).toFixed(0)}%）`
+    : `❌ **采样密度只有 ${(sampleRate*100).toFixed(0)}%**（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
+      `空档虽都在容忍内，但大部分时间没在观测`);
+}
 if(medSegFdRate!==null){
   c.push(medSegFdRate<SEG_FD_RATE_LIMIT
     ? `✅ 各生命周期内句柄无明显爬升（中位 ${medSegFdRate.toFixed(2)}个/h）`
@@ -475,7 +500,8 @@ const passOk = passRate===null || passRate>=0.95;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
-  && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT) ? 0 : 1);'
+  && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
+  && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT) ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
