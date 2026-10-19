@@ -142,6 +142,39 @@ for(const s of all){
 const lifetimes=lifeMap.size;
 const LIFE=[...lifeMap.values()].sort((a,b)=>a.first-b.first);
 
+// **重启归因**（2026-10-19 补）：S6 的字面要求是"无**人工**干预"，
+// 而"重启过几次"本身不区分"自愈救回来的"和"人去手动拉起来的"。
+// 这两者性质完全不同：watchdog 自愈恰恰是长期运行该有的能力，
+// 而人工重启会让"连续 7 天"作废。所以每次重启都要去 watchdog 日志里找证据：
+// 新生命周期开始前 15 分钟内若有"自愈:…已恢复"记录 → 判为自愈；
+// 找不到 → 如实标成"无自愈记录"，不替它圆场。
+const WD=process.env.DOTD_WATCHDOG_LOG||"/var/log/dotd-watchdog.log";
+let wdLines=[];
+try{
+  wdLines=fs.readFileSync(WD,"utf8").split("\n").filter(Boolean)
+    .map(l=>{
+      const m=l.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s+(.*)$/);
+      if(!m) return null;
+      return { ts: Math.floor(new Date(`${m[1]}T${m[2]}`).getTime()/1000), text: m[3] };
+    }).filter(Boolean);
+}catch{}
+const healed=wdLines.filter(w=>w.text.includes("已恢复"));
+const restartRows=[];
+for(let i=1;i<LIFE.length;i++){
+  const prev=LIFE[i-1], cur2=LIFE[i];
+  // 新进程的 proc_start 是它真正起来的时刻，比首个采样点更准
+  const bornAt=cur2.key.split(":")[0];
+  const born=Number(bornAt)||cur2.first;
+  const near=healed.filter(w=>w.ts>=born-900 && w.ts<=born+300);
+  restartRows.push({
+    pid:cur2.pid, born,
+    healed: near.length>0,
+    evidence: near.map(w=>w.text).join(" / "),
+    downtimeSec: Math.max(0, born-prev.last),
+  });
+}
+const unattended=restartRows.filter(r=>!r.healed);
+
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，跨度 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
@@ -152,6 +185,14 @@ if(lifetimes>1){
     console.log(`  · pid=${L.pid} ${new Date(L.first*1000).toISOString().replace("T"," ").slice(0,19)} → `+
                 `${new Date(L.last*1000).toISOString().replace("T"," ").slice(0,19)}  `+
                 `(${((L.last-L.first)/3600).toFixed(2)}h, ${L.samples} 点)`);
+  }
+  if(restartRows.length){
+    console.log("  重启归因（对照 watchdog 日志）：");
+    for(const r of restartRows){
+      const when=new Date(r.born*1000).toISOString().replace("T"," ").slice(0,19);
+      if(r.healed) console.log(`    ✔ ${when} pid=${r.pid} 自愈恢复（空窗 ${r.downtimeSec}s）← ${r.evidence}`);
+      else console.log(`    ✖ ${when} pid=${r.pid} **无自愈记录**（空窗 ${r.downtimeSec}s）—— 疑似人工干预`);
+    }
   }
 }
 console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
@@ -172,10 +213,15 @@ if(days>=7 && coveredDays>=7){
 }
 c.push(growth<50? "✅ RSS 增长 <50MB" : `❌ RSS 增长 ${growth.toFixed(1)}MB ≥50MB`);
 c.push(fdGrowth<=2? "✅ 无明显句柄泄漏" : `❌ 句柄增长 ${fdGrowth}`);
-if(lifetimes>1) c.push(`⚠ 期间重启过 ${lifetimes-1} 次（"连续 7 天"需说明原因：自愈不算人工干预，但要如实记录）`);
+if(unattended.length){
+  c.push(`❌ 有 ${unattended.length} 次重启**找不到自愈记录**（${unattended.map(r=>new Date(r.born*1000).toISOString().slice(11,19)).join(", ")}）`+
+         ` —— "无人工干预"不成立`);
+} else if(restartRows.length){
+  c.push(`✅ 期间重启 ${restartRows.length} 次，**全部是 watchdog 自愈**（无人干预，符合判据）`);
+}
 if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
 console.log("\n判定：" + c.join("；"));
-process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 ? 0 : 1);'
+process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && unattended.length===0 ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
