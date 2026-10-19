@@ -11,3 +11,5 @@
 | 2026-10-19 | S2 | 工具清单注入：`exec.runTool('tool.list')` 在容器内 ToolStore 能列出 word-count（直接 node 跑返回 1 项），但经 daemon 链路拿到空。日志只打出"发现 0 个"，说明工具调用成功了但结果结构不匹配，或调用根本没发生 | 模型感知不到已造工具，S2"可复用"判据未达标 | 待查：① 加原始返回结构日志定位；② 或改走 memory 桥（需给 MemoryServiceApi 加 listHomeDir/readHomeFile） |
 
 | 2026-10-19 | S2 | 工具清单已注入上下文（诊断确认 len=130），但模型回答"我上下文里没有工具清单"且仍用 shell.run 手写 | 复用行为未达成；模型对注入的 system 段不敏感 | 可尝试：① 把清单并入运行手册末尾（模型对首条 system 更敏感）；② 或改成 user 消息；③ 或明确要求 tasks 里带"先查工具有没有现成的" |
+
+| 2026-10-19 | S2(b) | **根因定位**：模型可见的 tools 是 `[..., tool.invoke]`（一个泛用工具），而自造工具 `word-count` 只是注入文本里的**数据**。模型必须自己完成"看到文字 → 想到要用 tool.invoke(name=word-count)"这一步间接映射。实测 3 个模型（deepseek/glm/agnes）全部失败 | S2(b) 无法通过提示词达成 | **正确解法**：把自造工具**动态注册成独立工具**（名字直接是 word-count，有独立 args_schema），模型就能像调 fs.read 一样直接选它。这是架构级改动，需改 toolSpecs() 动态生成 |
