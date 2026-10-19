@@ -2027,7 +2027,25 @@ try{
     segRate:SEG_RATE_LIMIT,contOkRate:CONT_OK_RATE_LIMIT,contDownSec:CONT_DOWN_LIMIT_SEC,
     relayRate:RELAY_RATE_LIMIT,httpRate:HTTP_RATE_LIMIT,coverRate:COVER_RATE_LIMIT,
     probeRate:PROBE_RATE_LIMIT,sampleRate:SAMPLE_RATE_LIMIT,deadHours:DEAD_HOURS_LIMIT,staleSec:STALE_LIMIT};
-  const row={at:new Date().toISOString(),exit:verdictOk?0:1,failures,scriptMd5,limits,soak:soakPath,md5,
+  // **窗口起止必须落盘**（2026-10-20 补，真缺陷）。
+  //
+  // 前几轮把「数据 md5」「尺子 md5」「阈值」都记了，但**没记窗口是哪一段**。
+  // `observedDays:7.001` 只说「跨了 7 天」，不说「是哪 7 天」。
+  //
+  // 这不是吹毛求疵：本项目 `soak-day0.txt` 已经改过 3 次
+  // （`soak-day0.old5h-*`、`soak-day0.pre-s5kill-*`、当前这份），
+  // 而且**当前这份的 mtime（03:44）比它写下的窗口起点（03:25:20）晚 19 分钟** ——
+  // 因为中途被重写过一次（只是写了同样的值）。
+  // 外部看审计行**无法区分「重写了同样的值」和「偷偷改了窗口」**：
+  // 两者都会让 `observedDays` 变，且都能凑出 `exit:0`。
+  //
+  // S6 的核心主张就是「连续 7 天」——**哪 7 天是这句话的全部内容**。
+  // 记三项：窗口起 / 窗口止 / 观测到的最后一点。
+  const winFirst=first.ts, winLast=last.ts;
+  const row={at:new Date().toISOString(),exit:verdictOk?0:1,failures,scriptMd5,limits,
+    windowStart:new Date(winFirst*1000).toISOString(),windowEndObserved:new Date(winLast*1000).toISOString(),
+    windowStartUnix:winFirst,windowEndUnix:winLast,
+    soak:soakPath,md5,
     records:all.length,observedDays:Number(coveredDays.toFixed(3)),spanDays:Number(days.toFixed(3)),
     rssGrowthMb:Number(growth.toFixed(1)),fdGrowth,maxFdPeak:maxFd,
     passRate:passRate===null?null:Number((passRate*100).toFixed(1)),probes:probesVerified.length,
