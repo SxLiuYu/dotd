@@ -62,7 +62,25 @@ do_probe() {
   local base=http://127.0.0.1:7788
   local hdr=(-H "Authorization: Bearer ${DOTD_MASTER_TOKEN:-}" -H "Content-Type: application/json")
   t0=$(date +%s)
-  tid=$(curl -s -m 20 "${hdr[@]}" -X POST --data-binary '{"text":"回复 OK 两个字母就行"}' "$base/api/messages" \
+  # **探测必须真的测能力**（2026-10-19 改）：原来只发"回复 OK 两个字母就行"，
+  # 那只能证明进程还活着，证明不了"成功率不掉"——而后者才是 S6 的判据。
+  # 现在按小时轮换四种真实任务，覆盖 模型 / 容器 / 工具 / 文件 四条路径；
+  # 轮换用确定性取模，所以长期跑下来每类都会被平均覆盖到，且可复现。
+  local slot=$(( $(date +%H) % 4 ))
+  local prompt
+  case "$slot" in
+    0) prompt="回复 OK 两个字母就行" ;;                                        # 纯存活
+    1) prompt="350 减 405 等于多少？只回数字" ;;                                # 纯推理
+    2) prompt="读一下 /dot/home/q3-sales.txt，只回文件里的总目标数字" ;;          # 文件+工具
+    3) prompt="用 shell 算一下 6 的 12 次方，只回数字" ;;                       # 容器执行
+  esac
+  local want
+  case "$slot" in
+    0) want="OK" ;; 1) want="-55" ;; 2) want="350" ;; 3) want="2176782336" ;;
+  esac
+  local answer
+  answer=$(printf '%s' "$prompt" | sed 's/\\/\\\\/g')
+  tid=$(curl -s -m 20 "${hdr[@]}" -X POST --data-binary "{\"text\":$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$prompt")}" "$base/api/messages" \
         | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p')
   if [ -n "$tid" ]; then
     local deadline=$(( $(date +%s) + 120 ))
@@ -72,7 +90,27 @@ const { DatabaseSync } = require("node:sqlite");
 const db = new DatabaseSync(process.env.HOME + "/.dotd/dotd.db", { readOnly: true });
 const r = db.prepare("SELECT status FROM tasks WHERE id=?").get(process.argv[1]);
 process.stdout.write(r ? r.status : ""); db.close();' "$tid")
-      [ "$st" = "done" ] && { ok=1; break; }
+      if [ "$st" = "done" ]; then
+        # done 只说明任务收口了，不说明答对了 —— S6 的"成功率不掉"要的是"还干得对"。
+        local ans
+        ans=$(node --disable-warning=ExperimentalWarning -e '
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.env.HOME + "/.dotd/dotd.db", { readOnly: true });
+const m = db.prepare("SELECT content FROM mem_messages WHERE task_id=? AND role=? AND kind=? ORDER BY seq DESC LIMIT 1").get(process.argv[1],"assistant","text");
+process.stdout.write(m ? String(m.content) : ""); db.close();' "$tid")
+        # 统一判据：回答里必须出现期望值。**不要写成 case + 通配 default**：
+        # 我第一版就是 `*) ok=1 ;;`，结果把 want 故意改成 -999999 时 ok 仍然是 1 ——
+        # 也就是说任何"没预料到的期望值"都会自动算过。那等于这条判据永远为真，
+        # 正是这一路反复要防的"判据自己会说谎"。
+        if [ -n "$want" ] && printf '%s' "$ans" | grep -qF -- "$want"; then
+          ok=1
+        else
+          ok=0
+        fi
+        # 记下这轮到底考了什么，报告里能看出覆盖
+        PROBE_SLOT=$slot; PROBE_WANT=$want
+        break
+      fi
       case "$st" in failed|cancelled|paused) break ;; esac
       sleep 3
     done
@@ -80,10 +118,11 @@ process.stdout.write(r ? r.status : ""); db.close();' "$tid")
   node -e '
 const fs=require("fs");
 const o={ts:Number(process.argv[1]),kind:"probe",ok:process.argv[2]==="1",
-  taskId:process.argv[3]||"",status:process.argv[4]||"",secs:Number(process.argv[5])};
+  taskId:process.argv[3]||"",status:process.argv[4]||"",secs:Number(process.argv[5]),
+  slot:process.argv[6],want:process.argv[7]};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))"
-  echo "probe: ok=$ok status=${st:-none} secs=$(( $(date +%s) - t0 ))"
+    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}"
+  echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} secs=$(( $(date +%s) - t0 ))"
 }
 
 do_report() {
