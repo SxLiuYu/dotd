@@ -101,7 +101,21 @@ do_sample() {
     echo "daemon 不在跑（已记录 alive=false）"
     return 0
   fi
-  rss_kb=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
+  # **读不到 RSS 时不写 0**（2026-10-20 修，真缺陷）。
+  #
+  # 原来 `|| echo 0`：/proc/<pid>/status 读失败（进程刚退出、权限变化、
+  # 采样撞上 exec 的瞬间）就记 `rss_kb: 0`。而 0 在判据里是**一个有效的极小值**：
+  #   · 落在首尾 → 算出"RSS 增长 200MB → 0MB"，还打印 `✅ RSS 增长 <50MB`
+  #   · 落在末尾 → 段内斜率算出 **-3.08MB/h**（负数，"在释放内存"）
+  #   · 落在峰值 → 把真泄漏的峰值削平
+  # 合成数据实测：真泄漏 200→300MB、最后 30 点读失败 →
+  #   `✅ RSS 增长 <50MB` 与 `❌ 峰值增长 90.2MB` **同时出现**，
+  #   还附一条 `⚠ 段内爬升 -3.08MB/h`。同一份数据三个说法，两个是凭空来的。
+  #
+  # 正确做法：读不到就**不写这个字段**（与 `container_ok`/`relay_up` 的"字段缺席"同一套语义），
+  # 判据侧只统计真正有值的点。这与第 66/67 轮那两条判据是同一个规矩：
+  # **"没测到"不等于"测到 0"**。
+  rss_kb=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null | head -1)
   n_threads=$(ls "/proc/$pid/task" 2>/dev/null | wc -l)
   fd=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
   cont=$(docker ps --filter name=dotd-dot-dot1 --format '{{.Status}}' 2>/dev/null | grep -c Up || true)
@@ -190,7 +204,8 @@ process.stdout.write(r && r.endpoint ? r.endpoint : ""); db.close();' 2>/dev/nul
   proc_start=${proc_start:-0}
   node -e '
 const fs=require("fs");
-const o={ts:Number(process.argv[1]),alive:true,rss_kb:Number(process.argv[2]),
+const o={ts:Number(process.argv[1]),alive:true,
+  ...(process.argv[2]!==""?{rss_kb:Number(process.argv[2])}:{}),
   fd:Number(process.argv[3]),threads:Number(process.argv[4]),
   container_up:Number(process.argv[5]),db_kb:Number(process.argv[6]),
   pid:Number(process.argv[7]),proc_start:Number(process.argv[8]),
@@ -553,6 +568,13 @@ if(!all.length){
 // **只跟同一个 daemon 生命周期比较**（见 sample 里的注释：跨重启会算出负数增长）
 const cur=all[all.length-1];
 const sameLifetime=all.filter(s=>s.proc_start===cur.proc_start && s.pid===cur.pid);
+// **只用真正采到 RSS 的点**（2026-10-20 修）：0 和 undefined 都算"没测到"。
+// **这个定义必须放在所有 RSS 计算之前** —— 前两版插在语义相邻处，
+// 造成本轮第三次 TDZ（`Cannot access 'rssOk' before initialization`）。
+// 三次都是同一个原因：1900 行单文件、变量散落，靠人工找位置。
+const rssOk=(s)=>typeof s.rss_kb==="number" && s.rss_kb>0;
+const rssPts=all.filter(rssOk);
+const rssSkipped=all.length-rssPts.length;
 const S=sameLifetime.length?sameLifetime:all;
 
 const first=all[0], last=all[all.length-1];
@@ -820,12 +842,12 @@ const med=(arr)=>{const a=arr.slice().sort((x,y)=>x-y);const n=a.length;
   return n%2? a[(n-1)/2] : (a[n/2-1]+a[n/2])/2;};
 const tailN=Math.max(1, Math.round(S.length*0.1));
 const headS=S.slice(0, tailN), tailS=S.slice(S.length-tailN);
-const rss0=med(headS.map(s=>s.rss_kb))/1024, rssN=med(tailS.map(s=>s.rss_kb))/1024;
+const rss0=med(headS.filter(rssOk).map(s=>s.rss_kb))/1024, rssN=med(tailS.filter(rssOk).map(s=>s.rss_kb))/1024;
 const growth=rssN-rss0;
 const fd0=med(headS.map(s=>s.fd)), fdN=med(tailS.map(s=>s.fd));
 const fdGrowth=fdN-fd0;
 const thGrowth=med(tailS.map(s=>s.threads))-med(headS.map(s=>s.threads));
-const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
+const maxRss=S.filter(rssOk).length? Math.max(...S.filter(rssOk).map(s=>s.rss_kb))/1024 : 0;
 // **fd 峰值必须看全窗口**（2026-10-19 修）：原来 `maxFd` 只从当前生命周期 `S` 取，
 // 重启后就只剩新进程的低值 —— 实测 fd 从 34 爬到 64、末尾重启一次，
 // 打印"单点峰值 34"（真实峰值 64），数字本身就是错的。
@@ -1262,8 +1284,8 @@ for(const L of LIFE){
   const body=seg.slice(warm);
   if(body.length<2) continue;
   const n2=Math.max(1,Math.round(body.length*0.34));
-  const r0=med(body.slice(0,n2).map(s=>s.rss_kb))/1024;
-  const r1=med(body.slice(body.length-n2).map(s=>s.rss_kb))/1024;
+  const r0=med(body.slice(0,n2).filter(rssOk).map(s=>s.rss_kb))/1024;
+  const r1=med(body.slice(body.length-n2).filter(rssOk).map(s=>s.rss_kb))/1024;
   const f0=med(body.slice(0,n2).map(s=>s.fd));
   const f1=med(body.slice(body.length-n2).map(s=>s.fd));
   const h=(body[body.length-1].ts-body[0].ts)/3600;
@@ -1310,18 +1332,7 @@ const maxSegRate=segRates.length? Math.max(...segRates) : null;
 // 判据：生命周期内中位增长率 < 2MB/h。7 天 = 168h，2MB/h 就是 ~336MB，
 // 远超 50MB —— 所以这个阈值不宽松，是专门用来抓"靠重启洗白"的泄漏。
 const SEG_RATE_LIMIT=2;
-
-// **两条判据都拦不住"慢慢漏、末尾重启一次"**（2026-10-19 补，真缺口）：
-//   · "当前生命周期首末差"：末尾重启后末段是新进程，差值只有 +1.8MB
-//   · "每段爬升速率中位"：1.15MB/h 恰好低于 2MB/h 阈值
-// 合成数据实测：daemon 从 200MB 爬到 400MB（**漏 200MB**），最后 2 小时重启一次
-// → 报告全绿、exit 0。
-// 根子在于"2MB/h × 168h = 336MB"与判据"增幅 <50MB"自相矛盾 ——
-// 速率阈值放得太宽，把总量漏掉了。
-// 补一条直读判据原文的量：**全窗口峰值增长** = 全窗口最高点 − 窗口开始时的基线。
-// 不管中间重启几次，内存最高到过多少是真实的。
-// 基线取"最前 10% 样本的中位数"而不是单点，避开启动瞬间的抖动与预热。
-const peakRss=Math.max(...all.map(s=>s.rss_kb))/1024;
+const peakRss=rssPts.length? Math.max(...rssPts.map(s=>s.rss_kb))/1024 : 0;
 // 基线要贴近**窗口开始**，不能取"前 10%"（7 天里那是 0.8 天）。
 // 用前 10% 的中位数会在持续增长时把基线抬高，判据实际要漏到 ~52.6MB 才报，
 // 与判据原文的 50MB 不符（实测 +49/50/51 都通过、+60 才失败）。
@@ -1353,11 +1364,14 @@ const BASE_WINDOW_SEC=7200;
 // 这一步之后 peakGrowth 在"启动即峰值"时会是 0。这不是漏洞：
 // 那种情况下的缓慢爬升由 segRate（每段爬升速率）去抓，两条判据分工明确 ——
 // 这条管"整体峰值涨了多少"，那条管"是不是一直在爬"。
-const peakIdx=all.reduce((m,s,k)=>s.rss_kb>all[m].rss_kb?k:m, 0);
+// `peakIdx` 保持**索引**语义（下面 L1368 用它取 all[peakIdx].ts）—— 改成对象会炸：
+// `TypeError: Cannot read properties of undefined (reading 'ts')`。
+// 另给一个 `peakPt` 表达"峰值那个点"，两者都从筛过的 rssPts 算。
+const peakIdx=all.findIndex(s=>s===rssPts.reduce((m,x)=>(x.rss_kb>m.rss_kb?x:m), rssPts[0]));
 const baseEndTs=Math.min(all[0].ts+BASE_WINDOW_SEC, all[peakIdx].ts);
 const baseSet=all.filter(s=>s.ts<=baseEndTs);
 const baseN=Math.max(1, baseSet.length);
-const baseRss=med(all.slice(0,baseN).map(s=>s.rss_kb))/1024;
+const baseRss=med(rssPts.filter(s=>s.ts<=all[peakIdx].ts).slice(0,baseN).map(s=>s.rss_kb))/1024;
 const peakGrowth=peakRss-baseRss;
 const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
 
