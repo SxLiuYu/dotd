@@ -21,8 +21,17 @@ export HOME="${HOME:-/root}"
 export PATH="${PATH:-/usr/local/sbin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 LOG=/var/log/dotd-boot.log
-exec >>"$LOG" 2>&1
-echo "===== $(date '+%F %T') WSL 启动 ====="
+# **每行都要带时间戳**（2026-10-20 修，真缺陷）。
+# 现场：soak.sh 的 parseLog 只认 `YYYY-MM-DD HH:MM:SS <正文>` 这个形状，
+# 而这里原来只在开头打一行带时间的 `===== ... WSL 启动 =====`，正文全裸。
+# 结果 parseLog 解析出 0 行 —— **boot 自愈证据在评估时根本不存在**。
+# 后果很严重：7 天窗口里只要 Windows 更新导致 WSL 重启一次，
+# soak 就找不到"这次重启是谁拉起来的"，判成「疑似人工干预」直接把验收打红，
+# 而实际上 dotd-boot.sh 4 秒就把它拉起来了（我实测过）。
+# 这是第⑥类（样本没测它声称测的东西）反过来：**证据存在，但格式让它不可读**。
+# 用 gawk 的 strftime 给 stdout/stderr 每一行前面加时间戳，输出形状与 watchdog 日志对齐。
+exec > >(gawk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0; fflush() }' >>"$LOG") 2>&1
+echo "===== WSL 启动 ====="
 
 wait_until() {  # wait_until <秒> <命令...>
   local max="$1"; shift
