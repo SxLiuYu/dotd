@@ -15,7 +15,19 @@ cd /root/dotd || exit 1
 set -a; . ./_tokens_src.env; set +a
 BASE=http://127.0.0.1:7788
 HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application/json")
-OUTDIR=/root/dotd/docs/acceptance
+# **OUTDIR 必须可覆盖**（2026-10-20 修，真缺陷）。
+#
+# 原来这里硬编码 `/root/dotd/docs/acceptance`，而下面紧接着就 `: > "$RESULTS"`
+# 清空证据文件。于是想验证"判定逻辑判得对不对"**只能拿真证据去跑**，
+# 跑一次证据就没了 —— 而验收脚本本身恰恰是最该被验证的东西：
+# 它是 S3/S4/S5 的唯一证据来源，判错了没人会发现。
+#
+# 对照：soak.sh 早就支持 `SOAK=` 覆盖（第 22 行注释写得很清楚：
+# "便于用合成数据验证 report 的判断逻辑是否真的判得对"）。
+# 三个验收脚本漏了这件事，等于它们的判定逻辑**从来没被验证过**。
+#
+# 与 SOAK 同一套约定：设了就用，没设就用默认。往回兼容，不影响正常验收。
+OUTDIR="${DOTD_ACCEPT_DIR:-/root/dotd/docs/acceptance}"
 mkdir -p "$OUTDIR"
 RESULTS="$OUTDIR/results.jsonl"
 export RESULTS
@@ -29,6 +41,65 @@ if [ -s "$RESULTS" ]; then
   cp "$RESULTS" "$ARCHIVE"
   echo "已归档上一轮结果：$ARCHIVE"
 fi
+
+# **纯判定模式：只看已有证据，不跑任何场景、不清空任何文件**（2026-10-20 修，真缺陷）。
+#
+# 原来想验证"这份判定逻辑判得对不对"，只能拿真证据去跑 —— 而脚本第一件事就是
+# `: > "$RESULTS"` 清空证据。于是验收脚本自己**从来没被验证过**：
+# 它是 S3 的唯一证据来源，判错了没人会发现（回归里引用次数 = 0）。
+#
+# 对照 soak.sh：早就支持 `SOAK=` 覆盖 + `report` 只读不写，所以它的判定逻辑
+# 被 120 个回归用例翻来覆去地验。三个验收脚本缺的就是这个"只读判定"入口。
+#
+# 用法：`acceptance.sh --judge`（读 $RESULTS，按同样的三态口径给结论）
+# 这样回归就能喂合成证据，验它判得对不对。
+if [ "${1:-}" = "--judge" ]; then
+  node -e '
+const fs=require("fs");
+let lines=[];
+try{
+  lines=fs.readFileSync(process.env.RESULTS,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+}catch(e){
+  console.log("");
+  console.log("判定：❌ **证据文件读不出来**："+process.env.RESULTS+" —— "+(e.code||e.message));
+  console.log("　　　　（先确认路径对不对；`--judge` 只读不写，不会碰你的证据）");
+  process.exit(1);
+}
+const total=lines.length, pass=lines.filter(r=>r.pass).length;
+const rate=total? (pass/total*100):0;
+for (const r of lines) console.log((r.pass?"✔":"✖"), String(r.id||"").padEnd(16), String((r.secs||0)+"s").padStart(5), r.name||"");
+console.log("");
+const EXPECT_TOTAL=20;
+console.log(`合计 ${pass}/${total} 通过 = ${rate.toFixed(1)}%` + (total<EXPECT_TOTAL?`   本次只跑了 ${total}/${EXPECT_TOTAL} 条（覆盖面不够）`:""));
+// **0 条不能说"未达标"**（2026-10-20 修）：
+// 原来先判 `rate<95` 再判 `total<EXPECT_TOTAL`，于是 total=0 时 rate=0，
+// 命中第一条 → 打印「❌ 未达标（还需 0 条）」。**"还需 0 条" + "未达标" 自相矛盾**，
+// 而且把"没有证据"说成了"证据不行"。两者处置完全不同：前者去查有没有跑，
+// 后者去查哪条挂了。必须先分流"一条都没有"。
+if(total===0){
+  console.log("判定：❌ **一条证据都没有**：文件里没有任何记录 —— 先确认场景有没有真的跑过");
+  process.exit(1);
+}
+if(total<EXPECT_TOTAL && rate>=95){
+  console.log(`判定：⏳ 已跑的 ${total} 条全过，但只覆盖 ${total}/${EXPECT_TOTAL} 条 —— 覆盖面不够，还不能算达标`);
+  process.exit(3);
+}
+if(rate<95){
+  console.log(`判定：❌ 未达标（还需 ${Math.ceil(total*0.95)-pass} 条），通过率 ${rate.toFixed(1)}% < 95%`);
+  process.exit(1);
+}
+console.log("判定：✅ 达标");
+process.exit(0);'
+  # **必须立刻 exit**（2026-10-20 修，真缺陷）：
+  # 没有这一句，`--judge` 打印完判定后会**继续往下跑真实场景** ——
+  # 下一句就是 `: > "$RESULTS"`，把证据清空，然后真的去调模型、跑 20 条。
+  # 症状极具迷惑性：判定文字完全正确（✅达标 / ⏳ / ❌），但退出码永远是最后
+  # 那轮真实汇总留下的值。实测：k1（20条全过）打印"✅ 达标"却 exit=1，
+  # 而 k1/results.jsonl 从 20 行变成 0 行 —— 证据被自己吃了。
+  # 这是第⑩类（不改 process.exit 就不算数）的镜像：**改了退出码，但没让它成为脚本的退出码**。
+  exit $?
+fi
+
 : > "$RESULTS"
 
 ONLY=("$@")

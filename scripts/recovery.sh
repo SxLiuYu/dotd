@@ -18,10 +18,79 @@ cd /root/dotd || exit 1
 set -a; . ./_tokens_src.env; set +a
 BASE=http://127.0.0.1:7788
 HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application/json")
-OUTDIR=/root/dotd/docs/acceptance
+# **OUTDIR 必须可覆盖**（2026-10-20 修，真缺陷）。
+#
+# 原来这里硬编码 `/root/dotd/docs/acceptance`，而下面紧接着就 `: > "$RESULTS"`
+# 清空证据文件。于是想验证"判定逻辑判得对不对"**只能拿真证据去跑**，
+# 跑一次证据就没了 —— 而验收脚本本身恰恰是最该被验证的东西：
+# 它是 S3/S4/S5 的唯一证据来源，判错了没人会发现。
+#
+# 对照：soak.sh 早就支持 `SOAK=` 覆盖（第 22 行注释写得很清楚：
+# "便于用合成数据验证 report 的判断逻辑是否真的判得对"）。
+# 三个验收脚本漏了这件事，等于它们的判定逻辑**从来没被验证过**。
+#
+# 与 SOAK 同一套约定：设了就用，没设就用默认。往回兼容，不影响正常验收。
+OUTDIR="${DOTD_ACCEPT_DIR:-/root/dotd/docs/acceptance}"
 mkdir -p "$OUTDIR"
 RESULTS="$OUTDIR/recovery.jsonl"
 export RESULTS
+
+# **纯判定模式：只看已有证据，不跑任何故障、不清空任何文件**（2026-10-20 修，真缺陷）。
+#
+# 原来想验证"这份判定逻辑判得对不对"，只能拿真证据去跑 —— 而脚本第一件事就是
+# `: > "$RESULTS"` 清空证据，而且它会**真的去 kill -9 daemon、停容器**。
+# 于是验收脚本自己**从来没被验证过**：它是 S5 的唯一证据来源（回归引用次数 = 0）。
+#
+# 对照 soak.sh：早就支持 `SOAK=` 覆盖 + `report` 只读不写。
+# 用法：`recovery.sh --judge`（读 $RESULTS，按同样的三态口径给结论）
+if [ "${1:-}" = "--judge" ]; then
+  node -e '
+const fs=require("fs");
+let ls=[]; let bad=0;
+try{
+  for(const ln of fs.readFileSync(process.env.RESULTS,"utf8").split("\n")){
+    if(!ln.trim()) continue;
+    try{ ls.push(JSON.parse(ln)); }catch{ bad++; }
+  }
+}catch(e){
+  console.log("");
+  console.log("判定：❌ **证据文件读不出来**："+process.env.RESULTS+" —— "+(e.code||e.message));
+  console.log("　　　　（先确认路径对不对；`--judge` 只读不写，不会碰你的证据）");
+  process.exit(1);
+}
+if(bad) console.log(`⚠ ${bad} 行残缺，已跳过`);
+const total=ls.length, pass=ls.filter(r=>r.pass).length;
+for (const r of ls) console.log((r.pass?"✔":"✖"), String(r.id||"").padEnd(16), String((r.secs||0)+"s").padStart(6), r.name||"", "|", r.evidence||"");
+console.log("");
+// **0 条不能说"已验的 0 项全过"**（2026-10-20 修，与 acceptance/honesty 同一处病根）。
+// 原来 `notRun.length===3` 时打印"⏳ 已验的 0 项全过，但还差 3 项"，
+// **"0 项全过"是空话** —— 没有证据不等于证据合格。必须先分流"一条都没有"。
+const ALL_IDS=["container_stop","relay_down","daemon_kill"];
+const ranIds=new Set(ls.map(r=>r.id));
+const notRun=ALL_IDS.filter(id=>!ranIds.has(id));
+if(total===0){
+  console.log("判定：❌ **一条证据都没有**：文件里没有任何记录 —— 先确认三种故障有没有真的验过");
+  process.exit(1);
+}
+console.log(`${pass}/${total} 自愈` + (notRun.length?`   没验：${notRun.join(", ")}`:""));
+if(pass!==total){
+  console.log(`判定：❌ 未达标（${total-pass} 项没通过）`);
+  process.exit(1);
+}
+if(notRun.length){
+  console.log(`判定：⏳ 已验的 ${total} 项全过，但还差 ${notRun.length} 项没验（${notRun.join(", ")}）—— 覆盖面不够`);
+  process.exit(3);
+}
+console.log("判定：✅ 达标");
+process.exit(0);'
+  # **必须立刻 exit**（2026-10-20 修，真缺陷）：
+  # 没有这一句，`--judge` 打印完判定后会**继续往下跑真实故障** ——
+  # 它会 kill -9 daemon、停容器、改网关，把正在跑的服务真的弄坏。
+  # 症状极具迷惑性：判定文字完全正确，但退出码永远是最后那轮真实汇总留下的值。
+  # 这是第⑩类的镜像：**改了退出码，但没让它成为脚本的退出码**。
+  exit $?
+fi
+
 : > "$RESULTS"
 
 LIMIT=300
