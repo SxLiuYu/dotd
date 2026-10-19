@@ -317,6 +317,26 @@ for(const x of probesRaw){
 // 判据要的是"在飞书里真的能干活的成功率"，所以只用验过出站+入站的探针。
 const probesVerified = probes.filter(p=>p.out!==undefined && p.ws!==undefined);
 const probesLegacy = probes.length - probesVerified.length;
+// **report 不能只信采集时算的 `ok`，必须自己复核一遍**（2026-10-20 补，真假绿）。
+//
+// 采集侧（do_probe）的逻辑是对的：`out_ok!=1 → ok=0`、`ws_ok!=1 → ok=0`。
+// 但 report 这边**只看 `p.ok`，从不看 `out`/`ws` 是否与它一致** ——
+// 于是采集侧任何一处算错，report 一点都发现不了。而这已经发生过两次：
+// ① 早期 `case ... *) ok=1` 兜底，把 want 改成 -999999 也判过；
+// ② `OUT_OK` 未定义时落盘成空串，"没测到"和"测到失败"长得一样。
+//
+// 合成数据实测：把 29 次探针**全部改成 out=0 ws=0**（飞书出站入站全断），
+// 只要 `ok` 仍是 true，report 就打印 `成功率 100%` 并 **exit 0**。
+// 也就是说 "在飞书里干活" 这个目标原话，在 report 侧**没有独立证据**。
+//
+// 修法：独立重算。`out`/`ws` 里只要有一个明确是 "0"，这条就该算失败 ——
+// **不管 `ok` 写的是什么**。两者不一致时单独报出来（那是采集端的 bug）。
+// 定义必须放在 probesVerified 之后、tailPassRate 之前（后者也要用）。
+const outWsSaysFail=(p)=>String(p.out)==="0" || String(p.ws)==="0";
+const okSaysFail=(p)=>p.ok!==true;
+const probeFailed=(p)=>okSaysFail(p) || outWsSaysFail(p);
+const probeContradictions=probesVerified.filter(p=>p.ok===true && outWsSaysFail(p));
+
 // 末尾成功率：**"不掉"不等于"总平均够"**，总平均会掩盖下降趋势。
 // 合成数据实测：160 次探针里最后 8 次全失败（最后一天成功率 0%），
 // 总数恰好 95% 压线 → exit 0，服务其实最后一天已经全坏了。
@@ -326,7 +346,7 @@ const probesLegacy = probes.length - probesVerified.length;
 // 这里写 4 而不引用 PROBE_PER_DAY：那个常量定义在后面，会 TDZ。
 const TAIL_PROBES=4;
 const tailProbes=probesVerified.slice().sort((a,b)=>a.ts-b.ts).slice(-TAIL_PROBES);
-const tailPassRate=tailProbes.length? tailProbes.filter(p=>p.ok).length/tailProbes.length : null;
+const tailPassRate=tailProbes.length? tailProbes.filter(p=>!probeFailed(p)).length/tailProbes.length : null;
 
 // **探针必须覆盖四条能力路径**（2026-10-19 补，真缺口，也是最根本的一次）：
 // 探针按 slot 轮换四种任务：
@@ -665,7 +685,7 @@ const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
 // 打印"单点峰值 34"（真实峰值 64），数字本身就是错的。
 const maxFd=all.length? Math.max(...all.map(s=>s.fd)) : 0;
 const maxFdCur=Math.max(...S.map(s=>s.fd));
-const passRate=probesVerified.length? probesVerified.filter(p=>p.ok).length/probesVerified.length : null;
+const passRate=probesVerified.length? probesVerified.filter(p=>!probeFailed(p)).length/probesVerified.length : null;
 
 // **耗时必须有判据**（2026-10-19 补，真缺口）：
 // `secs` 从第 1 轮就写进每一条 probe 记录了，但**从来没有判据用它**——
@@ -1185,6 +1205,12 @@ if(days>=7 && tailProbes.length>=4){
 if(probeSecs.length)
   console.log(`探针耗时：中位 ${medSecs.toFixed(0)}s，最慢 ${maxSecs}s，末尾 4 次中位 `+
               `${tailMedSecs===null?"—":tailMedSecs.toFixed(0)+"s"}（判据：单次 ≤${SLOW_MAX}s、中位 ≤${SLOW_MED}s）`);
+// **采集端算错了要说出来**（2026-10-20）：ok=true 但 out/ws 明确是 0，
+// 说明 `ok` 这个字段本身不可信 —— 那是采集侧的 bug，不是数据形状问题。
+// 不单独报，事后只能看到"成功率掉了"，查不出是产品坏了还是探针写错了。
+if(probeContradictions.length)
+  console.log(`⚠ **${probeContradictions.length} 条探针 ok=true 但 out/ws=0**（按失败计）：`+
+    `采集侧算错了，见 do_probe 的 out_ok/ws_ok 赋值`);
 if(passRate!==null){
   if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
   else {
@@ -1197,7 +1223,7 @@ if(passRate!==null){
     // 一个负数出现，说明这套归因在骗人 —— 宁可分成互斥桶，也不要靠减法。
     // 第二个错：bad 取的是 probes（含未验证的旧格式探针），
     // 而 passRate 的分母是 probesVerified —— 两个口径混用，归因数加起来对不上。
-    const bad=probesVerified.filter(p=>!p.ok);
+    const bad=probesVerified.filter(p=>probeFailed(p));
     const noOut=bad.filter(p=>p.out!==undefined && String(p.out)==="0").length;
     const noWs=bad.filter(p=>p.ws!==undefined && String(p.ws)==="0").length;
     // 既没送达也没入站：归为"飞书这条链路整个没通"，单列一桶
