@@ -50,3 +50,8 @@ scripts/tmp-*
 # ZCode 会话数据（可视化产物等，非项目源码）。原先只靠 .zcode/ 内嵌 .gitignore
 # 的 `*` 挡着，那是脆的；这里补根级规则。
 /.zcode/
+# soak.jsonl 是**运行中持续追加**的数据（WSL 上 cron 每 30 分钟写一条）。
+# 若把它纳入版本控制，每次'从 D: 同步到 WSL'都会用旧副本覆盖正在增长的文件，
+# 导致采样丢失 + 出现无身份的历史混合样本（2026-10-19 实际踩到）。
+docs/acceptance/soak.jsonl
+docs/acceptance/soak-stress.jsonl
