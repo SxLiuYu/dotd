@@ -38,8 +38,10 @@ test('fs.write 派发前自动补 expected_size', () => {
 });
 
 test('派发点传的是补过参的 argsForExec', () => {
-  assert.match(src, /const argsForExec = this\.withAutoExpectedSize\(call\.name, args\)/);
-  assert.match(src, /toolCall\(task, callId, call\.name, argsForExec,/);
+  // 自 S2(b) 动态工具路由起，派发用的是 execTool（动态工具翻译成 tool.invoke）；
+  // 但"派发前必须经过参数增强"这条约束不变 —— 断言的是 action，不是变量名。
+  assert.match(src, /const argsForExec = this\.withAutoExpectedSize\(execTool, execArgs\)/);
+  assert.match(src, /toolCall\(task, callId, execTool, argsForExec,/);
 });
 
 test('路径键归一化：/dot/home/x 与 x 命中同一条记录', () => {

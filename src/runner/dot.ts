@@ -1680,6 +1680,20 @@ export class DotRunner {
    * 所以 tool.create / tool.invoke 的 dangerously 档审批约束一字不动 —— 模型能"看见"
    * 这些工具，但真正执行时治理层照常拦。
    */
+  /**
+   * 本轮已动态注册成独立 tool 的自造工具名（S2(b)，2026-10-19）。
+   *
+   * 用途只有一个：**执行路由**。这些名字只出现在模型可见的 tools 里，
+   * 既不在 11 名契约词表（CAPABILITY_CATALOG）、也不在 config/tools.yml 白名单，
+   * 所以不能直接当 exec 工具名派发（会被 validateToolCall / gate 判 unknown_tool）。
+   * 派发前统一翻译成 tool.invoke(name=<它>, args=<模型给的参数>)。
+   *
+   * **为什么翻译而不是把它们加进白名单**：tool.invoke 是 dangerous 档（每次执行需主人
+   * 审批）。翻译后自造工具自动继承这条审批约束，不新增任何绕过治理的路径；
+   * 若改成"动态工具登记进白名单"，等于让模型自己写的脚本直接越过审批跑。
+   */
+  private readonly dynamicToolNames = new Set<string>();
+
   private async toolSpecs(task: Task): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
     const caps = await this.getCapabilities();
     const base = buildToolSpecs(caps);
@@ -1691,6 +1705,8 @@ export class DotRunner {
       // 名字冲突时以底座为准（内置工具优先，避免被自造工具顶掉）
       const taken = new Set(base.map((s) => s.name));
       const extra = dyn.filter((d) => !taken.has(d.name));
+      // 记下来供执行路由用（见 dynamicToolNames 注释）。
+      for (const d of extra) this.dynamicToolNames.add(d.name);
       return extra.length > 0 ? [...base, ...extra] : base;
     } catch (err) {
       this.log(`runner: 动态工具注册失败（不影响内置工具）：${err instanceof Error ? err.message : String(err)}`);
@@ -1977,9 +1993,28 @@ export class DotRunner {
       args = { __raw: call.arguments };
     }
 
+    // ═══ 动态工具执行路由（S2(b)，2026-10-19）══════════════════════════════
+    //
+    // 自造工具被动态注册成独立 tool 后，模型会**直接**发 call.name = 'word-count'。
+    // 但那名字不在契约词表、也不在治理白名单里，直接派发必然被两边拒绝：
+    //   src/exec/protocol.ts validateToolCall → findCapability() → unknown_tool
+    //   src/governance/gate.ts  lookupTool()  → undefined     → deny('工具未登记')
+    //
+    // 所以在这里翻译成真正的执行入口 tool.invoke（agent-runtime/server.ts 的
+    // 'tool.invoke' 分支 → toolStore.invoke(name, args)）。翻译后：
+    //   · 治理只认 tool.invoke → dangerous 档审批约束原样生效，不新增绕过路径；
+    //   · journal 记的也是 tool.invoke → 审批恢复（resumePendingStep）能按
+    //     final_params_json 正确重放，不会去执行一个不存在的工具名。
+    const isDynamicTool = this.dynamicToolNames.has(call.name);
+    const execTool = isDynamicTool ? 'tool.invoke' : call.name;
+    const execArgs: Record<string, unknown> = isDynamicTool
+      ? { name: call.name, args }
+      : args;
+
     // S1：sideEffect 词表唯一事实源 = exec.getCapabilities；未声明按 unknown
-    const se = this.sideEffectOf.get(call.name) ?? 'unknown';
-    const { seq, callId } = this.cp.journal.beginTool(task.id, epoch, call.name, args, se);
+    // 注意用 execTool：真正执行的是 tool.invoke，审计/派发口径必须与之一致。
+    const se = this.sideEffectOf.get(execTool) ?? 'unknown';
+    const { seq, callId } = this.cp.journal.beginTool(task.id, epoch, execTool, execArgs, se);
     // 用 **journal callId** 登记声明（与 tool 结果里的 call_id 同源），不是模型给的 id。
     // **必须在这里落声明**：thread 里的顺序必须是
     //   assistant/tool_call（声明） → system/tool_result（结果）
@@ -2026,7 +2061,7 @@ export class DotRunner {
     // 接缝 G5：goalDigest 由 Runner 在 evaluate 前截取（≤800B）注入治理审查档
     const verdict = await this.governance.evaluate(
       { dotId: task.dotId, taskRef: { taskId: task.id, journalStepId: callId }, emergency: this.router.emergencyActive },
-      { callId, tool: call.name, params: args, identity: identityOf(args) },
+      { callId, tool: execTool, params: execArgs, identity: identityOf(execArgs) },
       { goalDigest: goalDigestOf(ctx.goal) },
     );
 
@@ -2094,9 +2129,9 @@ export class DotRunner {
     // **自动补 expected_size**（2026-10-18）：模型不会主动传 CAS 参数（提示词写两轮都没用），
     // 所以由 Runner 在本任务读到过该文件时自动补上——把并发保护变成"默认行为"而不是"模型自觉"。
     // 只在本任务 fs.read 过它、且模型自己没传时才补；新建文件（没读过）不补。
-    const argsForExec = this.withAutoExpectedSize(call.name, args);
+    const argsForExec = this.withAutoExpectedSize(execTool, execArgs);
     const res = await this.exec.runTool(
-      toolCall(task, callId, call.name, argsForExec, this.effectiveDeadlineMs(call.name, argsForExec)),
+      toolCall(task, callId, execTool, argsForExec, this.effectiveDeadlineMs(execTool, argsForExec)),
     );
     const ok = res.status === 'ok';
     const warning = this.memoryWarnings.get(callId);

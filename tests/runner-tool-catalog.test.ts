@@ -533,3 +533,149 @@ test('system prompt：改已有文件必须带 expected_size（防并发丢更�
     '必须有这条硬纪律（仅工具描述不够——实测模型不会主动用）',
   );
 });
+
+// ── 7. S2(b)：动态工具执行路由（2026-10-19）─────────────────────────────
+
+/**
+ * 守的是什么：自造工具被**动态注册成独立 tool** 后，模型会直接发
+ * `call.name = 'word-count'`。这个名字既不在 11 名契约词表、也不在
+ * config/tools.yml 白名单里，若原样派发：
+ *   · src/exec/protocol.ts validateToolCall → findCapability() → unknown_tool
+ *   · src/governance/gate.ts  lookupTool()  → undefined     → deny('工具未登记')
+ * 即"模型照着新清单调，必被拒"——比不做动态注册更糟。
+ *
+ * 所以 Runner 在派发口把它翻译成 tool.invoke(name=<它>, args=<模型参数>)。
+ * 本用例用真实主循环跑一遍，断言**到达 exec 的**是被翻译后的调用。
+ */
+test('运行时：动态工具（word-count）被翻译成 tool.invoke 派发，不会被当未知工具拒掉', async () => {
+  const transport = makeStubTransport([
+    // 第一轮：模型直接调自造工具 word-count（模拟动态注册后的行为）
+    {
+      content: '',
+      toolCalls: [{ id: 'call_w1', name: 'word-count', arguments: '{"text":"你好 world"}' }],
+      usage: { promptTokens: 10, completionTokens: 5 },
+    },
+    // 第二轮：收尾
+    { content: '统计完成。', usage: { promptTokens: 10, completionTokens: 5 } },
+  ]);
+
+  /** exec 实际收到的调用（tool + args），这是"路由有没有生效"的唯一事实。 */
+  const execCalls: Array<{ tool: string; args: Record<string, unknown> }> = [];
+  const execApi = {
+    runTool: async (call: { call_id: string; tool: string; args: Record<string, unknown> }) => {
+      execCalls.push({ tool: call.tool, args: call.args });
+      // tool.list 是系统的动态注册查询，返回 word-count 让它进模型可见清单。
+      if (call.tool === 'tool.list') {
+        return {
+          call_id: call.call_id,
+          status: 'ok' as const,
+          result: {
+            tools: [{ name: 'word-count', description: '统计一段文本的中文字符数与英文单词数', params: { text: '文本' } }],
+          },
+        };
+      }
+      if (call.tool === 'tool.invoke') {
+        return {
+          call_id: call.call_id,
+          status: 'ok' as const,
+          result: { ok: true, exitCode: 0, stdout: '{"cjk":2,"words":1}', stderr: '' },
+        };
+      }
+      return { call_id: call.call_id, status: 'error' as const, error: { code: 'unknown_tool', message: '不该被派发', retryable: false } };
+    },
+    getCapabilities: async () => CAPS,
+    reconcileCall: async () => 'unknown' as const,
+    getCallResult: async () => null,
+    cancelTool: async () => {},
+  };
+
+  let seq = 0;
+  const task = {
+    id: 'tk_dyn_1',
+    dotId: 'dot1',
+    title: '统计字数',
+    goal: '统计这段文本的中文字符数与英文单词数：你好 world',
+    status: 'running' as const,
+    runEpoch: 1,
+    threadId: 'thr_dyn_1',
+    sessionId: 'thr_dyn_1',
+    resumeFromSeq: null,
+    budgetTokens: undefined,
+  };
+  const cp = {
+    pop: () => (seq === 0 ? (seq += 1, task) : null),
+    bindSession: () => {},
+    getTask: () => task,
+    journal: {
+      beginLlm: (_t: string, _e: number, _d: string) => ({ seq: (seq += 1), callId: `c_llm_${seq}` }),
+      endLlm: () => {},
+      beginTool: (t: string, e: number, name: string, _args: Record<string, unknown>) => ({
+        seq: (seq += 1),
+        callId: `c_tool_${seq}`,
+        // 记下 journal 侧看到的工具名，供下面的断言比对
+        _name: name,
+      }),
+      endTool: () => {},
+      skipStep: () => {},
+      markPending: () => {},
+      resumeStep: () => ({ callId: '' }),
+      tail: () => [],
+      getStepByCallId: () => null,
+    },
+    setAwaitingApproval: () => {},
+    heartbeat: () => ({ aborted: false, overBudget: false }),
+    finish: () => {},
+    failTask: () => {},
+    pauseByReason: () => {},
+  };
+  const memoryApi = {
+    openThread: async () => 'thr_dyn_1',
+    appendMessage: async () => ({ id: 'm', seq: 1 }),
+    appendSystemMessage: async () => ({ id: 'm', seq: 0 }),
+    buildContextBundle: async () => ({ memoryMd: '', manualExcerpts: [], summary: null }),
+    buildSessionReplay: async () => [],
+    beforeWrite: async () => ({ ok: true }),
+    sealTask: async () => {},
+    readFileNotes: async () => [],
+  };
+
+  const runner = new DotRunner(
+    {
+      cp: cp as unknown as ConstructorParameters<typeof DotRunner>[0]['cp'],
+      router: {
+        complete: (req: RouteRequest): Promise<RouteResult> => transport.complete(req),
+        emergencyActive: false,
+      } as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+      exec: execApi as unknown as ConstructorParameters<typeof DotRunner>[0]['exec'],
+      memory: memoryApi as unknown as ConstructorParameters<typeof DotRunner>[0]['memory'],
+      governance: {
+        // 治理放行（tool.invoke 在真实治理里是 dangerous 档，这里只验路由，不验档位）
+        evaluate: async () => ({ kind: 'allow', decisionId: 'd1', brief: null }),
+        claim: async () => ({ ok: true }),
+        forceApproval: async () => ({ approvalId: 0 }),
+      } as unknown as ConstructorParameters<typeof DotRunner>[0]['governance'],
+    },
+    { dotId: 'dot1' },
+  );
+
+  const out = await runner.runNext();
+  assert.equal(out.status, 'done', `主循环应跑完：${JSON.stringify(out)}`);
+
+  // 核心断言①：模型发的 word-count 绝不能原样到达 exec
+  const rawWordCount = execCalls.filter((c) => c.tool === 'word-count');
+  assert.equal(
+    rawWordCount.length,
+    0,
+    'word-count 不在契约词表/白名单，绝不能原样派发（会被 unknown_tool / 工具未登记拒掉）',
+  );
+
+  // 核心断言②：它必须被翻译成 tool.invoke，且原参数完整透传
+  const invoked = execCalls.filter((c) => c.tool === 'tool.invoke');
+  assert.equal(invoked.length, 1, `word-count 应被翻译成一次 tool.invoke，实际 ${invoked.length} 次`);
+  assert.equal(invoked[0]!.args['name'], 'word-count', 'tool.invoke 的 name 必须是原工具名');
+  assert.deepEqual(
+    invoked[0]!.args['args'],
+    { text: '你好 world' },
+    '模型给的参数必须原样透传给 tool.invoke',
+  );
+});

@@ -42,15 +42,17 @@ test('非法 timeout_ms（0/负数/非数字）不生效，回落到档位默认
 });
 
 test('派发点已切到 effectiveDeadlineMs（不再是写死的档位值）', () => {
-  // 派发点现在用 argsForExec（自动补过 expected_size 的参数）
+  // 派发点现在用 argsForExec（自动补过 expected_size 的参数）。
+  // 自 S2(b) 动态工具路由起变量名是 execTool/execArgs（动态工具翻译成 tool.invoke），
+  // 断言的是"经过参数增强 + 用 effectiveDeadlineMs"，与变量名无关。
   assert.match(
     src,
-    /const argsForExec = this\.withAutoExpectedSize\(call\.name, args\);/,
+    /const argsForExec = this\.withAutoExpectedSize\(execTool, execArgs\);/,
     '派发前必须经过参数增强',
   );
   assert.match(
     src,
-    /this\.effectiveDeadlineMs\(call\.name, argsForExec\)/,
+    /this\.effectiveDeadlineMs\(execTool, argsForExec\)/,
     'runTool 必须用 effectiveDeadlineMs（以增强后的参数计算）',
   );
 });
