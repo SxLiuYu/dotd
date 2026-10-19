@@ -43,6 +43,21 @@ PID_DAEMON() { pgrep -f 'src/daemon.ts' | head -1; }
 
 do_sample() {
   local pid rss_kb fd n_threads cont db_kb ts
+  # **probe 正在跑的时候不要采样**（2026-10-20 修，真缺陷）。
+  # 现场：soak.jsonl 里出现 fd=31，而 daemon 静息一直是 27。
+  # 查下去是我手工跑 probe 时，cron 的 sample 恰好也在跑 ——
+  # probe 要发飞书消息、等任务 done，期间 daemon 会开 HTTP 连接，
+  # 实测 fd 27 → 30，结束后回落到 27。**sample 采到的是 probe 的瞬时负载，不是泄漏。**
+  # 更糟的是 cron 本身就会撞：`*/30` 的 sample 在 :00/:30，
+  # `0 */6` 的 probe 也在 :00 —— **每 6 小时必然撞一次**，7 天 28 次。
+  # 已经做了两件事：
+  #   ① cron 把 probe 挪到 :15（避开 :00/:30）；
+  #   ② 这里再加一道保险：真撞上了就**跳过这次采样**（宁缺不脏）。
+  #      缺口由采样密度判据兜底（≥70%，跳过 28 次 / 336 次 = 8.3%，仍在阈值内）。
+  if pgrep -f "soak\.sh probe" >/dev/null 2>&1; then
+    echo "sample: skip（probe 正在跑，采到的 fd/RSS 会是它的瞬时负载）"
+    return 0
+  fi
   ts=$(date +%s)
   # **同一秒不要重复落盘**（2026-10-19 补）：date +%s 只有秒精度，
   # 手工连跑两次 sample、或 cron 与手工调用撞上，会写出两行完全相同的记录。
