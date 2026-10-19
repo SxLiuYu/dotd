@@ -243,6 +243,15 @@ const tailPassRate=tailProbes.length? tailProbes.filter(p=>p.ok).length/tailProb
 // 同一时间戳写 3 遍 → 369 次 / 应 346 次 = 107% → 判"密度达标"，
 // 而实际只有 123 个真实时刻（每 85 分钟一次，仅 36%）。
 // 按 ts 去重，重复行只算一次；重复的条数单独报出来。
+// **daemon 不在跑的采样点必须被说出来**（2026-10-19 补，真缺口）：
+// 这些记录 {alive:false} 原来被直接丢弃，于是报告里
+// "daemon 停了 6 天、之后正常跑了 9 天" 和 "我只采样了 9 天"
+// **长得一模一样** —— 前者是严重故障，后者只是还没开始。
+// 采样脚本每 30 分钟记一次，daemon 不在跑时写 alive=false，
+// 这就是"那段时间服务不可用"的直接证据，不能说丢就丢。
+const deadSamples = lines.filter(x=>x.kind!=="probe" && x.alive===false);
+const deadSampleCount = deadSamples.length;
+const deadSampleHours = deadSampleCount * 0.5;   // cron 每 30 分钟一次
 const dedupKey=(x)=>`${x.ts}|${x.proc_start}|${x.pid}`;
 const seenSampleKey=new Set();
 let dupSamples=0;
@@ -321,6 +330,16 @@ const probeCoverageOk=!(days>=7 && coveredProbeDays < allSegList.length-PROBE_DA
 // 末尾成功率判据（这里 days 已算好）
 // 少于 4 个探针算不准，不判定（交给密度/覆盖判据拦）
 const tailOk = !(days>=7 && tailProbes.length>=4 && tailPassRate<0.75);
+
+// **daemon 不在跑的时长要进入判定**（2026-10-19 补，真缺口）：
+// 上一版只把 alive=false 打印出来当提醒，不参与判定 ——
+// 于是"前 6 天 daemon 全死、后 9 天正常"这种，
+// 打印完"⚠ 144 小时服务不可用"照样 exit 0。
+// 判据是"连续 7 天"，那 7 天里服务得真的在跑。
+// 阈值 2 小时：cron 每 30 分钟采一次，容忍几次瞬时抖动（重启窗口、采样竞态），
+// 但"累计停了 2 小时以上"就不是抖动，是真的没在服务。
+const DEAD_HOURS_LIMIT=2;
+const deadOk = deadSampleHours <= DEAD_HOURS_LIMIT;
 const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际跨度"
 
 // **连续性**（2026-10-19 补）：只看"首尾跨了 7 天"是不够的 ——
@@ -550,6 +569,9 @@ const peakGrowth=peakRss-baseRss;
 const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
 
 console.log("== S6 长期运行现状 ==");
+if(deadSampleCount>0)
+  console.log(`⚠ 有 ${deadSampleCount} 个采样点记录到 **daemon 不在跑**（alive=false），`+
+              `约 ${deadSampleHours.toFixed(1)} 小时服务不可用；这些点不计入观测覆盖`);
 if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入被打断），已跳过，其余样本正常计入`);
 if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
@@ -652,6 +674,10 @@ if(days>=7){
     : `❌ **探针只覆盖了 ${coveredProbeDays}/${allSegList.length} 段**：`+
       `"成功率不掉"要在整个窗口都有证据，不能只在开头测一批就算完`);
 }
+c.push(deadOk
+  ? `✅ 期间服务不可用累计 ${deadSampleHours.toFixed(1)} 小时（≤${DEAD_HOURS_LIMIT}h）`
+  : `❌ **期间服务不可用累计 ${deadSampleHours.toFixed(1)} 小时**（>${DEAD_HOURS_LIMIT}h）：`+
+    `${deadSampleCount} 个采样点记录到 daemon 不在跑 —— "连续 7 天"那 7 天里服务得真的在跑`);
 if(days>=7 && tailProbes.length>=4){
   c.push(tailOk
     ? `✅ 末尾 ${tailProbes.length} 次探针成功率 ${(tailPassRate*100).toFixed(0)}%（判据 ≥75%，防止"最后几天坏掉但被总平均盖住"）`
@@ -704,7 +730,7 @@ console.log("\n判定：" + c.join("；"));
 // 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95)
