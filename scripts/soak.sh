@@ -985,6 +985,24 @@ for(const s of contPts){   // 同上：没有 container_up 的点不算离线
   else curDownStart=null;
 }
 const CONT_DOWN_LIMIT_SEC=2*3600;   // 和"服务不可用≤2h"同一个口径
+// **「率」和「最长连续」都抓不到「周期性短时假死」**（2026-10-20 修，真漏判）。
+//
+// 三条通道（网关 / daemon 可达 / 容器可执行）原来各只有两条判据：
+//   · 率 ≥95%
+//   · 最长连续断开 ≤2h
+// 有份数据把它们全都躲过去了：**每 12 小时假死 30 分钟**，7 天 14 次。
+//   · 每次 30 分钟 → 最长连续 30 分钟，远低于 2h ✅
+//   · 累计 7.5 小时 / 168 小时 = 4.5% → 率 95.5%，**险过** ✅（http 那条差点就红）
+// 于是 `http` / `relay` / `container_ok` 三个场景全部 **exit 0**。
+// 而主人那 7 天里有 7.5 小时发消息没人应。
+//
+// 这是**第 77 轮在 daemon 侧修过的同一个洞**（当时加了 `upRatio` 可用率判据），
+// 但那次只补了「daemon 进程在不在」，没补「它三个下游通不通」。
+// 又是「修一个地方没扫同类」（第 76、78 轮各犯一次，这是第三次）。
+//
+// 累计上限取 2 小时，与 `CONT_DOWN_LIMIT_SEC` 完全同口径：
+// 「不可用」这件事，不管是连续 2 小时还是分 4 次各 30 分钟，都是 2 小时。
+const CUM_DOWN_LIMIT_SEC=CONT_DOWN_LIMIT_SEC;
 
 const contDownOk=maxContDownSec<=CONT_DOWN_LIMIT_SEC;
 
@@ -1014,12 +1032,14 @@ const contOkTailPts=contTail.filter(s=>s.container_ok!==undefined);
 const contOkTailRate=contOkTailPts.length? contOkTailPts.filter(s=>Number(s.container_ok)===1).length/contOkTailPts.length : null;
 const contOkTailOk=!(days>=7 && contOkTailRate!==null && contOkTailRate<0.75);
 let maxContOkDownSec=0, curOkDownStart=null;
+    let sumContOkDownSec=0;             // 累计不可用
 for(const s of all){
   // 只在采了这个字段的点上判定（老样本没这个字段，不能当成"坏"）
   if(s.container_ok===undefined) continue;
   if(Number(s.container_ok)!==1){
     if(curOkDownStart===null) curOkDownStart=s.ts;
     maxContOkDownSec=Math.max(maxContOkDownSec, s.ts-curOkDownStart+1800);
+    sumContOkDownSec+=1800;
   } else curOkDownStart=null;
 }
 const CONT_OK_RATE_LIMIT=0.95;
@@ -1046,11 +1066,13 @@ const contOkUnknown=contOkSamples===0;
 const relayPts=all.filter(s=>s.relay_up!==undefined);
 const relayRate=relayPts.length? relayPts.filter(s=>Number(s.relay_up)===1).length/relayPts.length : null;
 let maxRelayDownSec=0, curRelayDownStart=null;
+    let sumRelayDownSec=0;              // 累计不可用：抓「周期性短时假死」
 for(const s of all){
   if(s.relay_up===undefined) continue;
   if(Number(s.relay_up)!==1){
     if(curRelayDownStart===null) curRelayDownStart=s.ts;
     maxRelayDownSec=Math.max(maxRelayDownSec, s.ts-curRelayDownStart+1800);
+    sumRelayDownSec+=1800;              // 每个坏点按 30 分钟计，与「最长连续」同口径
   } else curRelayDownStart=null;
 }
 // ── **「率」必须说明它覆盖了窗口的多大一块**（2026-10-20 补，第⑥类：样本没测它声称要测的东西）
@@ -1086,11 +1108,13 @@ const relayUnknown=relaySamples===0;
 const httpPts=all.filter(s=>s.http_ok!==undefined);
 const httpRate=httpPts.length? httpPts.filter(s=>Number(s.http_ok)===1).length/httpPts.length : null;
 let maxHttpDownSec=0, curHttpDownStart=null;
+    let sumHttpDownSec=0;               // 累计不可用
 for(const s of all){
   if(s.http_ok===undefined) continue;
   if(Number(s.http_ok)!==1){
     if(curHttpDownStart===null) curHttpDownStart=s.ts;
     maxHttpDownSec=Math.max(maxHttpDownSec, s.ts-curHttpDownStart+1800);
+    sumHttpDownSec+=1800;
   } else curHttpDownStart=null;
 }
 const HTTP_RATE_LIMIT=0.95;
@@ -1968,6 +1992,13 @@ c.push(contDownOk
     c.push(contOkDownOk
       ? `✅ 容器最长连续不可执行 ${(maxContOkDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
       : `❌ **容器最长连续不可执行 ${(maxContOkDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）`);
+    // **「率」和「最长连续」都抓不到「周期性短时假死」**（2026-10-20 补，真漏判）。
+    // 每 12 小时坏 30 分钟：最长连续 30 分钟 ✅、率 95.5% ✅ → exit 0，
+    // 而 7 天里累计 7.5 小时主人发命令没反应。
+    c.push(sumContOkDownSec<=CUM_DOWN_LIMIT_SEC
+      ? `✅ 容器累计不可执行 ${(sumContOkDownSec/3600).toFixed(1)} 小时（≤${CUM_DOWN_LIMIT_SEC/3600}h）`
+      : `❌ **容器累计不可执行 ${(sumContOkDownSec/3600).toFixed(1)} 小时**（>${CUM_DOWN_LIMIT_SEC/3600}h）：`+
+        `每次都很短、最长连续那条抓不到，但加起来主人有 ${(sumContOkDownSec/3600).toFixed(1)} 小时用不了`);
   }
 
 // 网关三条（与容器同口径）。**没有字段时说"判断不了"，不打勾也不判死。**
@@ -2000,6 +2031,10 @@ if(relayUnknown){
   c.push(relayDownOk
     ? `✅ 网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
     : `❌ **网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）：这段时间主人发什么都不通`);
+    c.push(sumRelayDownSec<=CUM_DOWN_LIMIT_SEC
+      ? `✅ 网关累计断开 ${(sumRelayDownSec/3600).toFixed(1)} 小时（≤${CUM_DOWN_LIMIT_SEC/3600}h）`
+      : `❌ **网关累计断开 ${(sumRelayDownSec/3600).toFixed(1)} 小时**（>${CUM_DOWN_LIMIT_SEC/3600}h）：`+
+        `每次都很短、最长连续那条抓不到，但加起来主人有 ${(sumRelayDownSec/3600).toFixed(1)} 小时发的消息到不了模型`);
 }
 
 // daemon 可达性三条（与容器/网关同口径）。**没有字段时说"判断不了"，不打勾也不判死。**
@@ -2019,6 +2054,10 @@ if(httpUnknown){
     ? `✅ daemon 最长连续不可达 ${(maxHttpDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
     : `❌ **daemon 最长连续不可达 ${(maxHttpDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）：`+
       `这段时间进程在但服务不回，主人发什么都不通`);
+    c.push(sumHttpDownSec<=CUM_DOWN_LIMIT_SEC
+      ? `✅ daemon 累计不可达 ${(sumHttpDownSec/3600).toFixed(1)} 小时（≤${CUM_DOWN_LIMIT_SEC/3600}h）`
+      : `❌ **daemon 累计不可达 ${(sumHttpDownSec/3600).toFixed(1)} 小时**（>${CUM_DOWN_LIMIT_SEC/3600}h）：`+
+        `每次都很短、最长连续那条抓不到，但加起来主人有 ${(sumHttpDownSec/3600).toFixed(1)} 小时发什么都没回`);
 }
 c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
