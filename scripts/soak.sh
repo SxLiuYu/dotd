@@ -285,7 +285,16 @@ for(const x of lines){
   if(seenSampleKey.has(k)){ dupSamples++; continue; }
   seenSampleKey.add(k); deduped.push(x);
 }
-const raw=deduped;
+// **必须按时间排序**（2026-10-19 修，真缺陷）：
+// 下面 `const cur=all[all.length-1]` / `const first=all[0]` 都假设了"文件按时间有序"，
+// 但这个假设**从来没被保证过**：cron 与手工调用撞车、时钟被 NTP 回拨、
+// 或者写入被打断后补写，都会让文件乱序。实测：
+// 同一份 8 天数据，只把**最后一条挪到文件开头**，报告就从
+//   "已观测 8.00 天（首尾样本跨 8.00 天）" 变成 "已观测 0.00 天（首尾样本跨 **-0.04** 天）"，
+// exit 从 0 变成 1 —— 内容一模一样，只是顺序不同，结论完全相反。
+// 而"首尾样本跨 -0.04 天"这种负数本来就不该被打印出来。
+// 排序放在去重之前更稳：去重用的是 (ts,proc_start,pid)，与顺序无关。
+const raw=deduped.slice().sort((a,b)=>a.ts-b.ts);
 const legacy=raw.filter(s=>s.proc_start===undefined||s.pid===undefined);
 const all=raw.filter(s=>s.proc_start!==undefined&&s.pid!==undefined);
 if(!all.length){
@@ -637,6 +646,13 @@ if(deadSampleCount>0)
               `约 ${deadSampleHours.toFixed(1)} 小时服务不可用；这些点不计入观测覆盖`);
 if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入被打断），已跳过，其余样本正常计入`);
 if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
+// **负跨度是结构性错误，必须报出来**（2026-10-19 补）。
+// 排序修好之后理论上不会再出现，但万一将来又有别的地方引入乱序，
+// 打印一个负数当"跨度"就是在骗人 —— 宁可明确报警。
+const negativeSpan = spanDays < 0;
+if(negativeSpan)
+  console.log(`❌ **首尾样本跨度为负（${spanDays.toFixed(2)} 天）**：样本没有按时间排列，`+
+              `各项判据都不可信 —— 这是报告逻辑的错，不是数据的问题`);
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
 if(days>=7) console.log(`探针密度：${probesVerified.length} 次（已验飞书） / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
@@ -840,7 +856,7 @@ console.log("\n判定：" + c.join("；"));
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk;
-process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
+process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
