@@ -1110,8 +1110,35 @@ const peakRss=Math.max(...all.map(s=>s.rss_kb))/1024;
 // 改为取"最前 2 小时内"的样本中位（30 分钟一次即 4 个），仍能抗噪，
 // 但偏差只有 2h/168h ≈ 1.2%，不会被增长拉高。
 const BASE_WINDOW_SEC=7200;
-const baseSet=all.filter(s=>s.ts<=all[0].ts+BASE_WINDOW_SEC);
-const baseN=Math.max(1,Math.min(baseSet.length, all.length));
+// **基线绝不能取在峰值之后**（2026-10-20 修，真假绿+假红）。
+//
+// 现场：窗口才 2 小时，报告同时打出两句互相矛盾的话 ——
+//   「RSS: 首段中位 221.7MB → 末段中位 203.6MB，增长 -18.0MB」
+//   「全窗口 RSS：基线 203.6MB → 最高 221.7MB，峰值增长 +18.0MB」
+// 同一个 daemon、同一批样本，一负一正。真实序列是
+//   221.7 → 201.9 → 202.0 → 203.6 → 203.6 → 203.6 → 203.6（MB）
+// 也就是**启动尖峰衰减后稳住**。而所谓 "+18.0MB 峰值增长" 其实是把衰减当成了增长。
+//
+// 根因：baseSet = `ts <= all[0].ts + 7200`，窗口不足 2 小时时它**吃下全部样本**，
+// 于是 baseRss = 全体中位（203.6），而峰值出现在**第一个点**（221.7）——
+// 基线取在了峰值之后。判据实际上在说"最高点比中位数高多少"，
+// 这与"随时间增长了多少"完全是两回事。
+//
+// 更糟的是它会**双向说谎**：
+//   · 启动尖峰衰减 → 报"增长 +18MB"（假红，吓人但不会误放）
+//   · 真泄漏但从中位数以下起步 → 基线被抬高，**少报**（假绿，危险）
+//
+// 修法：基线窗口**必须在峰值之前结束**。取"最前 2 小时"与"峰值出现时刻"的较小者，
+// 且至少要覆盖前 1/4 的时间，否则样本太少不抗噪（那就退回单点）。
+// 若峰值就在第一个点（启动尖峰），基线窗口退化为前 1 个点 —— 那不是缺陷，
+// 因为"从第一个点涨到峰值"确实是 0 增长，而真正的增长要看后面的走势。
+// 这一步之后 peakGrowth 在"启动即峰值"时会是 0。这不是漏洞：
+// 那种情况下的缓慢爬升由 segRate（每段爬升速率）去抓，两条判据分工明确 ——
+// 这条管"整体峰值涨了多少"，那条管"是不是一直在爬"。
+const peakIdx=all.reduce((m,s,k)=>s.rss_kb>all[m].rss_kb?k:m, 0);
+const baseEndTs=Math.min(all[0].ts+BASE_WINDOW_SEC, all[peakIdx].ts);
+const baseSet=all.filter(s=>s.ts<=baseEndTs);
+const baseN=Math.max(1, baseSet.length);
 const baseRss=med(all.slice(0,baseN).map(s=>s.rss_kb))/1024;
 const peakGrowth=peakRss-baseRss;
 const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
@@ -1199,7 +1226,12 @@ console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
 console.log(`RSS: 首段中位 ${rss0.toFixed(1)}MB → 末段中位 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
 console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点峰值不参与判据）`);
 // fd 全窗口峰值增长：与 RSS 的"全窗口峰值"同理 —— 重启会把 fd 泄漏洗白
-const fdBaseN=Math.max(1, Math.min(all.filter(s=>s.ts<=all[0].ts+BASE_WINDOW_SEC).length, all.length));
+// 与 RSS 的"全窗口峰值"同理，基线也**不能取在峰值之后**（2026-10-20 同一处修复）。
+// fd 的真实序列是稳稳的 27，偶尔被瞬间负载顶到 30+；若基线窗口吃下全部样本，
+// 基线就会落在峰值附近，把"瞬时尖峰"报成"泄漏"，或反过来把真泄漏洗白。
+const fdPeakIdx=all.reduce((m,s,k)=>s.fd>all[m].fd?k:m, 0);
+const fdBaseEndTs=Math.min(all[0].ts+BASE_WINDOW_SEC, all[fdPeakIdx].ts);
+const fdBaseN=Math.max(1, all.filter(s=>s.ts<=fdBaseEndTs).length);
 const fdBase=med(all.slice(0,fdBaseN).map(s=>s.fd));
 const fdPeakGrowth=maxFd-fdBase;
 // 阈值不能照抄 RSS 的 50（2026-10-19）：50MB 内存对 daemon 未必严重，
