@@ -92,6 +92,12 @@ esac
 if [ "$BEFORE" = "$AFTER" ]; then P=$((P+1)); echo "  ✔ ③ 没有新建工具（$BEFORE → $AFTER）"; else REASONS="$REASONS ③新建了工具;"; echo "  ✖ ③ 工具数变了（$BEFORE → $AFTER）"; fi
 # 该句字符数：用容器里的工具实测一次作为基准
 # 基准值：直接用容器里的工具算一次（文本经 stdin 传入，避开多层引号/参数丢失）
+# **基准值必须真的算出来，并且第④条必须比对它**（2026-10-20 修，真缺陷）。
+# 现场：这一行一直打印 "（基准：该句应为 ? 个字符）" —— EXPECT 永远是空。
+# 原因是工具返回的字段是 `char_count`，而这里找的是 `total_chars` / `chars`。
+# 后果不是"基准难看"，是**第④条判据从没验过答案对不对**：只要任务 done 且回答非空就过，
+# 哪怕模型答"共 9999 个字符"也照样 PASS。这是第⑤类 bug（收集了字段却没用上），
+# 也是最危险的一种"假过"——判据看着有 4 条，实际只有 3 条在起作用。
 EXPECT=$(printf '%s' "$SENTENCE" | docker exec -i dotd-dot-dot1 python3 -c '
 import json,subprocess,sys,os
 t = sys.stdin.read()
@@ -99,12 +105,27 @@ d = "/dot/home/tools/char-count"
 if not os.path.isdir(d):
     print(""); raise SystemExit
 r = subprocess.run([sys.executable,"run.py",json.dumps({"text":t})],cwd=d,capture_output=True,text=True)
+if r.returncode != 0:
+    print(""); raise SystemExit
 try:
-    o=json.loads(r.stdout); v=o.get("total_chars"); print(v if v is not None else o.get("chars",""))
+    o=json.loads(r.stdout)
 except Exception:
-    print("")' 2>/dev/null | tr -d '\r\n ')
+    print(""); raise SystemExit
+# 工具返回 {"char_count": N}；兼容 total_chars / chars 以防工具被重造时改名
+for k in ("char_count","total_chars","chars"):
+    if isinstance(o.get(k),(int,float)):
+        print(int(o[k])); raise SystemExit
+print("")' 2>/dev/null | tr -d '\r\n ')
 echo "  （基准：该句应为 ${EXPECT:-?} 个字符）"
-if [ -n "$ANS" ] && [ "$ST" = "done" ]; then P=$((P+1)); echo "  ✔ ④ 任务 done 且有回答"; else REASONS="$REASONS ④任务未正常完成;"; echo "  ✖ ④ 任务状态 $ST 或回答为空"; fi
+if [ -z "$EXPECT" ]; then
+  REASONS="$REASONS ④算不出基准值(无法验证答案对不对);"
+  echo "  ✖ ④ 算不出基准值 —— 无法验证答案，这一条不能算过"
+elif [ -n "$ANS" ] && [ "$ST" = "done" ] && printf '%s' "$ANS" | grep -qF "$EXPECT"; then
+  P=$((P+1)); echo "  ✔ ④ 任务 done、回答非空，且答案里含正确字符数 $EXPECT"
+else
+  REASONS="$REASONS ④任务未完成或答案里没有正确字符数$EXPECT;"
+  echo "  ✖ ④ 任务状态 $ST，或回答里找不到正确字符数 $EXPECT（回答：$(printf '%s' "$ANS" | head -c 120)）"
+fi
 
 echo ""
 if [ $P -eq 4 ]; then
