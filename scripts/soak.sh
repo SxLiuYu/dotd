@@ -303,7 +303,7 @@ const unattended=restartRows.filter(r=>!r.healed);
 // 修法：不看"生命周期内涨了多少"，而看**每个生命周期内是不是都在涨**——
 // 健康的进程重启后应该稳定，不该每段都单调爬升。
 // 用"段内增长率"的**中位数**（MB/小时）判断：稳定进程应接近 0。
-const segRates=[];
+const segRates=[], segFdRates=[];
 for(const L of LIFE){
   // **必须用 all，不能用 S**（2026-10-19 修，真缺陷）：
   // S 是"当前生命周期"的子集，拿它按 L.key 过滤，除当前这一段外**全部为空** ——
@@ -315,10 +315,20 @@ for(const L of LIFE){
   const n2=Math.max(1,Math.round(seg.length*0.1));
   const r0=med(seg.slice(0,n2).map(s=>s.rss_kb))/1024;
   const r1=med(seg.slice(seg.length-n2).map(s=>s.rss_kb))/1024;
+  const f0=med(seg.slice(0,n2).map(s=>s.fd));
+  const f1=med(seg.slice(seg.length-n2).map(s=>s.fd));
   const h=(seg[seg.length-1].ts-seg[0].ts)/3600;
-  if(h>=0.5) segRates.push((r1-r0)/h);
+  if(h>=0.5){ segRates.push((r1-r0)/h); segFdRates.push((f1-f0)/h); }
 }
 const medSegRate=segRates.length? med(segRates) : null;
+// **句柄也有同一个洞**（2026-10-19 修）：fd 判据同样只看"当前生命周期"的首末差，
+// 于是每段只涨 2 个、每 2 小时重启一次、8 天重启 96 次 —— 首末差仍是 +2，
+// 判 ✅，exit 0。合成数据实测：96 段每段都漏 2 个句柄，报告全绿。
+// 与 RSS 用同一套逻辑：看**每段是不是都在涨**，中位速率 ≥0.5 个/小时即判失败。
+// 0.5/h × 168h = 84 个句柄，远超 +2 的容忍度；而稳定进程的速率应接近 0。
+const medSegFdRate=segFdRates.length? med(segFdRates) : null;
+const maxSegFdRate=segFdRates.length? Math.max(...segFdRates) : null;
+const SEG_FD_RATE_LIMIT=0.5;
 // 为什么用中位数而不是最大值：**新起的 node 进程本来就会先爬后平**
 // （V8/JIT 预热、懒加载、连接池建满），这是正常现象不是泄漏。
 // 用"最大值"会把每次重启后的预热判成泄漏 —— 而重启恰恰是我们要允许的自愈行为。
@@ -354,6 +364,7 @@ console.log(`RSS: 首段中位 ${rss0.toFixed(1)}MB → 末段中位 ${rssN.toFi
 console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点峰值不参与判据）`);
 console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），单点峰值 ${maxFd}`);
 if(segRates.length) console.log(`各生命周期内 RSS 爬升速率：中位 ${medSegRate===null?"n/a":medSegRate.toFixed(2)+"MB/h"}，最大 ${maxSegRate.toFixed(2)}MB/h（${segRates.length} 段够长可算；最大值仅参考，新生进程预热会偏高）`);
+if(segFdRates.length) console.log(`各生命周期内句柄爬升速率：中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}，最大 ${maxSegFdRate.toFixed(3)}个/h`);
 console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}）`);
 console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
 console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
@@ -388,8 +399,14 @@ if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功�
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
 if(medSegRate!==null){
   c.push(medSegRate<SEG_RATE_LIMIT
-    ? `✅ 各生命周期内无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h）`
-    : `❌ **每个生命周期内都在爬升**（中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
+    ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h）`
+    : `❌ **每个生命周期内 RSS 都在爬升**（中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
+      `重启只是把泄漏截断，不是没漏`);
+}
+if(medSegFdRate!==null){
+  c.push(medSegFdRate<SEG_FD_RATE_LIMIT
+    ? `✅ 各生命周期内句柄无明显爬升（中位 ${medSegFdRate.toFixed(2)}个/h）`
+    : `❌ **每个生命周期内句柄都在爬升**（中位 ${medSegFdRate.toFixed(2)}个/h ≥${SEG_FD_RATE_LIMIT}）：`+
       `重启只是把泄漏截断，不是没漏`);
 }
 console.log("\n判定：" + c.join("；"));
@@ -402,7 +419,8 @@ console.log("\n判定：" + c.join("；"));
 const passOk = passRate===null || passRate>=0.95;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && unattended.length===0 && (contRate===null||contRate>=0.95)
-  && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT) ? 0 : 1);'
+  && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
+  && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT) ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
