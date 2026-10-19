@@ -960,6 +960,23 @@ for(const s of all){
     maxRelayDownSec=Math.max(maxRelayDownSec, s.ts-curRelayDownStart+1800);
   } else curRelayDownStart=null;
 }
+// ── **「率」必须说明它覆盖了窗口的多大一块**（2026-10-20 补，第⑥类：样本没测它声称要测的东西）
+//
+// 现场：7 天窗口里 `relay_up` 只在最后 1 天才开始采（49/337 点）。
+// 报告写 `✅ 网关连通率 100.0%（49 点）`—— 读者会以为**7 天都验过了**，
+// 实际只覆盖 1/7。剩下 6 天网关什么样，没人知道。
+//
+// 这不是措辞问题，是**判据在替一段没测过的时间打勾**。
+// 而且它在本项目里**必然发生**：67 轮里 soak.sh 改了 74 次，
+// `container_ok`/`relay_up`/`http_ok` 全是中途加的 ——
+// 于是每一个新判据刚上线时，都只能覆盖窗口的一小段。
+//
+// 规则：**「率」类判据只有在覆盖 ≥95% 的窗口时才能打 ✅**；
+// 覆盖不够时打 ⏳ 并写明覆盖了多少 —— 既不算通过也不算失败。
+// 与 `contOkRateOk` 的 `days>=7` 前缀同一个思路，但门槛换成「这个字段自己覆盖了多少」。
+const COVER_RATE_LIMIT=0.95;
+// 某个字段的覆盖率 = 带该字段的采样点数 / 全部采样点数
+const fieldCover=(pts,allN)=> allN? pts.length/allN : 0;
 const RELAY_RATE_LIMIT=0.95;
 // 与容器同口径：没满 7 天不算"率"（样本太少），但**最长连续断开任何时候都算**
 const relayRateOk=!(days>=7 && relayRate!==null && relayRate<RELAY_RATE_LIMIT);
@@ -994,6 +1011,40 @@ const httpRateOk=!(days>=7 && httpRate!==null && httpRate<HTTP_RATE_LIMIT);
 const httpDownOk=maxHttpDownSec<=CONT_DOWN_LIMIT_SEC;
 const httpSamples=httpPts.length;
 const httpUnknown=httpSamples===0;
+
+// **覆盖率不足 = 这条判据没有证据，不能打勾**（2026-10-20 补，照 container_ok 的先例）。
+//
+// 上面把「只覆盖 15%」渲染成 ⏳ 而不是 ✅，但那只改了措辞 ——
+// `relayRateOk`/`httpRateOk` 仍是 `true`，`process.exit` 照样可能给 0。
+// 这就是第⑩类（判据必须改退出码才算数）+ 第⑥类（样本没测它声称要测的东西）。
+//
+// 三档语义（与 L1885 的 container_ok 完全同一套）：
+//   days<7              → ⏳ 还没到裁定时刻（上面 `days>=7` 前缀已拦住）
+//   days>=7 且覆盖率<95% → **覆盖率不足 = 失败**：整整 7 天里这一项只看了零星几天，
+//                          不能算「这 7 天一直好」
+//   days>=7 且覆盖率够    → 按 rate/down 两条判
+//
+// **但要能区分「字段后加」和「采集坏了」**（照 L1897-1902 的做法）：
+// 老夹具（字段加进来之前造的）本来就没有这个字段，判死就是第⑥类的反向版本。
+// 所以只在「这段时间确实有能力采这个字段」时才追究覆盖率 ——
+// 判据是：同一处采集逻辑写的相邻字段在不在（relay: container_up；http: alive/container_up）。
+
+// **覆盖率的计算必须放在所有 *_Pts 之后**（TDZ）：
+// 第一版把它插在 `RELAY_RATE_LIMIT` 旁边，而 `httpPts` 定义在后面 ——
+// `ReferenceError: Cannot access 'httpPts' before initialization`，
+// 被 `exit 2`（判据坏了，不是数据不达标）立刻抓到。
+const relayCover=fieldCover(relayPts, all.length);
+const httpCover=fieldCover(httpPts, all.length);
+const contOkCover=fieldCover(contOkPts, all.length);
+
+// **覆盖率判定放在所有 *_Cover 之后**（TDZ 又是同一个坑，第二次）：
+// 第一版插在 `httpUnknown` 后面，而 `relayCover` 定义在后面 ——
+// `ReferenceError: Cannot access 'relayCover' before initialization`。
+// `exit 2` 两次都立刻抓到了；但更该记的是**为什么反复犯**：
+// 这个文件是 1900 行的单文件 node -e，变量散布在不同语义段里，
+// 「常量定义在哪」完全靠人工核对。这也是它需要 136 条回归兜着的原因。
+const relayCoverOk=!(days>=7 && !relayUnknown && relayCover<COVER_RATE_LIMIT);
+const httpCoverOk=!(days>=7 && !httpUnknown && httpCover<COVER_RATE_LIMIT);
 // 这 7 天里**有没有能力采** container_ok：看有没有 container_up。
 // 两者在同一处采集逻辑里相邻写入，有 up 就说明那次采集跑了。
 // 全窗口连 up 都没有 → 老数据，指标压根不存在，不追究。
@@ -1707,7 +1758,10 @@ if(relayUnknown){
   c.push(!relayRateOk
     ? `❌ **网关连通率 ${(relayRate*100).toFixed(1)}%**（${relaySamples} 点，<95%）：主人发的消息有一段到不了模型`
     : (days>=7
-        ? `✅ 网关连通率 ${(relayRate*100).toFixed(1)}%（${relaySamples} 点）`
+        ? (relayCover>=COVER_RATE_LIMIT
+            ? `✅ 网关连通率 ${(relayRate*100).toFixed(1)}%（${relaySamples} 点，覆盖 ${(relayCover*100).toFixed(0)}% 窗口）`
+            : `⏳ 网关连通率 ${(relayRate*100).toFixed(1)}%（${relaySamples} 点，**只覆盖 ${(relayCover*100).toFixed(0)}% 的窗口**）：`+
+              `剩下的时间网关什么样没人看过 —— 这条还不能打勾`)
         : `⏳ 网关连通率 ${(relayRate*100).toFixed(1)}%（${relaySamples} 点）：窗口未满 7 天，这条还没到判的时候`));
   c.push(relayDownOk
     ? `✅ 网关最长连续断开 ${(maxRelayDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
@@ -1721,7 +1775,10 @@ if(httpUnknown){
   c.push(!httpRateOk
     ? `❌ **daemon 可达率 ${(httpRate*100).toFixed(1)}%**（${httpSamples} 点，<95%）：进程在，但请求进不去`
     : (days>=7
-        ? `✅ daemon 可达率 ${(httpRate*100).toFixed(1)}%（${httpSamples} 点）`
+        ? (httpCover>=COVER_RATE_LIMIT
+            ? `✅ daemon 可达率 ${(httpRate*100).toFixed(1)}%（${httpSamples} 点，覆盖 ${(httpCover*100).toFixed(0)}% 窗口）`
+            : `⏳ daemon 可达率 ${(httpRate*100).toFixed(1)}%（${httpSamples} 点，**只覆盖 ${(httpCover*100).toFixed(0)}% 的窗口**）：`+
+              `剩下的时间 daemon 能不能用没人看过 —— 这条还不能打勾`)
         : `⏳ daemon 可达率 ${(httpRate*100).toFixed(1)}%（${httpSamples} 点）：窗口未满 7 天，这条还没到判的时候`));
   c.push(httpDownOk
     ? `✅ daemon 最长连续不可达 ${(maxHttpDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
@@ -1874,8 +1931,8 @@ process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && g
   && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
   && passOk && (medSegRate===null||segRates.length<2||segTooMany===0)
   && (medSegFdRate===null||fdSegTooMany===0)
-  && relayRateOk && relayDownOk
-  && httpRateOk && httpDownOk
+  && relayRateOk && relayDownOk && relayCoverOk
+  && httpRateOk && httpDownOk && httpCoverOk
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
   && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
   // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
