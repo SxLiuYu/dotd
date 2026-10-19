@@ -1432,6 +1432,10 @@ const hbVals=[...hbOutcome.values()];
 // 120 秒足够宽，又远小于两次采样的间隔（1800 秒），不会把真卡住洗白。
 const hbNow=Math.floor(Date.now()/1000);
 const hbHung=hbKeys.filter(k=>hbOutcome.get(k)===null && hbNow-Number(k.split(":")[0])>=120).length;
+// **"start 后无结局"必须能推出 ❌**（2026-10-20 补）。
+// 它本来只在心跳那一行的括号里露个数字，退出码里有 `hbHung<=3` 却**没有任何 ❌ 输出**。
+// 这正是第 61 轮那个病的镜像：判据红了，但终端不说为什么红 ——
+// 于是「把退出码改成只看 c[]」时它立刻从红变绿，暴露出它本来就缺这一行。
 const hbInFlight=hbKeys.filter(k=>hbOutcome.get(k)===null && hbNow-Number(k.split(":")[0])<120).length;
 const hbSkip=hbVals.filter(v=>v&&v.startsWith("skip")).length;
 const hbDead=hbVals.filter(v=>v&&v.startsWith("dead")).length;
@@ -1514,6 +1518,32 @@ console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"
             (contDown.length? `（${contDown.length} 个采样点容器不在线）` : ""));
 
 const c=[];
+
+// **能推 ❌ 的判据必须写在 `c[]` 之后**（2026-10-20，TDZ 第四次）。
+//
+// 这一轮把「退出码只看 c[]」定下来之后，我给两条原本沉默的判据
+// （`relayCoverOk`/`httpCoverOk`、`hbHung`）补上了 ❌ 输出，
+// 但插在了**它们算出来的地方**（L1087 / L1449），而 `c` 到 L1533 才定义 ——
+// `ReferenceError: Cannot access 'c' before initialization`，`exit 2`。
+//
+// 这是这份单文件脚本里**第四次**踩 TDZ（第 47/67/68 轮各一次）。
+// 规律很清楚：**「算出判据」的位置和「能说话」的位置不是同一个位置**。
+// 判据要在早期算（后面的判据依赖它），但只有 `c[]` 之后的代码才能 push。
+// 所以凡是「补一句 ❌」，都必须往 `c=[]` 后面搬，不能就地写。
+// **覆盖不足也必须能推出 ❌**（2026-10-20 补，同上）。
+// 这两个变量第 67 轮就加进了退出条件，但**从来没打印过任何东西** ——
+// 失败时是一句沉默的 `exit 1`。把退出码改成只看 c[] 之后，
+// `只看15%窗口须判红` 这个夹具立刻从红变绿，才把它揪出来。
+// 措辞要和已有的 ⏳ 对齐：`⏳` 是「还没到判的时候」，`❌` 是「满了 7 天却只覆盖这么多」。
+if(!relayCoverOk) c.push(`❌ **网关连通性只覆盖 ${(relayCover*100).toFixed(0)}% 的窗口**`+
+  `（满 7 天了，判据 ≥${(COVER_RATE_LIMIT*100).toFixed(0)}%）：剩下的时间网关什么样没人看过`);
+if(!httpCoverOk) c.push(`❌ **daemon 可达性只覆盖 ${(httpCover*100).toFixed(0)}% 的窗口**`+
+  `（满 7 天了，判据 ≥${(COVER_RATE_LIMIT*100).toFixed(0)}%）：剩下的时间服务通不通没人看过`);
+
+const hbHungOk = hbHung<=3;
+if(!hbHungOk) c.push(`❌ **${hbHung} 次 sample 在 start 之后没有结局**（判据 ≤3）：`+
+  `脚本中途死了（语法错 / 被 kill / 磁盘满），那几次采样直接丢了。`+
+  `soak.jsonl 上只显示"稀疏"，看起来像 cron 抖动，实际是采集器在崩。`);
 if(hasFuture){
   // 排在最前面：数据本身有问题，后面所有推算都不可信
   c.push(`❌ **样本时间戳在未来**：${futureSamples.length} 个点最多超前 ${maxFutureMin} 分钟`+
@@ -1941,54 +1971,22 @@ console.log("\n判定：" + c.join("；"));
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk && wantMismatch.length===0 && !dataReset && !day0Early;
-const verdictOk = Boolean(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
-  && !isCrashLoop
-  && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
-  // **"判断不了"不能当成"通过"**（2026-10-20 补，真假绿）。
-  //
-  // 现场：造 7 天完整窗口、337 个采样点**全部没有 container_ok 字段**，
-  // 其余全健康 → 报告打印
-  //   ⚠ 容器可执行性：还没有任何采样点带 container_ok，这条判断不了（既不算通过也不算失败）
-  // 然后 **exit 0**。**判据说"判断不了"，退出码说"通过"** —— 两者互相矛盾。
-  //
-  // 这不是理论问题：container_ok 是后加的字段，采集侧任何一处失败
-  // （字段名写错、打 /healthz 抛异常、加到旧版本上跑），
-  // 7 天里 337 个点就会全都没有这个字段，报告给一个 ⚠ 然后判成功。
-  // 而"容器进程活着、daemon 却用不了它"正是 S6 里最严重的那次盲区
-  // （第 31 轮：容器 tools 死了 5 小时，所有判据全绿）。
-  //
-  // 正确语义按证据强度分三档：
-  //   days<7            → 还没到裁定时刻，不判（这种情况 days>=7 已经先拦住了）
-  //   days>=7 且 0 点   → **证据缺失 = 失败**：整整 7 天没测过这一项，不能交付
-  //   days>=7 且有样本  → 按 rate/tail/down 三条判
-  // 所以这里要的是 `!(days>=7 && contOkUnknown)`，而不是无条件放行。
-  // **但不能倒过来把"历史夹具没这个字段"判成失败**（2026-10-20，当场自纠）。
-  //
-  // 上一版我写成 `!(days>=7 && contOkUnknown)`，结果 **16 个历史夹具全红**：
-  // `健康8天`/`探针均匀`/`短生命周期稳定` 这些是 `container_ok` 加进来之前造的，
-  // 它们没有这个字段是**当时确实没有这个指标**，不是"采集侧坏了"。
-  // 直接判死就是第⑥类 bug 的反向版本：把"指标不存在"算成"指标坏了"。
-  //
-  // 正确的判据要能区分两件事：
-  //   ① 这 7 天里**有没有能力采**这个字段 —— 看 `container_up`：
-  //      它是同一处采集逻辑写的（`cont_ok` 与 `cont` 相邻），
-  //      有 `container_up` 说明那次采集真的跑了，只是 `container_ok` 没写出来 → **是 bug**；
-  //   ② 整个窗口连 `container_up` 都没有 —— 那是老数据，指标压根不存在 → 不追究。
-  // 真窗口自检：从 day0 起 4 个采样点**全部带 container_ok=1**，所以这条不会误伤。
-  && !(days>=7 && contOkUnknown && contUpCapable)
-  && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
-  && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
-  && passOk && (medSegRate===null||segRates.length<2||segTooMany===0)
-  && (medSegFdRate===null||fdSegTooMany===0)
-  && relayRateOk && relayDownOk && relayCoverOk
-  && httpRateOk && httpDownOk && httpCoverOk
-  && (sampleRate===null||sampleRate>1.0/6? (sampleRate>=SAMPLE_RATE_LIMIT && sampleRate<=SAMPLE_RATE_MAX) : true)
-  && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
-  // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
-  // 说明脚本在执行途中死了（语法错 / 被 kill / 磁盘满），那次采样丢了。
-  // 一两次可以容忍（和采样密度的 30% 余量对齐），超过 3 次就必须说出来 ——
-  // 连续崩溃会让 7 天窗口悄悄少掉一整天数据，而 soak.jsonl 上只显示"稀疏"。
-  && hbHung<=3);
+// **结论只能有一个来源：c[]**（2026-10-20 补，结构性修复）。
+//
+// 原来 `verdictOk` 是一个**跨 48 行手写维护的布尔式**，
+// 而 `c[]` 里已经有 37 处 `❌`。同一个结论写了两遍，两遍会悄悄分家——
+// 而且**已经分家过两次**：
+//   · 第 67 轮：`relayCoverOk`/`httpCoverOk` 算出来了却没进 exit（率只覆盖 15% 窗口仍绿）；
+//   · 第 62 轮：RSS 侧「证据不足」分支被 `&& days>=7` 挡住，压根不打印。
+// 还发现第 1979/1980 行是**同一段条件复制了两遍**（`contOkUnknown||…` 写两次）——
+// 手写长布尔式的典型产物：复制粘贴、没人敢删。
+//
+// 正确做法：**退出码 = c[] 里有没有 ❌**。这样「加判据忘了加退出码」
+// 在结构上不可能发生 —— 加了 ❌ 就自动是红的，不用记得改第二个地方。
+//
+// 风险是反向的：某处条件在 exit 里、却不产生 ❌ → 会从红变绿。
+// 这靠回归兜（154 个夹具，含 8 个必须红的）。
+const verdictOk = !c.some(x=>String(x).startsWith("❌"));
 
 // ── **结论必须落盘**（2026-10-20 补，真缺陷）
 //
@@ -2153,7 +2151,15 @@ case "${1:-sample}" in
     REPORT_RC=$?
     cat "$REPORT_OUT"
     if [ "$REPORT_RC" -ne 0 ]; then
-      if grep -qE 'ReferenceError|TypeError|SyntaxError|is not defined|Cannot access' "$REPORT_OUT"; then
+            # **只认 node 堆栈的形状**（2026-10-20，护栏自己误报）。
+      # 原来是在报告输出里搜 `ReferenceError|TypeError|…` 这几个词。
+      # 但这一轮我在源码注释里写了「第 61 轮踩过的同一个坑（那次是 ReferenceError）」——
+      # 而**源码注释会被 dump 进报告**（堆栈里带代码上下文行），
+      # 于是护栏读到自己的注释，判定「脚本崩溃」，`exit 2`。
+      # 判据搜关键词、而关键词可能出现在**非错误的地方**（注释/文案/数据），
+      # 这是第⑨类「标签会撒谎」的反向：**检索会误中自己**。
+      # 收紧成 node 堆栈的真实形状：错误类型必须在行首、栈帧必须缩进四格。
+if grep -qE '^(ReferenceError|TypeError|SyntaxError|RangeError|Error): |^    at ' "$REPORT_OUT"; then
         echo ""
         echo "❌ report 脚本自身出错（上面是堆栈）—— 这不是\"数据不达标\"，是判据坏了，必须修"
         exit 2
@@ -2161,7 +2167,7 @@ case "${1:-sample}" in
       exit "$REPORT_RC"
     fi
     # 兜底：即使退出码是 0，输出里有堆栈也说明坏了
-    if grep -qE 'ReferenceError|TypeError|SyntaxError|is not defined|Cannot access' "$REPORT_OUT"; then
+    if grep -qE '^(ReferenceError|TypeError|SyntaxError|RangeError|Error): |^    at ' "$REPORT_OUT"; then
       echo ""
       echo "❌ report 脚本自身出错（退出码却是 0）—— 判据坏了，必须修"
       exit 2
