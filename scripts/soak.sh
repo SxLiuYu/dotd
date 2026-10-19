@@ -62,7 +62,8 @@ do_sample() {
   # 所以**无条件先登记一行心跳**，再去做事。文件很小（每次一行约 60 字节，
   # 7 天 336 行 ≈ 20KB），report 时能对出"cron 跑了但没采到"的具体原因。
   local HB="${SOAK_HB:-$(dirname "$SOAK")/soak-heartbeat.log}"
-  printf '%s start pid=%s\n' "$(date +%s)" "$" >>"$HB" 2>/dev/null || true
+  local _hbts; _hbts=$(date +%s)
+  printf '%s start pid=%s\n' "$_hbts" "$$" >>"$HB" 2>/dev/null || true
   # **probe 正在跑的时候不要采样**（2026-10-20 修，真缺陷）。
   # 现场：soak.jsonl 里出现 fd=31，而 daemon 静息一直是 27。
   # 查下去是我手工跑 probe 时，cron 的 sample 恰好也在跑 ——
@@ -1120,13 +1121,21 @@ for(const l of hbLines){
 }
 const hbStarts=hbOutcome.size;
 const hbVals=[...hbOutcome.values()];
-const hbHung=hbVals.filter(v=>v===null).length;
+// **还在飞的不算卡住**（2026-10-20 补）：cron 在 :00/:30 跑 sample，耗时约 0.3 秒。
+// 若 report 恰好在这 0.3 秒内执行，最后一行就是 start、还没有结局 ——
+// 那是**正在进行**，不是"死了"。判别方法：start 的时间戳距今 < 120 秒就当它还在跑。
+// 120 秒的选择：sample 正常 0.3 秒、最慢（容器探活超时）约 5 秒，
+// 120 秒足够宽，又远小于两次采样的间隔（1800 秒），不会把真卡住洗白。
+const hbNow=Math.floor(Date.now()/1000);
+const hbHung=hbKeys.filter(k=>hbOutcome.get(k)===null && hbNow-Number(k.split(":")[0])>=120).length;
+const hbInFlight=hbKeys.filter(k=>hbOutcome.get(k)===null && hbNow-Number(k.split(":")[0])<120).length;
 const hbSkip=hbVals.filter(v=>v&&v.startsWith("skip")).length;
 const hbDead=hbVals.filter(v=>v&&v.startsWith("dead")).length;
 const hbOk=hbVals.filter(v=>v&&v.startsWith("ok")).length;
 if(hbStarts>0){
   console.log(`心跳：${hbStarts} 次 sample 运行 —— ok ${hbOk} / skip ${hbSkip} / dead ${hbDead}`+
-    (hbHung?` / **start 后无结局 ${hbHung}**`:``));
+    (hbHung?` / **start 后无结局 ${hbHung}**`:``)+
+    (hbInFlight?` / 进行中 ${hbInFlight}`:``));
 }
 if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
 if(dupProbes>0) console.log(`⚠ 文件里有 ${dupProbes} 行重复探针（同一时刻同一 taskId），已去重，**不计入密度和成功率**`);
