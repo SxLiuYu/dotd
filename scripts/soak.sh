@@ -165,7 +165,15 @@ const sameLifetime=all.filter(s=>s.proc_start===cur.proc_start && s.pid===cur.pi
 const S=sameLifetime.length?sameLifetime:all;
 
 const first=all[0], last=all[all.length-1];
-const hours=(last.ts-first.ts)/3600, days=hours/24;
+// **观测时长的终点取"现在"，不取最后一个样本**（2026-10-19 修，真误差）：
+// cron 每 30 分钟一个点，所以任意时刻最后一个样本平均都在 15 分钟前。
+// 用 (last-first) 当观测时长，就永远差这半格 —— 恰好满 7 天时算出 6.98 天，
+// 判据 days>=7 不成立，**真跑满 7 天也会被判失败**。
+// 实际连续观测的时长是"从首个样本到现在"，末尾那半格由下面的 STALE_LIMIT 兜住
+// （超过 90 分钟没有新样本才算没在看）。
+const nowSec=Math.floor(Date.now()/1000);
+const hours=(nowSec-first.ts)/3600, days=hours/24;
+const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际跨度"
 
 // **连续性**（2026-10-19 补）：只看"首尾跨了 7 天"是不够的 ——
 // 采样器如果在中间死了 3 天，首尾照样跨 7 天，报告会给出一个虚假的"连续 7 天"。
@@ -189,7 +197,6 @@ const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
 // 判据：最后一个样本距现在不得超过 3 个采样周期（cron 30 分钟 → 90 分钟），
 // 超过就说明观测早已停止，无论历史跨度多长都不能算通过。
 const STALE_LIMIT=5400;
-const nowSec=Math.floor(Date.now()/1000);
 const staleness=nowSec-last.ts;
 const stale=staleness>STALE_LIMIT;
 // **用中位数比，不用单点比**（2026-10-19 修）。
@@ -263,7 +270,7 @@ for(let i=1;i<LIFE.length;i++){
 const unattended=restartRows.filter(r=>!r.healed);
 
 console.log("== S6 长期运行现状 ==");
-console.log(`采样点 ${all.length} 个，跨度 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天）`);
+console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
 if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
