@@ -408,7 +408,12 @@ const fd0=med(headS.map(s=>s.fd)), fdN=med(tailS.map(s=>s.fd));
 const fdGrowth=fdN-fd0;
 const thGrowth=med(tailS.map(s=>s.threads))-med(headS.map(s=>s.threads));
 const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
-const maxFd=Math.max(...S.map(s=>s.fd));const passRate=probesVerified.length? probesVerified.filter(p=>p.ok).length/probesVerified.length : null;
+// **fd 峰值必须看全窗口**（2026-10-19 修）：原来 `maxFd` 只从当前生命周期 `S` 取，
+// 重启后就只剩新进程的低值 —— 实测 fd 从 34 爬到 64、末尾重启一次，
+// 打印"单点峰值 34"（真实峰值 64），数字本身就是错的。
+const maxFd=all.length? Math.max(...all.map(s=>s.fd)) : 0;
+const maxFdCur=Math.max(...S.map(s=>s.fd));
+const passRate=probesVerified.length? probesVerified.filter(p=>p.ok).length/probesVerified.length : null;
 
 // **容器可用性**（2026-10-19 补）：`container_up` 一直在采，却从来没被任何判据用过 ——
 // 也就是说容器可以停一整天，而 S6 照样"通过"。probe 每 6 小时才跑一次，
@@ -598,7 +603,19 @@ if(lifetimes>1){
 console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
 console.log(`RSS: 首段中位 ${rss0.toFixed(1)}MB → 末段中位 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
 console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期，单点峰值不参与判据）`);
-console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}），单点峰值 ${maxFd}`);
+// fd 全窗口峰值增长：与 RSS 的"全窗口峰值"同理 —— 重启会把 fd 泄漏洗白
+const fdBaseN=Math.max(1, Math.min(all.filter(s=>s.ts<=all[0].ts+BASE_WINDOW_SEC).length, all.length));
+const fdBase=med(all.slice(0,fdBaseN).map(s=>s.fd));
+const fdPeakGrowth=maxFd-fdBase;
+// 阈值不能照抄 RSS 的 50（2026-10-19）：50MB 内存对 daemon 未必严重，
+// 但 50 个文件句柄是**大量**泄漏 —— 进程默认上限通常 1024 左右，
+// 漏到几百就必然 EMFILE 崩掉。实测 fd 34→64（+30）时用 50 判据
+// 仍然 exit 0，等于没修。
+// 取 20：daemon 正常 fd 约 27，20 个的增量已是 74% 增长，明显异常。
+// 参考点：健康 8 天实测峰值增长 0；每段漏 2 个（95 次重启）实测也靠这条不再漏网。
+const FD_PEAK_LIMIT=20;
+console.log(`句柄: 当前生命周期 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGrowth>=0?"+":""}${fdGrowth}）`);
+console.log(`全窗口句柄：基线 ${fdBase}（最前 ${fdBaseN} 个样本中位）→ 最高 ${maxFd}，峰值增长 ${fdPeakGrowth>=0?"+":""}${fdPeakGrowth}（判据 < +${FD_PEAK_LIMIT}，与重启无关）`);
 console.log(`全窗口 RSS：基线 ${baseRss.toFixed(1)}MB（最前 ${baseN} 个样本中位）→ 最高 ${peakRss.toFixed(1)}MB，`+
             `峰值增长 ${peakGrowth>=0?"+":""}${peakGrowth.toFixed(1)}MB（判据 < +${PEAK_GROWTH_LIMIT}MB，与重启无关）`);
 if(segRates.length) console.log(`各生命周期内 RSS 爬升速率：中位 ${medSegRate===null?"n/a":medSegRate.toFixed(2)+"MB/h"}，最大 ${maxSegRate.toFixed(2)}MB/h（${segRates.length} 段够长可算；最大值仅参考，新生进程预热会偏高）`);
@@ -637,6 +654,10 @@ if(stale){
 }
 c.push(growth<50? "✅ RSS 增长 <50MB" : `❌ RSS 增长 ${growth.toFixed(1)}MB ≥50MB`);
 c.push(fdGrowth<=2? "✅ 无明显句柄泄漏" : `❌ 句柄增长 ${fdGrowth}`);
+c.push(fdPeakGrowth<FD_PEAK_LIMIT
+  ? `✅ 全窗口句柄峰值增长 ${fdPeakGrowth} < ${FD_PEAK_LIMIT}`
+  : `❌ **全窗口句柄峰值增长 ${fdPeakGrowth} ≥${FD_PEAK_LIMIT}**：`+
+    `基线 ${fdBase} → 最高 ${maxFd}（重启把 fd 收回去，不能因此说没漏）`);
 if(unattended.length){
   c.push(`❌ 有 ${unattended.length} 次重启**找不到自愈记录**（${unattended.map(r=>new Date(r.born*1000).toISOString().slice(11,19)).join(", ")}）`+
          ` —— "无人工干预"不成立`);
@@ -731,7 +752,7 @@ console.log("\n判定：" + c.join("；"));
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk;
-process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
+process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
