@@ -854,6 +854,17 @@ export class DotRunner {
   private readonly repeatGuard = new Map<string, Map<string, { count: number; last: string; sameResultCount?: number }>>();
   /** 连续被护栏跳过派发的轮数（按任务 ID）；超过 REPEAT_MAX_SKIPS 就真的收口（防死循环）。 */
   private readonly repeatSkipsByTask = new Map<string, number>();
+
+  /**
+   * 每任务 × 每工具的调用次数（2026-10-19）。
+   *
+   * 为什么需要：重复守卫只认"同一 (工具,参数)"，而模型会**交替**调用 A、B、A、B 绕开它。
+   * 现场：一个"查 zen 并存笔记"的任务跑到 25 步还没写文件 ——
+   *   net.get(zen) → fs.stat(note 不存在) → net.get(zen) → fs.stat(note 不存在) → …
+   * 每一步单看都是"新调用"，守卫完全沉默。这里用"同一工具的总调用次数"兜底。
+   */
+  private readonly toolCallCounts = new Map<string, Map<string, number>>();
+
   private running = false;
 
   constructor(deps: RunnerDeps, opts: RunnerOptions = {}) {
@@ -1614,6 +1625,29 @@ export class DotRunner {
     const rec = bucket.get(key) ?? { count: 0, last: '' };
     rec.count += 1;
     bucket.set(key, rec);
+
+    // **跨工具打转**（2026-10-19 实测到的真实缺陷）：重复守卫原本只认
+    // "同一 (工具,参数)"，但模型会交替调用 A、B、A、B 绕开它。
+    // 现场：一个"查 zen 并存笔记"的任务跑到 25 步还没写文件 ——
+    //   net.get(zen) → fs.stat(note)不存在 → net.get(zen) → fs.stat(note)不存在 → …
+    // 每一步单独看都是"新的调用"，守卫完全沉默。
+    //
+    // 这里用**同一工具的近期调用次数**兜底：不看具体参数，只看"这个工具是不是
+    // 在这个任务里被用得太多"。阈值放得比单参数守卫宽，避免误伤合法的批量操作
+    // （比如连续读 10 个文件）；但同一工具超过 6 次、且任务已跑很久，就该提示了。
+    const perTool = this.toolCallCounts.get(taskId) ?? new Map<string, number>();
+    const used = (perTool.get(call.name) ?? 0) + 1;
+    perTool.set(call.name, used);
+    this.toolCallCounts.set(taskId, perTool);
+    if (used === 6 && (call.name === 'net.get' || call.name === 'fs.stat')) {
+      return {
+        note:
+          `【检查方向】\`${call.name}\` 在这个任务里已经调用 ${used} 次了。` +
+          `如果你已经**拿到了需要的信息**（比如接口返回了内容、文件确实不存在），` +
+          `就不要再重复查询 —— 直接用已有结果完成任务（该写文件就写文件，该回答就回答）。` +
+          `重复同样的查询不会让答案变得更好。`,
+      };
+    }
 
     // **结果没变化才是真打转**（2026-10-18 校准）：次数本身不可靠 ——
     // 有的任务合法地重复同一动作 8 次（tests/runner-plan.test.ts 的抗跑偏用例），
