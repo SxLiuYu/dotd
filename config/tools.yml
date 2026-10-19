@@ -28,6 +28,8 @@ tools:
   - name: fs.list
     tier: read
     # EX §7：目录枚举/mtime/size，深度 ≤4
+  - name: fs.remove
+    tier: write_file                        # 删除文件：先归档进 .archive/ 再 unlink，可恢复；目录只删空的
   - name: fs.stat
     tier: read
     # EX §7：mtime/size
@@ -58,6 +60,8 @@ tools:
   # 到点自动触发任务 —— 属于"改了系统状态"，不是只读查询。
   - name: schedule.create
     tier: write_file
+  - name: schedule.remove
+    tier: write_file                        # 停用而非硬删（enabled=0，可恢复）
   - name: schedule.list
     tier: read
 

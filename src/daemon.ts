@@ -86,7 +86,7 @@ import { loadMcpServers } from './exec/mcp-config.ts';
 import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
-import { createSchedule, listSchedules } from './control-plane/schedules.ts';
+import { createSchedule, listSchedules, removeSchedule } from './control-plane/schedules.ts';
 import type { ExecToolCall, ExecToolResult } from './shared/contracts.ts';
 import { CronExpressionParser } from 'cron-parser';
 import { createMemoryService } from './memory/MemoryService.ts';
@@ -1014,6 +1014,16 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       },
     };
   });
+  exec.registerHostTool('schedule.remove', async (args) => {
+    const id = typeof args['id'] === 'string' ? args['id'].trim() : '';
+    if (id.length === 0) {
+      return { ok: false, code: 'schedule_invalid', message: '要停用哪一条？给我 id（可用 schedule.list 查）' };
+    }
+    const r = removeSchedule(db, id);
+    if (!r.ok) return { ok: false, code: 'schedule_not_found', message: r.error ?? '没找到这条定时任务' };
+    return { ok: true, value: { id, removed: true, note: '已停用（不是硬删，能在管理界面恢复）' } };
+  });
+
   exec.registerHostTool('schedule.list', async () => {
     const rows = listSchedules(db);
     return {

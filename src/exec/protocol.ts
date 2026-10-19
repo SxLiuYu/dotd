@@ -139,6 +139,17 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     sideEffect: 'safe',
   },
   {
+    name: 'fs.remove',
+    mode: 'sync',
+    // 与其它 fs.* 的 sync 上限对齐（SYNC_MAX_DEADLINE_MS）。
+    // 2026-10-19 实测踩坑：原来写 15_000，模型按默认节奏传了更长的 deadline → deadline_too_long，
+    // 删除直接失败。删除要先把内容归档再 unlink，本来就比读慢，别卡这么紧。
+    max_deadline_ms: 60_000,
+    args_schema: obj({ path: str('要删除的文件或空目录（home 内相对路径）') }, ['path']),
+    // 删除不幂等（删第二次就是 not_a_file），但内容先进 .archive/ 可恢复，按 unknown 最保守
+    sideEffect: 'unknown',
+  },
+  {
     name: 'shell.run',
     mode: 'async',
     max_deadline_ms: 30 * 60_000,
@@ -228,6 +239,25 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     max_deadline_ms: 10_000,
     args_schema: obj({}, []),
     sideEffect: 'safe',
+  },
+  {
+    /**
+     * 宿主侧工具：停用一条定时任务（2026-10-19）。
+     *
+     * 为什么现在才加：主人说"把那个喝水提醒删了"，模型只能答"我删不掉，你在管理界面操作" ——
+     * 因为 removeSchedule 早就实现了（还带幂等修正），但没暴露成工具。
+     *
+     * 语义是**停用不是硬删**（crontabs.enabled=0）：可以带 includeDisabled 查到，
+     * 万一删错了还有救。所以定为 write_file 档而不是 dangerous。
+     */
+    name: 'schedule.remove',
+    mode: 'sync',
+    max_deadline_ms: 10_000,
+    args_schema: obj(
+      { id: str('要停用的定时任务 id（从 schedule.list 拿）') },
+      ['id'],
+    ),
+    sideEffect: 'replayable',
   },
 ];
 

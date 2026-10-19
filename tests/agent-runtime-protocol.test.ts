@@ -111,7 +111,7 @@ const _driftProof: [
 test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sideEffect）', () => {
   // 宿主侧工具（schedule.* 等）不进容器：它们由 daemon 直接执行，
   // 容器能力目录里不该有。所以对比时只比"容器内工具"。
-  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list']);
+  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list', 'schedule.remove']);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),
     [...HOST_TOOL_NAMES].filter((n) => !HOST_SIDE_ONLY.has(n)),
@@ -404,7 +404,7 @@ test('canonicalJson: 嵌套对象键排序，undefined 值键被滤除（与宿�
 // ═══════════════════════════════════════════════════════════════════
 
 test('能力目录: 容器内工具与契约词表一致（宿主侧工具不在其中）', () => {
-  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list']);
+  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list', 'schedule.remove']);
   const hostToolsInContainer = [...TOOL_NAMES].filter((n) => HOST_SIDE_ONLY.has(n));
   assert.equal(CAPABILITIES.length, TOOL_NAMES.length - hostToolsInContainer.length);
   assert.equal(new Set(CAPABILITIES.map((c) => c.name)).size, CAPABILITIES.length);
@@ -419,7 +419,7 @@ test('能力目录: 容器内工具与契约词表一致（宿主侧工具不在
 
 test('能力目录: mode 归属 = fs.* 为 sync，其余 async（EX §5.2 判据句）', () => {
   const sync = CAPABILITIES.filter((c) => c.mode === 'sync').map((c) => c.name);
-  assert.deepEqual(sync, ['fs.read', 'fs.write', 'fs.list', 'fs.stat']);
+  assert.deepEqual(sync, ['fs.read', 'fs.write', 'fs.list', 'fs.stat', 'fs.remove']);
   for (const c of CAPABILITIES) {
     if (!c.name.startsWith('fs.')) assert.equal(c.mode, 'async', c.name);
     // sync 一律压在 60s 硬顶内
@@ -434,6 +434,7 @@ test('能力目录: sideEffect 档位（契约 J2：未声明按 unknown）', ()
     'fs.write': 'replayable',
     'fs.list': 'safe',
     'fs.stat': 'safe',
+    'fs.remove': 'unknown',
     'shell.run': 'unknown',
     'browser.open': 'unknown',
     'browser.act': 'unknown',

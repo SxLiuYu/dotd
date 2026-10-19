@@ -15,7 +15,7 @@
  */
 
 import { realpathSync, statSync, lstatSync, existsSync } from 'node:fs';
-import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, statSync as statSize, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, statSync as statSize, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { FsOpsListEntry, FsOpsOp, FsOpsResponse, ToolResult } from './protocol.ts';
 import {
@@ -441,16 +441,55 @@ export class FsTools {
     } catch (e) {
       return pathError(callId, e);
     }
-    if (!existsSync(safe.abs)) {
-      return errorResult(callId, ERROR_CODES.not_a_file, `不存在：${safe.rel}`, false);
+    const st = lstatSync(safe.abs, { throwIfNoEntry: false });
+    if (st === undefined) {
+      return errorResult(callId, 'not_a_file', `不存在：${safe.rel}`, false);
     }
-    const st = statSync(safe.abs);
     return okResult(callId, {
       path: safe.rel,
       type: st.isDirectory() ? 'dir' : 'file',
       size_bytes: st.size,
       mtime: new Date(st.mtimeMs).toISOString(),
-      mode: st.mode,
+    });
+  }
+  /**
+   * fs.remove（2026-10-19）：删除一个文件或空目录。
+   *
+   * **先归档再删**：文件内容会先复制进 .archive/（与覆盖写同一套 FIFO 配额），
+   * 然后才 unlink。这样"删错了"还能从归档捞回来。
+   * 目录只允许删空的（rmdir），非空目录报 not_empty —— 避免一条误命令删掉整个目录树。
+   */
+  async remove(callId: string, args: Record<string, unknown>): Promise<ToolResult> {
+    let safe: SafePath;
+    try {
+      safe = this.resolve(args.path);
+    } catch (e) {
+      return pathError(callId, e);
+    }
+    let st;
+    try {
+      st = lstatSync(safe.abs, { throwIfNoEntry: false });
+    } catch (e) {
+      return errorResult(callId, ERROR_CODES.bad_args, String(e), false);
+    }
+    if (st === undefined) {
+      return errorResult(callId, 'not_a_file', `不存在：${safe.rel}`, false);
+    }
+    if (st.isDirectory()) {
+      try {
+        rmdirSync(safe.abs);
+        return okResult(callId, { path: safe.rel, removed: true, wasDir: true, archivedTo: null });
+      } catch {
+        return errorResult(callId, 'not_empty', `目录非空，拒绝删除：${safe.rel}（先清空里面的东西）`, false);
+      }
+    }
+    const archived = this.archiveBeforeOverwrite(safe);
+    unlinkSync(safe.abs);
+    return okResult(callId, {
+      path: safe.rel,
+      removed: true,
+      wasDir: false,
+      archivedTo: archived,
     });
   }
 

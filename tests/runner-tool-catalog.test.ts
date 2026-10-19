@@ -67,6 +67,7 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
       'fs.read',
       'fs.write',
       'fs.list',
+      'fs.remove',
       'fs.stat',
       'shell.run',
       'browser.open',
@@ -76,6 +77,7 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
       'net.get',
       'net.post',
       'schedule.create',
+      'schedule.remove',
       'schedule.list',
     ],
   );
@@ -227,7 +229,7 @@ test('buildToolSpecs：schema 逐字透传能力目录，description 全部来�
   assert.equal(specs[0]!.parameters, CAPS[0]!.args_schema);
 });
 
-test('工具引导段：讲清"先便宜后昂贵"的优先级，并覆盖 11 个工具名', () => {
+test('工具引导段：讲清"先便宜后昂贵"的优先级，并覆盖全部工具名', () => {
   assert.ok(TOOLS_GUIDE.length > 200);
   for (const name of TOOL_NAMES) {
     assert.ok(TOOLS_GUIDE.includes(name), `引导段没提到 ${name}，模型不知道它归哪一类`);

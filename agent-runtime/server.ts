@@ -629,6 +629,8 @@ export class AgentRuntime {
         return this.fs.list(call.call_id, call.args);
       case 'fs.stat':
         return this.fs.stat(call.call_id, call.args);
+      case 'fs.remove':
+        return this.fs.remove(call.call_id, call.args);
       case 'shell.run':
         return this.shell.run(call.call_id, call.args, call.deadline_ms);
       case 'browser.open':

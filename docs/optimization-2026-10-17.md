@@ -4049,3 +4049,68 @@ title 不同但 cron+prompt 相同的也拦（那只是措辞差异）。
 ## 269. 本轮门禁
 
 日常验收 5/5 · 查重生效 · 已清理一条重复提醒 · `tsc` exit 0 · **`npm test` 1521/1521**
+
+---
+
+# 第五十六轮：补齐删除能力（2026-10-19）
+
+## 270. 缺口确认
+
+你问"删除功能和权限"。查下来模型能看到的 15 个工具里：
+
+```
+fs.read / fs.write / fs.list / fs.stat   ← 能读能写，不能删
+shell.run                                 ← 能跑 rm，但要触发审批
+schedule.create / schedule.list           ← 能建能查，不能删
+```
+
+所以它在飞书里说"我删不掉定时任务"是**真话**——`removeSchedule` 早就实现了，
+但从没暴露成工具。
+
+## 271. 补上两个删除工具
+
+| 工具 | 语义 | 档位 |
+|---|---|---|
+| `schedule.remove` | **停用**不是硬删（`enabled=0`，能查回来） | write_file |
+| `fs.remove` | 删文件或空目录；**先归档进 `.archive/` 再删** | write_file |
+
+安全设计：
+- `fs.remove` 删除前先调 `archiveBeforeOverwrite`，旧内容进 `.archive/`（32MB FIFO 配额）
+- 目录只删空的（`rmdirSync`，非空报 `not_empty`）——避免一条命令删掉整棵树
+- `schedule.remove` 复用了第 42 轮修正过幂等性的 `removeSchedule`
+
+## 272. 过程中踩了一连串坑（都是加工具必然遇到的连锁）
+
+1. **容器侧要同步加**：`agent-runtime/protocol.ts` 的能力定义 + `fs.ts` 的 `remove` 实现
+   + `server.ts` 的 dispatch。少一处就是"工具存在但调不通"。
+2. **容器与宿主的顺序必须一致**：防漂移测试逐个同形比对，`fs.remove` 在两边的
+   位置都必须紧跟 `fs.stat` 之后。
+3. **改 `fs.ts` 时误删了 `stat` 方法**：重写 `remove` 的范围算过头，把相邻的 `stat` 一起
+   吞掉了。TS 报 `Property 'stat' does not exist` 才发现。补回时还先写错了返回字段
+   （`sizeBytes` vs `size_bytes`、`isFile` vs `type:'file'`），测试一个个指出来。
+4. **system prompt 又超预算**：加两条工具说明后 4034 > 4000，删掉一段旧的实测记录才落下。
+
+## 273. 最后一个是真 bug
+
+工具加完，模型却删不掉：
+
+```
+{"code":"deadline_too_long","message":"工具 fs.remove 的 deadline_ms 上限为 15000"}
+```
+
+我给 `max_deadline_ms` 写 15_000，而模型按默认节奏传了更长的值，直接拒。
+**删除要先归档再 unlink，本来就比读慢**，15 秒太紧。放宽到 60_000 后立刻成功。
+
+## 274. 实测
+
+```
+工具: fs.stat succeeded → fs.remove succeeded
+回答: delete-me.txt 已经删掉了，旧内容自动归档在 .archive/2026-10-19T04-18-03-499Z__delete-me.txt
+文件: ✅ 已删除
+归档: ✅ 在 .archive/ 里
+```
+
+## 275. 本轮门禁
+
+工具面 13 → 15 · 删除端到端通过（含归档）· **`npm test` 1521/1521** ·
+容器镜像已重建（80s）· `tsc` exit 0

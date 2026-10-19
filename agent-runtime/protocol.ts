@@ -28,6 +28,7 @@ export type ToolName =
   | 'fs.write'
   | 'fs.list'
   | 'fs.stat'
+  | 'fs.remove'
   | 'shell.run'
   | 'browser.open'
   | 'browser.act'
@@ -41,6 +42,7 @@ export const TOOL_NAMES: readonly ToolName[] = [
   'fs.write',
   'fs.list',
   'fs.stat',
+  'fs.remove',
   'shell.run',
   'browser.open',
   'browser.act',
@@ -204,6 +206,18 @@ export const CAPABILITIES: readonly Capability[] = [
       additionalProperties: false,
     },
     sideEffect: 'safe',
+  },
+  {
+    name: 'fs.remove',
+    mode: 'sync',
+    max_deadline_ms: SYNC_MAX_DEADLINE_MS,
+    args_schema: {
+      type: 'object',
+      required: ['path'],
+      properties: { path: { type: 'string', minLength: 1 } },
+      additionalProperties: false,
+    },
+    sideEffect: 'unknown',
   },
   {
     name: 'shell.run',

@@ -705,6 +705,7 @@ export type ToolName =
   | 'fs.write'
   | 'fs.list'
   | 'fs.stat'
+  | 'fs.remove'
   | 'shell.run'
   | 'browser.open'
   | 'browser.act'

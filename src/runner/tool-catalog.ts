@@ -131,6 +131,18 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     failures: 'not_a_directory（路径是文件或不存在）、too_deep（depth>4）、路径类错误同 fs.read。',
   },
   {
+    name: 'fs.remove',
+    description:
+      '删除 home 里的一个文件或空目录。**删除前会自动把旧内容存进 .archive/ 一次**，删错了能捞回来。' +
+      '目录只允许删空的（非空会报 not_empty）——避免一条命令删掉整个目录树。' +
+      '主人说"删掉那个文件""清理一下"时用它；只是想清空内容不想删文件，用 fs.write 写空串。',
+    params: {
+      path: 'home 内相对路径。要删整个非空目录，先逐个删里面的文件。',
+    },
+    returns: '返回 JSON：path、removed、archivedTo（归档到哪了，.archive/ 下）、note。',
+    failures: 'not_a_file（本来就不存在）、not_empty（目录非空）、path_outside_home（越界）。',
+  },
+  {
     name: 'fs.stat',
     description:
       '查单个路径的元信息：是文件还是目录、多大、最后修改时间。' +
@@ -282,6 +294,18 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       'schedule_invalid（cron 写错/段数不对/间隔太短）。**把 error 里的原话告诉主人**并请他确认时间，不要自己猜着重试。',
   },
   {
+    name: 'schedule.remove',
+    description:
+      '停用一条定时任务（主人说"把那个提醒删了""不用再提醒了"）。' +
+      '注意是**停用不是硬删**：这条任务会被标记为不启用，不再触发，但记录还在（管理界面能恢复）。' +
+      'id 从 schedule.list 拿；不确定是哪一条就先 list 一遍再删，别猜。',
+    params: {
+      id: '要停用的定时任务 id（形如 ct_xxx，从 schedule.list 返回里取）。',
+    },
+    returns: '返回 JSON：id、removed=true、note（说明是停用可恢复）。',
+    failures: 'schedule_not_found（没有这条或已经停用了）、schedule_invalid（没给 id）。',
+  },
+  {
     name: 'schedule.list',
     description:
       '列出已经创建的定时任务（含下次触发时间、上次触发结果）。主人问"我现在有哪些定时任务"时用它。',
@@ -421,6 +445,7 @@ export const NET_SEARCH_GUIDE = `联网查资料的判据（没有内置搜索�
 export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额外接了自己的工具，见各自说明）：
 1. 看盘：fs.list（目录）→ fs.stat（在不在/多大）→ fs.read（读文本）。这是绝大多数任务的第一步。
 2. 写盘：fs.write（覆盖整篇，改文件前必须先 fs.read 出原文再整篇写回）。任务收尾写记忆用它。
+   删除：fs.remove（先归档再删，可恢复；目录只删空的）。
 3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
    **读文档也用 shell.run**（不要用 fs.read——它只能读纯文本，二进制会被破坏）：
    · PDF：\`pdftotext 文件.pdf -\` 直接打出文本；\`pdfinfo 文件.pdf\` 看页数/元信息
@@ -428,7 +453,7 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
    · 纯文本/代码/日志：fs.read 就够
 4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
-6. 定时：schedule.create（建定时任务，主人说"每天/每周/待会儿提醒我"就用它）、schedule.list（看已有哪些）。cron 是 5 段（分 时 日 月 周）。
+6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
 通用约定：
 - 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
 - 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。
