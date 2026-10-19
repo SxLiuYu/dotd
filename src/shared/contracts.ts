@@ -909,6 +909,14 @@ export interface MemoryPort {
     opts: { status?: ThreadStatus; limit: number; cursor?: string },
   ): Promise<ThreadSummary[]>;
   listMessages(threadId: string, opts: { beforeSeq?: number; limit: number }): Promise<Message[]>;
+  /**
+   * 会话摘要刷新（MEM §4.4）。Runner 在任务收口前调一次。
+   *
+   * 可选：旧装配没实现时 Runner 跳过。**但当前装配必须实现并转发**——
+   * 2026-10-19 实测：memPortOf 适配器漏转发这一行，导致 422 个线程一条摘要都没生成
+   * （Runner 日志 hasFn=false），长会话只能靠硬裁，越聊越记不住开头。
+   */
+  refreshContextSummary?(threadId: string): Promise<boolean>;
 }
 
 /** MEM §8 listThreads 的最小投影（SF /api/conversations 只展示这些字段）。 */

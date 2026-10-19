@@ -637,6 +637,12 @@ function memPortOf(memory: MemoryServiceImpl): MemoryPort {
       }));
     },
     listMessages: (threadId, o) => memory.listMessages(threadId, o),
+    // **必须转发**（2026-10-19 实测发现）：契约里它是可选方法，适配器起初漏了这一行，
+    // 于是 Runner 拿到的 memory 端口上 refreshContextSummary 是 undefined，
+    // 走的是"旧装配没有它时跳过"的降级分支 —— 结果是**422 个线程一条摘要都没生成**，
+    // 长会话只能靠 8000 token 硬裁，越聊越记不住开头。
+    // Runner 侧日志形如：DIAG-SUM ... hasFn=false。
+    refreshContextSummary: (threadId) => memory.refreshContextSummary(threadId),
   };
 }
 
@@ -674,6 +680,11 @@ function memApiOf(memory: MemoryServiceImpl): MemoryServiceApi {
     needsMemoryRedo: (task, outcome) => memory.needsMemoryRedo(task, outcome),
     hasMemoryReminder: (taskId) => memory.hasMemoryReminder(taskId),
     markMemoryReminder: (taskId, at) => memory.markMemoryReminder(taskId, at),
+    // **会话摘要刷新**（2026-10-19 实测发现）：这是 Runner 实际用的适配器（memApiOf），
+    // 而契约里 refreshContextSummary 是可选方法——漏了这一行，Runner 拿到的就是 undefined，
+    // 走"旧装配没有它"的降级分支 → **422 个线程一条摘要都没生成**。
+    // （上一轮我误改到 memPortOf 上，那个是 SF 面用的，Runner 不看它。）
+    refreshContextSummary: (threadId) => memory.refreshContextSummary(threadId),
   };
 }
 

@@ -3583,3 +3583,71 @@ const REPLAY_BUDGET_TOKENS = 8_000;
 
 prompt 28329 → 15867（-44%）· 回答正确性不变 · **`npm test` 1518/1518**
 （+2 条守卫：重放不得用任务预算、预算必须是合理小值）· 诊断代码已清理
+
+---
+
+# 第四十九轮：会话摘要机制从未生效（2026-10-19）
+
+## 233. 顺着上轮的线索
+
+上轮把重放预算从 200000 降到 8000，prompt 降了 44%。但随即意识到：
+**预算只是遮盖，历史本身只增不减**——迟早撑满。
+
+于是去查摘要压缩机制（`context_summary`）：
+
+```
+422 个线程，有摘要：0 个
+最大那 476 条消息的线程：summary=null, upto_seq=0
+```
+
+## 234. 机制其实全都在
+
+- `refreshContextSummary()` 有完整实现（增量摘要、600 token 上限、失败不抛）
+- 触发判据齐全：`needsSummarize()` = 消息数 >64 或注入 >4000 tokens
+- 注入也接好了：daemon 里 `summarize: (transcript) => router.complete({track:'light'})`
+- Runner 也在收口前调：`await this.refreshSummary(task)`
+
+**全都在，却一条摘要都没生成。**
+
+## 235. 根因：改错了适配器
+
+加临时诊断打印调用现场：
+
+```
+DIAG-SUM refreshSummary task=... hasFn=false
+```
+
+`this.memory.refreshContextSummary` 是 **undefined**。而 daemon 里有**两个** memory 适配器：
+
+| 适配器 | 谁在用 | 有哪些方法 |
+|---|---|---|
+| `memPortOf()` | SF 面 | openThread / appendMessage / listThreads / listMessages |
+| **`memApiOf()`** | **Runner** | buildSessionReplay / sealTask / needsMemoryRedo / … |
+
+我第一次把转发加到了 `memPortOf` —— **Runner 根本不看那个**。
+而契约里 `refreshContextSummary` 是 `?` **可选**方法，所以类型检查不报错，
+Runner 静默走了"旧装配没有它"的降级分支。
+
+## 236. 修好之后
+
+```
+DIAG-SUM ... hasFn=true
+[dotd] runner: 已更新会话摘要 tk_mveovmw522fk6a/thr_01M56VDNAZDDACBEB80CE1EKNP
+summary 长度=322  upto_seq=481
+```
+
+**这个机制第一次真正跑通。** 长会话从此会把早期历史压成 600 token 以内的摘要。
+
+## 237. 方法论复盘
+
+上轮和这轮的两次卡壳，解法都是同一个：**加诊断打印真实状态，而不是读代码猜**。
+
+- 上轮：`console.error` 打出真实 messages 的 kind 分布 → 发现"裁错了对象"
+- 这轮：`console.error` 打出 `hasFn=false` → 发现"改错了适配器"
+
+两次都是在**看代码怎么看都对**的情况下，靠一行运行时输出破的局。
+
+## 238. 本轮门禁
+
+摘要首次生成成功（322 字节 / upto_seq=481）· **`npm test` 1521/1521**
+（+3 条守卫：两个适配器都要转发、Runner 必须用 memApiOf）· 诊断代码已清理
