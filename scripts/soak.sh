@@ -1578,8 +1578,15 @@ c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
   : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
     `基线 ${baseRss.toFixed(1)}MB → 最高 ${peakRss.toFixed(1)}MB（与期间重启几次无关）`);
-if(medSegRate===null && segRates.length>0 && days>=7)
-  c.push(`⚠ **RSS 段内爬升：证据不足，现在不判定**（只有 ${segRates.length} 段、都不到 2 小时）：`+
+// **"证据不足"要一有就报，不该等到满 7 天才报**（2026-10-20 修，与句柄侧统一）。
+// 原来这里带 `days>=7` 限定：于是"1 段、去预热后 1 小时"这种**真实存在**的早期窗口
+// 会被静默跳过 —— 报告里 RSS 那条 ⚠ 根本不出现，只剩句柄那条。
+// 而"证据不足"本身和满没满 7 天毫无关系：它就是"我现在没证据",
+// 越早说越有用（能早点发现采样点太少 / 重启太频繁）。
+// 第 60 轮把句柄侧对齐到 RSS 的三态门槛时，没发现 RSS 自己还挂了个 `days>=7`——
+// 结果两边又在"什么时候该报"上分了岔。
+if(medSegRate===null && segRates.length>0)
+  c.push(`⚠ **RSS 段内爬升：证据不足，现在不判定**（只有 ${segRates.length} 段、去掉每段预热后都不到 2 小时）：`+
          `不判死也不打勾 —— 全窗口峰值增长那条判据仍然有效，能兜住总量`);
 // **单段时不能用这条判据拦人**（2026-10-20 修，真缺陷）：
 // 这条判据的**目的**是抓"靠重启把泄漏洗白"——`medSegRate` 算的是**各生命周期**
