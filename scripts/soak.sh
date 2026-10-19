@@ -1352,10 +1352,25 @@ if(passRate!==null){
     const notTested=(v)=>v===undefined || v===null || v==="" || v==="?";
     const noChannelOnly=bad.filter(p=>!notTested(p.out) && String(p.out)!=="0" &&
                                        !notTested(p.ws) && String(p.ws)!=="0").length;
+    // **"任务没跑完" 和 "跑完了但没拿到子判据" 是两件事**（2026-10-20 修，第三变体）。
+    //
+    // probe 在 done 分支里才给 PROBE_SLOT/PROBE_WANT/OUT_OK/WS_OK 赋值。
+    // 若 120 秒内没到 done（模型卡住、容器慢、排队），循环自然结束后
+    // 仍会写一行 probe —— 此时 ok=0、slot=""、out=""、ws=""、status 停在 queued/running。
+    // 原来这种被归进 noChannel（"探针没拿到完整子判据"），措辞暗示**是采集侧漏了字段**。
+    // 而真相是**任务根本没跑完** —— 采集侧一点没漏，它老实记录了"没测到"。
+    // 两者处置完全不同：前者要改采集代码，后者要查服务为什么慢。
+    // 这是第 46 轮那条教训（"没开始采样"和"采了 7 天服务全瘫"同一句话）的第三个变体。
     const noChannel=bad.filter(p=>notTested(p.out) || notTested(p.ws)).length;
+    // 未结束的 status：任务还在队列里或正在跑，从没走到出站检查
+    const UNFINISHED=new Set(["queued","running",""]);
+    const unfinished=bad.filter(p=>UNFINISHED.has(String(p.status))).length;
+    const testedButNoChannel=noChannel-unfinished;
     c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败，可重叠计数：`+
            `${noOut} 次飞书出站未送达 / ${noWs} 次飞书入站长连接不在 / `+
-           `${noChannel} 次探针没拿到完整子判据 / ${noChannelOnly} 次出站入站都正常但答案不对）`+
+           (unfinished? `**${unfinished} 次探针任务 120 秒内没跑完**（status 停在 queued/running）/ `:"")+
+           (testedButNoChannel>0? `${testedButNoChannel} 次跑完了却没拿到完整子判据 / `:"")+
+           `${noChannelOnly} 次出站入站都正常但答案不对`+
            (bothDown? `；其中 ${bothDown} 次两条链路同时不通` : ""));
   }
 }
