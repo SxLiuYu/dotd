@@ -217,6 +217,16 @@ try{
   }
 }catch{}
 const probes=lines.filter(x=>x.kind==="probe");
+// **"已验飞书"的探针单列**（2026-10-19 补，真缺口）：
+// 早期版本的探针只发 HTTP、查 daemon 有没有回话，**根本没验飞书送达**，
+// 记录里没有 out/ws 字段，但 ok=true。
+// 这些旧记录混进来会把"成功率"和"密度"同时抬高：
+// 合成数据实测 28 条真探针 + 100 条旧探针（没验过飞书）
+// → 打印"成功率 100%"、exit 0；更糟的是"只有旧探针"时
+// passRate=null 又被当成通过 —— 同一个"零证据也算通过"的坑换了个地方。
+// 判据要的是"在飞书里真的能干活的成功率"，所以只用验过出站+入站的探针。
+const probesVerified = probes.filter(p=>p.out!==undefined && p.ws!==undefined);
+const probesLegacy = probes.length - probesVerified.length;
 // 修复前采的样本没有 pid/proc_start 字段（那时还没记录身份），
 // 它们无法参与"生命周期"判断，单独算一类，不混进来算增长。
 // **重复行可以伪造采样密度**（2026-10-19 补，真缺口）：
@@ -275,7 +285,7 @@ const maxFutureMin=futureSamples.length
 // 只在满 7 天后才判 —— 窗口刚开始时没探针是正常的，不该提前报错。
 const PROBE_PER_DAY=4;
 const expectProbes=days*PROBE_PER_DAY;
-const probeRate=expectProbes>0? probes.length/expectProbes : null;
+const probeRate=expectProbes>0? probesVerified.length/expectProbes : null;
 const PROBE_RATE_LIMIT=0.7;
 const probeDensityOk=!(days>=7 && (probeRate===null || probeRate<PROBE_RATE_LIMIT));
 const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际跨度"
@@ -346,8 +356,7 @@ const fd0=med(headS.map(s=>s.fd)), fdN=med(tailS.map(s=>s.fd));
 const fdGrowth=fdN-fd0;
 const thGrowth=med(tailS.map(s=>s.threads))-med(headS.map(s=>s.threads));
 const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
-const maxFd=Math.max(...S.map(s=>s.fd));
-const passRate=probes.length? probes.filter(p=>p.ok).length/probes.length : null;
+const maxFd=Math.max(...S.map(s=>s.fd));const passRate=probesVerified.length? probesVerified.filter(p=>p.ok).length/probesVerified.length : null;
 
 // **容器可用性**（2026-10-19 补）：`container_up` 一直在采，却从来没被任何判据用过 ——
 // 也就是说容器可以停一整天，而 S6 照样"通过"。probe 每 6 小时才跑一次，
@@ -512,7 +521,7 @@ if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入
 if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
-if(days>=7) console.log(`探针密度：${probes.length} 次 / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
+if(days>=7) console.log(`探针密度：${probesVerified.length} 次（已验飞书） / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
 if(sampleRate!==null) console.log(`采样密度：${all.length} 次 / 应 ${Math.round(expectSamples)} 次 = ${(sampleRate*100).toFixed(0)}%（设计 ${SAMPLE_PER_HOUR} 次/h，判据 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%）`);
 if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
@@ -544,7 +553,9 @@ if(segFdRates.length) console.log(`各生命周期内句柄爬升速率：中位
 // 实测线程从 11 涨到 31 时它照打不误、exit 仍为 0。明确标成参照值，不制造错觉。
 console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}，**仅供参考，不参与 S6 判定**）`);
 console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
-console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
+if(probesLegacy>0)
+  console.log(`⚠ ${probesLegacy} 条旧格式探针没验过飞书送达（无 out/ws 字段），不计入成功率`);
+console.log(`探针 ${probesVerified.length} 次（已验飞书），成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
 console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"%"}` +
             (contDown.length? `（${contDown.length} 个采样点容器不在线）` : ""));
 
@@ -598,8 +609,8 @@ if(isCrashLoop){
 }
 if(days>=7){
   c.push(probeDensityOk
-    ? `✅ 探针密度 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%（${probes.length} 次 / 应 ${Math.round(expectProbes)} 次）`
-    : `❌ **探针密度只有 ${probeRate===null?"0":(probeRate*100).toFixed(0)}%**（${probes.length} 次 / 应 ${Math.round(expectProbes)} 次）：`+
+    ? `✅ 探针密度 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%（已验飞书 ${probesVerified.length} 次 / 应 ${Math.round(expectProbes)} 次）`
+    : `❌ **探针密度只有 ${probeRate===null?"0":(probeRate*100).toFixed(0)}%**（已验飞书 ${probesVerified.length} 次 / 应 ${Math.round(expectProbes)} 次）：`+
       `"成功率不掉"需要真的测过，不能靠"一次都没测"来满足`);
 }
 if(passRate!==null){
