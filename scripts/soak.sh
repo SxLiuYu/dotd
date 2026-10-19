@@ -1988,6 +1988,22 @@ try{
   // 肉眼几乎看不出。尾部那条「脚本自身出错」的检查是唯一能兜住它的东西。
   const soakPath=process.env.SOAK;
   const vp=process.env.SOAK_VERDICT || String(soakPath).replace(/[^/]+$/,"")+"soak-verdict.jsonl";
+  // **必须记下判定脚本自己的 md5**（2026-10-20 补，真缺陷）。
+  //
+  // 审计行本来就记了**数据**的 md5 —— 数据没变就能复核。
+  // 但它没记**尺子**的 md5。而这份脚本在窗口期内被改了 **26 次**，
+  // 所有阈值（COVER_RATE_LIMIT / HTTP_RATE_LIMIT / PEAK_GROWTH_LIMIT / …）
+  // **全是这 26 次里新加的或改过的**。
+  //
+  // 后果：三天前那行 `exit:0`，今天拿到原样的数据也无法复核 ——
+  // 不知道当时用的是哪套判据、哪个阈值。
+  // 「数据可验、尺子不可验」比「两者都不可验」更危险：
+  // 它看起来有 md5、像是可复核的，实际上只能证明数据没变。
+  //
+  // 记两样：脚本 md5 + 当前生效的全部阈值。
+  // 阈值直接写进 JSON 而不是只记 md5 —— md5 能证同一性，但读不出"当时是多少"。
+  const selfPath=process.argv[1]||"";
+  let scriptMd5="?";
   let md5="?";
   try{ md5=require("node:child_process").execSync(`md5sum ${JSON.stringify(soakPath)} 2>/dev/null | cut -c1-32`,{encoding:"utf8"}).trim()||"?"; }catch(e){}
   // **exit 必须有原因**（2026-10-20 补）。
@@ -2005,7 +2021,13 @@ try{
     .filter(x=>x.startsWith("❌"))
     .map(x=>x.replace(/\*\*/g,"").slice(0,80))
     .slice(0,12);
-  const row={at:new Date().toISOString(),exit:verdictOk?0:1,failures,soak:soakPath,md5,
+  try{ scriptMd5=require("node:child_process")
+    .execSync(`md5sum ${JSON.stringify(process.env.SOAK_SELF||"/root/dotd/scripts/soak.sh")} 2>/dev/null | cut -c1-32`,{encoding:"utf8"}).trim()||"?"; }catch(e){}
+  const limits={rssMb:50,peakGrowthMb:PEAK_GROWTH_LIMIT,fdPeak:FD_PEAK_LIMIT,fdSegRate:SEG_FD_RATE_LIMIT,
+    segRate:SEG_RATE_LIMIT,contOkRate:CONT_OK_RATE_LIMIT,contDownSec:CONT_DOWN_LIMIT_SEC,
+    relayRate:RELAY_RATE_LIMIT,httpRate:HTTP_RATE_LIMIT,coverRate:COVER_RATE_LIMIT,
+    probeRate:PROBE_RATE_LIMIT,sampleRate:SAMPLE_RATE_LIMIT,deadHours:DEAD_HOURS_LIMIT,staleSec:STALE_LIMIT};
+  const row={at:new Date().toISOString(),exit:verdictOk?0:1,failures,scriptMd5,limits,soak:soakPath,md5,
     records:all.length,observedDays:Number(coveredDays.toFixed(3)),spanDays:Number(days.toFixed(3)),
     rssGrowthMb:Number(growth.toFixed(1)),fdGrowth,maxFdPeak:maxFd,
     passRate:passRate===null?null:Number((passRate*100).toFixed(1)),probes:probesVerified.length,
