@@ -150,12 +150,21 @@ process.stdout.write(r ? String(r.ok) : ""); db.close();' "$tid")
         # 这条路径是"在飞书里干活"的另一半（出站已验证，入站一直没验）。
         # 判据：日志里最近一次长连接状态必须是"已建立/已恢复"，
         # 不能停在"断开，重连中"或"错误"上。
-        local ws_state
-        ws_state=$(grep -oE '飞书长连接(已建立（事件订阅就绪）|已恢复|断开，重连中…|错误：[^ ]*)' "$DOTD_LOG" 2>/dev/null | tail -1)
-        case "$ws_state" in
-          *已建立*|*已恢复*) WS_OK=1 ;;
-          *) WS_OK=0 ;;
-        esac
+        # 注意别误杀：daemon 重启时日志会被轮转（mv 成 .prev），新日志里
+        # 长连接状态要过几秒才出现。若 probe 恰好落在重启后那一瞬，
+        # 会看到"还没有状态"而误判入站已坏 —— 那是**自愈刚完成**，不是故障。
+        # 所以判 0 之前先等一等（最多 3×2s），仍没有才认定断开。
+        local ws_state ws_ok=0 i
+        for i in 1 2 3; do
+          ws_state=$(grep -oE '飞书长连接(已建立（事件订阅就绪）|已恢复|断开，重连中…|错误：[^ ]*)' "$DOTD_LOG" 2>/dev/null | tail -1)
+          case "$ws_state" in
+            *已建立*|*已恢复*) ws_ok=1; break ;;
+            *断开*|*错误*) : ;;    # 明确的坏状态，也再等一轮看会不会恢复
+            *) : ;;                 # 还没有状态（刚启动），等
+          esac
+          [ "$i" -lt 3 ] && sleep 2
+        done
+        WS_OK=$ws_ok
         [ "$WS_OK" = "1" ] || ok=0
         # 记下这轮到底考了什么，报告里能看出覆盖
         PROBE_SLOT=$slot; PROBE_WANT=$want
