@@ -186,7 +186,13 @@ echo ""
 echo "════════ 汇总 ════════"
 node -e '
 const fs=require("fs");
-const ls=fs.readFileSync(process.env.RESULTS,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+// 逐行解析，坏行跳过（与 soak.sh 同步修）：一行残缺不该毁掉整份验收证据
+const ls=[]; let bad=0;
+for(const ln of fs.readFileSync(process.env.RESULTS,"utf8").split("\n")){
+  if(!ln.trim()) continue;
+  try{ ls.push(JSON.parse(ln)); }catch{ bad++; }
+}
+if(bad) console.log(`⚠ ${bad} 行残缺，已跳过`);
 const total=ls.length, pass=ls.filter(r=>r.pass).length;
 for (const r of ls) console.log((r.pass?"✔":"✖"), r.id.padEnd(18), String(r.secs+"s").padStart(5), r.name);
 console.log("");

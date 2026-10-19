@@ -19,6 +19,16 @@ OUTDIR=/root/dotd/docs/acceptance
 mkdir -p "$OUTDIR"
 RESULTS="$OUTDIR/results.jsonl"
 export RESULTS
+# **不要每次运行都清空历史**（2026-10-19 修）：原来是 `: > "$RESULTS"`，
+# 于是"只跑 1 个场景"会把之前 20 个场景的证据全部抹掉 ——
+# 实测就发生过：S3 记录 20/20，但 results.jsonl 只剩 1 行（最后那次单场景重跑）。
+# 判据要求"20 条场景成功率 ≥95%"，证据必须留下来。
+# 改为归档上一次的完整结果，再开新文件；`KEEP_HISTORY=1` 时可追加。
+ARCHIVE="$OUTDIR/results.$(date +%Y%m%d-%H%M%S).jsonl"
+if [ -s "$RESULTS" ]; then
+  cp "$RESULTS" "$ARCHIVE"
+  echo "已归档上一轮结果：$ARCHIVE"
+fi
 : > "$RESULTS"
 
 ONLY=("$@")
