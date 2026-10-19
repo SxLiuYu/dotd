@@ -28,6 +28,18 @@ PID_DAEMON() { pgrep -f 'src/daemon.ts' | head -1; }
 do_sample() {
   local pid rss_kb fd n_threads cont db_kb ts
   ts=$(date +%s)
+  # **同一秒不要重复落盘**（2026-10-19 补）：date +%s 只有秒精度，
+  # 手工连跑两次 sample、或 cron 与手工调用撞上，会写出两行完全相同的记录。
+  # 真实发生在我自己测试时（连跑两次 sample，两行 ts 都是 1792417117），
+  # 虽然 report 现在会按 ts 去重，但**别让脏数据进文件**更干净。
+  if [ -n "${SOAK:-}" ] && [ -s "$SOAK" ]; then
+    local last_ts
+    last_ts=$(tail -1 "$SOAK" 2>/dev/null | grep -o '"ts":[0-9]*' | head -1 | cut -d: -f2)
+    if [ "$last_ts" = "$ts" ]; then
+      echo "sample: 同一秒已有记录（ts=$ts），跳过避免重复"
+      return 0
+    fi
+  fi
   pid=$(PID_DAEMON)
   if [ -z "$pid" ]; then
     node -e 'const fs=require("fs");fs.appendFileSync(process.env.SOAK, JSON.stringify({ts:Number(process.argv[1]),alive:false})+"\n")' "$ts"
