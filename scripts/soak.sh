@@ -417,7 +417,20 @@ const raw=deduped.slice().sort((a,b)=>a.ts-b.ts);
 const legacy=raw.filter(s=>s.proc_start===undefined||s.pid===undefined);
 const all=raw.filter(s=>s.proc_start!==undefined&&s.pid!==undefined);
 if(!all.length){
-  console.log("还没有可用于判据的样本（无 pid 的历史样本 "+legacy.length+" 条已忽略）");
+  // **"没开始采样" 和 "采了 N 天但服务全程不在" 是两件完全不同的事**（2026-10-20 修）。
+  //
+  // 现场：造「7 天里 daemon 从第一天起就死着、cron 每 30 分钟记 alive=false」的数据 ——
+  // 判红是对的（exit 1），但**理由是错的**：
+  //   原来只说「还没有可用于判据的样本（无 pid 的历史样本 0 条已忽略）」
+  // 主人看到这句会去查「为什么没采样」，而真相是「采了 336 次，每次都发现 daemon 不在」。
+  // 前者是"还没开始"，后者是"跑了 7 天、7 天全瘫" —— 处置完全不同。
+  // 所以这里必须把 alive=false 的条数说出来。
+  if(deadSamples.length){
+    console.log(`❌ 没有任何"服务在跑"的样本，但有 ${deadSamples.length} 个采样点记录到 **daemon 不在跑**`+
+      `（约 ${(deadSamples.length*0.5).toFixed(1)} 小时）：这不是"还没开始采样"，是**这段时间服务全程不可用**。`);
+  } else {
+    console.log("还没有可用于判据的样本（无 pid 的历史样本 "+legacy.length+" 条已忽略）");
+  }
   process.exit(1);
 }
 

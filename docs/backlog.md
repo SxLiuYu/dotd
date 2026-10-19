@@ -87,4 +87,6 @@
 
 | 2026-10-20 | S6 窗口期审计 | **系统性核对"判据链完整性"**：一次性检查 13 个 `*Ok` 判据变量是否都真的影响 `process.exit`。结果：`contDownOk`/`contOkDownOk`/`contOkRateOk`/`contOkTailOk`/`contTailOk`/`passOk` 直接进 `process.exit`；`deadOk`/`failRunOk`/`probeCoverageOk`/`probeDensityOk`/`secsOk`/`slotOk`/`tailOk` 经 `passOk` 汇入。**13/13 全部有归属，无遗漏** | 无（判据链完整） | 这条审计本身留作下次改动后的复查清单：**加判据后必须确认它进了 `process.exit`**，否则等于没写（第⑩类 bug） |
 
-| 2026-10-20 | S1 复核 | `npm test` 偶发 1 个失败：`超时：server 卡住时按 timeoutMs 断开并报 mcp_timeout`（约 420ms 就报失败）。连跑 3 次复测 **1579/1579 全过**。该用例依赖真实时序（等一个"卡住的 server"按 timeoutMs 断），在高负载/慢盘偶发早退；本轮改动只有 `.gitignore`/文档/`soak.sh`，与 mcp 无交集 | 无（偶发，非回归） | 若能稳定复现，把该用例的 `timeoutMs` 调大或改为可控假时钟；当前记录在案，不修 |
+| 2026-10-20 | S6 判据 | **`negativeSpan` 是死判据**。`const negativeSpan = spanDays < 0`，而 `spanDays=(last.ts-first.ts)/86400`，`first`/`last` 取自已按 `ts` 排序的 `all`，所以 `spanDays` 恒 ≥0、`negativeSpan` 恒 false。它是在 round 40 修"同一份数据换顺序结论相反"时加的，排序修好后自己就失效了。**实测**：造「最后一条比第一条早 24 小时」的数据，报告打印 `首尾样本跨 1.52 天`（正数），判红实际靠的是 `hasFuture` + `hasGap`。**不影响正确性**，但留着会让人误以为"时间倒流已被覆盖"。删或改成"检查文件原始写入顺序是否倒流"都可以，后者价值不大——NTP 回拨和手工改文件在排序后都无害，真正要防的时钟跳变已被 `hasFuture` 覆盖。 |
+| 2026-10-20 | S6 环境 | 已一次性排查完，**都不是问题**，记下来免得下轮重查：`cron` `enabled`+`active`（systemd 拉起，`dotd-boot.sh` 不用管）；`day0` 存 epoch 不受时区影响；容器 `RestartPolicy=no` 但 watchdog 有 `docker start`+fleet 重建（r44 实测）；全系统无 `docker prune`；`unattended-upgrades` 的 `Automatic-Reboot` 默认 false 且无 `reboot-required`；磁盘 892G 空闲；db 17.8MB 且 `mem_messages`/`tasks` 有 `task_id`/`status` 索引，热路径不全表扫；`soak.sh` 第 18 行 `cd /root/dotd`，`env -i PATH=/usr/bin:/bin` 下 sample 正常。 |
+
