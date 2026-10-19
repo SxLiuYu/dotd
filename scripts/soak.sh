@@ -1106,11 +1106,30 @@ c.push(peakGrowth<PEAK_GROWTH_LIMIT
 if(medSegRate===null && segRates.length>0 && days>=7)
   c.push(`⚠ **RSS 段内爬升：证据不足，现在不判定**（只有 ${segRates.length} 段、都不到 2 小时）：`+
          `不判死也不打勾 —— 全窗口峰值增长那条判据仍然有效，能兜住总量`);
-if(medSegRate!==null){
+// **单段时不能用这条判据拦人**（2026-10-20 修，真缺陷）：
+// 这条判据的**目的**是抓"靠重启把泄漏洗白"——`medSegRate` 算的是**各生命周期**
+// 爬升率的中位数，它只有在**有多个生命周期**（即真的重启过）时才有意义。
+// 但在"pid 全程没变、整个窗口就 1 段"时：
+//   · 报告会打印"**每个**生命周期内 RSS 都在爬升"——可只有 1 个，谈不上"每个"，
+//     这句话本身就是错的；
+//   · 更要命的是**单段斜率分不清"预热/分配器扩容"和"泄漏"**。
+//     本轮实测：daemon 的 RSS 是**阶梯式**涨（涨一级 → 持平 80~100 秒 → 再涨一级），
+//     独立复现实验（1 次/秒 db.prepare()，280 秒）也是同样形状、总共只涨 2.2MB。
+//     一个 1.1 小时的窗口恰好覆盖"涨一级"，斜率就是正的且很大 → 判 ❌。
+//     这正是第 29 轮踩过两次的同一个坑（预热被当泄漏）。
+// 而"没有重启"的时候，根本不存在"重启洗白"这回事，
+// 总量由**全窗口峰值增长**那条判据（直读判据原文的 50MB、与重启无关）负责兜。
+// 所以：只有真的有多段（≥2）时才让这条参与拦截。
+const segCanFail = segRates.length >= 2;
+if(medSegRate!==null && segCanFail){
   c.push(medSegRate<SEG_RATE_LIMIT
-    ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h）`
-    : `❌ **每个生命周期内 RSS 都在爬升**（中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
+    ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h，${segRates.length} 段）`
+    : `❌ **每次重启后的生命周期都在爬升**（${segRates.length} 段，中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
       `重启只是把泄漏截断，不是没漏`);
+}else if(medSegRate!==null){
+  c.push(`⚠ **RSS 段内爬升：只有 ${segRates.length} 段（全程没重启），这条不参与判定**`+
+         `（实测 ${medSegRate.toFixed(2)}MB/h=参考值）：单段斜率分不清"预热/分配器扩容"和"泄漏"——`+
+         `RSS 阶梯式涨（涨一级→持平→再涨）时短窗口斜率天然为正。总量看上面的"全窗口峰值增长"`);
 }
 if(sampleRate!==null){
   c.push(sampleRate>=SAMPLE_RATE_LIMIT
@@ -1139,7 +1158,7 @@ const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCov
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
-  && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
+  && passOk && (medSegRate===null||segRates.length<2||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
   && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture ? 0 : 1);'
