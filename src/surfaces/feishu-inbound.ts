@@ -137,6 +137,15 @@ export function classifyFeishuInbound(
       text = '';
     }
     const msgType = typeof message['message_type'] === 'string' ? (message['message_type'] as string) : '';
+
+    // **富文本消息（post）**（2026-10-19 实测补）：主人在飞书里发带格式的消息
+    // （加粗、链接、分段、标题）走的是 post 类型，content 里**没有** text 字段，
+    // 而是一个 {zh_cn: {title, content: [[{tag,text,href}...]]}} 结构。
+    // 原来一律落进 ignore —— 主人发了一段排版好的话，bot 当没看见。
+    // 这里把它拍平成纯文本（保留标题、段落分隔、链接 href）。
+    if (msgType === 'post' && text.length === 0) {
+      text = flattenPostContent(String(message['content'] ?? ''));
+    }
     if (senderType === 'app' || senderType === 'bot') {
       return { kind: 'ignore', reason: 'bot_echo', detail: '机器人自身消息（防回环）', eventId };
     }
@@ -199,7 +208,13 @@ export function classifyFeishuInbound(
         // 落到下面的 ignore
       }
     }
-    if (text.length === 0 || (msgType.length > 0 && msgType !== 'text')) {
+    // 只有「文本」与「已拍平的富文本」算可执行消息；其余类型（图片/文件在各自分支已返回）
+    // 仍然 ack 不建任务，防 §6 匹配器误建。
+    //
+    // 2026-10-19：这里原来写的是 `msgType !== 'text'`，把 post 也排除了 ——
+    // 于是上面刚拍平好的富文本又被这条判断丢掉（改完测试仍 ignore，查了半天）。
+    const textLike = msgType === 'text' || msgType === 'post' || msgType.length === 0;
+    if (text.length === 0 || !textLike) {
       // 空文本/非文本消息：ack 不建任务、不进事件管线（防 §6 匹配器误建任务）
       const why = msgType === 'image'
         ? '图片消息但取不到 image_key'
@@ -232,6 +247,72 @@ function safeEqual(a: string, b: string): boolean {
   const ha = createHash('sha256').update(a).digest();
   const hb = createHash('sha256').update(b).digest();
   return timingSafeEqual(ha, hb);
+}
+
+/**
+ * 飞书富文本（post）content → 纯文本（2026-10-19）。
+ *
+ * 飞书的 post 消息结构：
+ * ```json
+ * { "zh_cn": { "title": "标题",
+ *              "content": [[{"tag":"text","text":"段落一"}],
+ *                          [{"tag":"a","text":"链接","href":"https://…"}]] } }
+ * ```
+ * `content` 是「段落数组」，每段是「行内元素数组」。行内 tag 有 text / a / at / img 等。
+ *
+ * 拍平规则（尽量不丢信息，也不引入噪音）：
+ *  - 标题单独一行（如果非空）
+ *  - 每段一行；行内元素按顺序拼接
+ *  - `a` 元素拼成 `文字(url)`（保留可点击信息，否则链接就丢了）
+ *  - `at` 拼成 `@名字`；`img` 拼成 `[图片]`（真实图片下载不在这个函数里）
+ *  - 未知 tag 若有 text 就取 text，否则跳过
+ *
+ * 任何解析失败都返回空串（调用方按"文本为空"处理），绝不抛。
+ */
+export function flattenPostContent(contentJson: string): string {
+  try {
+    const root = JSON.parse(contentJson) as Record<string, unknown>;
+    // 优先中文，退回第一个语言键（飞书可能返回 en_us 等）
+    const payload =
+      (root['zh_cn'] as Record<string, unknown> | undefined) ??
+      (Object.values(root).find((v) => v !== null && typeof v === 'object') as
+        | Record<string, unknown>
+        | undefined);
+    if (payload === undefined) return '';
+
+    const lines: string[] = [];
+    const title = typeof payload['title'] === 'string' ? payload['title'].trim() : '';
+    if (title.length > 0) lines.push(title);
+
+    const paragraphs = payload['content'];
+    if (Array.isArray(paragraphs)) {
+      for (const para of paragraphs) {
+        if (!Array.isArray(para)) continue;
+        const parts: string[] = [];
+        for (const el of para) {
+          if (el === null || typeof el !== 'object') continue;
+          const node = el as Record<string, unknown>;
+          const tag = typeof node['tag'] === 'string' ? (node['tag'] as string) : '';
+          const body = typeof node['text'] === 'string' ? (node['text'] as string) : '';
+          if (tag === 'a') {
+            const href = typeof node['href'] === 'string' ? (node['href'] as string) : '';
+            parts.push(href.length > 0 ? `${body}(${href})` : body);
+          } else if (tag === 'at') {
+            parts.push(body.length > 0 ? `@${body}` : '@某人');
+          } else if (tag === 'img') {
+            parts.push('[图片]');
+          } else {
+            parts.push(body);
+          }
+        }
+        const line = parts.join('').trim();
+        if (line.length > 0) lines.push(line);
+      }
+    }
+    return lines.join('\n').trim();
+  } catch {
+    return '';
+  }
 }
 
 // ── Encrypt Key 解密（可选；URL 配了 Encrypt Key 时体为 {encrypt: base64}）──

@@ -4817,3 +4817,55 @@ SQLite 连接: 3 个  ← 正常
 
 `toolCallCounts` 已随任务终态释放 · 内存/句柄审计无其它异常 ·
 **`npm test` 1539/1539**（+2 条守卫：三组缓存都要清、按 taskId 声明的缓存不许漏）
+
+---
+
+# 第六十八轮：飞书富文本消息被静默丢弃（2026-10-19）
+
+## 336. 测了你实际会发的消息类型
+
+| 类型 | 结果 |
+|---|---|
+| text 纯文本 | ✅ 正常 |
+| **post 富文本** | ❌ **被丢弃** |
+| image / file | ✅ 正常（前几轮补的） |
+| audio / media / sticker | ignore（暂不支持，合理） |
+
+**富文本是最容易踩的**：你在飞书里发带加粗、链接、分段的排版消息，走的就是 `post` 类型，
+content 里**没有 text 字段**，而是一个 `{zh_cn:{title, content:[[{tag,text,href}]]}}` 结构。
+原代码只认 `parsed.text`，于是这类消息一律落进 `ignore(non_text)` —— **bot 当没看见**。
+
+## 337. 修复踩了两个坑
+
+**坑①**：写了 `flattenPostContent` 把富文本拍平，测试还是 ignore。
+查了半天才发现下游还有一道判断：
+
+```ts
+if (text.length === 0 || (msgType.length > 0 && msgType !== 'text')) {  // post !== 'text'
+```
+拍平好的文本又被这条丢掉了。改成 `textLike = text || post || 无类型`。
+
+**坑②**：测试脚本自己的签名传错了（把 cfg 塞进第三个参数），
+导致连纯文本都被 `allowlist` 拒 —— **浪费了一轮排查**。
+测试脚本写错比代码写错更难发现，因为它给出的"证据"是错的。
+
+## 338. flattenPostContent 的规则
+
+```
+{zh_cn:{title:"项目进度", content:[[{tag:"text",text:"完成了"}],
+                                  [{tag:"a",text:"文档",href:"https://e.com"}]]}}
+       ↓
+"项目进度\n完成了\n文档(https://e.com)"
+```
+
+- 标题单独一行
+- `content` 是段落数组，每段一行
+- `a` → `文字(url)`（保留可点击信息，否则链接就丢了）
+- `at` → `@名字`；`img` → `[图片]`
+- 语言键优先 `zh_cn`，否则取第一个（`en_us` 等）
+- 坏 JSON / 空结构 → 空串，绝不抛
+
+## 339. 本轮门禁
+
+富文本端到端识别 OK · 纯文本行为不变 · 不支持的类型仍合理忽略 ·
+**`npm test` 1546/1546**（+7 条守卫：5 个 flatten 用例 + post 识别 + 纯文本回归）
