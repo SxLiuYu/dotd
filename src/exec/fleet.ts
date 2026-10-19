@@ -319,6 +319,20 @@ export class Fleet {
     this.memTokens.set(dotId, token);
   }
 
+  /**
+   * **清掉 token 缓存**（2026-10-19 修）。
+   *
+   * 现场：容器重建后容器内会生成新 token，而 memTokens 里还是旧值 ——
+   * currentToken 优先返回缓存，于是探活用旧 token 去打新容器，一直 401。
+   * 症状是**探活在成功/失败之间反复横跳**（日志里 "连续失败→unhealthy"
+   * 和 "恢复→ready" 交替出现），而容器其实是好的。
+   *
+   * 调用时机：探活失败时先清缓存重读一次；容器 recreate/接管后也清。
+   */
+  invalidateToken(dotId: string): void {
+    this.memTokens.delete(dotId);
+  }
+
   // ── degraded 闸门（§2.2）─────────────────────────────────────────
 
   /** docker 不可用：置位 + 发事件（S6：持续 >5min 由求救模块按 since 判定）。 */

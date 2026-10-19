@@ -1372,6 +1372,26 @@ export class ExecServiceImpl implements ExecService {
       return { ok: true, state: this.fleet.getContainer(dotId)?.state ?? 'unknown' };
     }
 
+    // **探活失败先怀疑 token 过期**（2026-10-19 修）：
+    // 容器重建后 token 会变，而 fleet 的 memTokens 缓存没有失效机制，
+    // 于是拿旧 token 打新容器 → 永久 401 → 探活判定 unhealthy，但容器其实是好的。
+    // 症状是探活在成功/失败之间反复横跳。这里清缓存重读一次再判。
+    this.fleet.invalidateToken(dotId);
+    const retryOk = await this.probeHealth(dotId);
+    if (retryOk) {
+      this.healthFailStreak.delete(dotId);
+      if (row.state === 'unhealthy') {
+        try {
+          this.fleet.transition(dotId, 'booting', { reason: 'periodic healthcheck 恢复(token 已刷新)' });
+          this.fleet.transition(dotId, 'ready', { reason: 'periodic healthcheck 恢复(token 已刷新)' });
+          console.error('[exec] 容器探活恢复（token 缓存已刷新）：unhealthy → booting → ready');
+        } catch (err) {
+          console.error(`[exec] 探活恢复被状态机拒绝：${String(err)}`);
+        }
+      }
+      return { ok: true, state: this.fleet.getContainer(dotId)?.state ?? 'unknown' };
+    }
+
     const streak = (this.healthFailStreak.get(dotId) ?? 0) + 1;
     this.healthFailStreak.set(dotId, streak);
     // 连续 3 次失败才判 unhealthy（与 boot 期判据一致：EX §4.1）

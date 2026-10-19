@@ -4685,3 +4685,79 @@ docker start
 ## 325. 本轮门禁
 
 状态纠正 + 自愈全链路实测通过 · **`npm test` 1535/1535**（+3 条守卫）
+
+---
+
+# 第六十六轮：探活在成功/失败之间反复横跳（2026-10-19）
+
+## 326. 上轮的自愈，还有一个隐藏故障
+
+上轮加了周期探活，实测能纠正状态、能自愈。但继续测发现：
+
+```
+容器进程: Up 21 seconds      ← 容器在跑
+数据库 state: unhealthy       ← 但状态没恢复
+任务: fs.list failed，回答"容器是 unhealthy 状态"
+```
+
+查日志：
+
+```
+[exec] 容器探活连续失败 3 次：ready → unhealthy
+[exec] 容器探活恢复：unhealthy → booting → ready
+[exec] 容器探活连续失败 3 次：ready → unhealthy
+[exec] 容器探活恢复：unhealthy → booting → ready
+```
+
+**在成功和失败之间反复横跳。**
+
+## 327. 根因：token 缓存只写不删
+
+```
+数据库 endpoint: 172.21.0.2    ← 正确
+容器实际 IP:     172.21.0.2    ← 一致（不是网络问题）
+healthz 无 token: HTTP 401     ← 容器活着，只是鉴权失败
+```
+
+`Fleet.currentToken()` 的实现：
+
+```ts
+const cached = this.memTokens.get(dotId);
+if (cached !== undefined) return cached;   // ← 永远优先返回缓存
+```
+
+**容器重建后容器内生成新 token，而缓存里是旧的，且从来没人清。**
+于是探活拿旧 token 打新容器，永久 401 —— 但容器其实是好的。
+
+## 328. 修法：加失效入口 + 失败时重试一次
+
+```ts
+invalidateToken(dotId: string): void {
+  this.memTokens.delete(dotId);
+}
+```
+
+探活失败时先清缓存重读一次，再判定状态。
+
+## 329. 实测
+
+```
+状态: 90 秒内一直是 ready（之前反复横跳）
+任务: fs.list succeeded
+回答: home 根目录下共 15 项：6 个文件、9 个目录……
+```
+
+## 330. 这一轮的教训
+
+**"缓存"是可靠性问题的常见来源，尤其是"对象会变但缓存不知道"的时候。**
+
+这个缓存本身设计没错（避免每次都读文件），错在**没有失效路径**——
+容器重建是明确的"对象变了"的时刻，但代码里没有任何地方通知缓存。
+
+判断标准：**如果一个缓存的值依赖某个会变化的外部对象，
+就必须有"该对象变了"的清缓存入口。**
+
+## 331. 本轮门禁
+
+状态稳定 90s 不跳 · 任务正常执行 · **`npm test` 1537/1537**（+2 条守卫：
+invalidateToken 存在且真的 delete、探活失败路径会清缓存重探）
