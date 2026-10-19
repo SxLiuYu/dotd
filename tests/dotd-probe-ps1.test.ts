@@ -96,3 +96,15 @@ test('Write-Log 用 AppendAllText 而不是 Add-Content（并发拉取时不被�
   assert.ok(/AppendAllText/.test(src), 'Write-Log 应使用 [IO.File]::AppendAllText');
   assert.ok(/catch\s*\{[\s\S]{0,200}?\}/.test(src.slice(src.indexOf('function Write-Log'), src.indexOf('function Write-Log') + 900)), 'Write-Log 内要有 try/catch 兜底');
 });
+test('探针必须有进程级互斥（防手动运行与计划任务并发自愈）', () => {
+  // 现场（2026-10-19）：10:12:40 与 10:13:16 两次自愈并发执行，
+  // 两个探针各自跑到 `wsl --shutdown`，互相把对方刚拉起的 WSL 关掉。
+  // 计划任务的 MultipleInstances=IgnoreNew 只挡"任务自己"，挡不住手动运行。
+  assert.ok(/System\.Threading\.Mutex/.test(src), '应用命名 Mutex 做进程级互斥');
+  assert.ok(/dotd-probe-singleton/.test(src), 'Mutex 名应固定为 dotd-probe-singleton');
+  assert.ok(
+    /if\s*\(\s*-not\s+\$acquired\s*\)\s*\{\s*exit\s+0\s*\}/.test(src),
+    '拿不到锁应静默退出（不算失败、不写日志）',
+  );
+  assert.ok(/AbandonedMutexException/.test(src), '要处理上一个持有者崩溃留下的 Mutex');
+});

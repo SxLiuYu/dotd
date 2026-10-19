@@ -3025,3 +3025,57 @@ try {
 
 探针抓到真实 WSL 卡死并自愈（66s）· 心跳正常每分钟留痕 · **`npm test` 1508/1508**
 （+3 条守卫：CRLF 换行、心跳存在、AppendAllText）
+
+---
+
+# 第四十轮：并发自愈会互相打架（2026-10-19）
+
+## 184. 从日志里发现的模式
+
+翻探针日志，看到这两行挨得很近：
+
+```
+10:12:40  self-heal: restarting daemon
+10:12:40  WSL unresponsive; wsl --shutdown then restart
+10:13:16  self-heal: restarting daemon        ← 又来一次
+10:13:16  WSL unresponsive; wsl --shutdown then restart
+10:15:40  self-heal OK (82s)
+10:15:40  self-heal OK (66s)                  ← 两个都在报"成功"
+```
+
+**两个探针实例同时在修**。它们各自跑到 `wsl --shutdown`，结果互相把对方刚拉起来的 WSL 又关掉 ——
+所以两个都耗了 60~80 秒才"成功"，实际上是互相拖累。
+
+## 185. 为什么计划任务的防并发没挡住
+
+计划任务确实配了 `MultipleInstances=IgnoreNew`。但那个**只挡"任务自己"的并发** ——
+我在手动排查时也会直接跑 `dotd-probe.ps1`，这条路径不受计划任务约束。
+
+而自愈本身要 60–80 秒，超过 1 分钟的触发间隔，所以很容易撞上。
+
+## 186. 修法：进程级命名 Mutex
+
+```
+$mutexName = 'Global\dotd-probe-singleton'
+```
+
+- 拿不到锁 → **静默 exit 0**（不算失败、不写日志，避免刷屏）
+- 处理 `AbandonedMutexException`（上一个持有者崩了要能接管）
+
+这挡的是**所有来源**：计划任务、手动运行、别的脚本调用。
+
+## 187. 实测
+
+**并发防护**：同时启动 5 个探针 →
+
+```
+日志里只有 1 条完整检查序列
+daemon 被正确恢复（OK）
+没有出现互相打断
+```
+
+**单实例防护**：同时启动 3 个探针 → `probe started` 只出现 1 次。
+
+## 188. 本轮门禁
+
+并发自愈实测通过 · **`npm test` 1509/1509**（+1 条互斥守卫）· daemon/飞书/容器正常

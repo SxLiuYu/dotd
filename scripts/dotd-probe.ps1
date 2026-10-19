@@ -1,7 +1,23 @@
 param(
     [int]$LoopSeconds = 0,
     [string]$LogPath = "$env:TEMP\dotd-probe.log"
+
 )
+
+# 互斥：计划任务每分钟拉起一个探针，而自愈本身可能耗时 60-80 秒；
+# 手动排查时又可能同时跑一遍 -> 两个探针同时执行 wsl --shutdown，
+# 互相把对方刚拉起的 WSL 关掉。2026-10-19 实测到过（10:12:40 与 10:13:16 并发）。
+# 计划任务的 MultipleInstances=IgnoreNew 只挡"任务自己"，挡不住手动运行。
+$mutexName = 'Global\dotd-probe-singleton'
+$mutex = New-Object System.Threading.Mutex($false, $mutexName)
+$acquired = $false
+try {
+    $acquired = $mutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $acquired = $true
+}
+if (-not $acquired) { exit 0 }
+
 $ErrorActionPreference = 'Continue'
 $StateDir = Join-Path $env:TEMP 'dotd-probe-state'
 if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
