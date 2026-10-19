@@ -421,6 +421,26 @@ const passRate=probesVerified.length? probesVerified.filter(p=>p.ok).length/prob
 // 判据取"容器在线的采样点占比"，容忍 <5% 的短暂抖动（重建/重启几秒属正常）。
 const contRate=all.length? all.filter(s=>Number(s.container_up)===1).length/all.length : null;
 const contDown=all.filter(s=>Number(s.container_up)!==1);
+// **容器在线率也不能只看全窗口平均**（2026-10-19 补，与末尾成功率/不可用时长同一个病根）：
+// 合成数据实测：最后 6 小时容器全挂（10 个采样点 container_up=0），
+// 全窗口平均仍有 97.4% ≥95% → exit 0。
+// 交付出去的成品此刻是坏的，判据还在说"容器在线率 ≥95%"。
+// 补两条：
+//   ① 末尾窗口在线率（最后 12 个采样点 = 6 小时；
+//      cron 每 30 分钟一个，12 个 = 6 小时，正好兜住"最近坏掉"）
+//   ② 连续离线时长（最长的连续 container_up!=1 段）
+const CONT_TAIL_N=12;
+const contTail=all.slice(-CONT_TAIL_N);
+const contTailRate=contTail.length? contTail.filter(s=>Number(s.container_up)===1).length/contTail.length : null;
+const contTailOk=!(days>=7 && contTailRate!==null && contTailRate<0.75);
+// 最长连续离线时长（按采样点间隔 30 分钟估）
+let maxContDownSec=0, curDownStart=null;
+for(const s of all){
+  if(Number(s.container_up)!==1){ if(curDownStart===null) curDownStart=s.ts; maxContDownSec=Math.max(maxContDownSec, s.ts-curDownStart+1800); }
+  else curDownStart=null;
+}
+const CONT_DOWN_LIMIT_SEC=2*3600;   // 和"服务不可用≤2h"同一个口径
+const contDownOk=maxContDownSec<=CONT_DOWN_LIMIT_SEC;
 
 // 生命周期 = 一个 daemon 进程从生到死。>1 说明期间重启过 ——
 // "连续 7 天不干预"必须把这件事显式说出来，否则报告在撒谎。
@@ -731,6 +751,15 @@ if(passRate!==null){
   }
 }
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
+if(days>=7 && contTailRate!==null){
+  c.push(contTailOk
+    ? `✅ 末尾 ${contTail.length} 个采样点容器在线率 ${(contTailRate*100).toFixed(0)}%（判据 ≥75%，看"最近 6 小时"）`
+    : `❌ **末尾 ${contTail.length} 个采样点容器在线率只有 ${(contTailRate*100).toFixed(0)}%**（判据 ≥75%）：`+
+      `全窗口平均 ${(contRate*100).toFixed(1)}% 掩盖了最近坏掉 —— 交付出去的成品此刻不能用`);
+}
+c.push(contDownOk
+  ? `✅ 容器最长连续离线 ${(maxContDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h，与"服务不可用"同口径）`
+  : `❌ **容器最长连续离线 ${(maxContDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）`);
 c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
   : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
@@ -767,7 +796,7 @@ console.log("\n判定：" + c.join("；"));
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
-  && unattended.length===0 && (contRate===null||contRate>=0.95)
+  && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
