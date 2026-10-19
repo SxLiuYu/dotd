@@ -154,9 +154,13 @@ process.stdout.write(r ? String(r.ok) : ""); db.close();' "$tid")
 const fs=require("fs");
 const o={ts:Number(process.argv[1]),kind:"probe",ok:process.argv[2]==="1",
   taskId:process.argv[3]||"",status:process.argv[4]||"",secs:Number(process.argv[5]),
-  slot:process.argv[6],want:process.argv[7]};
+  slot:process.argv[6],want:process.argv[7],
+  // **把两个子判据分别记下来**（2026-10-19 补）：ok 是"答对 且 发到飞书"的合成结果，
+  // 只存 ok 的话，7 天里某次失败事后完全分不清是"模型答错了"还是"飞书没发出去"，
+  // 而这两种的处置完全不同。7 天要跑 168 小时，出问题必须能事后归因。
+  out:process.argv[8]||""};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}"
+    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}" "${OUT_OK:-}"
   echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} 飞书出站=${OUT_OK:-?} secs=$(( $(date +%s) - t0 ))"
 }
 
@@ -411,7 +415,16 @@ if(unattended.length){
 } else if(restartRows.length){
   c.push(`✅ 期间重启 ${restartRows.length} 次，**全部是 watchdog 自愈**（无人干预，符合判据）`);
 }
-if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
+if(passRate!==null){
+  if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
+  else {
+    // 失败要能归因：答错 vs 飞书没发出去
+    const bad=probes.filter(p=>!p.ok);
+    const noOut=bad.filter(p=>p.out!==undefined && String(p.out)!=="1").length;
+    c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败：`+
+           `${noOut} 次飞书未送达 / ${bad.length-noOut} 次未答对或未完成）`);
+  }
+}
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
 if(medSegRate!==null){
   c.push(medSegRate<SEG_RATE_LIMIT
