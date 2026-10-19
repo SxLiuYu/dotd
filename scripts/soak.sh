@@ -1576,13 +1576,34 @@ if(medSegRate===null && segRates.length>0 && days>=7)
 // 而"没有重启"的时候，根本不存在"重启洗白"这回事，
 // 总量由**全窗口峰值增长**那条判据（直读判据原文的 50MB、与重启无关）负责兜。
 // 所以：只有真的有多段（≥2）时才让这条参与拦截。
+// **泄漏不能只看中位数：一段在漏，其余干净，中位就会把它洗白**（2026-10-20 修）。
+//
+// 现场（合成数据，实测 `exit 0`、报告全绿）：
+//   3 段生命周期，前两段 RSS 稳稳 200MB（速率 0），第三段 3MB/h 在爬。
+//   中位 = med([0, 0, 3]) = **0** → 「各生命周期内 RSS 无明显爬升」。
+//   同时全窗口峰值只涨了 22.5MB（因为第三段只有 8 小时）< 50MB → 也绿。
+//   两条判据同时漏，报告说"没有泄漏"，`exit 0`。
+//
+// 而 `maxSegRate` **早就算出来了**（L1136），却只出现在打印语句里，
+// 从没进过 `process.exit` —— 又是第⑤类（采集了却没用）叠第⑩类（不改退出码就等于不存在）。
+//
+// 为什么该用"任一段"而不是"中位"：
+// 泄漏的本质是"跑得越久、漏得越多"，**一个生命周期在漏就是真在漏**，
+// 不会因为别的生命周期是干净的就不算。中位数在这里是错的统计量 ——
+// 它默认"多数段的行为代表整体"，而故障恰恰是少数段的事。
+// （对照：`peakGrowth` 管总量、`segRate` 管趋势，两者都不该被"多数正常"稀释。）
+//
+// 保留中位值一起打印，因为"多数段正常、只有一段漏"和"段段都在漏"
+// 是两种不同的病，看一眼中位能立刻区分。
 const segCanFail = segRates.length >= 2;
+const segTooMany = segRates.filter(r=>r>=SEG_RATE_LIMIT).length;
 if(medSegRate!==null && segCanFail){
-  c.push(medSegRate<SEG_RATE_LIMIT
-    ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h，${segRates.length} 段）`
-    : `❌ **每次重启后的生命周期都在爬升**（${segRates.length} 段，中位 ${medSegRate.toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}）：`+
+  c.push(segTooMany===0
+    ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h、最高 ${(maxSegRate===null?0:maxSegRate).toFixed(2)}MB/h，${segRates.length} 段）`
+    : `❌ **${segTooMany}/${segRates.length} 段在爬升**（最高 ${(maxSegRate===null?0:maxSegRate).toFixed(2)}MB/h ≥${SEG_RATE_LIMIT}，中位 ${medSegRate.toFixed(2)}MB/h）：`+
       `重启只是把泄漏截断，不是没漏`);
-}else if(medSegRate!==null){
+}
+if(medSegRate!==null && !segCanFail){
   c.push(`⚠ **RSS 段内爬升：只有 ${segRates.length} 段（全程没重启），这条不参与判定**`+
          `（实测 ${medSegRate.toFixed(2)}MB/h=参考值）：单段斜率分不清"预热/分配器扩容"和"泄漏"——`+
          `RSS 阶梯式涨（涨一级→持平→再涨）时短窗口斜率天然为正。总量看上面的"全窗口峰值增长"`);
@@ -1593,10 +1614,15 @@ if(sampleRate!==null){
     : `❌ **采样密度只有 ${(sampleRate*100).toFixed(0)}%**（${all.length} 次 / 应 ${Math.round(expectSamples)} 次）：`+
       `空档虽都在容忍内，但大部分时间没在观测`);
 }
+// 句柄侧与 RSS 同一个洞（2026-10-20 一并修）：`maxSegFdRate` 早就算出来了，
+// 却只出现在打印里，从没进过 `process.exit`。3 段里只有 1 段漏句柄时，
+// 中位会被另外两段拉回 0，报告说"无明显爬升"。理由与 RSS 完全一致 ——
+// 泄漏是"跑得越久漏得越多"，一个生命周期在漏就是真在漏。
+const fdSegTooMany = segFdRates.filter(r=>r>=SEG_FD_RATE_LIMIT).length;
 if(medSegFdRate!==null){
-  c.push(medSegFdRate<SEG_FD_RATE_LIMIT
-    ? `✅ 各生命周期内句柄无明显爬升（中位 ${medSegFdRate.toFixed(2)}个/h）`
-    : `❌ **每个生命周期内句柄都在爬升**（中位 ${medSegFdRate.toFixed(2)}个/h ≥${SEG_FD_RATE_LIMIT}）：`+
+  c.push(fdSegTooMany===0
+    ? `✅ 各生命周期内句柄无明显爬升（中位 ${medSegFdRate.toFixed(2)}个/h、最高 ${(maxSegFdRate===null?0:maxSegFdRate).toFixed(2)}个/h）`
+    : `❌ **${fdSegTooMany}/${segFdRates.length} 段在漏句柄**（最高 ${(maxSegFdRate===null?0:maxSegFdRate).toFixed(2)}个/h ≥${SEG_FD_RATE_LIMIT}，中位 ${medSegFdRate.toFixed(2)}个/h）：`+
       `重启只是把泄漏截断，不是没漏`);
 }
 console.log("\n判定：" + c.join("；"));
@@ -1648,8 +1674,8 @@ process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && g
   && !(days>=7 && contOkUnknown && contUpCapable)
   && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
   && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
-  && passOk && (medSegRate===null||segRates.length<2||medSegRate<SEG_RATE_LIMIT)
-  && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
+  && passOk && (medSegRate===null||segRates.length<2||segTooMany===0)
+  && (medSegFdRate===null||fdSegTooMany===0)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
   && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture
   // **sample 中途崩掉要有后果**（2026-10-20）：心跳里有"start 后无结局"，
