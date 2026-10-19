@@ -157,6 +157,8 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
   {
     name: 'shell.run',
     description:
+      '**动手前先想一句：我已造的工具里有没有能干这事的？** 有就先用 tool.invoke 调它，别用 shell 重写一遍。' +
+      '（已造工具清单在上下文里，或随时 tool.list 查。）' +
       '在容器里执行一条 bash 命令（`bash -c`，工作目录是 /dot/home，无 TTY），返回退出码与 stdout/stderr。' +
       '适合：grep 搜内容、按行截取大文件、统计/排序、批量处理、装在本机工具链里的命令行工具。' +
       '简单读一个文件用 fs.read 更快更省；fs.read 读不动的大文件、需要"按条件筛"时才用 shell。' +

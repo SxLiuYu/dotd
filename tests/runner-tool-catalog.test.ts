@@ -423,7 +423,10 @@ test('运行时：查 model 请求 messages —— [0] 是 system prompt，末�
   assert.equal(transport.requests.length, 2, '两轮模型请求');
   // 注：自 S2（2026-10-19）起，每个任务开头会自动查一次 tool.list 注入工具清单
   // （call_id 以 'inventory_' 开头）。那是系统内部行为，不算"模型发起的工具调用"。
-  const modelCalls = capsCalls.filter((c) => !c.call_id.startsWith('inventory_'));
+  // 系统内部的清单查询有两处：inventory_*（注入工具清单）、dynspec_*（动态注册自造工具）。
+  // 两者都不是模型发起的调用，一律排除。
+  const INTERNAL_PREFIXES = ['inventory_', 'dynspec_'];
+  const modelCalls = capsCalls.filter((c) => !INTERNAL_PREFIXES.some((pfx) => c.call_id.startsWith(pfx)));
   assert.equal(modelCalls.length, 2, '两个工具都真的执行了（不含系统注入的清单查询）');
 
   const req0 = transport.requests[0]!;

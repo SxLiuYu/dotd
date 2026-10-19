@@ -644,6 +644,9 @@ class RunContext {
    */
   toolInventoryNote: string | null = null;
 
+  /** TOOL-REUSE-GUARD：本任务是否已经提醒过一次"你有现成工具"（只提醒一次）。 */
+  toolReuseHinted = false;
+
   /** 任务目标：恒为最后一条 user 消息（§4.1 事件任务没有历史对话时它是唯一输入）。 */
   buildMessages(bundle: {
     memoryMd: string;
@@ -1093,10 +1096,17 @@ export class DotRunner {
       );
       this.log(`runner: 工具清单 ${task.id}：发现 ${usable.length} 个自造工具`);
       if (usable.length > 0) {
+        // 措辞刻意写成"指令"而不是"告知"：2026-10-19 实测，只写
+        // "（这些是以前造的，别重写）" 时模型照样手写 shell.run —— 它把这句当成背景信息。
+        // 改了三点：① 明确说"先检查"；② 给出具体调用格式；③ 说明什么时候才该新造。
         toolInventory =
-          '# 你已有的自造工具\n' +
+          '# 你已有的自造工具（动手前先看这份清单）\n' +
           usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
-          '\n\n（这些是以前造的，能直接 tool.invoke 用 —— 别重写一遍。）';
+          '\n' +
+          '\n**规则**：\n' +
+          '1. 上面有能干这活的 → 必须用 tool.invoke(name, args) 调它，**不要**用 shell.run 重写一遍；\n' +
+          '2. 没有但以后还会重复 → 用 tool.create 造一个（造完记得也 invoke 一次自测）；\n' +
+          '3. 只有一次性临时活、上面也没有对口的，才直接用 shell.run。';
       }
     } catch (err) {
       this.log(`runner: 工具清单注入失败 ${task.id}：${err instanceof Error ? err.message : String(err)}`);
@@ -1361,7 +1371,7 @@ export class DotRunner {
     //
     // 注意 `req` **两条路径共用同一份对象**：除 `stream` 标记外没有任何字段差异，
     // 这样"无总线时行为不变"是可对照的（tests/runner-stream.test.ts 断言了请求体）。
-    const tools = await this.toolSpecs();
+    const tools = await this.toolSpecs(task);
     // 先问"能不能流式"，再定请求体：`stream` 标记只在确实走流式时才出现（complete 请求逐字不变）。
     const useStream = this.useStream();
     // 多模态：在**投影之后**的 ChatMessage 数组上挂图片。
@@ -1650,9 +1660,80 @@ export class DotRunner {
    * （何时用/参数怎么填/返回什么/失败怎么读），参数行与当前 schema 求交，
    * 宿主/容器两份目录有差异时也不会教模型填一个不存在的字段。
    */
-  private async toolSpecs(): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
+  /**
+   * 模型可见的工具清单（S2(b)，2026-10-19）。
+   *
+   * **动态注册自造工具**：不只用 tool.invoke 这个泛用入口，还把 tools/<name>/ 里
+   * 每个自造工具**当成独立工具**塞进清单 —— 名字直接用 <name>，参数 schema 从
+   * manifest.params 生成。
+   *
+   * 为什么必须这么做（2026-10-19 定位的根因）：
+   *   早先只把工具清单作为**文本**注入上下文，模型必须自己完成
+   *   「看到文字说有 word-count → 想到要用 tool.invoke(name='word-count')」这个间接映射。
+   *   实测 deepseek-v4.1-flash / glm-5.3-flash / agnes-3.0-flash **三个模型全部失败**，
+   *   都选择用 shell.run 手写。三个不同厂商同时失败说明不是"模型不听话"，
+   *   而是**任务难度本身超纲**：间接映射比"从工具列表里选一个"难得多。
+   *
+   *   改成独立工具后，word-count 和 fs.read 在模型眼里是一类东西，选它不需要额外推理。
+   *
+   * 安全：动态工具**仍然走 tool.invoke 的实际执行路径**（这里只改"暴露方式"），
+   * 所以 tool.create / tool.invoke 的 dangerously 档审批约束一字不动 —— 模型能"看见"
+   * 这些工具，但真正执行时治理层照常拦。
+   */
+  private async toolSpecs(task: Task): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
     const caps = await this.getCapabilities();
-    return buildToolSpecs(caps);
+    const base = buildToolSpecs(caps);
+
+    // 动态追加自造工具（读失败就当没有，不影响主流程）
+    try {
+      const dyn = await this.dynamicToolSpecs(task);
+      if (dyn.length === 0) return base;
+      // 名字冲突时以底座为准（内置工具优先，避免被自造工具顶掉）
+      const taken = new Set(base.map((s) => s.name));
+      const extra = dyn.filter((d) => !taken.has(d.name));
+      return extra.length > 0 ? [...base, ...extra] : base;
+    } catch (err) {
+      this.log(`runner: 动态工具注册失败（不影响内置工具）：${err instanceof Error ? err.message : String(err)}`);
+      return base;
+    }
+  }
+
+  /** 读 tools/ 下所有工具，转成 tool schema。 */
+  private async dynamicToolSpecs(task: Task): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
+    if (!(await this.hasToolList())) return [];
+    const r = await this.exec.runTool(toolCall(task, `dynspec_${Date.now()}`, 'tool.list', {}, 60_000));
+    const payload = (r as { result?: { tools?: Array<Record<string, unknown>> } }).result;
+    const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+    const out: Array<{ name: string; description?: string; parameters?: object }> = [];
+    for (const x of tools) {
+      const name = typeof x['name'] === 'string' ? x['name'] : '';
+      const desc = typeof x['description'] === 'string' ? x['description'] : '';
+      if (name.length === 0 || desc.length === 0) continue;
+      if (x['broken'] !== undefined && x['broken'] !== null) continue; // 坏工具别暴露
+      const params = (x['params'] ?? {}) as Record<string, unknown>;
+      const props: Record<string, { type: string; description?: string }> = {};
+      for (const [k, v] of Object.entries(params)) {
+        props[k] = { type: 'string', description: typeof v === 'string' ? v : String(v) };
+      }
+      out.push({
+        name,
+        description:
+          `【自造工具】${desc}` +
+          (typeof x['returns'] === 'string' ? `\n返回：${x['returns']}` : ''),
+        parameters: { type: 'object', properties: props, additionalProperties: true },
+      });
+    }
+    return out;
+  }
+
+  /** 当前能力目录里有没有 tool.list（没有就别白跑一次调用）。 */
+  private async hasToolList(): Promise<boolean> {
+    try {
+      const caps = await this.getCapabilities();
+      return caps.some((c) => c.name === 'tool.list');
+    } catch {
+      return false;
+    }
   }
 
   private async getCapabilities(): Promise<Array<{ name: string; mode: 'sync' | 'async'; max_deadline_ms: number; args_schema: object; sideEffect: 'safe' | 'replayable' | 'unknown' }>> {
@@ -1911,6 +1992,36 @@ export class DotRunner {
       ctx.currentTurnText,
     );
     journalIds?.push({ id: callId, name: call.name, arguments: call.arguments });
+
+    // ═══ TOOL-REUSE-GUARD（S2(b)，2026-10-19）═══════════════════════════════
+    //
+    // 为什么是代码而不是提示词：提示词已试满 3 次全失败（见 docs/prompt-attempts.md）——
+    //   ① 注入工具清单 / ② 改指令式措辞 / ③ 写进 shell.run 说明书
+    // 模型照样用 shell.run 手写脚本。观察到的模式是"它压根没把已有工具纳入候选"。
+    //
+    // 这条守卫做一件很窄的事：**当模型想用 shell.run，而 task 的上下文里已经注入了
+    // 自造工具清单时，先拦一次**，回喂一句"你有现成工具，先看看"。
+    // 模型下一次仍坚持 shell.run 的话**放行** —— 守卫只提醒一次，不做硬拦截：
+    // 强拦会让"确实该用 shell 的活"卡死，那比不复用更糟。
+    if (call.name === 'shell.run' && ctx.toolInventoryNote !== null && !ctx.toolReuseHinted) {
+      ctx.toolReuseHinted = true;
+      this.cp.journal.skipStep(callId, 'tool_reuse_hint');
+      ctx.feed({
+        ok: false,
+        callId,
+        toolName: call.name,
+        dispatched: false,
+        value: {
+          code: 'tool_reuse_available',
+          message:
+            '先等一下：你已经造过能干这类活的工具，别用 shell 重写一遍。' +
+            '按上下文里的「你已有的自造工具」清单，用 tool.invoke 调它；' +
+            '如果确实没有对口的，再重新发一次同样的 shell.run（这次不会被拦）。',
+          available: ctx.toolInventoryNote,
+        },
+      });
+      return { kind: 'continue' };
+    }
 
     // 接缝 G5：goalDigest 由 Runner 在 evaluate 前截取（≤800B）注入治理审查档
     const verdict = await this.governance.evaluate(
@@ -2637,6 +2748,76 @@ const ASYNC_TOOL_DEADLINE_FALLBACK_MS = 30 * 60_000;
  * 拼接责任在 exec 工具层：模型给相对路径时在此补 `/dot/home/` 前缀；
  * 模型已给绝对路径（或任何非相对写法）时原样透传，由 fleet 侧护栏裁决。
  */
+/**
+ * TOOL-REUSE-GUARD 的匹配器（S2(b)，2026-10-19）。
+ *
+ * 目的：判断"这个任务的活，是不是某个自造工具已经能干"。
+ *
+ * 判据刻意保守 —— 宁可漏判（放行 shell.run）也不要误判（把正常任务卡死）：
+ *  ① 工具名出现在 goal 里 → 命中（最强信号，如 goal 含 "word-count"）
+ *  ② 中文二元组（bigram）重叠 ≥ 2 个 → 命中
+ *     例：goal「统计…中文字…英文单词」vs 工具描述「统计…中文字符数…英文单词数」
+ *         共享 bigram：统计 / 中文 / 英文 / 单词 → 4 个，明确命中
+ *  ③ 英文词（≥4 字母，排除通用词）重叠 ≥ 2 个 → 命中
+ *
+ * 为什么用 bigram 而不是分词：项目里没有中文分词依赖，bigram 对中英混排够用，
+ * 且不需要引入新依赖（目标 S2 不包含"加依赖"这件事）。
+ *
+ * @returns 命中的工具名；没命中返回 null
+ */
+export function matchToolForGoal(
+  goal: string,
+  tools: Array<{ name: string; description: string }>,
+): { name: string; why: string } | null {
+  const g = goal.toLowerCase();
+  // 中文二元组（连续两个汉字）
+  const bigrams = (s: string): Set<string> => {
+    const out = new Set<string>();
+    const cjk = s.match(/[一-龥]{2,}/g) ?? [];
+    for (const run of cjk) {
+      for (let i = 0; i + 1 < run.length; i += 1) out.add(run.slice(i, i + 2));
+    }
+    return out;
+  };
+  // 英文词（≥4 字母），排除过于通用的
+  const STOP = new Set(['this', 'that', 'with', 'from', 'have', 'will', 'test', 'text', 'code', 'file', 'data']);
+  const words = (s: string): Set<string> => {
+    const out = new Set<string>();
+    for (const w of s.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g) ?? []) {
+      if (!STOP.has(w)) out.add(w);
+    }
+    return out;
+  };
+
+  const goalBi = bigrams(g);
+  const goalWords = words(g);
+
+  let best: { name: string; why: string; score: number } | null = null;
+  for (const tl of tools) {
+    // ① 工具名直接出现
+    if (g.includes(tl.name.toLowerCase())) {
+      return { name: tl.name, why: 'goal 里直接提到了这个工具名' };
+    }
+    const desc = tl.description.toLowerCase();
+    const descBi = bigrams(desc);
+    const descWords = words(desc);
+
+    const biHit = [...goalBi].filter((x) => descBi.has(x));
+    const wordHit = [...goalWords].filter((x) => descWords.has(x));
+    const score = biHit.length + wordHit.length * 2;
+
+    // ②③ 至少 2 个中文 bigram 或 2 个英文词（或 1 个词 + 1 个 bigram）
+    const strong = biHit.length >= 2 || wordHit.length >= 2;
+    if (strong && (best === null || score > best.score)) {
+      const parts: string[] = [];
+      if (biHit.length > 0) parts.push('中文词重叠 ' + biHit.slice(0, 4).join('/'));
+      if (wordHit.length > 0) parts.push('英文词重叠 ' + wordHit.slice(0, 3).join('/'));
+      best = { name: tl.name, why: parts.join('，'), score };
+    }
+  }
+  return best === null ? null : { name: best.name, why: best.why };
+}
+
 function toolCall(
   task: Task,
   callId: string,
