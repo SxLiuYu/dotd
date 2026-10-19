@@ -67,6 +67,36 @@ do_sample() {
   fd=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
   cont=$(docker ps --filter name=dotd-dot-dot1 --format '{{.Status}}' 2>/dev/null | grep -c Up || true)
   db_kb=$(stat -c '%s' "$HOME/.dotd/dotd.db" 2>/dev/null | awk '{print int($1/1024)}')
+  # **容器"能干活"和"在跑"是两回事**（2026-10-20 修，S6 判据内的致命盲区）。
+  #
+  # 现场（第 33 轮）：容器 `Up 6 hours`、daemon 活着、RSS/句柄全正常，
+  # 但**所有容器工具返回 container_not_ready**，持续了整整 5 小时。
+  # 主人发来的每条命令都失败、模型连试 3 次后把 DSML 标签原样吐出去。
+  # 而当时报告是**全绿**的 —— 因为 `container_up` 只看 `docker ps` 的 `Up`，
+  # 看不出"daemon 以为它不可用"（记录里是 unhealthy，工具门控直接拒绝派发）。
+  #
+  # 判据"成功率不掉"本来能抓到，但它的采样密度是**每 6 小时 4 颗探针**，
+  # 而这次故障只持续 5 小时 —— **恰好能躲在两次探针之间**。
+  # 判据没错，是采样频率低于故障存活时间。所以在这里补一个**每 30 分钟**的
+  # 低成本能力探针：直接拿**库里那个 endpoint**（daemon 实际会用的那个）打 /healthz。
+  # 11 毫秒、不过模型、不进任务队列，纯粹回答"daemon 现在能不能用容器"。
+  #
+  # 为什么用库里的 endpoint 而不是 `docker inspect` 的真实 IP：
+  # 故障的本质就是**这两者不一致**（库里 172.18.0.3，实况 172.21.0.2）。
+  # 拿真实 IP 去打永远 200，等于什么都没测。必须用 daemon 会用的那个。
+  cont_ok=0
+  if [ -f "$HOME/.dotd/exec-tokens/dot1.token" ]; then
+    ep=$(node --disable-warning=ExperimentalWarning -e '
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync(process.env.HOME + "/.dotd/dotd.db", { readOnly: true });
+const r = db.prepare("SELECT endpoint FROM containers WHERE dot_id=? ORDER BY id DESC LIMIT 1").get("dot1");
+process.stdout.write(r && r.endpoint ? r.endpoint : ""); db.close();' 2>/dev/null)
+    if [ -n "$ep" ]; then
+      code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $(cat "$HOME/.dotd/exec-tokens/dot1.token")" "$ep/healthz" 2>/dev/null)
+      [ "$code" = "200" ] && cont_ok=1
+    fi
+  fi
   # **记录 daemon 身份**（进程启动时刻 + pid）。没有这个，RSS 判据是假的：
   # 2026-10-19 实测就踩到了 —— 采样 3 个点算出"RSS 增长 -32.1MB"，看着很好，
   # 其实是中途 daemon 被重启过，拿"新进程的小内存"减"旧进程的大内存"，
@@ -85,10 +115,11 @@ const fs=require("fs");
 const o={ts:Number(process.argv[1]),alive:true,rss_kb:Number(process.argv[2]),
   fd:Number(process.argv[3]),threads:Number(process.argv[4]),
   container_up:Number(process.argv[5]),db_kb:Number(process.argv[6]),
-  pid:Number(process.argv[7]),proc_start:Number(process.argv[8])};
+  pid:Number(process.argv[7]),proc_start:Number(process.argv[8]),
+  container_ok:Number(process.argv[9])};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}"
-  echo "sample: rss=${rss_kb}KB fd=$fd threads=$n_threads container_up=$cont db=${db_kb}KB pid=$pid"
+    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}"
+  echo "sample: rss=${rss_kb}KB fd=$fd threads=$n_threads container_up=$cont container_ok=$cont_ok db=${db_kb}KB pid=$pid"
 }
 
 do_probe() {
@@ -607,6 +638,44 @@ const CONT_DOWN_LIMIT_SEC=2*3600;   // 和"服务不可用≤2h"同一个口径
 
 const contDownOk=maxContDownSec<=CONT_DOWN_LIMIT_SEC;
 
+// ── **容器"能干活"率**（2026-10-20 补，S6 判据内最严重的一次盲区）───────────
+//
+// 第 33 轮现场：容器 `Up 6 hours`、daemon 活着、RSS/句柄/存活全正常，
+// 但**所有容器工具持续 5 小时返回 container_not_ready**。主人发来的每条命令
+// 都在失败，模型连试 3 次后把 DSML 标签原样吐给主人。而报告**全绿**。
+//
+// 为什么 `container_up` 没抓到：它读的是 `docker ps` 的 `Up`，回答的是
+// "进程在不在"，而不是"daemon 能不能用"。故障时容器进程好好的，
+// 坏的是 `containers.endpoint` 与实况不一致 → 探活失败 → 判 unhealthy →
+// 工具门控直接拒绝派发。**容器活着，但干不了活。**
+//
+// 为什么 probe 没抓到：probe 每 6 小时 4 颗，而故障持续 5 小时，
+// **恰好躲在两次探针之间**。判据没错，是采样频率低于故障存活时间。
+//
+// 所以补 `container_ok`（每 30 分钟一个点，直接拿库里 endpoint 打 /healthz，
+// 11 毫秒、不过模型）。判据口径与 container_up 对齐：全程占比 ≥95%，
+// 且末尾 12 点（6 小时）在线率 ≥75%，且最长连续"不可干活"≤2h。
+const contOkRate=all.length? all.filter(s=>Number(s.container_ok)===1).length/all.length : null;
+const contOkDown=all.filter(s=>Number(s.container_ok)!==1);
+const contOkTailRate=contTail.length? contTail.filter(s=>Number(s.container_ok)===1).length/contTail.length : null;
+const contOkTailOk=!(days>=7 && contOkTailRate!==null && contOkTailRate<0.75);
+let maxContOkDownSec=0, curOkDownStart=null;
+for(const s of all){
+  // 只在采了这个字段的点上判定（老样本没这个字段，不能当成"坏"）
+  if(s.container_ok===undefined) continue;
+  if(Number(s.container_ok)!==1){
+    if(curOkDownStart===null) curOkDownStart=s.ts;
+    maxContOkDownSec=Math.max(maxContOkDownSec, s.ts-curOkDownStart+1800);
+  } else curOkDownStart=null;
+}
+const CONT_OK_RATE_LIMIT=0.95;
+const contOkRateOk=!(days>=7 && contOkRate!==null && contOkRate<CONT_OK_RATE_LIMIT);
+const contOkRatePending=!(days>=7);   // 没满 7 天：既不能打 ✅ 也不能打 ❌
+const contOkDownOk=maxContOkDownSec<=CONT_DOWN_LIMIT_SEC;
+const contOkSamples=all.filter(s=>s.container_ok!==undefined).length;
+// 没有数据时**既不能说好也不能说坏**，要显式说"判断不了"
+const contOkUnknown=contOkSamples===0;
+
 // 生命周期 = 一个 daemon 进程从生到死。>1 说明期间重启过 ——
 // "连续 7 天不干预"必须把这件事显式说出来，否则报告在撒谎。
 const lifeMap=new Map();
@@ -1099,6 +1168,27 @@ if(contRows.length)
 c.push(contDownOk
   ? `✅ 容器最长连续离线 ${(maxContDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h，与"服务不可用"同口径）`
   : `❌ **容器最长连续离线 ${(maxContDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）`);
+
+  // 容器"能干活"（容器进程活着 ≠ daemon 能用它）—— 2026-10-20 补，S6 最严重的一次盲区
+  if(contOkUnknown){
+    c.push("⚠ **容器可执行性：还没有任何采样点带 container_ok，这条判断不了**（既不算通过也不算失败）");
+  }else{
+    if(contOkRatePending){
+      c.push(`⏳ 容器可执行率 ${(contOkRate*100).toFixed(1)}%（${contOkSamples} 点，实测值照列）：**窗口未满 7 天，这条还没到判的时候**`);
+    }else{
+      c.push(contOkRateOk
+        ? `✅ 容器可执行率 ${(contOkRate*100).toFixed(1)}%（${contOkSamples} 点，判据 ≥${(CONT_OK_RATE_LIMIT*100).toFixed(0)}%；直接拿库里 endpoint 打 /healthz）`
+        : `❌ **容器可执行率只有 ${(contOkRate*100).toFixed(1)}%**（${contOkSamples} 点）：容器进程活着，但 daemon 用不了它 —— 主人发的命令全在失败`);
+    }
+    c.push(contOkRatePending
+      ? `⏳ 末尾 6 小时容器可执行率 ${contOkTailRate===null?"—":(contOkTailRate*100).toFixed(0)+"%"}（实测值照列）：窗口未满 7 天，还没到判的时候`
+      : (contOkTailOk
+        ? `✅ 末尾 6 小时容器可执行率 ${contOkTailRate===null?"—":(contOkTailRate*100).toFixed(0)+"%"}（≥75%）`
+        : `❌ **末尾 6 小时容器可执行率只有 ${(contOkTailRate*100).toFixed(0)}%**：交付出去此刻就是坏的`));
+    c.push(contOkDownOk
+      ? `✅ 容器最长连续不可执行 ${(maxContOkDownSec/60).toFixed(0)} 分钟（≤${CONT_DOWN_LIMIT_SEC/3600}h）`
+      : `❌ **容器最长连续不可执行 ${(maxContOkDownSec/60).toFixed(0)} 分钟**（>${CONT_DOWN_LIMIT_SEC/3600}h）`);
+  }
 c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
   : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
@@ -1158,6 +1248,7 @@ const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCov
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
+  && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
   && passOk && (medSegRate===null||segRates.length<2||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
