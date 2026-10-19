@@ -18,7 +18,9 @@ set -uo pipefail
 cd /root/dotd || exit 1
 OUTDIR=/root/dotd/docs/acceptance
 mkdir -p "$OUTDIR"
-SOAK="$OUTDIR/soak.jsonl"
+# 允许用 SOAK=... 覆盖，便于用合成数据验证 report 的判断逻辑是否真的判得对
+# （不然只能等 7 天才能知道"它会判错吗"，那太晚了）。
+SOAK="${SOAK:-$OUTDIR/soak.jsonl}"
 export SOAK
 
 PID_DAEMON() { pgrep -f 'src/daemon.ts' | head -1; }
