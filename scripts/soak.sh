@@ -786,6 +786,10 @@ const contOkDownOk=maxContOkDownSec<=CONT_DOWN_LIMIT_SEC;
 const contOkSamples=contOkPts.length;
 // 没有数据时**既不能说好也不能说坏**，要显式说"判断不了"
 const contOkUnknown=contOkSamples===0;
+// 这 7 天里**有没有能力采** container_ok：看有没有 container_up。
+// 两者在同一处采集逻辑里相邻写入，有 up 就说明那次采集跑了。
+// 全窗口连 up 都没有 → 老数据，指标压根不存在，不追究。
+const contUpCapable=all.some(s=>s.container_up!==undefined);
 
 // 生命周期 = 一个 daemon 进程从生到死。>1 说明期间重启过 ——
 // "连续 7 天不干预"必须把这件事显式说出来，否则报告在撒谎。
@@ -1299,7 +1303,13 @@ c.push(contDownOk
 
   // 容器"能干活"（容器进程活着 ≠ daemon 能用它）—— 2026-10-20 补，S6 最严重的一次盲区
   if(contOkUnknown){
-    c.push("⚠ **容器可执行性：还没有任何采样点带 container_ok，这条判断不了**（既不算通过也不算失败）");
+        c.push(days>=7 && contUpCapable
+      ? "❌ **整整 7 天、每次采集都有 container_up，却没有任何一个点带上 container_ok**："
+        +"采集侧把这一项漏了。容器进程活着、daemon 能不能用它，这一项**一次都没测过**"
+      : days>=7
+        ? "⚠ **容器可执行性：整个窗口的采样都没有 container_ok**（连 container_up 也没有，"
+          +"说明是加字段之前的老数据）—— 这条判断不了，但也不该拿来判失败"
+        : "⚠ **容器可执行性：还没有任何采样点带 container_ok，这条暂时判断不了**（窗口未满 7 天）");
   }else{
     if(contOkRatePending){
       c.push(`⏳ 容器可执行率 ${(contOkRate*100).toFixed(1)}%（${contOkSamples} 点，实测值照列）：**窗口未满 7 天，这条还没到判的时候**`);
@@ -1376,6 +1386,39 @@ const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCov
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
+  // **"判断不了"不能当成"通过"**（2026-10-20 补，真假绿）。
+  //
+  // 现场：造 7 天完整窗口、337 个采样点**全部没有 container_ok 字段**，
+  // 其余全健康 → 报告打印
+  //   ⚠ 容器可执行性：还没有任何采样点带 container_ok，这条判断不了（既不算通过也不算失败）
+  // 然后 **exit 0**。**判据说"判断不了"，退出码说"通过"** —— 两者互相矛盾。
+  //
+  // 这不是理论问题：container_ok 是后加的字段，采集侧任何一处失败
+  // （字段名写错、打 /healthz 抛异常、加到旧版本上跑），
+  // 7 天里 337 个点就会全都没有这个字段，报告给一个 ⚠ 然后判成功。
+  // 而"容器进程活着、daemon 却用不了它"正是 S6 里最严重的那次盲区
+  // （第 31 轮：容器 tools 死了 5 小时，所有判据全绿）。
+  //
+  // 正确语义按证据强度分三档：
+  //   days<7            → 还没到裁定时刻，不判（这种情况 days>=7 已经先拦住了）
+  //   days>=7 且 0 点   → **证据缺失 = 失败**：整整 7 天没测过这一项，不能交付
+  //   days>=7 且有样本  → 按 rate/tail/down 三条判
+  // 所以这里要的是 `!(days>=7 && contOkUnknown)`，而不是无条件放行。
+  // **但不能倒过来把"历史夹具没这个字段"判成失败**（2026-10-20，当场自纠）。
+  //
+  // 上一版我写成 `!(days>=7 && contOkUnknown)`，结果 **16 个历史夹具全红**：
+  // `健康8天`/`探针均匀`/`短生命周期稳定` 这些是 `container_ok` 加进来之前造的，
+  // 它们没有这个字段是**当时确实没有这个指标**，不是"采集侧坏了"。
+  // 直接判死就是第⑥类 bug 的反向版本：把"指标不存在"算成"指标坏了"。
+  //
+  // 正确的判据要能区分两件事：
+  //   ① 这 7 天里**有没有能力采**这个字段 —— 看 `container_up`：
+  //      它是同一处采集逻辑写的（`cont_ok` 与 `cont` 相邻），
+  //      有 `container_up` 说明那次采集真的跑了，只是 `container_ok` 没写出来 → **是 bug**；
+  //   ② 整个窗口连 `container_up` 都没有 —— 那是老数据，指标压根不存在 → 不追究。
+  // 真窗口自检：从 day0 起 4 个采样点**全部带 container_ok=1**，所以这条不会误伤。
+  && !(days>=7 && contOkUnknown && contUpCapable)
+  && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
   && (contOkUnknown||(contOkRateOk&&contOkTailOk&&contOkDownOk))
   && passOk && (medSegRate===null||segRates.length<2||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
