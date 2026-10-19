@@ -239,8 +239,19 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
       | { title: string; thread_id: string | null }
       | undefined;
     if (!task || task.thread_id === null) return null;
-    const chatId = feishuChatIdForThread(deps.db, task.thread_id);
-    if (chatId === null) return null; // 非飞书来源任务
+// **回退到主人默认会话**（2026-10-19 实测发现的定时任务缺口）：
+    // 定时触发的任务挂在 channel='event' 的线程上（external_ref=null），
+    // feishuChatIdForThread 返回 null → 出站直接跳过 → **主人永远收不到定时任务的结果**。
+    // 而"定时提醒"的全部意义就是主动告诉主人，发不出去等于没做。
+    //
+    // 判据：线程不是飞书来源（event/web）时，回退到 surfaces.feishu.owner_chat_id 的第一个。
+    // 这不会误伤：真正的飞书会话仍按 chat_id 精确回原会话。
+    const threadChat = feishuChatIdForThread(deps.db, task.thread_id);
+    const chatId = threadChat ?? deps.fallbackChatId ?? null;
+    if (chatId === null) return null;
+    if (threadChat === null) {
+      deps.log(`飞书出站：${p.taskId} 非飞书会话，改投默认会话 ${chatId}`);
+    }
     const body = lastAssistantText(deps.db, task.thread_id, p.taskId);
     if (p.to === 'done') {
       if (body === null) {
