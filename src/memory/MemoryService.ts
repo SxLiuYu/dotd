@@ -455,10 +455,65 @@ export class MemoryServiceImpl implements MemoryService {
       const freshTokens = usable.reduce((n, m) => n + m.tokenEst, 0);
       if (!needsSummarize(allCount?.c ?? 0, prevTokens + freshTokens)) return false;
 
+      // **摘要输入必须只留对话语义**（2026-10-19 实测修的）。
+      //
+      // 原来这里是 `usable.map((m) => `${m.role}：${m.content}`)` —— 把 tool_result 的
+      // 完整 JSON（`{"call_id":"01M56...","tool":"fs.write","ok":true,...}`）原样灌进去。
+      // 实测一个 122 条工具输出 + 5 条对话的线程：**工具输出占 99%**。
+      // 模型被 JSON 淹没，产出的"摘要"就是把 JSON 截断到 1800 字节 —— 等于没摘要。
+      //
+      // 新做法（两段压缩）：
+      //  ① 工具调用压成记号（`（工具 fs.write✓）`）——保留"做过什么"，去掉 JSON；
+      //  ② **连续相同的记号合并成一条带计数的**（`（工具 fs.write✓ ×7）`）。
+      //     第二步是实测补的：只做①时，一个 73 次工具调用的线程输入里还是
+      //     73 行 `（工具 fs.read✓）`，把仅有的几句对话冲得看不见。
+      //     合并后同类操作塌成一行，对话重新成为主体。
+      const compressForSummary = (m: (typeof usable)[number]): string => {
+        if (m.kind !== 'tool_result') return `${m.role}：${m.content}`;
+        // 从 JSON 里尽量取出工具名与成败，取不到就退化成通用记号
+        let tool = '';
+        let ok = '';
+        try {
+          const j = JSON.parse(m.content) as { tool?: unknown; ok?: unknown };
+          if (typeof j.tool === 'string') tool = j.tool;
+          if (typeof j.ok === 'boolean') ok = j.ok ? '✓' : '✗';
+        } catch {
+          // 非 JSON（老数据/截断）——只标记存在，不带内容
+        }
+        return tool.length > 0 ? `\u0000TOOL:${tool}${ok}` : '\u0000TOOL:调用';
+      };
+
+      // 先压成记号，再把「连续相同」的记号折叠成 ×N
+      const folded: string[] = [];
+      let runMark = '';
+      let runCount = 0;
+      const flushRun = (): void => {
+        if (runCount === 0) return;
+        const label = runMark.slice('\u0000TOOL:'.length);
+        folded.push(runCount === 1 ? `（工具 ${label}）` : `（工具 ${label} ×${runCount}）`);
+        runMark = '';
+        runCount = 0;
+      };
+      for (const m of usable) {
+        const piece = compressForSummary(m);
+        if (piece.startsWith('\u0000TOOL:')) {
+          if (piece === runMark) runCount += 1;
+          else {
+            flushRun();
+            runMark = piece;
+            runCount = 1;
+          }
+        } else {
+          flushRun();
+          folded.push(piece);
+        }
+      }
+      flushRun();
+
       const transcript = [
         prev !== null ? `【已有摘要】\n${prev}` : '',
         '【新增对话】',
-        ...usable.map((m) => `${m.role}：${m.content}`),
+        ...folded,
       ]
         .filter((s) => s.length > 0)
         .join('\n');
