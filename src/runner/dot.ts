@@ -680,7 +680,32 @@ class RunContext {
       });
     }
 
-    out.push(...this.messages);
+    // 历史裁剪（2026-10-19 实测发现）：原来无条件把整个会话历史全量塞进去。
+    // 现场：一个线程累积到 461 条消息，其中 460 条是历史 tool_result（只有 2 条真实
+    // 用户消息），每次调用都装载 prompt=28035 tokens —— 绝大部分是早已作废的工具输出。
+    //
+    // 裁剪规则（保守，只丢最没信息量的那类）：
+    //   ① 保留全部 user/assistant 正文（那是对话本身）；
+    //   ② tool_result 只保留最近若干条（旧结果的价值随时间快速衰减：
+    //      几轮前的列目录输出对当前判断没有意义）；
+    //   ③ 从尾部往前数着保留，保证"最近的对话一定在"。
+    //
+    // 为什么按条数而不是按 token：逐条估算 token 每轮都做太贵，而这里要的只是
+    // 一个上界。60 条工具结果足以覆盖单个任务的完整上下文。
+    const KEEP_RECENT_TOOL_RESULTS = 60;
+    const kept: Message[] = [];
+    let toolResultsKept = 0;
+    for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+      const m = this.messages[i];
+      if (m === undefined) continue;
+      if (m.kind === 'tool_result') {
+        if (toolResultsKept >= KEEP_RECENT_TOOL_RESULTS) continue;
+        toolResultsKept += 1;
+      }
+      kept.push(m);
+    }
+    kept.reverse();
+    out.push(...kept);
 
     // ③ 本回合工具结果：同一轮 LLM 发出的多个调用先合并成**一条** assistant.tool_calls，
     //    再跟各自的 tool 结果。裸 role=tool 会被 OpenAI 兼容网关以"没有前置 tool_calls"
