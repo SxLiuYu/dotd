@@ -724,6 +724,16 @@ const isCrashLoop = LIFE.length>1 && longestLifeHours < MIN_LONGEST_LIFE_HOURS;
 // 健康的进程重启后应该稳定，不该每段都单调爬升。
 // 用"段内增长率"的**中位数**（MB/小时）判断：稳定进程应接近 0。
 const segRates=[], segFdRates=[];
+// **短窗口的斜率不可信，必须记账**（2026-10-19 补）：
+// 丢掉预热后，1.2 小时的段只剩 ~0.6 小时可比，2 个采样点算出的斜率
+// 噪声极大（一次 5MB 抖动 = 8MB/h）。但"段太短"不能当成"没问题"——
+// 那正是这一轮前面刚修掉的坑。
+// 同时也不能把短段的斜率跟长段的斜率一视同仁：真跑的第一天只有 1.5 小时，
+// 报出 9.82MB/h，而 7 天窗口的中位数才有统计意义。
+// 折中：**短段计入中位数（不然短生命周期不受检）**，
+// 但单独统计"有多少段的观测窗口短于 2 小时"，在报告里说明这个中位数的置信度。
+// 判据本身不因短段放宽 —— 否则又回到"短段免检"。
+let shortSegs=0, longSegs=0; const segHours=[];
 for(const L of LIFE){
   // **必须用 all，不能用 S**（2026-10-19 修，真缺陷）：
   // S 是"当前生命周期"的子集，拿它按 L.key 过滤，除当前这一段外**全部为空** ——
@@ -731,16 +741,67 @@ for(const L of LIFE){
   // 判据碰巧还抓到了这个例子（因为那 1 段正好在爬），但换成
   // "只有早期几段在爬、当前段平稳"就会漏掉，等于判据又变成看运气。
   const seg=all.filter(s=>String(s.proc_start)+":"+String(s.pid)===L.key);
-  if(seg.length<4) continue;                     // 太短算不准
-  const n2=Math.max(1,Math.round(seg.length*0.1));
-  const r0=med(seg.slice(0,n2).map(s=>s.rss_kb))/1024;
-  const r1=med(seg.slice(seg.length-n2).map(s=>s.rss_kb))/1024;
-  const f0=med(seg.slice(0,n2).map(s=>s.fd));
-  const f1=med(seg.slice(seg.length-n2).map(s=>s.fd));
-  const h=(seg[seg.length-1].ts-seg[0].ts)/3600;
-  if(h>=0.5){ segRates.push((r1-r0)/h); segFdRates.push((f1-f0)/h); }
+  // **`seg.length<4` 会把「短生命周期」整段跳过**（2026-10-19 修，真缺陷）：
+  // 采样每 30 分钟一次，4 个样本 = 2 小时。于是任何**短于 2 小时**的生命周期
+  // 都算不出速率，全被 `continue` 掉。
+  // 合成数据实测：8 天里重启 **159 次**（每段 1.2 小时，每段 RSS 涨 4MB，
+  // 累计泄漏 **636MB**），每段只采到 1~2 个样本 → segRates 为空 →
+  // medSegRate=null → `(medSegRate===null||...)` **当成通过** → exit 0，
+  // 报告打印"✅ RSS 增长 <50MB"。
+  // 这是第 14 轮那个坑的第三次复发：**零证据被当成合格**。
+  // 而且它和"崩溃循环"判据配合起来正好漏掉一类系统：
+  //   最长存活 1.2h ≥ MIN_LONGEST_LIFE_HOURS(1h) → 不算崩溃循环；
+  //   每段太短算不出速率 → 不算泄漏。
+  // 两条判据之间的缝，正好能塞进"每 1.2 小时崩一次、每次崩前漏 4MB"。
+  // 修法：2 个样本就能算斜率（首末差 ÷ 时长），把门槛降到 2。
+  // 噪声问题靠"取所有段的中位数"吸收，不靠丢掉段。
+  if(seg.length<3) continue;                     // 3 个点才够"丢掉预热段"
+  // **必须丢掉每段开头的预热期**（2026-10-19 修，第一版 `seg.length<2` 误杀了正常进程）：
+  // 新起的 node 进程前 20% 时间里 RSS 会先涨一段（V8/JIT 预热、懒加载、连接池），
+  // 然后平稳。若拿"首末差 ÷ 时长"算斜率，这段预热会被算成 6MB/h 的"泄漏"——
+  // 合成数据实测：每段先涨 6MB 后平（完全正常），判据报
+  // "各生命周期内 RSS 爬升速率：中位 6.00MB/h" → exit 1，**把健康进程判成泄漏**。
+  // 这正是"判据会说谎"的第二个方向：不该拦的拦了。
+  // 原门槛 `seg.length<4` 之所以能挡住它，纯属巧合：短段被整段跳过，
+  // 所以预热从没被算进去过 —— 但代价是短生命周期完全不受检（见上一条注释）。
+  // 正确做法：**保留短段，但只看段的后半部分**，让预热自然被排除。
+  // 段长 1.2h、采样 30 分钟 → 3 个点，取后 2 个 → 1 小时窗口，
+  // 足以算出斜率，又不受预热影响。
+  const warm=Math.floor(seg.length/2);           // 丢掉前一半（预热 + 建池）
+  const body=seg.slice(warm);
+  if(body.length<2) continue;
+  const n2=Math.max(1,Math.round(body.length*0.34));
+  const r0=med(body.slice(0,n2).map(s=>s.rss_kb))/1024;
+  const r1=med(body.slice(body.length-n2).map(s=>s.rss_kb))/1024;
+  const f0=med(body.slice(0,n2).map(s=>s.fd));
+  const f1=med(body.slice(body.length-n2).map(s=>s.fd));
+  const h=(body[body.length-1].ts-body[0].ts)/3600;
+  if(h>=0.25){
+    segRates.push((r1-r0)/h); segFdRates.push((f1-f0)/h);
+    if(h<2) shortSegs++; else longSegs++;
+    segHours.push(h);
+  }
 }
-const medSegRate=segRates.length? med(segRates) : null;
+// **中位爬升率需要"足够的证据"才有意义**（2026-10-19 修，第二次误杀）：
+// 判据的目的是抓"每段都在爬、靠重启把泄漏截断"——这**本质上需要多段**才能成立。
+// 真跑第一天只有 1 段、观测 1.09 小时，去掉预热后剩下的是
+// "GC 回落到谷底后重新爬升"那一段，斜率天然为正（实测 9.82MB/h）。
+// 拿它判 "❌ 每段都在爬" 是在把正常预热曲线当泄漏 —— 第二次误杀。
+// 但**不能因此让短段免检**（那就退回本轮前面刚修的坑）。
+// 分三种情况，按证据强度：
+//   ① 有 ≥1 段观测 ≥2h        → 用这些段的中位数（长段才有统计意义）
+//   ② 没有长段，但有 ≥3 段     → 用全部短段的中位数
+//      （重复"重启+爬升"本身就是证据，不需要每段够长）
+//   ③ 既没长段、段数又 <3      → **证据不足**，不判死也不打 ✅，
+//      明确打印"现在还判断不了"。
+//      （全窗口峰值增长那条判据仍然有效，它不依赖分段，能兜住总量）
+const longRates = segHours.map((h,i)=>h>=2? segRates[i] : null).filter(v=>v!==null);
+const medLongRate = longRates.length? med(longRates) : null;
+const segEvidence = longRates.length>0 ? "long" : (segRates.length>=3 ? "multi" : "insufficient");
+const medSegRate = segEvidence==="long" ? medLongRate
+                 : segEvidence==="multi" ? med(segRates)
+                 : null;
+const medSegRateRaw = segRates.length? med(segRates) : null;   // 仅用于打印
 // **句柄也有同一个洞**（2026-10-19 修）：fd 判据同样只看"当前生命周期"的首末差，
 // 于是每段只涨 2 个、每 2 小时重启一次、8 天重启 96 次 —— 首末差仍是 +2，
 // 判 ✅，exit 0。合成数据实测：96 段每段都漏 2 个句柄，报告全绿。
@@ -835,7 +896,13 @@ console.log(`句柄: 当前生命周期 首段中位 ${fd0} → 末段中位 ${f
 console.log(`全窗口句柄：基线 ${fdBase}（最前 ${fdBaseN} 个样本中位）→ 最高 ${maxFd}，峰值增长 ${fdPeakGrowth>=0?"+":""}${fdPeakGrowth}（判据 < +${FD_PEAK_LIMIT}，与重启无关）`);
 console.log(`全窗口 RSS：基线 ${baseRss.toFixed(1)}MB（最前 ${baseN} 个样本中位）→ 最高 ${peakRss.toFixed(1)}MB，`+
             `峰值增长 ${peakGrowth>=0?"+":""}${peakGrowth.toFixed(1)}MB（判据 < +${PEAK_GROWTH_LIMIT}MB，与重启无关）`);
-if(segRates.length) console.log(`各生命周期内 RSS 爬升速率：中位 ${medSegRate===null?"n/a":medSegRate.toFixed(2)+"MB/h"}，最大 ${maxSegRate.toFixed(2)}MB/h（${segRates.length} 段够长可算；最大值仅参考，新生进程预热会偏高）`);
+if(segRates.length){
+  const ev = segEvidence==="long" ? `按 ${longRates.length} 段 ≥2h 的中位数`
+           : segEvidence==="multi" ? `${segRates.length} 段都不足 2h，但段数够多，按全部段的中位数`
+           : `**证据不足**：只有 ${segRates.length} 段、且都不到 2 小时`;
+  console.log(`各生命周期内 RSS 爬升速率：${medSegRate===null?"现在还判断不了":medSegRate.toFixed(2)+"MB/h"}（${ev}；`+
+              `全部 ${segRates.length} 段中位 ${medSegRateRaw===null?"n/a":medSegRateRaw.toFixed(2)}MB/h，最大 ${segRates.length?maxSegRate.toFixed(2):"n/a"}MB/h —— 最大值仅参考，预热会偏高）`);
+}
 if(segFdRates.length) console.log(`各生命周期内句柄爬升速率：中位 ${medSegFdRate===null?"n/a":medSegFdRate.toFixed(3)+"个/h"}，最大 ${maxSegFdRate.toFixed(3)}个/h`);
 // 线程数不参与 S6 判定（S6 的四条判据是：连续 7 天无人工干预 / RSS 增幅 / 成功率 / 句柄）。
 // 但原来这行只打印一个"+15"却不给结论，读起来像"检查过了、没问题"——
@@ -1006,6 +1073,9 @@ c.push(peakGrowth<PEAK_GROWTH_LIMIT
   ? `✅ 全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB < ${PEAK_GROWTH_LIMIT}MB`
   : `❌ **全窗口 RSS 峰值增长 ${peakGrowth.toFixed(1)}MB ≥${PEAK_GROWTH_LIMIT}MB**：`+
     `基线 ${baseRss.toFixed(1)}MB → 最高 ${peakRss.toFixed(1)}MB（与期间重启几次无关）`);
+if(medSegRate===null && segRates.length>0 && days>=7)
+  c.push(`⚠ **RSS 段内爬升：证据不足，现在不判定**（只有 ${segRates.length} 段、都不到 2 小时）：`+
+         `不判死也不打勾 —— 全窗口峰值增长那条判据仍然有效，能兜住总量`);
 if(medSegRate!==null){
   c.push(medSegRate<SEG_RATE_LIMIT
     ? `✅ 各生命周期内 RSS 无明显爬升（中位 ${medSegRate.toFixed(2)}MB/h）`
