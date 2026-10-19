@@ -3199,3 +3199,67 @@ docker=f1277794...  最近健康=...
 
 `dotd container` / `--reset` 实测通过 · **`npm test` 1512/1512**（+3 条路由守卫）·
 `sos-test` 未受影响（命令链已修）
+
+---
+
+# 第四十三轮：出站消息终于能事后追查了（2026-10-19）
+
+## 199. 一个从没被验证过的假设
+
+之前所有验证都走 HTTP API（`/api/messages`），但**飞书里的真实使用走的是另一条路径**：
+WS 长连接 → `handleFeishuCallback` → 任务 → 出站 `sendText` 回原会话。
+
+查这条链路有没有可追查的记录时发现：**没有任何出站审计表**，只有日志。
+而日志在每次 daemon 重启时被清空（`wsl-daemon.sh` 里 `: > "$LOG"`）。
+
+**后果**：主人说"我没收到回复"时，完全无法回答——
+那条任务回没回？发到哪个会话？飞书 API 报了什么错？全都查不到。
+
+## 200. 修法：落一张小表
+
+迁移 `130_surf_outbound_log.sql`：
+
+| 列 | 含义 |
+|---|---|
+| kind | task_reply / approval |
+| dedup_key | 与发送侧的去重键一致，便于和日志对上 |
+| chat_id | 发到哪个会话 |
+| **ok** | 成功/失败 |
+| **error** | 失败原因（排查关键） |
+| text_preview | 前 200 字（全文已在 mem_messages） |
+
+配套：
+- `recordOutbound()` / `listOutbound()`（写失败**绝不**影响发送本身——审计是旁路）
+- `GET /api/outbound?limit=&kind=`
+- `dotd outbound -n 20 -k task_reply`
+
+## 201. 中途被迁移保护挡住
+
+加完迁移，daemon 直接拒绝启动：
+
+```
+MigrationError: 迁移后 user_version=130，期望 120
+```
+
+**这是保护机制的正确行为**——`expectedVersion` 必须与迁移目录里最大的 NNN 一致，
+防止"代码和库版本对不上"。同步改成 130 后正常。
+
+## 202. 然后是一串测试断言要跟
+
+`npm test` 报了 5 处失败，全是硬编码 `user_version=120` 的断言（分布在 4 个文件）。
+一处一处改完 **1516/1516 全绿**。
+
+这类"新增迁移就要改一堆断言"的摩擦值得记下来——它说明版本号被复制到了太多地方。
+
+## 203. 实测
+
+```
+写入 2 条（1 成功 1 失败）→ 读出 → CLI 显示
+[OK ] task_reply → oc_test_123
+[FAIL] task_reply → oc_test_123 (permission denied)
+```
+
+## 204. 本轮门禁
+
+出站审计写入/读出/CLI 全部实测通过 · **`npm test` 1516/1516**（+4 条审计测试）·
+迁移 130 生效 · daemon/飞书/容器正常

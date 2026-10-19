@@ -614,6 +614,36 @@ export function buildCli(opts: CliOptions = {}): Command {
     });
 
   program
+    .command('outbound')
+    .description('出站审计（GET /api/outbound：飞书回复有没有发出去、发到哪个会话、失败原因）')
+    .option('-n, --limit <n>', '条数（默认 20）', '20')
+    .option('-k, --kind <kind>', '按类型过滤（task_reply / approval）')
+    .action(async (opts: { limit?: string; kind?: string }) => {
+      const o = merged();
+      const qs = new URLSearchParams();
+      if (opts.limit !== undefined) qs.set('limit', opts.limit);
+      if (opts.kind !== undefined) qs.set('kind', opts.kind);
+      const q = qs.toString();
+      const r = await api<{
+        count?: number;
+        items?: Array<{ kind: string; chatId: string; ok: boolean; error: string | null; textPreview: string; at: string }>;
+        error?: string;
+      }>('GET', `/api/outbound${q === '' ? '' : `?${q}`}`, undefined, o);
+      if (!r.ok) return fail(o, r.kind === 'unreachable' ? 'daemon 不可达' : r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      const items = r.body.items ?? [];
+      if (items.length === 0) {
+        emit(o, '（还没有出站记录）');
+        return;
+      }
+      emit(o, `最近 ${items.length} 条出站：`);
+      for (const x of items) {
+        const mark = x.ok ? 'OK ' : 'FAIL';
+        emit(o, `  [${mark}] ${x.at}  ${x.kind} → ${x.chatId}${x.ok ? '' : `  (${x.error ?? '?'})`}`);
+        emit(o, `         ${x.textPreview.replace(/\s+/g, ' ').slice(0, 70)}`);
+      }
+    });
+
+  program
     .command('sos-test')
     .description('求救通道自检（GET /api/channels：如实报每个通道的当前可用性、投递顺序与最近台账）')
     .action(async () => {

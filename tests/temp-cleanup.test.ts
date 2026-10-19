@@ -101,7 +101,7 @@ test('池模式：借还之间数据隔离，cleanup 后临时目录同样消失
   const rows = b.db.prepare('SELECT count(*) AS c FROM crontabs').get() as { c?: number } | undefined;
   assert.equal(rows?.c, 0, '复用的池库必须是空表（上一个用例的数据不得残留）');
   const uv = b.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
-  assert.equal(uv?.user_version, 120, '迁移终态 120（P1-3 加 FTS、第十三轮加 task_paused）');
+  assert.equal(uv?.user_version, 130, '迁移终态 130（P1-3 加 FTS、第十三轮加 task_paused、第四十三轮加 outbound_log）');
   const rootB = b.root;
   b.cleanup();
   assert.equal(existsSync(rootB), false);

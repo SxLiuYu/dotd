@@ -162,6 +162,19 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
       const out = await build();
       if (out === null) return;
       const res = await deps.gateway.sendText(out.chatId, out.text);
+      // **落库**（2026-10-19）：原来出站只写日志，而日志在 daemon 重启时会被清空
+      // （wsl-daemon.sh 用 `: > "$LOG"`）。结果"这条任务到底回没回主人、发到哪个会话"
+      // 事后完全查不到 —— 主人问"我没收到回复"时无从回答。
+      // 落一张小表，成功失败都记。
+      recordOutbound(deps.db, {
+        kind: 'task_reply',
+        dedupKey: key,
+        chatId: out.chatId,
+        ok: res.ok,
+        error: res.error ?? null,
+        textPreview: out.text.slice(0, 200),
+        at: new Date().toISOString(),
+      });
       if (res.ok) {
         sent.set(key, Date.now());
         claimed = true;
@@ -225,4 +238,81 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
     unsubscribeTask();
     unsubscribeApproval();
   };
+}
+
+/**
+ * 记录一条出站消息（2026-10-19）。
+ *
+ * **为什么不落库不行**：出站原来只写日志，而日志在 daemon 重启时被清空。
+ * 主人说"我没收到回复"时，需要能回答：这条回没回、发到哪个会话、失败原因是什么。
+ *
+ * 尽力而为：写库失败不能影响发送本身（它只是审计，不是关键路径）。
+ */
+export function recordOutbound(
+  db: DatabaseSync | undefined,
+  row: {
+    kind: string;
+    dedupKey: string;
+    chatId: string;
+    ok: boolean;
+    error: string | null;
+    textPreview: string;
+    at: string;
+  },
+): void {
+  if (db === undefined) return;
+  try {
+    db.prepare(
+      `INSERT INTO surf_outbound_log (kind, dedup_key, chat_id, ok, error, text_preview, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      row.kind,
+      row.dedupKey,
+      row.chatId,
+      row.ok ? 1 : 0,
+      row.error,
+      row.textPreview,
+      row.at,
+    );
+    // 只留最近 2000 条（约一周量级），防无限增长
+    db.prepare(
+      `DELETE FROM surf_outbound_log WHERE id <= (SELECT MAX(id) FROM surf_outbound_log) - 2000`,
+    ).run();
+  } catch {
+    // 审计写失败不影响发送
+  }
+}
+
+/** 读出站审计（最近的 N 条，可按 kind 过滤）。 */
+export function listOutbound(
+  db: DatabaseSync,
+  opts: { limit?: number; kind?: string } = {},
+): Array<{
+  id: number;
+  kind: string;
+  chatId: string;
+  ok: boolean;
+  error: string | null;
+  textPreview: string;
+  at: string;
+}> {
+  const limit = opts.limit ?? 20;
+  const rows = (
+    opts.kind === undefined
+      ? db.prepare(
+          `SELECT id, kind, chat_id, ok, error, text_preview, at FROM surf_outbound_log ORDER BY id DESC LIMIT ?`,
+        ).all(limit)
+      : db.prepare(
+          `SELECT id, kind, chat_id, ok, error, text_preview, at FROM surf_outbound_log WHERE kind = ? ORDER BY id DESC LIMIT ?`,
+        ).all(opts.kind, limit)
+  ) as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: Number(r['id']),
+    kind: String(r['kind']),
+    chatId: String(r['chat_id']),
+    ok: Number(r['ok']) === 1,
+    error: r['error'] === null ? null : String(r['error']),
+    textPreview: String(r['text_preview']),
+    at: String(r['at']),
+  }));
 }

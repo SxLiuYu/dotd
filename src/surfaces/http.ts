@@ -52,6 +52,7 @@ import { CronExpressionParser } from 'cron-parser';
 import type { HookConfig, SurfacesConfig } from './types.ts';
 import { createIngress, ingest, MAX_BODY_BYTES, normalizeHook, originAllowed } from './ingress.ts';
 import { handleFeishuCallback, maybeDecryptFeishuBody } from './feishu-inbound.ts';
+import { listOutbound } from './feishu-outbound.ts';
 import { SseBus, parseStreamQuery } from './sse.ts';
 import { createHeartbeatAdmin } from './heartbeat-tick.ts';
 import { buildTaskView, type CallLogRow } from './task-view.ts';
@@ -98,6 +99,7 @@ export type Route =
   | 'schedules'
   | 'schedule_by_id'
   | 'container'
+  | 'outbound'
   | 'static';
 
 export interface MatchResult {
@@ -134,6 +136,9 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   // 容器状态（2026-10-19）：quarantined 是 recreate_count>3/24h 的**保护机制**，
   // 但隔离后所有依赖容器的任务都会失败，且现象是"模型说容器有问题"——不好排查。
   // 这里给一个查询/重置入口。
+  // 出站审计（2026-10-19）：飞书回复有没有发出去、发到哪、失败原因。
+  // 原来只写日志，而日志每次 daemon 重启都被清空 -> "我没收到回复"无从查证。
+  if (m === 'GET' && p === '/api/outbound') return { route: 'outbound', params: {} };
   if (m === 'GET' && p === '/api/container') return { route: 'container', params: {} };
   if (m === 'POST' && p === '/api/container/reset') return { route: 'container', params: { action: 'reset' } };
 
@@ -853,6 +858,23 @@ export function createHttpServer(deps: HttpDeps): Server {
        * "读路径待补"的说明——那是"承诺有了、路没通"。这里把路补上：
        * 直接读 SF 自己的拒绝审计表（`auth/origin/rate/schema/size/allowlist/parse`）。
        */
+      /** GET /api/outbound?limit=20&kind=task_reply —— 出站审计。 */
+      case 'outbound': {
+        const limitRaw = Number(url.searchParams.get('limit') ?? '20');
+        const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 200) : 20;
+        const kind = url.searchParams.get('kind') ?? undefined;
+        const items = listOutbound(deps.db, {
+          limit,
+          ...(kind === undefined || kind.length === 0 ? {} : { kind }),
+        });
+        json(res, 200, {
+          ok: true,
+          count: items.length,
+          items: items.map((x) => ({ ...x, at: x.at })),
+        });
+        return;
+      }
+
       /**
        * GET  /api/container               容器状态（state/recreate_count/最近健康）
        * POST /api/container/reset         重置为 ready 并清零 recreate_count

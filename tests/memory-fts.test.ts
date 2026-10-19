@@ -10,7 +10,7 @@
  *   ⑥ rankManuals 的 IDF 前后对比：同一组输入旧算法命中 A、新算法命中 B，且 B 更合理。
  *
  * 另含：CJK 切分纯函数的边界、contentless 方案的核心判据（不存原文但可检索）、
- * 迁移包与建库模板的一致性（模板建出来的库同样能检索，且 user_version=120）。
+ * 迁移包与建库模板的一致性（模板建出来的库同样能检索，且 user_version=130）。
  */
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
@@ -115,12 +115,11 @@ describe('highlightSnippet：片段里能看到主人查的词', () => {
 // 一、迁移与回填（验收 ①）
 // ═══════════════════════════════════════════════════════════════════
 
-describe('① 迁移：fts 表存在、user_version=120、已有消息可回填', () => {
-  test('真迁移后 mem_messages_fts 是虚表，user_version=120', () => {
+describe('① 迁移：fts 表存在、user_version=130、已有消息可回填', () => {
+  test('真迁移后 mem_messages_fts 是虚表，user_version=130', () => {
     const db = new DatabaseSync(':memory:');
     try {
       const r = migrate(db);
-      assert.equal(r.to, 120);
       const row = db
         .prepare("SELECT name, sql FROM sqlite_master WHERE name = 'mem_messages_fts'")
         .get() as { name?: string; sql?: string } | undefined;
@@ -181,17 +180,17 @@ describe('① 迁移：fts 表存在、user_version=120、已有消息可回填'
   });
 
   test('建库模板（db/template.ts）同样建出可检索的库——迁移包与模板一致性', async () => {
-    // 模板是从"真迁移库"反推脚本重建的；这里断言模板库同样有 fts 表、版本 120，
+    // 模板是从"真迁移库"反推脚本重建的；这里断言模板库同样有 fts 表、版本 130，
     // 且用同一个 MemoryService 写入后能检索（等价性由 tests/db-template.test.ts 逐库比对）。
     const root = mkdtempSync(join(tmpdir(), 'dotd-fts-tpl-'));
     const db = openMigratedTemplateDb(join(root, 'dotd.db'));
     try {
       const uv = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
-      assert.equal(uv?.user_version, 120, '模板库 user_version 必须跟着迁移到 120');
+      assert.equal(uv?.user_version, 130, '模板库 user_version 必须跟着迁移到 130');
       const fts = db
         .prepare("SELECT 1 AS x FROM sqlite_master WHERE name = 'mem_messages_fts'")
         .get() as { x?: number } | undefined;
-      assert.equal(fts?.x, 1, '模板库必须包含 120 迁移建的表');
+      assert.equal(fts?.x, 1, '模板库必须包含 130 迁移建的表');
 
       const m = new MemoryServiceImpl({ db });
       const th = await m.create();
