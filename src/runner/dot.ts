@@ -1047,6 +1047,43 @@ export class DotRunner {
       { threadId: session.threadId ?? undefined, taskId: session.id },
     );
 
+    // **自造工具清单注入**（S2，2026-10-19）。
+    //
+    // 为什么不做成"提示词让模型记得查 tool.list"：实测不行 —— 让它在同类任务上
+    // 复用之前造的工具，它直接 shell.run 手写了一遍，压根没想起去查。
+    // 提示词是"指望它想起来"，注入是"每次开局就摆在眼前"。
+    //
+    // 代价：每任务一次工具列表查询（本地读目录，毫秒级）+ 几十 token。
+    // 收益：造过的工具不会白造 —— 这是 S2 "能力可积累" 成立的关键。
+    // 工具数为 0 时不产出任何内容（不影响没造过工具的场景）。
+    let toolInventory: string | null = null;
+    try {
+      const caps = await this.getCapabilities();
+      if (caps.some((c) => c.name === 'tool.list')) {
+        const r = await this.exec.runTool({
+          call_id: `inventory_${task.id}`,
+          dot_id: session.dotId,
+          task_id: task.id,
+          tool: 'tool.list',
+          args: {},
+          deadline_ms: 60_000,
+        } as never);
+        const payload = (r as { result?: { tools?: Array<Record<string, unknown>> } }).result;
+        const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+        const usable = tools.filter(
+          (x) => typeof x['name'] === 'string' && typeof x['description'] === 'string' && String(x['description']).length > 0,
+        );
+        if (usable.length > 0) {
+          toolInventory =
+            '# 你已有的自造工具\n' +
+            usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
+            '\n\n（这些是以前造的，能直接 tool.invoke 用 —— 别重写一遍。）';
+        }
+      }
+    } catch {
+      // 清单注入是增强项，失败不影响主流程
+    }
+
     // ⑤/§7.3 重建顺序：buildSessionReplay（LLM 全文）→ tool_result 全文覆盖 → journal.tail → 提示
     const ctx = new RunContext(session.goal);
     const replay = session.threadId === null
@@ -1079,6 +1116,21 @@ export class DotRunner {
       if (s.kind === 'tool' && s.status === 'succeeded' && s.callId !== null) {
         ctx.feedToolResult(s.callId, s.resultJson);
       }
+    }
+
+    // **把自造工具清单推入上下文**（S2）。放在历史之后、当前提示之前：
+    // 它是"这次开工前该知道的事实"，位置比历史更靠近当前请求。
+    if (toolInventory !== null) {
+      ctx.push({
+        id: 'sys:tool-inventory',
+        threadId: session.threadId ?? '',
+        seq: 0,
+        role: 'system',
+        kind: 'text',
+        content: toolInventory,
+        tokenEst: Math.ceil(toolInventory.length / 3.5),
+        createdAt: 0,
+      });
     }
     // CP §5.3 恢复注记（merge/注入）与 §7.3 第 4 步 openStepNotes 首条：
     // 两个方法在 Journal 实现里存在（journal.ts:256/276），但 CP §8 契约面

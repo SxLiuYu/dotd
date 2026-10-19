@@ -317,10 +317,10 @@ test('运行时：查 model 请求 messages —— [0] 是 system prompt，末�
   ]);
 
   // 能力目录换成宿主真目录（Runner 的 toolSpecs 从这里取）。
-  const capsCalls: string[] = [];
+  const capsCalls: Array<{ call_id: string; tool: string }> = [];
   const execApi = {
     runTool: async (call: { call_id: string; tool: string; args: Record<string, unknown> }) => {
-      capsCalls.push(call.tool);
+      capsCalls.push({ call_id: call.call_id, tool: call.tool });
       if (call.tool === 'fs.read') {
         return {
           call_id: call.call_id,
@@ -421,7 +421,10 @@ test('运行时：查 model 请求 messages —— [0] 是 system prompt，末�
   const out = await runner.runNext();
   assert.equal(out.status, 'done', `主循环应跑完：${JSON.stringify(out)}`);
   assert.equal(transport.requests.length, 2, '两轮模型请求');
-  assert.equal(capsCalls.length, 2, '两个工具都真的执行了');
+  // 注：自 S2（2026-10-19）起，每个任务开头会自动查一次 tool.list 注入工具清单
+  // （call_id 以 'inventory_' 开头）。那是系统内部行为，不算"模型发起的工具调用"。
+  const modelCalls = capsCalls.filter((c) => !c.call_id.startsWith('inventory_'));
+  assert.equal(modelCalls.length, 2, '两个工具都真的执行了（不含系统注入的清单查询）');
 
   const req0 = transport.requests[0]!;
   // ① messages[0] = system prompt（每一轮都在）

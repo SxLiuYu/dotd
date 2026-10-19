@@ -221,7 +221,7 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
      */
     name: 'schedule.create',
     mode: 'sync',
-    max_deadline_ms: 10_000,
+    max_deadline_ms: 60_000,
     args_schema: obj(
       {
         title: str('这条定时任务的名字，如"早间天气"'),
@@ -244,7 +244,7 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     /** 宿主侧工具：列出已创建的定时任务。 */
     name: 'schedule.list',
     mode: 'sync',
-    max_deadline_ms: 10_000,
+    max_deadline_ms: 60_000,
     args_schema: obj({}, []),
     sideEffect: 'safe',
   },
@@ -260,7 +260,7 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
      */
     name: 'schedule.remove',
     mode: 'sync',
-    max_deadline_ms: 10_000,
+    max_deadline_ms: 60_000,
     args_schema: obj(
       { id: str('要停用的定时任务 id（从 schedule.list 拿）') },
       ['id'],
@@ -277,7 +277,11 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
      */
     name: 'tool.list',
     mode: 'sync',
-    max_deadline_ms: 10_000,
+    // **必须与 sync 派发档一致**（2026-10-19 修）。
+    // Runner 对 sync 工具一律派 syncTierMs(60s)；这里若写 10_000，
+    // 校验 min(10_000, asyncDeadline) 会把 60s 判成 deadline_too_long ——
+    // 模型根本没传 deadline，是系统自己派的值超了自己的上限。
+    max_deadline_ms: 60_000,
     args_schema: obj({}, []),
     sideEffect: 'safe',
   },
