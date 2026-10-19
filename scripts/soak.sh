@@ -20,8 +20,24 @@ OUTDIR=/root/dotd/docs/acceptance
 mkdir -p "$OUTDIR"
 # 允许用 SOAK=... 覆盖，便于用合成数据验证 report 的判断逻辑是否真的判得对
 # （不然只能等 7 天才能知道"它会判错吗"，那太晚了）。
+# **记录 SOAK 是不是用户覆盖的**（2026-10-19）：下面 day0 核对只在"真跑"时生效。
+if [ -n "${SOAK:-}" ]; then export SOAK_OVERRIDDEN=1; fi
 SOAK="${SOAK:-$OUTDIR/soak.jsonl}"
 export SOAK
+# **窗口起点必须是可核对的独立事实**（2026-10-19 补，真缺口）：
+# `docs/acceptance/soak-day0.txt` 从第 1 轮就存在，但**没有任何代码读它** ——
+# 它只是我手写的一个备注。报告的"已观测 N 天"完全由 JSONL 首尾样本算出。
+# 于是：**把 soak.jsonl 清空重来，窗口就静默重置了，没人知道**。
+# 合成场景：跑了 3 天 → 清空 → 又跑 8 天。报告会说"8 天、密度 100%、成功率 100%、
+# 全部 ✅"，而真实经过的时间是 11 天，其中有一次重置动作被抹掉了。
+# 判据是"**连续** 7 天无人工干预"，"连续"必须能对抗"清空重来"。
+# 所以把 day0 抬成判据的一部分：
+#   ① 数据里最早的样本不能**晚于** day0 + 容忍（说明数据被重置过）
+#   ② day0 本身不能被改动（它写在文件里，改动会留下痕迹 —— 但我们能核对的是
+#      "当前数据是否覆盖得住 day0"，这已经能挡住清空重来）
+# 只在跑真实窗口时生效（合成数据测试用 SOAK= 覆盖，没有 day0 文件，跳过）。
+DAY0_FILE="${SOAK_DAY0:-$OUTDIR/soak-day0.txt}"
+export DAY0_FILE
 
 PID_DAEMON() { pgrep -f 'src/daemon.ts' | head -1; }
 
@@ -353,6 +369,34 @@ const first=all[0], last=all[all.length-1];
 // （超过 90 分钟没有新样本才算没在看）。
 const nowSec=Math.floor(Date.now()/1000);
 const hours=(nowSec-first.ts)/3600, days=hours/24;
+// **窗口起点核对**（2026-10-19 补）：见脚本顶部 DAY0_FILE 的说明。
+// day0 是独立写入的事实，数据最早样本不能晚于它太多。
+// 晚于 day0 + 1 小时 → 说明数据被清空重来过，"连续 N 天"不成立。
+// 容差 1 小时：day0 是手工 `date +%s` 记的，而第一次 cron sample 可能
+// 最多晚 30 分钟（cron 每 30 分钟一次），留 2 倍余量。
+// **只在"真跑"时生效**（2026-10-19 修，第一版把 11 个健康用例全误杀了）：
+// 第一版无条件读 DAY0_FILE，而合成数据的默认 DAY0_FILE 仍指向真实的
+// docs/acceptance/soak-day0.txt —— 两者相差 8 天，于是"数据晚于 day0 72 小时"
+// 把**每一个健康用例都判成失败**。
+// 这正是"判据本身会说谎"的第二个方向：不该拦的拦了。
+// 区分方式：只有在**用默认 SOAK 路径**（也就是真跑）时才核对 day0。
+// 用 SOAK= 覆盖 = 合成数据 = 测判据逻辑，不该被真实 day0 约束。
+// 显式传 SOAK_DAY0= 时也生效（用于验证 day0 判据本身）。
+// 显式传 SOAK_DAY0= 时也要生效 —— 那是"专门验证 day0 判据本身"的场景。
+const isRealRun = !process.env.SOAK_OVERRIDDEN || !!process.env.SOAK_DAY0;
+let day0Ts=null, dataReset=false, day0Early=false, day0Compat=null;
+if(isRealRun){
+  try{
+    const txt=fs.readFileSync(process.env.DAY0_FILE,"utf8").trim();
+    const m=txt.match(/\s(\d{9,})$/);
+    day0Ts = m ? Number(m[1]) : Math.floor(new Date(txt.split(/\s+/).slice(0,2).join(" ")).getTime()/1000);
+    if(Number.isFinite(day0Ts) && day0Ts>0){
+      dataReset = first.ts > day0Ts + 3600;
+      day0Early = first.ts < day0Ts - 60;
+      day0Compat=true;
+    }
+  }catch{}
+}
 
 // **时间戳在未来 = 数据坏了，不能当成负数天数照算**（2026-10-19 补，真缺口）：
 // 时钟回拨、NTP 跳变、或有人手改了文件，都会让 ts 跑到 now 之后。
@@ -918,6 +962,17 @@ if(passRate!==null){
   const dist=[0,1,2,3].map(s=>`${SLOT_NAMES[s]} ${slotSeen[String(s)]||0}`).join(" / ");
   if(probesVerified.length) console.log(`探针能力覆盖：${dist}`+(slotMissing.length?`　**未覆盖：${slotMissing.map(s=>SLOT_NAMES[s]).join("、")}**`:""));
 }
+if(day0Compat)
+  console.log(`窗口起点核对：day0=${new Date(day0Ts*1000).toISOString().slice(0,16).replace("T"," ")}，`+
+              `最早样本=${new Date(first.ts*1000).toISOString().slice(0,16).replace("T"," ")}`+
+              (dataReset? `　❌ **晚了 ${((first.ts-day0Ts)/3600).toFixed(1)} 小时**`:dataReset===false?"　✅ 覆盖得住 day0":"")); 
+if(dataReset)
+  c.push(`❌ **数据最早样本比 day0 晚了 ${((first.ts-day0Ts)/3600).toFixed(1)} 小时**：`+
+         `说明中间**清空或重建过数据文件**，"连续 N 天"的前提被破坏了 —— `+
+         `报告里的天数只能证明"这份数据跨了 N 天"，不能证明"这件事连续跑了 N 天"`);
+if(day0Early)
+  c.push(`❌ **数据比 day0 还早 ${((day0Ts-first.ts)/60).toFixed(0)} 分钟**：day0 记错了，`+
+         `"连续 7 天"的起点不可信`);
 if(!slotOk)
   c.push(`❌ **探针有 ${slotMissing.length} 条能力路径 7 天没测过**：`+
          `${slotMissing.map(s=>SLOT_NAMES[s]).join("、")} —— `+
@@ -980,7 +1035,7 @@ console.log("\n判定：" + c.join("；"));
 // 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk && !dataReset && !day0Early;
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
