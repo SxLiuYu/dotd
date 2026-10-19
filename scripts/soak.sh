@@ -90,8 +90,15 @@ const fs=require("fs");
 let lines=[];
 try{lines=fs.readFileSync(process.env.SOAK,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);}catch{}
 const probes=lines.filter(x=>x.kind==="probe");
-const all=lines.filter(x=>x.kind!=="probe"&&x.alive);
-if(!all.length){console.log("还没有样本");process.exit(1);}
+// 修复前采的样本没有 pid/proc_start 字段（那时还没记录身份），
+// 它们无法参与"生命周期"判断，单独算一类，不混进来算增长。
+const raw=lines.filter(x=>x.kind!=="probe"&&x.alive);
+const legacy=raw.filter(s=>s.proc_start===undefined||s.pid===undefined);
+const all=raw.filter(s=>s.proc_start!==undefined&&s.pid!==undefined);
+if(!all.length){
+  console.log("还没有可用于判据的样本（无 pid 的历史样本 "+legacy.length+" 条已忽略）");
+  process.exit(1);
+}
 
 // **只跟同一个 daemon 生命周期比较**（见 sample 里的注释：跨重启会算出负数增长）
 const cur=all[all.length-1];
@@ -121,6 +128,7 @@ const LIFE=[...lifeMap.values()].sort((a,b)=>a.first-b.first);
 
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，跨度 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天）`);
+if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
 if(lifetimes>1){
   for(const L of LIFE){
