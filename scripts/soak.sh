@@ -227,6 +227,16 @@ const probes=lines.filter(x=>x.kind==="probe");
 // 判据要的是"在飞书里真的能干活的成功率"，所以只用验过出站+入站的探针。
 const probesVerified = probes.filter(p=>p.out!==undefined && p.ws!==undefined);
 const probesLegacy = probes.length - probesVerified.length;
+// 末尾成功率：**"不掉"不等于"总平均够"**，总平均会掩盖下降趋势。
+// 合成数据实测：160 次探针里最后 8 次全失败（最后一天成功率 0%），
+// 总数恰好 95% 压线 → exit 0，服务其实最后一天已经全坏了。
+// 定义必须放在这里（密度/覆盖判据在更早位置要用），
+// 放到 passOk 旁边会 TDZ —— 我踩了一次，靠上一轮加的 exit 2 立刻发现。
+// 末尾取最后 4 个（cron 每 6 小时一次 → 约覆盖最后 1 天）。
+// 这里写 4 而不引用 PROBE_PER_DAY：那个常量定义在后面，会 TDZ。
+const TAIL_PROBES=4;
+const tailProbes=probesVerified.slice().sort((a,b)=>a.ts-b.ts).slice(-TAIL_PROBES);
+const tailPassRate=tailProbes.length? tailProbes.filter(p=>p.ok).length/tailProbes.length : null;
 // 修复前采的样本没有 pid/proc_start 字段（那时还没记录身份），
 // 它们无法参与"生命周期"判断，单独算一类，不混进来算增长。
 // **重复行可以伪造采样密度**（2026-10-19 补，真缺口）：
@@ -307,6 +317,10 @@ for(let i=0; i*86400<=nowSec-first.ts; i++) allSegList.push(i);
 const coveredProbeDays=allSegList.filter(i=>probeSegs.has(i)).length;
 const PROBE_DAY_MISS_ALLOWED=1;
 const probeCoverageOk=!(days>=7 && coveredProbeDays < allSegList.length-PROBE_DAY_MISS_ALLOWED);
+
+// 末尾成功率判据（这里 days 已算好）
+// 少于 4 个探针算不准，不判定（交给密度/覆盖判据拦）
+const tailOk = !(days>=7 && tailProbes.length>=4 && tailPassRate<0.75);
 const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际跨度"
 
 // **连续性**（2026-10-19 补）：只看"首尾跨了 7 天"是不够的 ——
@@ -638,6 +652,12 @@ if(days>=7){
     : `❌ **探针只覆盖了 ${coveredProbeDays}/${allSegList.length} 段**：`+
       `"成功率不掉"要在整个窗口都有证据，不能只在开头测一批就算完`);
 }
+if(days>=7 && tailProbes.length>=4){
+  c.push(tailOk
+    ? `✅ 末尾 ${tailProbes.length} 次探针成功率 ${(tailPassRate*100).toFixed(0)}%（判据 ≥75%，防止"最后几天坏掉但被总平均盖住"）`
+    : `❌ **末尾 ${tailProbes.length} 次探针成功率只有 ${(tailPassRate*100).toFixed(0)}%**（判据 ≥75%）：`+
+      `总平均 ${(passRate*100).toFixed(0)}% 掩盖了下降趋势 —— 判据要的是"不掉"，不是"平均还行"`);
+}
 if(passRate!==null){
   if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
   else {
@@ -680,7 +700,11 @@ console.log("\n判定：" + c.join("；"));
 // 退出码却还是 0，脚本层面会当成通过。合成数据实测：28 次探针全后半失败、
 // 总成功率 50%，exit 仍是 0。这等于 S6 最容易退化的那条判据没有约束力。
 // 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk;
+// **"不掉"不等于"总平均够"**（2026-10-19 补，真缺口）：
+// 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
+// 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
+// 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95)
