@@ -208,6 +208,38 @@ export function classifyFeishuInbound(
         // 落到下面的 ignore
       }
     }
+
+    // **语音消息**（2026-10-19）：content = {file_key, duration(ms)}。
+    //
+    // 诚实的能力边界：当前**没有语音转写**能力（容器里无 ffmpeg/whisper，
+    // 模型配置也没声明音频输入）。所以这里不假装能听懂，而是：
+    //   ① 建一个任务（而不是静默 ignore），让主人**收到一条明确回复**；
+    //   ② 回复里说清楚"收到了语音，但暂时转不了文字"，并给替代方案。
+    //
+    // 为什么值得做：主人发语音被**静默丢弃**是最差的体验 —— 说了半天没有任何反应，
+    // 分不清是没收到、正在处理、还是坏了。明确说"收到了但做不了"至少是可预期的。
+    if (msgType === 'audio') {
+      let durationSec = 0;
+      try {
+        const parsed = JSON.parse(String(message['content'] ?? '{}')) as { duration?: unknown };
+        if (typeof parsed.duration === 'number') durationSec = Math.round(parsed.duration / 1000);
+      } catch {
+        // 时长未知
+      }
+      const lenPart = durationSec > 0 ? `，约 ${durationSec} 秒` : '';
+      return {
+        kind: 'message',
+        dedupKey,
+        eventId,
+        chatId,
+        text:
+          `（主人发来一条语音${lenPart}）` +
+          '我收到了这条语音，但目前还不支持语音转文字，听不到里面的内容。' +
+          '请把要点用文字发给我；长内容也可以先转成文字再发。',
+        raw: { source: 'http', dotId, text, payload: obj, dedupKey, actor: `feishu:${chatId}` },
+      };
+    }
+
     // 只有「文本」与「已拍平的富文本」算可执行消息；其余类型（图片/文件在各自分支已返回）
     // 仍然 ack 不建任务，防 §6 匹配器误建。
     //

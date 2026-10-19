@@ -96,8 +96,10 @@ test('纯文本行为不变', () => {
   assert.equal(d.kind, 'message');
 });
 
-test('真正不支持的类型仍然 ignore（audio/media/sticker）', () => {
-  for (const t of ['audio', 'media', 'sticker']) {
+// 注：audio 自 2026-10-19 起不再 ignore（改为明确回复"暂不支持转文字"），
+// 断言见 tests/surfaces-feishu-audio.test.ts。这里只钉住真正无声无息的那几类。
+test('真正不支持且不常见输入的类型仍然 ignore（media/sticker）', () => {
+  for (const t of ['media', 'sticker']) {
     const d = classifyFeishuInbound(envelope(t, { file_key: 'fk' }), CFG);
     assert.equal(d.kind, 'ignore', `${t} 应仍被忽略`);
   }

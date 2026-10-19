@@ -61,9 +61,11 @@ test('分类：图片消息缺 image_key → 仍然 ignore（不建空任务）'
   if (d.kind === 'ignore') assert.ok(d.detail.includes('image_key'), `detail 应说清原因，实际 ${d.detail}`);
 });
 
-test('分类：其它非文本（音频/文件）仍然 ignore（不误建任务）', () => {
-  // 注意：file 已单独支持（见上面的用例），这里只测仍不支持的媒体类型。
-  for (const t of ['audio', 'media', 'sticker', 'video']) {
+// 注：audio 自 2026-10-19 起不再 ignore（改为明确回复"暂不支持转文字"），
+// 断言见 tests/surfaces-feishu-audio.test.ts。这里只钉住真正不支持的媒体类型。
+test('分类：其它非文本媒体仍然 ignore（不误建任务）', () => {
+  // 注意：file / audio 已单独支持（见上面与 audio 用例），这里只测仍不支持的。
+  for (const t of ['media', 'sticker', 'video']) {
     const body = {
       schema: '2.0',
       header: { event_id: `ev_${t}`, event_type: 'im.message.receive_v1' },
