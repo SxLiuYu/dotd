@@ -381,6 +381,11 @@ function makeFeishuMedia(
      * 下载文件消息（PDF/Excel/Word 等）—— 2026-10-19。
      *
      * 端点与图片**不同**：GET /im/v1/messages/{message_id}/resources/{file_key}?type=file。
+     *
+     * **file_key 必须取自消息体**（2026-10-19 实测确认）：飞书在发送消息时会**重新生成**
+     * file_key —— 上传接口返回的 key 与消息里的是两个不同的值。用上传时那个去下载会报
+     * `234003 File not in msg`（看起来像"没权限"，实际是"key 不属于这条消息"）。
+     * 本函数收到的 fileKey 来自 handleFeishuCallback 里的 decision.fileKey（即消息体），是对的。
      * 文件名保留（只做危险字符过滤），因为**扩展名决定模型怎么处理**
      * （.pdf 用 pdftotext，.xlsx 用 python 解 zip）。落盘到 media/ 下，与图片同目录。
      */
