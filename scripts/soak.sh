@@ -108,12 +108,27 @@ const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
 const maxFd=Math.max(...S.map(s=>s.fd));
 const passRate=probes.length? probes.filter(p=>p.ok).length/probes.length : null;
 
-// 重启次数 = 样本里出现过的不同 daemon 生命周期数
-const lifetimes=new Set(all.map(s=>String(s.proc_start)+":"+String(s.pid))).size;
+// 生命周期 = 一个 daemon 进程从生到死。>1 说明期间重启过 ——
+// "连续 7 天不干预"必须把这件事显式说出来，否则报告在撒谎。
+const lifeMap=new Map();
+for(const s of all){
+  const k=String(s.proc_start)+":"+String(s.pid);
+  if(!lifeMap.has(k)) lifeMap.set(k,{key:k,pid:s.pid,first:s.ts,last:s.ts,samples:0});
+  const L=lifeMap.get(k); L.last=s.ts; L.samples++;
+}
+const lifetimes=lifeMap.size;
+const LIFE=[...lifeMap.values()].sort((a,b)=>a.first-b.first);
 
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，跨度 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
+if(lifetimes>1){
+  for(const L of LIFE){
+    console.log(`  · pid=${L.pid} ${new Date(L.first*1000).toISOString().replace("T"," ").slice(0,19)} → `+
+                `${new Date(L.last*1000).toISOString().replace("T"," ").slice(0,19)}  `+
+                `(${((L.last-L.first)/3600).toFixed(2)}h, ${L.samples} 点)`);
+  }
+}
 console.log(`当前生命周期内采样 ${S.length} 个点，pid=${cur.pid}`);
 console.log(`RSS: 起 ${rss0.toFixed(1)}MB → 末 ${rssN.toFixed(1)}MB，增长 ${growth>=0?"+":""}${growth.toFixed(1)}MB（判据 < +50MB）`);
 console.log(`RSS 峰值 ${maxRss.toFixed(1)}MB（仅当前生命周期）`);
@@ -125,6 +140,7 @@ const c=[];
 if(days>=7) c.push("✅ 已满 7 天"); else c.push(`❌ 未满 7 天（还差 ${(7-days).toFixed(2)} 天）`);
 c.push(growth<50? "✅ RSS 增长 <50MB" : `❌ RSS 增长 ${growth.toFixed(1)}MB ≥50MB`);
 c.push(fdGrowth<=2? "✅ 无明显句柄泄漏" : `❌ 句柄增长 ${fdGrowth}`);
+if(lifetimes>1) c.push(`⚠ 期间重启过 ${lifetimes-1} 次（"连续 7 天"需说明原因：自愈不算人工干预，但要如实记录）`);
 if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
 console.log("\n判定：" + c.join("；"));
 process.exit(days>=7 && growth<50 && fdGrowth<=2 ? 0 : 1);'
