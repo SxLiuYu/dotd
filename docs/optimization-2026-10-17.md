@@ -3995,3 +3995,57 @@ const chatId = threadChat ?? deps.fallbackChatId ?? null;
 ## 264. 本轮门禁
 
 定时提醒端到端送达真实飞书会话 · 探针 crontab 已清理 · `tsc` exit 0 · **`npm test` 1521/1521**
+
+---
+
+# 第五十五轮：日常验收 + 修掉重复提醒（2026-10-19）
+
+## 265. 用主人真会说的话验收
+
+不测功能点，直接说人话：
+
+| 我说 | Dot 回答 | 耗时 |
+|---|---|---|
+| 现在几点了 | 2026-10-19 03:52 UTC / 北京时间 11:52 周一，还说明容器时钟是 UTC | 6s |
+| 今天有什么安排，我记得设过提醒 | **列出 3 个定时任务**，并指出其中两个是重复的 | 9s |
+| 把「周五前提交季度总结」记一下 | 写进长期记忆，**并说明不知道是哪一周所以没擅自设提醒** | 10s |
+| 读一下那个 q3 目录 | 直接读出数据整理成表 | 8s |
+| 算买房要多少年（月存1万 / 500万） | 41.67 年，还问要不要算几档对比 | 5s |
+
+**5/5 都合理，且都在 5–10 秒内。**
+
+第三句尤其值得记：我说"周五前"，它没有硬猜是哪周、没有擅自建提醒，而是记下来并说明。
+**这正是"不确定时问一句"该有的样子**（前面几轮补的纪律在起作用）。
+
+## 266. 但它顺手指出一个真问题
+
+第 2 条回答里它说："其中两个是重复的"。
+
+查证：`每日喝水提醒` 和 `早上喝水提醒` 两条，**cron 都是 0 7 * * ***，prompt 内容几乎一样。
+原因是主人两次说"每天早上7点提醒我喝水"，而 `createSchedule` **没有查重**。
+
+后果：到点会收到两条几乎一样的提醒。已清理掉一条。
+
+## 267. 修法：cron + prompt 查重
+
+```ts
+const dup = db.prepare(
+  'SELECT id, title FROM crontabs WHERE enabled=1 AND cron=? AND prompt=? AND dot_id=? LIMIT 1'
+).get(cron, prompt, dotId);
+if (dup !== undefined) return { ok: true, schedule: <原那条>, deduplicated: true };
+```
+
+判据用 (cron, prompt) 完全一致：同一条命令重复下不会重复建；
+title 不同但 cron+prompt 相同的也拦（那只是措辞差异）。
+真想要两条一样的？改 prompt 加区分即可。
+
+## 268. 实测
+
+```
+第 1 次: ok=true deduplicated=false id=ct_01M594SSFQJ
+第 2 次: ok=true deduplicated=true  id=ct_01M594SSFQJ   ← 同一条
+```
+
+## 269. 本轮门禁
+
+日常验收 5/5 · 查重生效 · 已清理一条重复提醒 · `tsc` exit 0 · **`npm test` 1521/1521**

@@ -59,6 +59,11 @@ export interface CreateScheduleResult {
   ok: boolean;
   schedule?: ScheduleRow;
   error?: string;
+  /**
+   * true = 已存在 (cron, prompt) 相同的启用任务，返回的是原来那条，没有新建。
+   * 调用方（工具层）可以据此告诉模型"这条已经在了，没有重复创建"。
+   */
+  deduplicated?: boolean;
 }
 
 /** 算下一次触发时刻的注入点（调度器已有同一实现在用，测试可替换）。 */
@@ -111,6 +116,22 @@ export function createSchedule(
   const quiet = input.quietHours ?? null;
   if (quiet !== null && !/^\d{2}:\d{2}-\d{2}:\d{2}$/.test(quiet)) {
     return { ok: false, error: `quietHours 形状应为 '23:00-07:30'，收到 ${quiet}` };
+  }
+
+  // **查重**（2026-10-19 验收时发现）：主人两次说"每天早上7点提醒我喝水"，
+  // 产生了两条 cron 相同、内容几乎一样的任务 —— 到点会收到两条重复提醒。
+  // 判据用 (cron, prompt) 完全一致：同一条命令重复下不会重复建；
+  // title 不同但 cron+prompt 相同的也拦（那只是措辞差异，提醒内容一样）。
+  // 明确想建两条一样的？改 prompt 加区分即可。
+  const dup = db
+    .prepare('SELECT id, title FROM crontabs WHERE enabled=1 AND cron=? AND prompt=? AND dot_id=? LIMIT 1')
+    .get(cron, prompt, dotId) as { id: string; title: string } | undefined;
+  if (dup !== undefined) {
+    return {
+      ok: true,
+      schedule: toRow(db.prepare('SELECT * FROM crontabs WHERE id=?').get(dup.id)),
+      deduplicated: true,
+    };
   }
 
   const id = newCrontabId();
