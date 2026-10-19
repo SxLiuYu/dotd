@@ -68,6 +68,8 @@ do_probe() {
   ts=$(date +%s)
   set -a; . ./_tokens_src.env 2>/dev/null; set +a
   local base=http://127.0.0.1:7788
+  # daemon 的 stdout 日志：用来判断飞书长连接状态（见下面入站判据）
+  local DOTD_LOG="${DOTD_DAEMON_LOG:-/tmp/dotd-wsl.log}"
   local hdr=(-H "Authorization: Bearer ${DOTD_MASTER_TOKEN:-}" -H "Content-Type: application/json")
   t0=$(date +%s)
   # **探测必须真的测能力**（2026-10-19 改）：原来只发"回复 OK 两个字母就行"，
@@ -142,6 +144,19 @@ process.stdout.write(r ? String(r.ok) : ""); db.close();' "$tid")
         done
         [ "$out_ok" = "1" ] || ok=0
         OUT_OK=$out_ok
+        # **还要确认飞书那条入站长连接还活着**（2026-10-19 补，真缺口）：
+        # probe 走的是 HTTP API，**完全绕开飞书入站**。所以长连接断了、重连也失败时，
+        # 用户在飞书里发消息根本没人接，而 probe 照样 ok=1、报告全绿。
+        # 这条路径是"在飞书里干活"的另一半（出站已验证，入站一直没验）。
+        # 判据：日志里最近一次长连接状态必须是"已建立/已恢复"，
+        # 不能停在"断开，重连中"或"错误"上。
+        local ws_state
+        ws_state=$(grep -oE '飞书长连接(已建立（事件订阅就绪）|已恢复|断开，重连中…|错误：[^ ]*)' "$DOTD_LOG" 2>/dev/null | tail -1)
+        case "$ws_state" in
+          *已建立*|*已恢复*) WS_OK=1 ;;
+          *) WS_OK=0 ;;
+        esac
+        [ "$WS_OK" = "1" ] || ok=0
         # 记下这轮到底考了什么，报告里能看出覆盖
         PROBE_SLOT=$slot; PROBE_WANT=$want
         break
@@ -158,10 +173,10 @@ const o={ts:Number(process.argv[1]),kind:"probe",ok:process.argv[2]==="1",
   // **把两个子判据分别记下来**（2026-10-19 补）：ok 是"答对 且 发到飞书"的合成结果，
   // 只存 ok 的话，7 天里某次失败事后完全分不清是"模型答错了"还是"飞书没发出去"，
   // 而这两种的处置完全不同。7 天要跑 168 小时，出问题必须能事后归因。
-  out:process.argv[8]||""};
+  out:process.argv[8]||"",ws:process.argv[9]||""};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}" "${OUT_OK:-}"
-  echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} 飞书出站=${OUT_OK:-?} secs=$(( $(date +%s) - t0 ))"
+    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}" "${OUT_OK:-}" "${WS_OK:-}"
+  echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} 飞书出站=${OUT_OK:-?} 飞书入站=${WS_OK:-?} secs=$(( $(date +%s) - t0 ))"
 }
 
 do_report() {
@@ -421,8 +436,10 @@ if(passRate!==null){
     // 失败要能归因：答错 vs 飞书没发出去
     const bad=probes.filter(p=>!p.ok);
     const noOut=bad.filter(p=>p.out!==undefined && String(p.out)!=="1").length;
+    const noWs=bad.filter(p=>p.ws!==undefined && String(p.ws)!=="1").length;
+    const other=bad.length-noOut-noWs;
     c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败：`+
-           `${noOut} 次飞书未送达 / ${bad.length-noOut} 次未答对或未完成）`);
+           `${noOut} 次飞书未送达 / ${noWs} 次飞书入站长连接不在 / ${other} 次未答对或未完成）`);
   }
 }
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
