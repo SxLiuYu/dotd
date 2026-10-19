@@ -5341,3 +5341,70 @@ bus.publish('router.breaker_changed', { from: 'open', to: 'closed' });
 
 拆分 `stop_reason` 时我只改了生产方（标什么原因），忘了消费方（按原因做什么）。
 **一个字段有多个读点时，改它的语义必须把所有读点都搜一遍。**
+
+---
+
+# 第七十五轮：把"改字段语义要搜遍读点"变成机械检查（2026-10-19）
+
+## 377. 上一轮的教训，落实成守卫
+
+上一轮发现：拆 `stop_reason` 时只改了生产方，忘了消费方。
+这轮先把所有读点列出来核对，然后**把它变成测试**。
+
+## 378. 审计结果：还漏了一个定义
+
+所有按值过滤的地方（`queue.ts:628/660`、`guard.ts:267`）都覆盖了。
+但发现类型定义没同步：
+
+```ts
+export type StopReason = 'user' | 'tool_risk' | 'circuit_open' | 'watermark' | 'budget' | 'shutdown';
+//                        ↑ 少了 no_qualified_primary / endpoints_unreachable
+```
+
+而 `Task.stopReason` 对外暴露用的就是这个类型 —— **新原因在类型层面"不存在"**，
+且 tsc 不报错（写入路径用的是 `pauseByReason` 的另一套字面量）。
+
+## 379. 三处定义必须一致 → 加机械守卫
+
+`stop_reason` 现在有**三个**定义点：
+
+| 位置 | 作用 |
+|---|---|
+| `db/migrations/140*.sql` 的 CHECK | 数据库允许写什么 |
+| `contracts.ts` 的 `StopReason` | 对外 API / 前端看到的类型 |
+| `queue.ts` 的 `pauseByReason` 签名 | 内部能标什么 |
+
+`tests/stop-reason-single-source.test.ts` 从**源码正则**里把三处值都抽出来逐个比对：
+- 迁移 CHECK = StopReason（完全相等）
+- pauseByReason ⊆ StopReason（不能凭空造）
+- 三种模型不可用原因都在词表里
+
+## 380. 验证守卫真的有效
+
+故意把 `endpoints_unreachable` 从类型里删掉，重跑：
+
+```
+✖ 迁移 CHECK 约束 = contracts.StopReason
+✖ pauseByReason 接受的原因 ⊆ StopReason
+✖ 三种模型不可用原因都在词表里
+3 条全挂
+```
+
+还原后恢复全绿。**守卫是有效的，不是摆设。**
+
+## 381. 一个自己造成的失误
+
+清理临时脚本时用了 `Remove-Item scripts\*.mjs`，**把仓库依赖的 7 个脚本一起删了**
+（`doctor.mjs` / `setup.mjs` / `smoke.mjs` / `mcp-echo-server.mjs` 等）。
+测试从 1560 掉到 1524 才暴露。
+
+这些文件在 `.gitignore` 之外，但我误以为只有自己新写的临时脚本。
+**幸好 WSL 侧有一份完整副本**，从 `/root/dotd/scripts/` 同步回来全部恢复。
+
+教训：**通配符删除必须先 `-WhatIf` 看清清单**。这条以前只在教科书上见过，
+这次真踩了，代价是差点丢 7 个文件。
+
+## 382. 本轮门禁
+
+三处定义机械对齐（含反向验证）· `StopReason` 已补两个新值 ·
+误删的 7 个脚本已恢复 · **`npm test` 1563/1563**

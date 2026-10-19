@@ -113,8 +113,25 @@ export type StepKind = 'llm' | 'tool';
  */
 export type SideEffect = 'safe' | 'replayable' | 'unknown';
 
-/** CP §3：tasks.stop_reason CHECK（契约 §9：任务挂起等模型 = paused(stop_reason='circuit_open')）。 */
-export type StopReason = 'user' | 'tool_risk' | 'circuit_open' | 'watermark' | 'budget' | 'shutdown';
+/**
+ * CP §3：tasks.stop_reason CHECK（迁移 140 后的完整词表）。
+ *
+ * **三种"模型不可用"必须分开**（2026-10-19）：原来它们共用一个 `circuit_open`，
+ * 而恢复逻辑按 reason 批量回 queued —— 共用导致网关修好后任务不回队。
+ *
+ *  - `circuit_open`          breaker 真的打开了（端点级故障，backoff 后自愈）
+ *  - `no_qualified_primary`  没有合格主端点（**配置问题**，改配置后手动 resume）
+ *  - `endpoints_unreachable` 全部端点连不上（**网关/网络问题**，网关恢复即自动回队）
+ */
+export type StopReason =
+  | 'user'
+  | 'tool_risk'
+  | 'circuit_open'
+  | 'no_qualified_primary'
+  | 'endpoints_unreachable'
+  | 'watermark'
+  | 'budget'
+  | 'shutdown';
 
 export interface Task {
   id: string;
