@@ -4182,3 +4182,66 @@ GOV 五档里 `write_file` 是放行、`dangerous` 才是人工确认——删�
 
 `fs.remove` 已提到 dangerous · 拦截 + 批准 + 执行 + 归档 全链路实测通过 ·
 `tsc` exit 0 · **`npm test` 1521/1521**
+
+---
+
+# 第五十八轮：shell 能绕过全部网络管控（2026-10-19）
+
+## 282. 顺着"权限边界"往下查
+
+上一轮修了 `fs.remove` 绕过审批。这一轮系统性地问：
+**还有哪些工具能替代受管控的动作？**
+
+对照表：
+
+| 受管控动作 | 可替代它的工具 | 结论 |
+|---|---|---|
+| shell.run (rm) [dangerous] | fs.remove | ✅ 上轮已堵 |
+| shell.run (sudo/docker) | 无 | ✅ |
+| net.post [write_file] | **shell.run curl** | ⚠️ **没堵** |
+
+## 283. 实测确认绕过
+
+```
+DOTD_NET_TOOLS=get            ← 主人只开了 GET
+容器里 curl POST → HTTP 200   ← shell 能 POST 到任意地址
+```
+
+容器里 `curl`、`wget`、`python3` 都在，DNS 通、443 通。
+而 `shell.run` 的危险词表只有 `rm/sudo/docker/> /dev/`——
+**`curl -X POST` 完全不在里面，走 write_file 档默认放行。**
+
+也就是说：主人把出网设成"只读 GET"，模型换个工具就能 POST 到任何地方。
+
+## 284. 修法：网络命令进危险词表
+
+```
+whenContains: ["rm ", "sudo ", "docker ", "> /dev/",
+               "curl ", "wget ", "nc ", "telnet ", "ssh ", "scp ", "ftp "]
+```
+
+代价是"用 curl 抓个网页"也要审批。**这是有意的**：
+想抓网页请用 `net.get`（read 档，直接放行），shell 里的网络命令一律当危险动作。
+
+## 285. 实测（带对照组）
+
+```
+A. shell.run 跑 curl  → awaiting_approval，approval=5   ✅ 拦住了
+B. net.get 访问网页    → done，直接成功                 ✅ 正常放行
+```
+
+**对照组很关键**：只有 A 被拦、B 正常，才能说明是"精准收紧"而不是"把网络整个废掉"。
+
+## 286. 两轮的共同教训
+
+同一个模式出现了两次：
+
+- 第 57 轮：`fs.remove` 成了绕过 `shell.run rm` 审批的通道
+- 第 58 轮：`shell.run curl` 成了绕过 `net.post` 管控的通道
+
+**加工具 / 加能力时，必须问一句："这东西能不能替代某个受管控的动作？"**
+只看"它自己危不危险"是不够的——一个看似无害的工具，可能是管制的后门。
+
+## 287. 本轮门禁
+
+curl/wget/ssh 等进危险词表 · A 被拦 / B 放行 双组实测 · `tsc` exit 0 · **`npm test` 1521/1521**

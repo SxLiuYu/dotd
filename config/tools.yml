@@ -41,7 +41,12 @@ tools:
     tier: write_file                        # 容器内 shell（EX §7：bash -c，cwd=/dot/home，超时必填）
     upgrade:                                # 命中即提档（解析规则见 GOV §3.1）
       tier: dangerous
-      whenContains: ["rm ", "sudo ", "docker ", "> /dev/"]
+      # **出网命令必须在此**（2026-10-19 实测发现）：容器里 curl/wget/python 都能出网，
+      # 而 DOTD_NET_TOOLS=get 只限制 net.* 工具 —— 模型用 `curl -X POST` 就能完全绕过
+      # net.post 的管控（实测 curl POST 拿到 HTTP 200）。同理 nc/telnet/ssh 等也是通路。
+      # 加这一批的代价：正常的"用 curl 抓个网页"会走审批。这是有意的 ——
+      # 想抓网页请用 net.get（read 档，直接放行），shell 里的网络命令一律当危险动作。
+      whenContains: ["rm ", "sudo ", "docker ", "> /dev/", "curl ", "wget ", "nc ", "telnet ", "ssh ", "scp ", "ftp "]
   - name: browser.open
     tier: read                              # 只导航不交互
   - name: browser.act                       # click/type/submit 合并为一个动作工具
