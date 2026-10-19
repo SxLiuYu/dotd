@@ -199,6 +199,13 @@ const maxRss=Math.max(...S.map(s=>s.rss_kb))/1024;
 const maxFd=Math.max(...S.map(s=>s.fd));
 const passRate=probes.length? probes.filter(p=>p.ok).length/probes.length : null;
 
+// **容器可用性**（2026-10-19 补）：`container_up` 一直在采，却从来没被任何判据用过 ——
+// 也就是说容器可以停一整天，而 S6 照样"通过"。probe 每 6 小时才跑一次，
+// 中间最多 6 小时是盲区，靠 probe 兜不住，必须用每个 sample 点的 container_up 判断。
+// 判据取"容器在线的采样点占比"，容忍 <5% 的短暂抖动（重建/重启几秒属正常）。
+const contRate=all.length? all.filter(s=>Number(s.container_up)===1).length/all.length : null;
+const contDown=all.filter(s=>Number(s.container_up)!==1);
+
 // 生命周期 = 一个 daemon 进程从生到死。>1 说明期间重启过 ——
 // "连续 7 天不干预"必须把这件事显式说出来，否则报告在撒谎。
 const lifeMap=new Map();
@@ -270,6 +277,8 @@ console.log(`句柄: 首段中位 ${fd0} → 末段中位 ${fdN}（增长 ${fdGr
 console.log(`线程: 首段中位 → 末段中位（增长 ${thGrowth>=0?"+":""}${thGrowth}）`);
 console.log(`（首/末段各取 ${tailN} 个样本的中位数，避免单点噪声误判）`);
 console.log(`探针 ${probes.length} 次，成功率 ${passRate===null?"n/a":(passRate*100).toFixed(0)+"%"}`);
+console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"%"}` +
+            (contDown.length? `（${contDown.length} 个采样点容器不在线）` : ""));
 
 const c=[];
 if(days>=7 && coveredDays>=7){
@@ -289,8 +298,9 @@ if(unattended.length){
   c.push(`✅ 期间重启 ${restartRows.length} 次，**全部是 watchdog 自愈**（无人干预，符合判据）`);
 }
 if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
+if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
 console.log("\n判定：" + c.join("；"));
-process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && unattended.length===0 ? 0 : 1);'
+process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && unattended.length===0 && (contRate===null||contRate>=0.95) ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
