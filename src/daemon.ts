@@ -1227,8 +1227,37 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ⑩b CP §7.1 步骤 7：scheduler.start（registerInternalJob 全部就位后起 tick）。
   //     recoverOnStartup 只做恢复动作、不起定时器（recovery.ts:170-203），起 tick
   //     是装配层的活。心跳 tick / queue.gc / 看门狗 / memory guard 都靠它。
+  // **memory-retention 每日 job**（2026-10-19 实测发现：全仓库零调用方）。
+  // 文档里写着"§6.1 保留策略（心跳 job memory-retention 每日）"，接口有、实现有、
+  // 但**没有任何地方调它** —— 于是 90 天归档、库清理、以及会话摘要的存量补做
+  // 全都永远不会发生。实测：423 个线程里只有 1 个有摘要，其余 5 个 >64 条的大线程
+  // 因为"只在任务收口时触发"而永远补不上。
+  //
+  // 挂成 heavy job，每 10 分钟检查一次是否到点（isDailyDue 之内逻辑幂等，
+  // 同 queue.gc 的写法）。首次启动时立刻跑一次，把存量的补上。
+  let lastRetentionAt = 0;
+  cp.scheduler.registerInternalJob({
+    name: 'memory-retention',
+    kind: 'heavy',
+    everyMs: 10 * 60_000,
+    run: async () => {
+      const nowMs = Date.now();
+      // 每日一次；但首次（lastRetentionAt=0）立刻跑
+      if (lastRetentionAt !== 0 && nowMs - lastRetentionAt < 24 * 3600_000) return;
+      lastRetentionAt = nowMs;
+      try {
+        const report = await memory.runRetention(nowMs);
+        log(
+          `[memory] retention 完成：封存违规 ${report.sealViolations.length}、补 task_end ${report.orphanTaskEndsBackfilled.length}`,
+        );
+      } catch (err) {
+        log(`[memory] retention 失败（不影响主循环）：${String(err)}`);
+      }
+    },
+  });
+
   cp.scheduler.start();
-  log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard）');
+  log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention）');
 
   // ⑪ Runner 循环（常驻，数量 = 并发额度）
   //

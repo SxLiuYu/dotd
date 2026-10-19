@@ -80,6 +80,44 @@ export interface RetentionDeps {
   now: () => number;
 }
 
+/**
+ * 扫出"该有摘要但还没有"的线程（2026-10-19）。
+ *
+ * 为什么需要补做：会话摘要只在**任务收口前**触发（Runner 的 refreshSummary）。
+ * 这意味着存量线程——在摘要机制接通之前就聊了几百条的那些——**永远不会被处理**，
+ * 除非主人又在该会话里说一句话。
+ *
+ * 实测：接通后 423 个线程里只有 1 个有摘要（就是刚跑过任务的那个），
+ * 而 5 个 >64 条的大线程全是 null。其中一个是真实飞书会话（107 条）。
+ *
+ * 这个函数供每日 retention job 调用，返回需要补的 threadId 列表；
+ * 真正的摘要生成仍走 MemoryService.refreshContextSummary（那里才有 summarize 注入）。
+ *
+ * @param threshold 消息条数阈值（与 needsSummarize 的判据一致，默认 64）
+ * @param limit     本次最多返回几个（防止一次补太多把低智能轨打满）
+ */
+export function scanThreadsNeedingSummary(
+  db: DatabaseSync,
+  threshold = 64,
+  limit = 20,
+): string[] {
+  const rows = db
+    .prepare(
+      `
+      SELECT t.id AS id, COUNT(m.seq) AS c
+      FROM mem_threads t
+      JOIN mem_messages m ON m.thread_id = t.id
+      WHERE (t.context_summary IS NULL OR LENGTH(t.context_summary) = 0)
+      GROUP BY t.id
+      HAVING COUNT(m.seq) > ?
+      ORDER BY c DESC
+      LIMIT ?
+    `,
+    )
+    .all(threshold, limit) as Array<{ id: string; c: number }>;
+  return rows.map((r) => r.id);
+}
+
 /** §6.3：断点扫描的 SQL（同 thread 之后无 task_end 的 task_start）。 */
 const SQL_ORPHAN_TASK_STARTS = `
   SELECT m.thread_id AS thread_id, m.task_id AS task_id, m.seq AS seq

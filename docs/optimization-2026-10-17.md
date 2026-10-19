@@ -3651,3 +3651,83 @@ summary 长度=322  upto_seq=481
 
 摘要首次生成成功（322 字节 / upto_seq=481）· **`npm test` 1521/1521**
 （+3 条守卫：两个适配器都要转发、Runner 必须用 memApiOf）· 诊断代码已清理
+
+---
+
+# 第五十轮：每日 retention 从来没有被调度过（2026-10-19）
+
+## 239. 上轮的尾巴
+
+摘要机制接通后，423 个线程里**只有 1 个**有摘要——就是刚跑过任务的那个。
+其余 5 个 >64 条的大线程仍然是 null。
+
+原因很清楚：摘要只在**任务收口前**触发（Runner 的 refreshSummary）。
+存量线程如果主人不再说话，就永远补不上。
+
+## 240. 于是想加"每日补做"，结果挖出更大的问题
+
+在 `runRetention` 里加了补做逻辑，然后准备挂到每日 job 上——
+结果发现 **`runRetention` 全仓库零调用方**：
+
+```
+src/memory/MemoryService.ts:998   async runRetention(...)      ← 实现
+src/memory/types.ts:374           runRetention(...)            ← 接口声明
+src/memory/retention.ts:191       export function runRetention  ← 核心逻辑
+—— 没有任何地方调用它 ——
+```
+
+文档里明明白白写着"§6.1 保留策略（**心跳 job memory-retention 每日**）"，
+`Scheduler` 的注释也点名"MEM memory-compaction/memory-retention 全部挂这里"——
+**但注册那一步从来没写**。
+
+后果（都是静默的）：
+- 90 天归档从不执行 → 老线程永远不封存
+- 库清理从不执行
+- 我上轮加的摘要补做也永远不会跑
+
+## 241. 修法：注册成 heavy job
+
+```ts
+cp.scheduler.registerInternalJob({
+  name: 'memory-retention',
+  kind: 'heavy',
+  everyMs: 10 * 60_000,
+  run: async () => {
+    // 每日一次；首次（lastRetentionAt=0）立刻跑，把存量补上
+    if (lastRetentionAt !== 0 && nowMs - lastRetentionAt < 24 * 3600_000) return;
+    ...
+  },
+});
+```
+
+scheduler 启动日志现在会带上它：
+`heartbeat.tick / queue.gc / watchdog / guard / memory-retention`
+
+## 242. 实测
+
+手动调一次 `runRetention`：
+
+```
+补做前: 有摘要 1 / 423
+补做后: 有摘要 6 / 423     ← 5 个存量大线程全部补上
+```
+
+其中一个是**真实飞书会话**（1794 字节摘要）。
+
+## 243. 这轮的两个"零调用方"
+
+连续两轮都在同一个主题上打转，都是同一个模式：
+**实现有、接口有、文档写了，但接线那一步没做。**
+
+- 上轮：`refreshContextSummary` 漏在 Runner 用的适配器上
+- 这轮：`runRetention` 根本没有调度
+
+这类缺陷**类型检查抓不到**（接口是可选方法 / 函数有导出），
+**单测也抓不到**（测的是函数本身，不是"有没有人调它"）。
+
+唯一有效的检查是：**看一眼真实运行时有没有发生过这件事**。
+这两轮都是靠"查数据库里 422 个 null / 1 个非 null"发现的。
+
+## 244. 本轮门禁
+
+retention job 已注册并出现在启动日志 · 摘要覆盖率 1→6 · **`npm test` 1521/1521**

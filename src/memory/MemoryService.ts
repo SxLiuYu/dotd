@@ -64,6 +64,7 @@ import {
   reconcileIndex,
   recordSearchStat,
   runRetention as runRetentionCore,
+  scanThreadsNeedingSummary,
   scanSessionBreaks,
   SEARCH_STATS_MAX_BYTES,
   SEARCH_STATS_WINDOW_MS,
@@ -1019,6 +1020,17 @@ export class MemoryServiceImpl implements MemoryService {
     if (report.orphanTaskEndsBackfilled.length > 0) {
       const b = this.readKvNumber('seal_backfilled') ?? 0;
       this.writeKv('seal_backfilled', String(b + report.orphanTaskEndsBackfilled.length), at);
+    }
+    // **存量会话补摘要**（2026-10-19）：摘要本来只在任务收口前触发（Runner 的 refreshSummary），
+    // 于是「摘要机制接通之前」就聊了几百条的存量线程**永远不会被处理**——
+    // 实测接通后 423 个线程里只有 1 个有摘要，5 个 >64 条的大线程全是 null。
+    // 这里每天补几个（limit=20 防把低智能轨打满），失败静默（refreshContextSummary 自己吞异常）。
+    for (const threadId of scanThreadsNeedingSummary(this.db, 64, 20)) {
+      try {
+        await this.refreshContextSummary(threadId);
+      } catch {
+        // 摘要失败不影响 retention 本身
+      }
     }
     return report;
   }
