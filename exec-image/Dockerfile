@@ -42,6 +42,13 @@ USER dot
 # 不覆盖 PLAYWRIGHT_BROWSERS_PATH：基座已设 /ms-playwright 且浏览器就位（实测），
 # 指去空目录会让 chromium 查找扑空。
 ENV HOME=/dot/home DISPLAY=:99
-VOLUME ["/dot/home", "/dot/profiles"]     # state 卷与 token bind 在容器创建参数里挂
+# **注释必须单独成行**（2026-10-19 实测）：JSON 数组形式的指令后面跟 # 注释时，
+# docker 会把注释按空格拆开**当成数组元素** —— 这里原本是
+#   VOLUME ["/dot/home", "/dot/profiles"]     # state 卷与 token bind 在容器创建参数里挂
+# 结果镜像声明了 8 个卷：2 个正确的 + "#"、"/dot/profiles]"、"[/dot/home,"、"bind"、
+# "state"、"token"、"卷与"、"在容器创建参数里挂" 这 6 个垃圾路径。
+# 后果：每次创建容器都白建 8 个匿名卷（实测累积到 168 个），且容器里多出
+# /dot/profiles]、/dot/home, 这类畸形目录。
+VOLUME ["/dot/home", "/dot/profiles"]
 EXPOSE 9223
 ENTRYPOINT ["node", "/opt/agent-runtime/dist/server.js"]
