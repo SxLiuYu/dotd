@@ -565,7 +565,9 @@ test('模型熔断：AllEndpointsDownError → paused(circuit_open)（无 waitin
   const out = await runner.runNext();
   assert.equal(out.status, 'paused', '模型全灭应挂起');
   assert.equal(taskOf(tmp, taskId)!['status'], 'paused');
-  assert.equal(taskOf(tmp, taskId)!['stop_reason'], 'circuit_open');
+  // 2026-10-19：不再标 circuit_open —— 网关不可达和端点熔断是两回事，
+  // 共用 circuit_open 会导致网关修好后任务不回队（实测）。
+  assert.equal(taskOf(tmp, taskId)!['stop_reason'], 'endpoints_unreachable');
 });
 
 // ── 6. 步数硬上限 → failed(budget)（CP §5.4）────────────────────────────

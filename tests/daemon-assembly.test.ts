@@ -208,7 +208,7 @@ test('关停：shutdown 幂等 + shutdown_marker + OUTBOX 留痕', async (t) => 
   assert.ok(outbox.includes('优雅退出'), `OUTBOX 无优雅退出留痕：${outbox.slice(0, 200)}`);
 });
 
-test('装配：库里迁移到位（user_version=130）', async (t) => {
+test('装配：库里迁移到位（user_version=140）', async (t) => {
   const { daemon, close } = await boot();
 
   const row = tmp.db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
@@ -216,6 +216,6 @@ test('装配：库里迁移到位（user_version=130）', async (t) => {
   const v = row === undefined ? (tmp.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number }).user_version : row.user_version;
   // 必须等于 db/migrations/ 里最大的 NNN。新增迁移包时同步改这里和 src/daemon.ts
   // 的 expectedVersion——两处漏一处，这个测试就是唯一会响的警报。
-  assert.equal(v, 130);
+  assert.equal(v, 140);
   void close;
 });

@@ -309,7 +309,22 @@ export interface ControlPlane {
   /** CP §8（补旧稿缺失）：模型路由/执行面可调用。 */
   pauseByReason(
     taskId: string,
-    reason: 'circuit_open' | 'watermark' | 'budget' | 'tool_risk',
+    /**
+     * 暂停原因词表（2026-10-19 扩充）。
+     *
+     * 三种"模型不可用"必须分开：原来共用 'circuit_open'，而恢复逻辑按 reason
+     * 批量回 queued —— 共用导致**网关修好时任务不回队**（router.mode_changed 不触发）：
+     *  - circuit_open           breaker 打开（端点级故障，自愈）
+     *  - no_qualified_primary   没有合格主端点（配置问题，不自愈）
+     *  - endpoints_unreachable  全部端点连不上（网关/网络问题，网关恢复即好）
+     */
+    reason:
+      | 'circuit_open'
+      | 'no_qualified_primary'
+      | 'endpoints_unreachable'
+      | 'watermark'
+      | 'budget'
+      | 'tool_risk',
   ): void;
   /**
    * Runner 专用（CP §5.4 硬上限）：直接把在途任务判 failed 并写 stop_reason，

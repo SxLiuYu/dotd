@@ -10,7 +10,7 @@
  *   ⑥ rankManuals 的 IDF 前后对比：同一组输入旧算法命中 A、新算法命中 B，且 B 更合理。
  *
  * 另含：CJK 切分纯函数的边界、contentless 方案的核心判据（不存原文但可检索）、
- * 迁移包与建库模板的一致性（模板建出来的库同样能检索，且 user_version=130）。
+ * 迁移包与建库模板的一致性（模板建出来的库同样能检索，且 user_version=140）。
  */
 
 import { test, describe, beforeEach, afterEach } from 'node:test';
@@ -115,8 +115,8 @@ describe('highlightSnippet：片段里能看到主人查的词', () => {
 // 一、迁移与回填（验收 ①）
 // ═══════════════════════════════════════════════════════════════════
 
-describe('① 迁移：fts 表存在、user_version=130、已有消息可回填', () => {
-  test('真迁移后 mem_messages_fts 是虚表，user_version=130', () => {
+describe('① 迁移：fts 表存在、user_version=140、已有消息可回填', () => {
+  test('真迁移后 mem_messages_fts 是虚表，user_version=140', () => {
     const db = new DatabaseSync(':memory:');
     try {
       const r = migrate(db);
@@ -209,7 +209,7 @@ describe('① 迁移：fts 表存在、user_version=130、已有消息可回填'
     const db = openMigratedTemplateDb(join(root, 'dotd.db'));
     try {
       const uv = db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
-      assert.equal(uv?.user_version, 130, '模板库 user_version 必须跟着迁移到 130');
+      assert.equal(uv?.user_version, 140, '模板库 user_version 必须跟着迁移到 140');
       const fts = db
         .prepare("SELECT 1 AS x FROM sqlite_master WHERE name = 'mem_messages_fts'")
         .get() as { x?: number } | undefined;

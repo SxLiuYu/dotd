@@ -1324,16 +1324,31 @@ export class DotRunner {
     } catch (err) {
       // 模型故障支线：熔断耗尽 → paused(circuit_open)，等 router.mode_changed 批量回 queued
       if (err instanceof AllEndpointsDownError || err instanceof NoQualifiedPrimaryError) {
-        // **必须留日志**（2026-10-18 实测）：熔断原来只把状态写进 tasks.stop_reason，
-        // 日志里一个字都没有 —— 主人只看到"DS 不回话"，无从判断是模型端点挂了还是 dotd 坏了。
-        // 这与之前"WSL 密钥错误只藏在数据库里"是同一类问题：关键故障必须能在日志里看见。
+        // **三种"模型不可用"必须分开标**（2026-10-19 实测改）。
+        //
+        // 原来这一支不分情况一律 `pauseByReason('circuit_open')`，导致：
+        // 网关端口没起来（AllEndpointsDownError）→ 任务标成 circuit_open →
+        // 而恢复路径 resumeCircuitOpenTasks 只在 router.mode_changed / breaker_changed 时跑，
+        // 网关修好时两者都不发生 → **任务永远卡在 paused**（实测）。
+        //
+        // 现在按真实成因标 reason，恢复逻辑可以分别处理：
+        //  - no_qualified_primary：配置问题，改配置才好，不会自愈（提示主人改配置）
+        //  - endpoints_unreachable：网关/网络问题，网关恢复即好（提示检查网关）
+        //  - circuit_open：breaker 真的开了，backoff 后自愈（发 breaker_changed 唤醒）
+        const pauseReason =
+          err instanceof AllEndpointsDownError ? 'endpoints_unreachable' : 'no_qualified_primary';
+        const hint =
+          pauseReason === 'endpoints_unreachable'
+            ? '所有模型端点都连不上 —— 先检查模型网关（relay / gpt-load）是否在跑；网关恢复后任务会自动回队。'
+            : '没有合格的主端点 —— 这是配置问题（config/models.yml 的 primary 端点/凭据），改好配置后手动 resume。';
+        // **必须留日志**（2026-10-18 实测）：关键故障必须能在日志里看见，
+        // 否则主人只看到"不回话"，无从判断是端点挂了还是 dotd 坏了。
         this.log(
-          `runner: 模型熔断 → paused(circuit_open) ${task.id}` +
-            `（${err instanceof Error ? err.name : 'unknown'}：${errText(err)}）。` +
-            `端点恢复后由 router.mode_changed 批量回 queued，无需人工干预。`,
+          `runner: 模型不可用 → paused(${pauseReason}) ${task.id}` +
+            `（${err instanceof Error ? err.name : 'unknown'}：${errText(err)}）。${hint}`,
         );
-        this.cp.pauseByReason(task.id, 'circuit_open');
-        await this.seal(task, 'cancelled', 'circuit_open');
+        this.cp.pauseByReason(task.id, pauseReason);
+        await this.seal(task, 'cancelled', pauseReason);
         return {
           kind: 'pause',
           out: { taskId: task.id, epoch, status: 'paused', summary: err.message },

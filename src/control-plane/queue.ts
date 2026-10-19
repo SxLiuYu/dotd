@@ -573,7 +573,13 @@ export class Queue {
    */
   pauseByReason(
     taskId: string,
-    reason: 'circuit_open' | 'watermark' | 'budget' | 'tool_risk',
+    reason:
+      | 'circuit_open'
+      | 'no_qualified_primary'
+      | 'endpoints_unreachable'
+      | 'watermark'
+      | 'budget'
+      | 'tool_risk',
   ): void {
     const row = this.getRow(taskId);
     if (row === null || isTerminal(row.status)) return;

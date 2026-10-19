@@ -1,9 +1,9 @@
-﻿/**
+/**
 });
   // 与「complete() 路径遇到非熔断类模型错误」的收口对齐。
   //
   // 事实（读码 + 实测）：在这套实现里，complete() 把**所有**异常都算候选失败——
-  // 走完候选就抛 AllEndpointsDownError → Runner 收成 paused(circuit_open)。
+  // 走完候选就抛 AllEndpointsDownError → Runner 收成 paused(endpoints_unreachable)。
   // 所以 complete 路径根本**产不出**"failed"型收口（实测：单端点 bad_protocol 也是 paused）。
   // 而流式首字节后断流是 §4.7 明令「绝不重放」→ 只失败一次、不耗候选 → 落到
   // stepLlm 的"其余模型错误"分支，收成 failed。两条路径因此**必然不同**，
@@ -17,12 +17,12 @@
   const b = await outcomeFacts(offline, off.taskId, offFirst);
   assert.equal(offline.rec.chat.length, 1, 'complete 路径：单端点一次调用');
   assert.equal(b.status, 'paused', 'complete 路径的失败会升级成全候选耗尽 → paused（既有语义）');
-  assert.equal(b.stopReason, 'circuit_open');
+  assert.equal(b.stopReason, 'endpoints_unreachable');
   // 对照结论：流式断流**不**走 paused，而是可恢复的 failed；两者都是"安全收口"，
   // 区别只在「有没有把错误升级成全端点不可用」——断流没资格做那个升级。
   assert.equal(first.status, 'failed');
   assert.equal(task['status'], 'queued', '断流后可恢复：回队列等 retry');
-  assert.notEqual(task['stop_reason'], 'circuit_open', '断流不得把任务打成熔断暂停');
+  assert.notEqual(task['stop_reason'], 'endpoints_unreachable', '断流不得把任务打成端点不可达暂停');
   // 两条路径都把自己的失败写进 journal（complete 侧记 error 前缀，stream 侧同样）
   const offLlmSteps = stepsOf(offline.tmp, off.taskId).filter((s) => s['kind'] === 'llm');
   assert.match(String(offLlmSteps[0]!['result_json']), /^error:/, 'complete 路径同样以 error: 记');
@@ -463,7 +463,7 @@ async function fixture(opts: {
 
 /**
  * 单端点 fixture（models.yml 只留 cloud-main）：用于"一次调用即收口"的对照用例，
- * 避免多候选耗尽把错误升级成 AllEndpointsDownError → paused(circuit_open)。
+ * 避免多候选耗尽把错误升级成 AllEndpointsDownError → paused(endpoints_unreachable)。
  */
 async function fixtureSingleEndpoint(turn: { chatError?: Error }): Promise<Fixture> {
   const tmp = makeTempDataDir();
@@ -730,7 +730,7 @@ async function outcomeFacts(
 
 
 
-test('② 首字节前全候选耗尽：流式与 complete() 的收口逐字一致（paused + circuit_open）', async () => {
+test('② 首字节前全候选耗尽：流式与 complete() 的收口逐字一致（paused + endpoints_unreachable）', async () => {
   const brokenDown = (): Record<string, Turn[]> => ({
     'cloud-main': [{ chatError: new AllEndpointsDownError(['cloud-main#primary'], false), streamFailAfter: 0 }],
     'local-llm': [{ chatError: new AllEndpointsDownError(['local-llm#primary'], false), streamFailAfter: 0 }],
@@ -753,7 +753,7 @@ test('② 首字节前全候选耗尽：流式与 complete() 的收口逐字一�
   // 收口事实逐字段相同
   assert.equal(a.status, 'paused');
   assert.equal(a.taskStatus, 'paused');
-  assert.equal(a.stopReason, 'circuit_open', '熔断耗尽 → pauseByReason(circuit_open)');
+  assert.equal(a.stopReason, 'endpoints_unreachable', '全候选耗尽 → pauseByReason(endpoints_unreachable)');
   assert.deepEqual(a.status, b.status);
   assert.equal(a.taskStatus, b.taskStatus);
   assert.equal(a.stopReason, b.stopReason);
@@ -853,7 +853,7 @@ test('② 首字节后断流：clean abort → 计入一条可恢复错误（fai
   // 与「complete() 路径的失败收口」对读（本仓库的既有语义，实测确认）：
   //
   // complete() 把**所有**异常都算候选失败 —— 走完候选就抛 AllEndpointsDownError，
-  // Runner 收成 paused(circuit_open)。所以 complete 路径**产不出** failed 型收口
+// Runner 收成 paused(endpoints_unreachable)。所以 complete 路径**产不出** failed 型收口
   // （实测：单端点 bad_protocol 也是 paused）。
   // 而流式首字节后断流是 §4.7 明令「绝不重放」→ 只失败一次、不耗候选 → 落到 stepLlm
   // 的"其余模型错误"分支，收成 failed（可恢复，回队列重试）。
@@ -866,11 +866,11 @@ test('② 首字节后断流：clean abort → 计入一条可恢复错误（fai
   const offLlmSteps = stepsOf(offline.tmp, off.taskId).filter((s) => s['kind'] === 'llm');
   assert.equal(offline.rec.chat.length, 1, 'complete 路径：单端点一次调用');
   assert.equal(b.status, 'paused', 'complete 的失败会耗尽候选 → paused（既有语义，未改）');
-  assert.equal(b.stopReason, 'circuit_open');
+  assert.equal(b.stopReason, 'endpoints_unreachable');
   // 断流侧：可恢复的 failed，**不**升级成熔断暂停
   assert.equal(first.status, 'failed');
   assert.equal(task['status'], 'queued', '断流后可恢复：回队列等 retry');
-  assert.notEqual(task['stop_reason'], 'circuit_open', '断流不得把任务打成熔断暂停');
+  assert.notEqual(task['stop_reason'], 'endpoints_unreachable', '断流不得把任务打成端点不可达暂停');
   // 记法差异（如实）：断流走 endLlm 记 'error:…'；耗尽分支不记 endLlm，步停在 started。
   // 耗尽分支**不调 endLlm**（步停在 started，由看门狗/恢复收口）——这与断流分支不同，
   assert.match(String(llmSteps[0]!['result_json']), /^error:/, 'stream 路径同样以 error: 记');

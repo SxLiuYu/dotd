@@ -5176,3 +5176,106 @@ if (!degraded(ev.payload.from) || degraded(ev.payload.to)) return;
 
 网关链路恢复（HTTP 200）· 新任务正常 done · 遗留暂停任务已清理 ·
 **`npm test` 1553/1553** · `breaker_changed` 订阅已加（含 shutdown 注销）
+
+---
+
+# 第七十三轮：三种"模型不可用"被混成一个原因（2026-10-19）
+
+## 365. 从上一轮遗留的疑点查起
+
+实测发现：**breaker 一直是 `closed`，任务却因 `circuit_open` 暂停了。**
+
+追到 `runner/dot.ts`：
+
+```ts
+if (err instanceof AllEndpointsDownError || err instanceof NoQualifiedPrimaryError) {
+  this.cp.pauseByReason(task.id, 'circuit_open');   // ← 两种错误共用一个 reason
+}
+```
+
+三种完全不同的故障被混成一个：
+
+| 错误 | 真实含义 | 恢复方式 |
+|---|---|---|
+| `AllEndpointsDownError` | 全部端点连不上（**网关/网络**） | 网关恢复即好 |
+| `NoQualifiedPrimaryError` | 没有合格主端点（**配置**） | 改配置才好 |
+| 真·熔断 | breaker 打开（**端点级**） | backoff 后自愈 |
+
+而恢复逻辑（`resumeCircuitOpenTasks`）只在 `mode_changed` / `breaker_changed` 时触发 ——
+**网关修好时两者都不发生，任务永远卡着。** 这正是上一轮实测到的现象。
+
+## 366. 修法：给三种情况各自的 stop_reason
+
+```
+circuit_open          breaker 真的开了
+no_qualified_primary  配置问题（不自愈，提示改配置）
+endpoints_unreachable 网关/网络问题（网关恢复即好）
+```
+
+## 367. 然后撞上 SQLite 的 CHECK 约束
+
+`tasks.stop_reason` 有 CHECK 约束，只允许旧的那几种值 —— 新值写不进去：
+
+```
+CHECK constraint failed: stop_reason IN (...)
+```
+
+而**异常被外层 catch 成 failed**，于是测试里看到的是"任务失败"而不是"暂停"。
+（这个现象本身很迷惑：日志里 REASON 明明是对的，任务却是 failed。）
+
+SQLite 不能 ALTER CHECK，只能重建表。**重建过程连踩三个坑**：
+
+**坑① 不能写 BEGIN/COMMIT**
+```
+cannot start a transaction within a transaction
+```
+框架自己已经`BEGIN IMMEDIATE`，文件里再写就嵌套了。
+
+**坑② 不能有 `PRAGMA foreign_keys=ON`**
+框架把文件里**所有** PRAGMA 在 DDL 之前一次性跑完：
+```
+执行 PRAGMA foreign_keys=OFF
+执行 PRAGMA foreign_keys=ON      ← 又把外键打开了
+foreign_keys 现在 = 1
+DROP TABLE tasks → FOREIGN KEY constraint failed（task_results 引用它）
+```
+只要 OFF，不要 ON —— `foreign_keys` 是连接级设置，下次新连接默认就是 ON。
+
+**坑③ 注释里不能有单引号**
+我的注释里写了 `('user','tool_risk',...)` 做示例，而 `splitStatements`
+把 `'` 当成字符串起点，一路吞到下一个 `'` —— 结果：
+```
+语句数: 6（应该是 9）
+[0] CREATE TABLE tasks_new ...     ← PRAGMA 不见了
+...
+[7] 没了                          ← 最后一个索引也不见了
+```
+注释里的单引号全换成中文引号后，9 条语句齐全。
+
+## 368. 实测
+
+```
+✓ 迁移成功
+user_version=140
+tasks 行数: 564（数据完整）
+索引: idx_tasks_pop / idx_tasks_live / idx_tasks_done 全在
+✓ 新 stop_reason 可写入
+daemon: OK  任务: done
+```
+
+## 369. 本轮门禁
+
+`npm test` **1557/1557**（+4 条迁移守卫：不许 BEGIN、不许 ON、注释不许单引号、语句拆分完整）·
+生产库已迁到 140 且数据完整 · daemon 正常运行
+
+## 370. 一个值得记的模式
+
+**"多种故障共用一个状态值"是个反复出现的坑。**
+
+前面几轮也遇到过类似的：
+- 第 66 轮：token 缓存没有失效 → "对象变了但缓存不知道"
+- 第 71 轮：FTS 对账藏在热路径 → "注释说不在，其实在"
+- 第 73 轮：三种模型故障共用一个 reason → "状态值丢失了区分度"
+
+**一个状态值如果可能由多种成因产生，它的下游判断必然出错。**
+要么拆细，要么在别处保留成因信息。
