@@ -148,6 +148,9 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '在容器里执行一条 bash 命令（`bash -c`，工作目录是 /dot/home，无 TTY），返回退出码与 stdout/stderr。' +
       '适合：grep 搜内容、按行截取大文件、统计/排序、批量处理、装在本机工具链里的命令行工具。' +
       '简单读一个文件用 fs.read 更快更省；fs.read 读不动的大文件、需要"按条件筛"时才用 shell。' +
+      '**文件系统边界（重要）**：shell 能读整个**容器**文件系统（/etc、/usr 等都在），' +
+      '而 fs.* 只能读写 /dot/home。所以 fs.read 报 path_outside_home 时，如果确实要看容器内的系统文件，' +
+      '可以用 shell；但**主人家的文件（/root、dotd.db、密钥）在容器里看不见**，那是宿主，别去试。' +
       '限制：环境变量只有 PATH/HOME/LANG/DISPLAY/SHELL（家里拿不到任何密钥）；**不能联网**（没有 curl 到外网的通道，要联网用 net.*）；' +
       'stdout/stderr 各截断 1MB；timeout_ms 必填且到时整组进程会被 SIGKILL。命令里出现 rm/sudo/docker/`> /dev/` 会触发人工审批，任务会挂起等主人，能用 fs.* 就别写 rm。',
     params: {

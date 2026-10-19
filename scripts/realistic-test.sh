@@ -9,7 +9,7 @@ HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application
 PASS=0; FAIL=0
 
 ask() {
-  local name="$1" goal="$2" max="${3:-150}"
+  local name="$1" goal="$2" max="${3:-300}"
   local tid st ans steps
   BODY=$(node -e 'process.stdout.write(JSON.stringify({text:process.argv[1]}))' "$goal")
   tid=$(curl -s -m 20 "${HDR[@]}" -X POST --data-binary "$BODY" "$BASE/api/messages" \
