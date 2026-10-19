@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { EventBus } from '../src/shared/bus.ts';
-import { makeTempDataDir, registerTempPath } from './helpers.ts';
+import { makeTempDataDir, registerTempPath, removeTempPath } from './helpers.ts';
 import type { TempDataDir } from './helpers.ts';
 import { createGovernance, initGovernance } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
@@ -122,6 +122,22 @@ export function makeGovFixture(
   // 登记进 helpers 的临时路径表：即使调用方忘了 cleanup()，`sweepTempPaths()` 也会回收
   // （此前这里每个 fixture 泄漏一个目录，TEMP 里积了数百个 dotd-gov-cfg-*）。
   registerTempPath(root);
+  // **不指望调用方调 cleanup()**（2026-10-19 修，真缺陷）：
+  // 实测这 3 个 governance 测试文件共 12 处 `makeGovFixture`，
+  // **一处都没有调用 `.cleanup()`** —— 于是每个 fixture 留下一个
+  // `dotd-gov-cfg-*`，另有 `makeTempDataDir` 留一个 `dotd-test-*`。
+  // 逐文件扫描确认残留：governance-memory 13、quarantine-audit 15、review-catalog 24，
+  // 合计正是全量运行净增的 52 个。
+  // 把清理挂到**进程退出**上：只要建过 fixture 就一定会被兜底，
+  // 与"调用方记不记得 cleanup"无关。exit 里只能做同步操作 —— 这里全是同步的。
+  process.once('exit', () => {
+    try {
+      tmp.cleanup();
+    } catch {
+      /* 尽力而为 */
+    }
+    removeTempPath(root);
+  });
   const toolsPath = join(root, 'tools.yml');
   const rulesPath = join(root, 'rules.yml');
   writeFileSync(
@@ -190,6 +206,15 @@ export function makeGovFixture(
     rt,
     cleanup() {
       tmp.cleanup();
+      // **`dotd-gov-cfg-*` 也必须在这里删掉**（2026-10-19 修，真缺陷）：
+      // 上面 `registerTempPath(root)` 只保证"**如果**有人调 sweepTempPaths() 就会回收"，
+      // 而实测 57 个用临时目录的测试文件里**只有 16 个**写了 `test.after(sweepTempPaths)`。
+      // 于是这 3 个 governance 文件每跑一次就留下 13~24 个 `dotd-gov-cfg-*`
+      // （逐文件扫描确认：governance-memory 13、quarantine-audit 15、review-catalog 24）。
+      // 残留目录堆到一万多个后 `rmSync`/目录枚举变慢，会把整份测试文件拖到超时崩溃，
+      // 表现为间歇性 `pass 1527 / fail 2`（总数少于 1575）—— 见 temp-cleanup.test.ts 的说明。
+      // 所以清理要放在**每个使用者本来就会调用的 cleanup() 里**，而不是指望约定。
+      removeTempPath(root);
     },
   };
 }

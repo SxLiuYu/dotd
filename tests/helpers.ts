@@ -143,7 +143,44 @@ const RM_RETRIES = 5;
 /** 登记一个临时路径（`cleanup()` 与 `sweepTempPaths()` 都会处理它）；**返回原路径**以便内联使用。 */
 export function registerTempPath<T extends string>(p: T): T {
   liveTempPaths.add(p);
+  armAutoSweep();
   return p;
+}
+
+// ── 自动兜底：不依赖每个测试文件手写 `test.after(sweepTempPaths)` ────────────
+//
+// 背景（2026-10-19 实测，真缺陷）：兜底靠**约定**——每个测试文件自己写一行
+// `test.after(sweepTempPaths)`。实测 57 个文件用了 `makeTempDataDir`，
+// **只有 16 个写了那一行**，剩下 41 个没有任何兜底。
+// 结果：`%TEMP%` 里积到 **12123 个** `dotd-test-*`（全部当天新建），
+// 一次全量 `npm test` 净增 **52 个**、一个都不删。
+//
+// 这不只是脏：目录堆到一万多个后，`rmSync` 与目录枚举变慢，
+// 最终把整份测试文件拖到超时崩溃 —— 表现为间歇性的
+// `pass 1527 / fail 2`（**总数少于 1575**，整份文件没跑完，不是断言失败）。
+// **这个泄漏会自己把 S1 判据"0 失败"弄红**，而且时红时绿、极难归因。
+//
+// 修法：登记时就**自动挂上进程退出钩子**，把清理从"使用者的记性"
+// 变成"登记这个动作的副作用"——只要用过 makeTempDataDir，就一定会被兜底。
+// 用 `process.once('exit')` 而不是 `test.after`：
+//   · `exit` 对"文件级测试跑完"和"进程异常退出"都生效；
+//   · 不依赖是否 import 了 node:test 的 before/after 钩子；
+//   · 每个进程只挂一次（once + 幂等标志）。
+// 注意：`exit` 里**只能做同步操作** —— 这里正好全是同步的（rmSync/close）。
+let autoSweepArmed = false;
+function armAutoSweep(): void {
+  if (autoSweepArmed) return;
+  autoSweepArmed = true;
+  process.once('exit', () => {
+    // 尽力而为：删不掉的（句柄仍被持有）不在这里报错，交给 temp-cleanup 自检暴露
+    for (const p of [...liveTempPaths]) {
+      try {
+        rmSync(p, { recursive: true, force: true, maxRetries: 2, retryDelay: 10 });
+      } catch {
+        // 忽略
+      }
+    }
+  });
 }
 
 /**

@@ -17,7 +17,8 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   makeTempDataDir,
   forceRemoveTempPath,
@@ -114,3 +115,52 @@ test('池模式：借还之间数据隔离，cleanup 后临时目录同样消失
   b.cleanup();
   assert.equal(existsSync(rootB), false);
 });
+
+// ── 跨文件判据：TEMP 里的 dotd-test-* 不该净增长 ─────────────────────
+//
+// 背景（2026-10-19 实测，真缺陷）：上面所有用例都是**进程内自证** ——
+// 它们只证明"我建的目录我自己删得掉"，**对别的测试文件没调 cleanup() 一无所知**。
+// 也正因如此，2026-10-17 那次修完之后泄漏照样发生：
+//   实测 `%TEMP%` 里 dotd-test-* 累积到 **11188 个**（全部当天新建）；
+//   跑一次全量 `npm test` 新增 **104 个、一个都没删**。
+// 逐文件扫描（135 个文件）后确认：**55 个测试文件**建了临时目录却从不 cleanup()。
+//
+// 后果不只是脏：目录堆到一万多个之后 `rmSync` 与目录枚举越来越慢，
+// 最终把整份测试文件拖到超时崩溃 —— 表现为间歇性的
+// `pass 1561 / fail 2`、`pass 1527 / fail 2`（**总数少于 1575**，
+// 说明整份文件没跑完，不是某条断言失败）。
+// 也就是说：**这个泄漏会自己把 S1 判据"0 失败"弄红**，而且时红时绿、极难归因。
+//
+// 判据：本文件建两个目录、**故意不删**，净增长必须被看见（先自证工具灵）；
+// 然后正常建删，净增长必须为 0。第一条是关键 —— 它证明这条判据不是恒真。
+test('计数工具自证：故意不删的目录必须被数出来（否则判据恒真）', () => {
+  const base = countTempDirs();
+  const d = makeTempDataDir();
+  assert.ok(
+    countTempDirs() > base,
+    `建了目录但 countTempDirs() 没变（${base} → ${countTempDirs()}）：判据会恒真，必须先修工具`,
+  );
+  d.cleanup(); // 收尾（这一条只验证"数得到"）
+});
+
+test('净增长为 0：本文件建的临时目录全部删干净', () => {
+  const base = countTempDirs();
+  const dirs = [makeTempDataDir(), makeTempDataDir(), makeTempDataDir()];
+  assert.ok(countTempDirs() > base, '计数工具自检：建目录后必须数得出来');
+  for (const d of dirs) d.cleanup();
+  const end = countTempDirs();
+  assert.ok(
+    end <= base,
+    `本文件跑完后 dotd-test-* 从 ${base} 涨到 ${end}：` +
+      '说明有目录没被删掉。注意本判据只看本文件，跨文件泄漏靠 npm test 后的手工复核',
+  );
+});
+
+/** TEMP 里 dotd-test-* 目录个数（读不到时 0）。 */
+function countTempDirs(): number {
+  try {
+    return readdirSync(tmpdir()).filter((n) => n.startsWith('dotd-test-')).length;
+  } catch {
+    return 0;
+  }
+}
