@@ -42,6 +42,8 @@ export interface ScheduleRow {
   quietHours: string | null;
   /** 错过多次时补投几次：latest=只补最近一次，skip=不补。 */
   catchup: 'latest' | 'skip';
+  /** 一次性任务：触发成功后自动停用（迁移 150）。 */
+  once: boolean;
 }
 
 /** 创建参数。 */
@@ -53,6 +55,14 @@ export interface CreateScheduleInput {
   skipIfBusy?: boolean;
   quietHours?: string | null;
   catchup?: 'latest' | 'skip';
+  /**
+   * 一次性任务（2026-10-19）：true = 触发成功后自动停用。
+   *
+   * 用在"今天下午3点提醒我开会"这种场景 —— 原来只能建"每天15:00"再解释限制。
+   * 注意：cron 仍要给出**下一次**正确时刻的表达式（一次性任务通常配合
+   * 一个能算出目标时刻的 cron，比如 "0 15 19 10 *" 限定到具体日期）。
+   */
+  once?: boolean;
 }
 
 export interface CreateScheduleResult {
@@ -137,8 +147,8 @@ export function createSchedule(
   const id = newCrontabId();
   db.prepare(
     `INSERT INTO crontabs
-       (id, dot_id, title, prompt, cron, enabled, next_fire, skip_if_busy, quiet_hours, catchup)
-     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+       (id, dot_id, title, prompt, cron, enabled, next_fire, skip_if_busy, quiet_hours, catchup, once)
+     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     dotId,
@@ -149,6 +159,7 @@ export function createSchedule(
     input.skipIfBusy === false ? 0 : 1,
     quiet,
     input.catchup ?? 'latest',
+    input.once === true ? 1 : 0,
   );
 
   return { ok: true, schedule: toRow(db.prepare('SELECT * FROM crontabs WHERE id=?').get(id)) };
@@ -194,5 +205,6 @@ function toRow(raw: unknown): ScheduleRow {
     skipIfBusy: Number(r['skip_if_busy']) === 1,
     quietHours: r['quiet_hours'] === null || r['quiet_hours'] === undefined ? null : String(r['quiet_hours']),
     catchup: r['catchup'] === 'skip' ? 'skip' : 'latest',
+    once: Number(r['once'] ?? 0) === 1,
   };
 }

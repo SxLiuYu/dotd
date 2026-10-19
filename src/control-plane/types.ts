@@ -137,6 +137,8 @@ export interface CrontabRow {
   skip_if_busy: number;
   quiet_hours: string | null;
   catchup: 'latest' | 'skip';
+  /** 一次性任务（迁移 150）：1 = 触发成功后自动停用，不再重复。 */
+  once: number;
 }
 
 // ── 2. 配置（config/dotd.yml 的 CP 侧投影）────────────────────────────────

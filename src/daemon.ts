@@ -743,7 +743,7 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 130）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 140 });
+    const res = migrate(db, { expectedVersion: 150 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -999,6 +999,8 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
         prompt: typeof args['prompt'] === 'string' ? args['prompt'] : '',
         cron: typeof args['cron'] === 'string' ? args['cron'] : '',
         ...(typeof args['quiet_hours'] === 'string' ? { quietHours: args['quiet_hours'] } : {}),
+        // 一次性任务（迁移 150）：触发成功即停用
+        ...(args['once'] === true ? { once: true } : {}),
       },
       cronNext,
     );

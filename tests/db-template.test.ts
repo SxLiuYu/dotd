@@ -135,7 +135,7 @@ test('模板缓存：getDbTemplate() 幂等，且模板脚本必须回放 ALTER�
   const a = getDbTemplate();
   const b = getDbTemplate();
   assert.equal(a, b, '模板只建一次（进程内缓存）');
-  assert.equal(a.userVersion, 140, '迁移终态 user_version=140');
+  assert.equal(a.userVersion, 150, '迁移终态 user_version=150');
   // 090/100 两个迁移包是纯 ADD COLUMN：模板脚本必须显式带上 ALTER，否则重建出来的表缺列。
   assert.match(a.script, /ALTER\s+TABLE\s+\S+\s+ADD\s+COLUMN/i, '模板脚本必须回放 ADD COLUMN');
   const tpl = openMigratedTemplateDb();
@@ -158,7 +158,7 @@ test('反例守卫：只看 sqlite_master.sql 重建会丢 user_version（说明
   const ref = referenceDb();
   try {
     const script = buildSchemaScript(ref);
-    assert.match(script, /^PRAGMA user_version=140;/);
+    assert.match(script, /^PRAGMA user_version=150;/);
     const naive = new DatabaseSync(':memory:');
     try {
       const texts = (

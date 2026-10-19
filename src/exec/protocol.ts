@@ -80,6 +80,8 @@ export function endpointUrl(ip: string, port: number): string {
 export type JsonSchema = Record<string, unknown>;
 
 const str = (desc: string): JsonSchema => ({ type: 'string', description: desc });
+// 2026-10-19：schedule.create 需要 once 布尔参数，补一个与 str 同形的 helper
+const bool = (desc: string): JsonSchema => ({ type: 'boolean', description: desc });
 const obj = (props: Record<string, JsonSchema>, required: string[] = []): JsonSchema => ({
   type: 'object',
   properties: props,
@@ -226,6 +228,12 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
         prompt: str('到点要让 bot 去做的那件事（一句话任务描述）'),
         cron: str('5 段 cron：分 时 日 月 周。例：0 9 * * * = 每天 9:00；0 */2 * * * = 每两小时'),
         quiet_hours: str("安静时段，如 '23:00-07:30'；该时段内不触发（可选）"),
+        once: bool(
+          '一次性任务：true = 触发成功后自动停用。' +
+            '主人说"今天下午3点提醒我"这类**只说一次**的场景用它；' +
+            '说"每天/每周"则不要传。注意 cron 仍要算出目标时刻，' +
+            '比如今天15:00 用 "0 15 19 10 *"（日 月 锁定到具体日期）。',
+        ),
       },
       ['title', 'prompt', 'cron'],
     ),

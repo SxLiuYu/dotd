@@ -287,6 +287,31 @@ export class Scheduler {
       this.deps.record('watchdog', 'normal', JSON.stringify({ crontab: ct.id, badCron: ct.cron }));
       return;
     }
+
+    // **一次性任务：触发成功后就停用**（2026-10-19 加）。
+    //
+    // 背景：主人说"今天下午3点提醒我开组会"，而 crontabs 只有 cron 表达式（重复触发），
+    // 没法表达"只触发一次"。原来模型只能建"每天 15:00"再解释这个限制。
+    //
+    // 判据刻意收窄：只有 `status === 'fired'`（真的投递了）才停用。
+    // 被 quiet_hours/busy 跳过（status='skipped_*'）不算触发过 —— 继续等下一次机会，
+    // 否则"设了提醒但正好在忙，就永远收不到了"，比重复更糟。
+    // 不删记录而是 enabled=0：保留历史可查，也方便主人事后恢复。
+    if (ct.once === 1 && status === 'fired') {
+      this.deps.db
+        .prepare(
+          `UPDATE crontabs SET enabled=0, next_fire=?, last_fired_at=?, last_fire_seq=last_fire_seq+1,
+                   last_fire_status=? WHERE id=?`,
+        )
+        .run(nextFire, now, status, ct.id);
+      this.deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({ crontab: ct.id, once: true, disabledAfterFire: true }),
+      );
+      return;
+    }
+
     if (status !== null) {
       this.deps.db
         .prepare(
