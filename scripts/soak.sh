@@ -1443,11 +1443,34 @@ if(passRate!==null){
     const UNFINISHED=new Set(["queued","running",""]);
     const unfinished=bad.filter(p=>UNFINISHED.has(String(p.status))).length;
     const testedButNoChannel=noChannel-unfinished;
+    // **"答案不对"可能是容器坏了，不是模型笨**（2026-10-20 修，真假红）。
+    //
+    // 探针只检查"回答里有没有期望值"。容器 quarantined/unhealthy 时，
+    // 模型会回"没能完成：容器处于 quarantined 状态"，里面当然没有期望值 → ok=0，
+    // 而 out/ws 都是 1（飞书链路好得很）→ 正好落进 noChannelOnly 这一桶，
+    // 报告写「出站入站都正常但答案不对」。
+    //
+    // 真实数据佐证：历史上有 7 个探针任务在容器 quarantined 期间失败，
+    // 模型都正确说了"容器被隔离"，但报告的措辞把人指向"模型答错"。
+    // 一个环境故障被说成能力问题，排查方向就整个错了。
+    //
+    // 修：把失败探针的**时间点**与采样里的 container_ok/container_up 对齐。
+    // 探针每 6 小时一次、采样每 30 分钟一次，取探针时刻**前后 1 小时**内的采样点，
+    // 只要有任意一个记录到容器不可用，就把这条归到"容器不可用"桶。
+    // 这是"证据主体与被判对象一致"（第③类）在归因上的应用：
+    // 说"答案不对"之前，必须先确认"当时环境是好的"。
+    const contBadAt=(p)=>{
+      const near=all.filter(s=>Math.abs(s.ts-p.ts)<=3600);
+      return near.some(s=>String(s.container_ok)==="0" || String(s.container_up)==="0");
+    };
+    const contBad=bad.filter(p=>contBadAt(p)).length;
+    const answerWrong=noChannelOnly-contBad;
     c.push(`❌ 成功率 ${(passRate*100).toFixed(0)}%（${bad.length} 次失败，可重叠计数：`+
            `${noOut} 次飞书出站未送达 / ${noWs} 次飞书入站长连接不在 / `+
            (unfinished? `**${unfinished} 次探针任务 120 秒内没跑完**（status 停在 queued/running）/ `:"")+
            (testedButNoChannel>0? `${testedButNoChannel} 次跑完了却没拿到完整子判据 / `:"")+
-           `${noChannelOnly} 次出站入站都正常但答案不对`+
+           (contBad? `**${contBad} 次当时容器不可用**（答案拿不到，不是模型笨）/ `:"")+
+           (answerWrong>0? `${answerWrong} 次出站入站都正常、容器也好但答案不对`:"")+
            (bothDown? `；其中 ${bothDown} 次两条链路同时不通` : ""));
   }
 }
