@@ -32,3 +32,37 @@
 
 不在 S6 判据文字内（判据只说"成功率不掉/无人工干预/内存/句柄"），
 且加进去会让探针变慢、成本变高，所以先记着不动。
+
+## daemon 空闲时 RSS 稳定爬升 ~10MB/h（S6 判据内，2026-10-19 实测）
+
+**状态**：已确认为真实泄漏，待修。属于 S6「RSS 增幅 < 50MB」判据内，不是判据外问题。
+
+**证据**（窗口第 3.5 小时，pid=26833，空闲，窗口内仅 38 个任务 / 198 条消息）：
+
+| 区间 | 变化 | 折算 |
+|---|---|---|
+| 219256 → 219980 kB | +724kB / 5min | 8.7 MB/h |
+| 219984 → 220488 kB | +504kB / 10min | 3.0 MB/h |
+| 221152 → 221860 kB | +708kB / 3.7min | 11.6 MB/h |
+| 221864 → 222564 kB | +700kB / 3.7min | 11.4 MB/h |
+| 222576 → 223316 kB | +740kB / 5.2min | 9.2 MB/h |
+
+- 启动后 6 分钟降到最低 183.9MB，此后 **11 次采样中 10 次单调上升**，无平台期、无回落。
+- `RssAnon` 同步增长（155448 → 158264kB），`RssFile` 恒定 65052kB → **是 JS 堆，不是 mmap 假象**。
+- 最小二乘拟合 **9.00MB/h**，7 天外推 **1512MB**，超判据 30 倍。
+- 线程数 11、句柄 28，**均不增长** → 不是句柄泄漏。
+
+**已排除**：
+- 不是业务量驱动：窗口内仅 38 任务 / 198 消息，撑不起 35MB+ 的增量。
+- 不是 `scheduler.scanUndecidedEvents`：未决策事件数 = 0，tick 不产出对象。
+- 不是 crontab：5 个里只有 1 个 enabled，且每天一次。
+- 不是 SSE keepAlive / scheduler timer 未清：两处都有 `clearInterval`。
+- 不是 SQLite WAL 膨胀：db_kb 稳定。
+
+**待查**（按嫌疑排序）：
+1. `src/runner/dot.ts` 的 8 个无界 Map/Set（`sealed`/`pendingResults`/`pendingCalls`/`callArgs`/`readSizes`/`repeatGuard`/`repeatSkipsByTask`/`toolCallCounts`）——但空闲期无任务，这些不该增长，需实测确认。
+2. `src/surfaces/http.ts:275` 的 `seen` Set。
+3. `src/surfaces/ingress.ts:115` 的 `buckets` Map（限流桶，按 key 累积？）。
+4. 飞书长连接 `feishu-ws.ts` 的消息缓冲区。
+
+**注意**：诊断这个泄漏**不需要重启 daemon**（重启会作废 7 天窗口）。可以用 `--inspect` 之外的手段（`/proc/<pid>/status`、`process.memoryUsage` 通过一次性的 HTTP 端点）继续观察；若必须重启，窗口将从头计算。
