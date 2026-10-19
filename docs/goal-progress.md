@@ -335,6 +335,30 @@
       daemon 日志 12KB（84 行）、内存最高 400MB 也没接近任何配额。
     - **18 条判据总回归全对**。
   - **窗口未受影响**：day-0 仍为 2026-10-19 20:53:14，pid=26833 连续运行。
+  - **第 11 轮：验收证据本身会被毁掉（两处）**：
+    - **一行残缺 JSON 会丢掉全部 7 天数据**：`report` 原来对整个文件一次性
+      `map(JSON.parse)`，只要有一行残缺（进程被 kill、断电、写了一半）就抛错、
+      被外层 `catch` 吞掉 → 报告打印"还没有可用于判据的样本"，看上去像"你还没开始"，
+      实际 384 条好样本就躺在文件里被判据全部丢弃。7 天要追加 336 次，
+      中途被打断是现实概率事件。已改为逐行解析，坏行跳过并**报出条数**，不静默。
+      验证：末尾残缺 → 384 条正常计入 + ⚠1 行；中间 3 行坏（含空行）→ ⚠2 行；
+      全坏 → exit 1 不崩。
+    - **S3 的 20 条证据被覆盖成 1 条**：`acceptance.sh` 有 `: > "$RESULTS"`，
+      每次运行先清空。于是"只重跑 1 个场景"就把之前 20 个场景的证据全抹掉 ——
+      实测就是如此：`docs/goal-progress.md` 记着 S3 = 20/20，
+      而 `results.jsonl` 只剩 1 行 `edit_file`。判据要求"20 条场景 ≥95%"，
+      证据却留不住，复核时等于没有。已改为先归档（带时间戳）再开新文件，
+      并把归档文件加入 `.gitignore`（执行痕迹不进版本库）。
+      **并据此把 S3 全量重跑了一遍以恢复证据：仍然 20/20 = 100%**
+      （calc 5s / calc2 4s / calc3 4s / read_file 7s / list_dir 6s / write_file 9s /
+      edit_file 12s / net_get 6s / search_note 10s / sched_create 7s / sched_list 7s /
+      vision_png 7s / vision_invoice 10s / pdf_read 13s / excel_read 15s /
+      tool_create 25s / tool_reuse 6s / multi_step 6s / summary 8s /
+      honesty_capability 6s）。
+    - `honesty.sh` / `recovery.sh` 的整文件 `map(JSON.parse)` 也一并改成逐行解析。
+    - **三个步骤的验收证据现已逐条可查**：S3 20/20、S4 10/10、S5 3/3
+      （53s / 55s / 115s，均 <300s）。
+  - **窗口未受影响**：day-0 仍为 2026-10-19 20:53:14，pid=26833 连续运行。
 - **结论**：❌ 未通过（时间未到）。真信号为正，但不能据此宣布达标——真泄漏可能几十小时后才显形。
   `docs/soak-report.md` 如实记录，7 天后跑 `bash scripts/soak.sh report` 复判。
 - **修掉采样器的一处"假数据"**（第 2 轮自查发现）：第一版 `report` 直接把最早与最晚样本的
