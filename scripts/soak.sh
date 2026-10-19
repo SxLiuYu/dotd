@@ -413,6 +413,32 @@ for(let i=1;i<LIFE.length;i++){
 }
 const unattended=restartRows.filter(r=>!r.healed);
 
+// **"全部自愈"不等于"长期稳定运行"**（2026-10-19 补，真缺口）：
+// 判据原文是"连续 7 天无人工干预"。原来只检查"每次重启有没有自愈日志"，
+// 却没限制**重启频率** —— 于是"每 30 分钟崩一次、每次都被 watchdog 拉起"
+// 这种明显不可用的服务，也能满足"无人工干预"。
+// 合成数据实测：8 天崩 383 次、每次 20 秒被拉起 → 报告全绿、exit 0。
+// 补一条：**不能是崩溃循环**（最长连续存活 ≥1 小时）。
+//
+// 阈值为什么只定 1 小时，而不是 24 小时：
+//   · 判据原文只有四条（无人工干预 / RSS / 成功率 / 句柄），
+//     **没有规定重启频率**。把它设成 24h 等于偷偷加要求 ——
+//     我先写成 24h，"每 6 小时自愈一次但完全平稳"的正常场景就被误杀了
+//     （watchdog 本来就该这么干活，不能因为它在干活就判失败）。
+//   · 但"每 30 分钟死一次、20 秒被拉起"也判过，同样不能接受：
+//     那不是"长期运行"，是崩溃循环。
+//   · 1 小时只用来区分这两者，是很弱的底线：任何死得比每小时还勤的服务，
+//     都不能叫"在跑"。实测分离度：健康场景 5.5h+，崩溃循环 0.5h。
+//
+// 重启**次数**和**平均间隔**一律打印出来，让人自己判断，
+// 但只有"崩溃循环"这一档才拦（详细权衡见 docs/backlog.md）。
+const lifeSpanSec=(L)=>Math.max(0, L.last-L.first);
+const longestLifeSec=LIFE.length? Math.max(...LIFE.map(lifeSpanSec)) : 0;
+const longestLifeHours=longestLifeSec/3600;
+const MIN_LONGEST_LIFE_HOURS=1;
+const avgRestartMin = restartRows.length ? (hours*60/restartRows.length) : null;
+const isCrashLoop = LIFE.length>1 && longestLifeHours < MIN_LONGEST_LIFE_HOURS;
+
 // **重启会把 RSS 增长"洗白"，必须单独看**（2026-10-19 修，真缺陷）：
 // RSS 判据只比较"当前生命周期"的首末中位数（因为跨重启相减毫无意义）。
 // 但如果内存以每小时 12MB 的速度漏、而 watchdog 每 2 小时自愈重启一次，
@@ -548,8 +574,27 @@ c.push(fdGrowth<=2? "✅ 无明显句柄泄漏" : `❌ 句柄增长 ${fdGrowth}`
 if(unattended.length){
   c.push(`❌ 有 ${unattended.length} 次重启**找不到自愈记录**（${unattended.map(r=>new Date(r.born*1000).toISOString().slice(11,19)).join(", ")}）`+
          ` —— "无人工干预"不成立`);
-} else if(restartRows.length){
-  c.push(`✅ 期间重启 ${restartRows.length} 次，**全部是 watchdog 自愈**（无人干预，符合判据）`);
+}
+// 先限制"稳定性"（不能是崩溃循环），再说"重启都是自愈的"。
+// 顺序很重要：只夸"全部自愈"而不限制频率，就是在给崩溃洗白。
+if(isCrashLoop){
+  c.push(`❌ **崩溃循环**：最长连续存活只有 ${longestLifeHours.toFixed(2)} 小时`+
+         `（<${MIN_LONGEST_LIFE_HOURS}h），期间重启 ${restartRows.length} 次、平均每 ${avgRestartMin.toFixed(0)} 分钟一次。`+
+         `"每次都被自愈"不等于"长期运行"`);
+} else {
+  // 只有一个生命周期 = 还没重启过，本来就谈不上"崩溃循环"。
+  // 但这时存活时长可能远短于 1 小时（窗口刚开始），
+  // 写"≥1h"就是假话 —— 实测窗口跑到 0.8h 时打印过
+  // "最长连续存活 0.8 小时（≥1h，非崩溃循环）"，自相矛盾。
+  if(LIFE.length<=1 && restartRows.length===0){
+    if(longestLifeSec>0)
+      c.push(`✅ 期间未重启过，当前进程已连续运行 ${longestLifeHours.toFixed(1)} 小时（崩溃循环判据要重启过才有意义）`);
+  } else if(longestLifeSec>0 && longestLifeHours>=MIN_LONGEST_LIFE_HOURS){
+    c.push(`✅ 最长连续存活 ${longestLifeHours.toFixed(1)} 小时（≥${MIN_LONGEST_LIFE_HOURS}h，非崩溃循环）`);
+  }
+  if(restartRows.length){
+    c.push(`✅ 期间重启 ${restartRows.length} 次，全部是 watchdog 自愈（无人干预）；平均每 ${avgRestartMin.toFixed(0)} 分钟一次`);
+  }
 }
 if(days>=7){
   c.push(probeDensityOk
@@ -601,6 +646,7 @@ console.log("\n判定：" + c.join("；"));
 // 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
+  && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
