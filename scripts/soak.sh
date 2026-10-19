@@ -218,6 +218,19 @@ const first=all[0], last=all[all.length-1];
 // （超过 90 分钟没有新样本才算没在看）。
 const nowSec=Math.floor(Date.now()/1000);
 const hours=(nowSec-first.ts)/3600, days=hours/24;
+
+// **"成功率不掉"不能靠"一次都没测"来满足**（2026-10-19 补，真缺口）：
+// passRate 在没有任何 probe 时是 null，而 passOk 把 null 当成通过 ——
+// 于是 probe 的 cron 整个挂掉、7 天一次能力验证都没做，判定里
+// 连"成功率"那行都不会出现，其余判据全绿，exit 0。
+// 合成数据实测：8 天采样正常但 0 条 probe 记录 → exit 0。
+// 判据：探针密度也要达标（probe cron 是 `0 */6 * * *`，即 4 次/天，取 ≥70%）。
+// 只在满 7 天后才判 —— 窗口刚开始时没探针是正常的，不该提前报错。
+const PROBE_PER_DAY=4;
+const expectProbes=days*PROBE_PER_DAY;
+const probeRate=expectProbes>0? probes.length/expectProbes : null;
+const PROBE_RATE_LIMIT=0.7;
+const probeDensityOk=!(days>=7 && (probeRate===null || probeRate<PROBE_RATE_LIMIT));
 const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际跨度"
 
 // **连续性**（2026-10-19 补）：只看"首尾跨了 7 天"是不够的 ——
@@ -401,6 +414,7 @@ const SEG_RATE_LIMIT=2;
 console.log("== S6 长期运行现状 ==");
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
+if(days>=7) console.log(`探针密度：${probes.length} 次 / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
 if(sampleRate!==null) console.log(`采样密度：${all.length} 次 / 应 ${Math.round(expectSamples)} 次 = ${(sampleRate*100).toFixed(0)}%（设计 ${SAMPLE_PER_HOUR} 次/h，判据 ≥${(SAMPLE_RATE_LIMIT*100).toFixed(0)}%）`);
 if(legacy.length) console.log(`（另有 ${legacy.length} 条修复前的历史样本无 daemon 身份，不计入判据）`);
 console.log(`daemon 生命周期数：${lifetimes}（>1 说明期间重启过）`);
@@ -458,6 +472,12 @@ if(unattended.length){
 } else if(restartRows.length){
   c.push(`✅ 期间重启 ${restartRows.length} 次，**全部是 watchdog 自愈**（无人干预，符合判据）`);
 }
+if(days>=7){
+  c.push(probeDensityOk
+    ? `✅ 探针密度 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%（${probes.length} 次 / 应 ${Math.round(expectProbes)} 次）`
+    : `❌ **探针密度只有 ${probeRate===null?"0":(probeRate*100).toFixed(0)}%**（${probes.length} 次 / 应 ${Math.round(expectProbes)} 次）：`+
+      `"成功率不掉"需要真的测过，不能靠"一次都没测"来满足`);
+}
 if(passRate!==null){
   if(passRate>=0.95) c.push("✅ 成功率 ≥95%");
   else {
@@ -496,7 +516,7 @@ console.log("\n判定：" + c.join("；"));
 // 退出码却还是 0，脚本层面会当成通过。合成数据实测：28 次探针全后半失败、
 // 总成功率 50%，exit 仍是 0。这等于 S6 最容易退化的那条判据没有约束力。
 // 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
-const passOk = passRate===null || passRate>=0.95;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
