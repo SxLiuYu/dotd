@@ -207,7 +207,21 @@ try{
 const probes=lines.filter(x=>x.kind==="probe");
 // 修复前采的样本没有 pid/proc_start 字段（那时还没记录身份），
 // 它们无法参与"生命周期"判断，单独算一类，不混进来算增长。
-const raw=lines.filter(x=>x.kind!=="probe"&&x.alive);
+// **重复行可以伪造采样密度**（2026-10-19 补，真缺口）：
+// 同一时间戳写 3 遍 → 369 次 / 应 346 次 = 107% → 判"密度达标"，
+// 而实际只有 123 个真实时刻（每 85 分钟一次，仅 36%）。
+// 按 ts 去重，重复行只算一次；重复的条数单独报出来。
+const dedupKey=(x)=>`${x.ts}|${x.proc_start}|${x.pid}`;
+const seenSampleKey=new Set();
+let dupSamples=0;
+const deduped=[];
+for(const x of lines){
+  if(x.kind==="probe"||!x.alive) continue;
+  const k=dedupKey(x);
+  if(seenSampleKey.has(k)){ dupSamples++; continue; }
+  seenSampleKey.add(k); deduped.push(x);
+}
+const raw=deduped;
 const legacy=raw.filter(s=>s.proc_start===undefined||s.pid===undefined);
 const all=raw.filter(s=>s.proc_start!==undefined&&s.pid!==undefined);
 if(!all.length){
@@ -229,6 +243,16 @@ const first=all[0], last=all[all.length-1];
 // （超过 90 分钟没有新样本才算没在看）。
 const nowSec=Math.floor(Date.now()/1000);
 const hours=(nowSec-first.ts)/3600, days=hours/24;
+
+// **时间戳在未来 = 数据坏了，不能当成负数天数照算**（2026-10-19 补，真缺口）：
+// 时钟回拨、NTP 跳变、或有人手改了文件，都会让 ts 跑到 now 之后。
+// 原来直接算 now-first 得到"已观测 -1.00 小时 / -0.04 天"，
+// 然后照样拿去比 7 天 —— 负数当然不达标，看似"判对了"，
+// 但真正该说的"数据有问题"一个字没提，读的人只会以为"还没跑够"。
+const futureSamples=all.filter(s=>s.ts>nowSec+300);   // 容忍 5 分钟时钟漂移
+const hasFuture=futureSamples.length>0;
+const maxFutureMin=futureSamples.length
+  ? Math.max(...futureSamples.map(s=>Math.round((s.ts-nowSec)/60))) : 0;
 
 // **"成功率不掉"不能靠"一次都没测"来满足**（2026-10-19 补，真缺口）：
 // passRate 在没有任何 probe 时是 null，而 passOk 把 null 当成通过 ——
@@ -447,6 +471,7 @@ const PEAK_GROWTH_LIMIT=50;      // 就是判据原文的 50MB
 
 console.log("== S6 长期运行现状 ==");
 if(badLines>0) console.log(`⚠ 文件里有 ${badLines} 行残缺 JSON（写入被打断），已跳过，其余样本正常计入`);
+if(dupSamples>0) console.log(`⚠ 文件里有 ${dupSamples} 行重复样本（同一时刻同一进程），已按 ts 去重，不计入密度`);
 console.log(`采样点 ${all.length} 个，已观测 ${hours.toFixed(2)} 小时（${days.toFixed(2)} 天 / 需 7 天；首尾样本跨 ${spanDays.toFixed(2)} 天）`);
 console.log(`观测连续性：最长空档 ${(maxGap/3600).toFixed(2)}h，扣除断档后有效覆盖 ${coveredDays.toFixed(2)} 天`);
 if(days>=7) console.log(`探针密度：${probes.length} 次 / 应 ${Math.round(expectProbes)} 次 = ${probeRate===null?"0":(probeRate*100).toFixed(0)}%（设计 ${PROBE_PER_DAY} 次/天，判据 ≥${(PROBE_RATE_LIMIT*100).toFixed(0)}%）`);
@@ -486,6 +511,11 @@ console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"
             (contDown.length? `（${contDown.length} 个采样点容器不在线）` : ""));
 
 const c=[];
+if(hasFuture){
+  // 排在最前面：数据本身有问题，后面所有推算都不可信
+  c.push(`❌ **样本时间戳在未来**：${futureSamples.length} 个点最多超前 ${maxFutureMin} 分钟`+
+         `（时钟跳变或文件被改过）—— 先查清时间，再看别的判据`);
+}
 if(stale){
   // 观测已经停了，历史跨度再长也没意义 —— 这条要排在最前面说，
   // 否则读者会先看到"✅ 已满 7 天"而下结论。
@@ -563,7 +593,7 @@ process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGr
   && passOk && (medSegRate===null||medSegRate<SEG_RATE_LIMIT)
   && (medSegFdRate===null||medSegFdRate<SEG_FD_RATE_LIMIT)
   && (sampleRate===null||sampleRate>=SAMPLE_RATE_LIMIT)
-  && peakGrowth<PEAK_GROWTH_LIMIT ? 0 : 1);'
+  && peakGrowth<PEAK_GROWTH_LIMIT && !hasFuture ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
