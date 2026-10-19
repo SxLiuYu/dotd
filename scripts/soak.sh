@@ -180,6 +180,18 @@ for(let i=1;i<sorted.length;i++){
   if(g>GAP_LIMIT) deadTotal+=g-GAP_LIMIT;   // 超出容忍的部分算"没在看"
 }
 const coveredDays=Math.max(0,(hours*3600-deadTotal))/86400;
+
+// **"现在还在采样吗"**（2026-10-19 修，真缺陷）：
+// 上面的 coveredDays 只量"样本首尾之间的跨度扣断档"，完全不看**末尾之后**。
+// 于是采样器跑满 7 天后彻底死掉，隔 23 天再来看，报告照样打印
+// "✅ 已满 7 天且观测连续"、exit 0 —— 而此刻根本没有任何东西在观测。
+// 这正是"报告在撒谎"里最危险的一种：数据本身都是真的，结论却已经过期。
+// 判据：最后一个样本距现在不得超过 3 个采样周期（cron 30 分钟 → 90 分钟），
+// 超过就说明观测早已停止，无论历史跨度多长都不能算通过。
+const STALE_LIMIT=5400;
+const nowSec=Math.floor(Date.now()/1000);
+const staleness=nowSec-last.ts;
+const stale=staleness>STALE_LIMIT;
 // **用中位数比，不用单点比**（2026-10-19 修）。
 // 踩到的现场：报告显示"句柄增长 +3 → ❌"，但那 37 是压测高峰的瞬时值；
 // 密集采样 120 秒实测 fd 一直是 34、RSS 一直 222MB。
@@ -281,7 +293,12 @@ console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"
             (contDown.length? `（${contDown.length} 个采样点容器不在线）` : ""));
 
 const c=[];
-if(days>=7 && coveredDays>=7){
+if(stale){
+  // 观测已经停了，历史跨度再长也没意义 —— 这条要排在最前面说，
+  // 否则读者会先看到"✅ 已满 7 天"而下结论。
+  c.push(`❌ **观测已停止**：最后一个样本在 ${(staleness/3600).toFixed(2)}h 前`+
+         `（超过 ${(STALE_LIMIT/3600).toFixed(1)}h 即视为没在看）`);
+} else if(days>=7 && coveredDays>=7){
   c.push("✅ 已满 7 天且观测连续");
 } else if(days>=7){
   c.push(`❌ 首尾跨 ${days.toFixed(2)} 天，但**观测有断档**：扣除断档后只有 ${coveredDays.toFixed(2)} 天`+
@@ -307,7 +324,7 @@ console.log("\n判定：" + c.join("；"));
 // 总成功率 50%，exit 仍是 0。这等于 S6 最容易退化的那条判据没有约束力。
 // 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
 const passOk = passRate===null || passRate>=0.95;
-process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
+process.exit(!stale && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
   && unattended.length===0 && (contRate===null||contRate>=0.95)
   && passOk ? 0 : 1);'
 }
