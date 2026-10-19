@@ -1254,6 +1254,23 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // 挂成 heavy job，每 10 分钟检查一次是否到点（isDailyDue 之内逻辑幂等，
   // 同 queue.gc 的写法）。首次启动时立刻跑一次，把存量的补上。
   let lastRetentionAt = 0;
+  // **容器运行期探活**（2026-10-19 补）。
+  // 原来 healthcheck 只在 boot 跑一次，运行期容器挂了数据库 state 还是 ready，
+  // 任务派发过去直接 transport_error —— 状态失真 + 无重试 = 容器一抖任务就挂。
+  // 实测：docker stop 后 state 仍显示 ready，任务失败两次后由模型自己放弃。
+  cp.scheduler.registerInternalJob({
+    name: 'exec.healthcheck',
+    kind: 'light',
+    everyMs: 60_000,
+    run: async () => {
+      try {
+        await exec.periodicHealthCheck('dot1');
+      } catch (err) {
+        log(`[exec] 探活异常（忽略）：${String(err)}`);
+      }
+    },
+  });
+
   cp.scheduler.registerInternalJob({
     name: 'memory-retention',
     kind: 'heavy',
@@ -1275,7 +1292,7 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   });
 
   cp.scheduler.start();
-  log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention）');
+  log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention / exec.healthcheck）');
 
   // ⑪ Runner 循环（常驻，数量 = 并发额度）
   //

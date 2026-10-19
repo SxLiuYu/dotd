@@ -1334,6 +1334,61 @@ export class ExecServiceImpl implements ExecService {
     return n;
   }
 
+  /**
+   * **运行期定期探活**（2026-10-19 补）。
+   *
+   * 原来 healthcheck 只在 boot 时跑一次（fleet.ts boot 复探），运行期完全靠
+   * "调用失败后由重试兜底"——但实测发现：**根本没有重试**。
+   *
+   * 现场：`docker stop` 掉容器后，数据库 state 仍然是 `ready`，
+   * 后续任务派发过去拿到 `transport_error: fetch failed`，直接失败给主人看。
+   * 状态失真 + 无重试 = 容器一抖，任务就挂。
+   *
+   * 这个函数由 daemon 挂成周期 job（默认 60s）：
+   *  - ready 但探活失败 → 记一次失败；连续 3 次（healthFailStreak）→ 转 unhealthy
+   *  - unhealthy 但探活成功 → 转回 ready（自愈）
+   * 只改状态，不重启容器（重启是 watchdog 的活，职责分开）。
+   */
+  async periodicHealthCheck(dotId = 'dot1'): Promise<{ ok: boolean; state: string }> {
+    const row = this.fleet.getContainer(dotId);
+    if (row === null) return { ok: false, state: 'absent' };
+    const ok = await this.probeHealth(dotId);
+
+    if (ok) {
+      this.healthFailStreak.delete(dotId);
+      if (row.state === 'unhealthy') {
+        // 探活恢复 → 拉回可用态。
+        // **必须走 unhealthy → booting → ready**（状态机定义的合法路径）：
+        // CONTAINER_TRANSITIONS.unhealthy = ['booting','quarantined','lost','removed']，
+        // 直接跳 ready 会被拒（2026-10-19 实测：日志连着打两次"恢复"但状态没变）。
+        try {
+          this.fleet.transition(dotId, 'booting', { reason: 'periodic healthcheck 恢复' });
+          this.fleet.transition(dotId, 'ready', { reason: 'periodic healthcheck 恢复' });
+          console.error('[exec] 容器探活恢复：unhealthy → booting → ready');
+        } catch (err) {
+          console.error(`[exec] 容器探活恢复被状态机拒绝：${String(err)}`);
+        }
+      }
+      return { ok: true, state: this.fleet.getContainer(dotId)?.state ?? 'unknown' };
+    }
+
+    const streak = (this.healthFailStreak.get(dotId) ?? 0) + 1;
+    this.healthFailStreak.set(dotId, streak);
+    // 连续 3 次失败才判 unhealthy（与 boot 期判据一致：EX §4.1）
+    if (streak >= 3 && row.state === 'ready') {
+      try {
+        this.fleet.transition(dotId, 'unhealthy', { reason: 'periodic healthcheck 连续失败' });
+      } catch {
+        /* 状态机不允许就跳过 */
+      }
+      console.error(`[exec] 容器探活连续失败 ${streak} 次：ready → unhealthy`);
+    }
+    return { ok: false, state: this.fleet.getContainer(dotId)?.state ?? 'unknown' };
+  }
+
+  /** 各 dot 的连续探活失败计数（只在内存里，重启归零）。 */
+  private readonly healthFailStreak = new Map<string, number>();
+
   /** healthcheck 探活（§4.1/§5.5）。 */
   private async probeHealth(dotId: string): Promise<boolean> {
     const row = this.fleet.getContainer(dotId);

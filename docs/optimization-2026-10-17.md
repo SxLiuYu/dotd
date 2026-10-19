@@ -4607,3 +4607,81 @@ for (const p of out.pointers) seen.set(p.path, p);  // 重复 key 覆盖 → 保
 
 长记忆端到端通过（三件事全记住）· Pointers 去重生效 ·
 **`npm test` 1532/1532**（+2 条守卫：重复只留一条且保留最新、无重复时顺序不变）
+
+---
+
+# 第六十五轮：容器挂了，数据库还以为它活着（2026-10-19）
+
+## 319. 从成功率数据发现线索
+
+查长期趋势，成功率一路走高（10-17: 50% → 10-18: 97% → 10-19: 99%）。
+但失败原因的前三名很扎眼：
+
+```
+29×  container_not_ready（unhealthy）
+15×  container_not_ready（quarantined）
+13×  container_not_ready（suspended）
+```
+
+按小时分布看，全部集中在**我主动操作容器的时刻**（06时创建 / 10时重置 / 19时重建）。
+不是随机故障，而是"容器状态变化期间任务被拒"。
+
+## 320. 实测：`docker stop` 后状态纹丝不动
+
+```
+docker stop 容器
+数据库 state: 还是 ready     ← 状态失真
+任务: fs.list failed → transport_error: fetch failed
+回答: "容器执行器没有响应"
+```
+
+而 `ExecService.ts:1128` 的注释写着"运行期 unhealthy 由**重试+重启**兜底"——
+**实测根本没有重试**，是模型自己重试了一次然后放弃。
+
+根因：**healthcheck 只在 boot 时跑一次**（`fleet.ts` boot 复探），运行期完全没探活。
+
+## 321. 补一个周期探活 job
+
+```
+exec.healthcheck  everyMs: 60_000
+  ready + 连续 3 次探活失败 → unhealthy
+  unhealthy + 探活成功       → 恢复
+```
+
+scheduler 启动日志现在带上了它：
+`heartbeat.tick / queue.gc / watchdog / guard / memory-retention / exec.healthcheck`
+
+## 322. 第一次修自愈失败：状态机不认这条路
+
+日志显示连着打了两次"恢复"，但 `state` 一直是 `unhealthy`。查状态机：
+
+```ts
+unhealthy: ['booting', 'quarantined', 'lost', 'removed'],
+//          ↑ 没有 'ready'
+```
+
+**`unhealthy → ready` 是非法转移**，而我把异常 try/catch 吞掉了，看起来像"执行了"。
+
+改成合法路径 `unhealthy → booting → ready`。
+
+## 323. 修好后实测（全链路）
+
+```
+初始:   ready
+docker stop
+  180s: unhealthy     ✅ 状态纠正生效
+docker start
+   60s: ready         ✅ 自愈生效
+```
+
+## 324. 这轮的两个教训
+
+**① "由重试兜底"这种注释必须验证。** 注释说重试兜底，实测根本没有重试——
+代码里的承诺和实际行为是两件事。
+
+**② 状态机拒绝转移时，静默 catch 是最坏的处理。** 它让日志显示"成功了"、
+状态却纹丝不动。现在改成把拒绝原因打出来。
+
+## 325. 本轮门禁
+
+状态纠正 + 自愈全链路实测通过 · **`npm test` 1535/1535**（+3 条守卫）
