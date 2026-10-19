@@ -109,6 +109,21 @@ export function parseMemoryMd(text: string): ParsedMemoryMd {
       out.pointers.push({ path: ptr![1]!, note: (ptr![2] ?? '').trim() });
     }
   }
+
+  // **Pointers 去重**（2026-10-19）：同一个 path 只留最后一条。
+  //
+  // 现场：MEMORY.md 里同一件事被记成两条不同文件名（phoenix-payment-demo.md /
+  // phoenix-project-demo.md），两条都进了 Pointers，白占一个展示槽位。
+  // Pointers 是有条数上限的展示列表（实测只显示 10 条，notes 却有 20 个），
+  // 重复项会挤掉真正需要被看到的条目。
+  //
+  // 只按 path 完全相同去重 —— 不动语义判断（"什么算同一件事"交给模型），
+  // 这里只保证"同一个文件不要在列表里出现两次"。保留最后一条（后写的更新）。
+  if (out.pointers.length > 1) {
+    const seen = new Map<string, { path: HomeRelPath; note: string }>();
+    for (const p of out.pointers) seen.set(p.path, p); // Map.set 重复 key 覆盖 → 天然保留最后一条
+    out.pointers = [...seen.values()];
+  }
   return out;
 }
 
