@@ -13,7 +13,13 @@
  *
  * §5.2 路由表（rev2 全部写明属主）：
  * | GET /api/health · /api/whoami            | 本模块 |
- * | POST /api/messages {text}                | cp.submit({title:text.slice(0,60),goal:text,priority:1}) |
+ * | POST /api/messages {text, threadId?}     | cp.submit({title:text.slice(0,60),goal:text,priority:1}) |
+ *                                             |   **threadId 语义**（2026-10-19 实测补充）：|
+ *                                             |   - 不传 → 每句话**新建会话**（多轮对话接不上，|
+ *                                             |     但长期记忆仍生效，实测能答出历史上的暗号）；|
+ *                                             |   - 传已有的 → 复用该会话，**本会话上下文连续**|
+ *                                             |     （实测："我刚才让你记的暗号"能准确答出）。|
+ *                                             |   飞书路径按 chat_id 自动复用，不受此影响。   |
  * | GET /api/queue?dot=                     | cp.list() 投影 |
  * | POST /api/queue/:id/cancel              | cp.cancel(id,'user') |
  * | GET /api/conversations?dot=&before=&limit= | 记忆模块会话 API（MemoryPort） |
