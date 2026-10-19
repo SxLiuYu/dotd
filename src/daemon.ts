@@ -196,7 +196,7 @@ export function appendOutbox(dataDir: string, line: string): void {
  * P1-1 并发配置读取：**只有显式声明才返回键**（返回空对象 = 全走 DEFAULT_CP_CONFIG）。
  *
  * 环境变量（前缀 DOTD_）：
- *  - `DOTD_MAX_RUNNING`（int ≥1）：并发额度，默认仍是 1；
+ *  - `DOTD_MAX_RUNNING`（int ≥1）：并发额度，**默认 3**（2026-10-19 从 1 提上来）；
  *  - `DOTD_INTERACTIVE_RESERVE`（int ≥0）：给主人对话预留的额外名额，默认 0；
  *  - `DOTD_PREEMPTIBLE_PRIORITY`（int 0..10）：可被对话抢占的后台优先级阈值，默认 0=关闭。
  *

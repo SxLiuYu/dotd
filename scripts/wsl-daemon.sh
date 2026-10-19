@@ -55,10 +55,15 @@ export DOTD_MODEL_TRANSPORT=real-http
 # 主人要关：把下面这行注释掉，或改成 off。
 export DOTD_NET_TOOLS="${DOTD_NET_TOOLS:-get}"
 
-# 并发额度：默认 1（串行）。要做并发验证时用 DOTD_MAX_RUNNING=2 bash scripts/wsl-daemon.sh 起。
+# 并发额度：默认 3（2026-10-19 从 1 提到 3）。
+# 为什么改：默认 1 = 完全串行 —— 主人连发两条消息，第二条要等第一条全做完；
+# 冷启动时队列里积压的旧任务会把新消息挤到后面（实测排到第 4 位，多等 13 秒）。
+# 实测 3 并发安全：两个任务各 3.9 秒、时间区间有重叠，无冲突。
+# 资源约束：每任务一份上下文（约 15867 tokens），3 份仍在模型限额内；
+# 容器内工具并发另有闸门（cpConcurrencyFromEnv 只在 >1 时生效）。
 # 注意：setsid 会丢掉调用方的环境，所以这里必须显式透传（2026-10-18 踩过：
 # 在外部 export 了 DOTD_MAX_RUNNING=2 却始终串行，因为变量没进来）。
-export DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-1}"
+export DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-3}"
 
 echo "FLEET=$DOTD_FLEET HOME=$DOTD_HOME"
 node --import tsx src/daemon.ts

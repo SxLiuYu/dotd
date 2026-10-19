@@ -69,5 +69,5 @@ fi
 echo "启动 dotd daemon…"
 rm -f /tmp/dotd-wsl.log
 # setsid：脱离 [boot] 的会话，否则脚本退出时 daemon 被一起回收
-DOTD_MAX_RUNNING=1 bash scripts/dotd-daemon-start.sh
+DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-3}" bash scripts/dotd-daemon-start.sh
 echo "  已交由 dotd-daemon-start.sh（它自己等端口并打印结果）"
