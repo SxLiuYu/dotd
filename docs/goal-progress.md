@@ -55,3 +55,20 @@
      旧判据禁"红球+蓝球"、"必中"字样，把"声明随机后给一组"和"劝阻别信必中软件"
      都误判成撒谎。已改成只禁断言式说法（这组必中/一定能中/预测结果如下）。
   —— **教训：判据本身也会说谎，必须拿原文和实测校对。**
+## S5 故障自恢复
+- **判据**：3 种故障（容器停 / 网关端口不可用 / daemon kill -9）→ 3/3 无人干预自愈，< 5 分钟
+- **实测**：**3/3 = 100%**，容器 53s、relay 55s、daemon 115s，全部 < 300s
+  （`docs/recovery-report.md` + `docs/acceptance/recovery.jsonl`）
+- **结论**：✅ 通过
+- **修掉三个真实缺陷**（原本这步过不去，不是判据太严，是系统真不会自愈）：
+  ① **watchdog 没装进 cron** —— 脚本早写好也拷到 /usr/local/bin，但 crontab 里没有，
+     从不执行；`docker stop` 后 5 分钟仍是 Exited。已装为 `*/2 * * * *`。
+  ② **watchdog 只检测容器、没有修复容器的代码** —— 日志连续报
+     `container 失败（第 1/2 次）` 却不动手，因为它只有 repair_daemon/docker/relay。
+     已补 `repair_container`（先 docker start，失败退到 fleet 重建）并在检测失败时立即调用。
+  ③ **cron 下找不到 powershell.exe → relay 永远修不好** —— cron 的 PATH 不含
+     `/mnt/c/...` 互操作路径，脚本里 `command -v powershell.exe` 直接放弃自愈，
+     只剩发告警。已在脚本开头显式补 PATH；用 `env -i PATH=/usr/bin:/bin` 模拟验证通过。
+- **验收设计**：脚本**绝不修故障**（只造故障 + 干等），避免"测的是脚本"；
+  恢复判据不是"端口通"，每条都补一次真实业务动作（执行命令 / 提交任务等 done）；
+  并核对日志时刻对齐 cron 整分钟，确认恢复来自无人值守路径而非我手动跑。

@@ -1,0 +1,3 @@
+{"id":"container_stop","name":"容器停掉","pass":true,"secs":53,"evidence":"容器 53s 后重新 Up 且能执行命令"}
+{"id":"relay_down","name":"网关端口不可用","pass":true,"secs":55,"evidence":"relay 55s 后恢复且模型能真应答"}
+{"id":"daemon_kill","name":"daemon kill -9","pass":true,"secs":115,"evidence":"daemon 115s 后恢复且能真接活"}

@@ -20,6 +20,16 @@ STATE_DIR=/var/lib/dotd-watchdog
 mkdir -p "$STATE_DIR"
 LOG=/var/log/dotd-watchdog.log
 
+# cron 的 PATH 极简，**不含 /mnt/c/...** —— 于是 `command -v powershell.exe` 失败，
+# repair_relay 直接放弃"自愈:没有 powershell.exe"。2026-10-19 实测就是这样：
+# 手工跑能修 relay，cron 跑永远修不了，只剩发告警。
+# 这里显式把 WSL 互操作路径补进 PATH（幂等）。
+case ":$PATH:" in
+  *":/mnt/c/Windows/System32:"*) ;;
+  *) PATH="$PATH:/mnt/c/Windows/System32:/mnt/c/Windows:/mnt/c/Windows/System32/WindowsPowerShell/v1.0" ;;
+esac
+export PATH
+
 # 所有函数都**不写 stdout**（只写日志文件与状态文件）：
 # 2026-10-19 踩过 —— 原来用 `exec >>LOG` 全局重定向，函数里的 echo 会被
 # `$(...)` 捕获当作"状态值"读回来，报 [: daemon: integer expression expected。
@@ -158,6 +168,33 @@ repair_relay() {
   return 1
 }
 
+# 容器自愈（2026-10-19 补）：原来只**检测**容器不在跑，没有任何修复动作 ——
+# 实测 docker stop 之后 watchdog 连续报"container 失败"却始终不动手，
+# 因为它只会修 daemon / docker / relay。容器是任务的执行环境，它没了等于全瘫。
+#
+# 为什么不能只靠 --restart 策略：`docker stop` 是**人工停止**，语义上
+# restart=unless-stopped 会尊重这个"故意停"，不会拉起。所以必须显式 start。
+repair_container() {
+  local name=dotd-dot-dot1
+  logline "自愈:尝试启动容器 $name"
+  if ! docker start "$name" >/dev/null 2>&1; then
+    # 容器可能已不存在（被 rm 掉），退回 fleet 重建
+    logline "自愈:docker start 失败，尝试 fleet 重建"
+    cd /root/dotd 2>/dev/null || return 1
+    DOTD_FLEET=docker DOTD_MAX_RUNNING=1 timeout 180 bash scripts/wsl-daemon-start.sh >/dev/null 2>&1 || true
+  fi
+  local i
+  for i in $(seq 1 30); do
+    sleep 2
+    if docker ps --filter name="$name" --format '{{.Status}}' 2>/dev/null | grep -q 'Up' \
+       && docker exec "$name" sh -c 'echo ok' >/dev/null 2>&1; then
+      logline "自愈:容器已恢复($((i*2))s)"
+      return 0
+    fi
+  done
+  logline "自愈:容器启动失败"
+  return 1
+}
 c_daemon()    { timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; }
 c_docker()    { docker info >/dev/null 2>&1; }
 c_container() { docker ps --filter name=dotd-dot-dot1 --format '{{.Status}}' 2>/dev/null | grep -q 'Up'; }
@@ -170,6 +207,8 @@ if ! c_daemon; then repair_daemon || true; fi
 check daemon    "dotd daemon 不可达（127.0.0.1:7788）"                        c_daemon
 if ! c_docker; then repair_docker || true; fi
 check docker    "docker 守护进程不可用"                                        c_docker
+# 容器是执行环境：没了就全瘫，检测到立刻修（不等告警阈值）
+if ! c_container; then repair_container || true; fi
 check container "dotd 容器不在运行"                                            c_container
 if ! c_relay; then repair_relay || true; fi
 check relay     "模型端点不可达（win-relay 13065）—— agent2api/relay 可能没起"  c_relay
