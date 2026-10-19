@@ -895,12 +895,40 @@ const contDownSpans=[];
 // 下一个采样点看到的就是"已经回来了"）。我第一版只查 sp.end ±15 分钟，
 // 而自愈记录写在 sp.start 附近 → 全判成"无自愈记录"，把正常自愈误杀成"人工干预"。
 // 现在：窗口 = 掉线开始前 15 分钟 到 掉线结束后 15 分钟。
+// **证据的主体必须和被判的对象一致**（2026-10-20 修，真假绿）。
+//
+// 原来这里传的正则是 `/容器已恢复|daemon\s*已恢复|daemon\s*就绪/` ——
+// 后两项的主体是 **daemon**，不是容器。而"daemon 恢复"和"容器恢复"是两件事：
+// watchdog 重启 daemon 时容器根本没动，日志里照样有「daemon 已恢复」。
+//
+// 合成数据实测：7 天窗口里容器掉 **90 分钟**（低于 2h 阈值，contDownOk 抓不到），
+// watchdog 日志里**只有「daemon 已恢复」，一个字都没提容器** ——
+// 也就是说容器其实是**人工拉起来**的。报告却打印
+//   「容器掉线 ... 持续 90 分钟（watchdog 自愈）」
+//   「容器掉线 1 次，全部有自愈记录（watchdog 自己拉回来的）」
+// 并 **exit 0**。**"无人工干预"被一个不相干子系统的恢复日志顶替了。**
+//
+// 这个错和第 5 轮修 relay/daemon 那处是**同一个**（第③类：证据主体错配）：
+// 当时的注释写着"不是所有'已恢复'都算 daemon 自愈"，
+// 但同一个错误在容器这条路径上一直留着 —— 修一个地方不等于修一类问题。
+//
+// 现在容器只认容器自己的证据。允许「daemon 就绪」是**唯一**的例外，
+// 且必须有理由：容器重建后 daemon 起不来会写"就绪"，
+// 那条日志确实间接证明容器可用了 —— 但只在 `docker start/run` 场景成立，
+// 所以放宽到"同一时间窗内有 daemon 就绪"，并把它在输出里标出来。
 const healInSpan=(sp, re)=>
   wdLines.some(w=>w.ts>=sp.start-900 && w.ts<=sp.end+900 && re.test(w.text) && !/失败/.test(w.text));
+// 容器自愈的**专属**证据：
+//   · watchdog: "容器已恢复"
+//   · boot:     "docker 就绪" / "容器就绪"
+//   · daemon:   "daemon 就绪" —— 容器重建后 daemon 能起来，间接证明容器可用
+const healedContainer=(txt)=>
+  !/失败/.test(txt) && (/容器已恢复/.test(txt) || /docker\s*就绪/.test(txt) ||
+                        /容器就绪/.test(txt) || /daemon\s*就绪/.test(txt));
 const contRows=contDownSpans
   .filter(sp=>(sp.end-sp.start)>=1800)      // 至少一个采样周期才算一次"掉线"
   .map(sp=>({...sp, secs:sp.end-sp.start,
-             healed: healInSpan(sp, /容器已恢复|daemon\s*已恢复|daemon\s*就绪/)}));
+             healed: healInSpan(sp, /./) && wdLines.some(w=>w.ts>=sp.start-900 && w.ts<=sp.end+900 && healedContainer(w.text))}));
 const contUnattended=contRows.filter(r=>!r.healed);
 // watchdog 的"已恢复"、boot 的"daemon 就绪"都算自动恢复。
 // **不是所有"已恢复"都算 daemon 自愈**（2026-10-19 修，真缺口）：
