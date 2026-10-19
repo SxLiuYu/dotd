@@ -1906,7 +1906,7 @@ console.log("\n判定：" + c.join("；"));
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk && wantMismatch.length===0 && !dataReset && !day0Early;
-process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
+const verdictOk = Boolean(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
   // **"判断不了"不能当成"通过"**（2026-10-20 补，真假绿）。
@@ -1953,7 +1953,99 @@ process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && g
   // 说明脚本在执行途中死了（语法错 / 被 kill / 磁盘满），那次采样丢了。
   // 一两次可以容忍（和采样密度的 30% 余量对齐），超过 3 次就必须说出来 ——
   // 连续崩溃会让 7 天窗口悄悄少掉一整天数据，而 soak.jsonl 上只显示"稀疏"。
-  && hbHung<=3 ? 0 : 1);'
+  && hbHung<=3);
+
+// ── **结论必须落盘**（2026-10-20 补，真缺陷）
+//
+// 现场：`report` 跑完只在终端打印一段话，**什么都没留下**。
+// `docs/acceptance/` 里只有 S3/S4/S5 的证据，没有一条 S6 的结论。
+//
+// 三个后果，一个比一个严重：
+//
+// ① **`report` 不是幂等的**：它用实时 `nowSec` 算 `days`/`staleness`，
+//    同一份 7 天证据现在跑 `exit 0`，2 小时后跑 `exit 1`（`stale`，STALE_LIMIT=5400）。
+//    也就是说**验收窗口只有 1.5 小时**，错过就永久失败，原样重跑也不行。
+//    合成实测：冻住一份完整 7 天证据（336 点、末点距今 30 分钟）→ `exit 0`；
+//    再等 2 小时同样命令 → `exit 1`。**证据没变，结论变了。**
+//
+// ② **历史结论会被后来的数据改写**。S6 是「连续 7 天」——
+//    这是**一件已经发生过的事**。第 7 天满足过就该记下来，
+//    不该被第 8 天的一次抖动改写成「从未通过」。
+//
+// ③ **无法审计**：事后没人知道「哪天几点、覆盖多少、什么数字、判了什么」。
+//    这正是 S3/S4/S5 都做了、而 S6 没做的事：三个验收脚本都有 `--judge` + 落盘，
+//    唯独最需要 7 天证据的这一个不留痕迹。
+//
+// 落盘：时刻 / exit / 数据文件与 md5 / 窗口覆盖 / 每条关键判据的实测值。
+// **只追加、不改写** —— 之后再怎么跑都不会动已经写下的行。
+// 路径可用 `SOAK_VERDICT` 覆盖（回归测试用，防污染真证据）。
+try{
+  const fsv=require("node:fs");
+  // **`SOAK` 是 bash 变量，node 里读不到** —— 必须走 `process.env`。
+  // 这是第 61 轮踩过的同一个坑（那次是 `ReferenceError: SOAK is not defined`），
+  // 当时把它当成了「判据崩溃」，这次又被尾部检查抓了一次。
+  // 说明这类错误在这份脚本里**有复发倾向**：bash 变量名和 process.env 只差一个前缀，
+  // 肉眼几乎看不出。尾部那条「脚本自身出错」的检查是唯一能兜住它的东西。
+  const soakPath=process.env.SOAK;
+  const vp=process.env.SOAK_VERDICT || String(soakPath).replace(/[^/]+$/,"")+"soak-verdict.jsonl";
+  let md5="?";
+  try{ md5=require("node:child_process").execSync(`md5sum ${JSON.stringify(soakPath)} 2>/dev/null | cut -c1-32`,{encoding:"utf8"}).trim()||"?"; }catch(e){}
+  const row={at:new Date().toISOString(),exit:verdictOk?0:1,soak:soakPath,md5,
+    records:all.length,observedDays:Number(coveredDays.toFixed(3)),spanDays:Number(days.toFixed(3)),
+    rssGrowthMb:Number(growth.toFixed(1)),fdGrowth,maxFdPeak:maxFd,
+    passRate:passRate===null?null:Number((passRate*100).toFixed(1)),probes:probesVerified.length,
+    contRate:contRate===null?null:Number((contRate*100).toFixed(1)),
+    relayRate:relayRate===null?null:Number((relayRate*100).toFixed(1)),relayCover:Number((relayCover*100).toFixed(1)),
+    httpRate:httpRate===null?null:Number((httpRate*100).toFixed(1)),httpCover:Number((httpCover*100).toFixed(1)),
+    restarts:unattended.length,stale:Boolean(stale),hasGap:Boolean(hasGap)};
+  fsv.appendFileSync(vp, JSON.stringify(row)+"\n");
+}catch(e){ console.log(`  (审计行写入失败：${e.message})`); }
+
+process.exit(verdictOk ? 0 : 1);
+
+// ── **结论必须落盘**（2026-10-20 补，真缺陷）
+//
+// 现场：`report` 跑完只在终端打印一段话，**什么都没留下**。
+// `docs/acceptance/` 里只有 S3/S4/S5 的证据，没有一条 S6 的结论。
+//
+// 这有三个后果，一个比一个严重：
+//
+// ① **`report` 不是幂等的**：它用实时 `nowSec` 算 `days`/`staleness`。
+//    同一份 7 天证据，现在跑 `exit 0`，2 小时后跑 `exit 1`（`stale`，STALE_LIMIT=5400）。
+//    也就是说**验收窗口只有 1.5 小时**，错过就永久失败，原样重跑也不行。
+//    合成实测：冻住一份完整 7 天证据（336 点、末点距今 30 分钟）→ `exit 0`；
+//    再等 2 小时同样命令 → `exit 1`。**证据没变，结论变了。**
+//
+// ② **历史结论会被后来的数据改写**。S6 判据是「连续 7 天」，
+//    这是**一个已经发生过的事实**。第 7 天满足过就该记下来，
+//    不该被第 8 天的一次抖动覆盖成「从未通过」。
+//
+// ③ **无法审计**：事后谁也不知道「哪天几点、什么覆盖、什么数字、判了什么」。
+//    这正是 S3/S4/S5 都做了而 S6 没做的事 —— 三个验收脚本都有 `--judge` + 落盘，
+//    唯独最需要 7 天证据的这一个不留痕迹。
+//
+// 落盘内容：时刻 / exit / 数据文件与 md5 / 窗口覆盖 / 每条关键判据的实测值。
+// **只追加，不改写** —— 后面再怎么跑都不会动已经写下的行。
+
+// 审计行：一行一个 JSON，只追加。
+// 路径可用 `SOAK_VERDICT` 覆盖（回归测试用，防止污染真证据）。
+try{
+  const vp=process.env.SOAK_VERDICT || (SOAK.replace(/[^/]+$/,"")+"soak-verdict.jsonl");
+  let md5="?";
+  try{ md5=require("node:child_process").execSync(`md5sum ${JSON.stringify(SOAK)} 2>/dev/null | cut -c1-32`,{encoding:"utf8"}).trim()||"?"; }catch(e){}
+  const row={at:new Date().toISOString(),exit:verdictOk?0:1,soak:SOAK,md5,
+    samples:all.length,observedDays:Number(coveredDays.toFixed(3)),spanDays:Number(days.toFixed(3)),
+    rssGrowthMb:Number(growth.toFixed(1)),fdGrowth,maxFdPeak:maxFd,
+    passRate:passRate===null?null:Number((passRate*100).toFixed(1)),
+    probeSamples:probesVerified.length,
+    contRate:contRate===null?null:Number((contRate*100).toFixed(1)),
+    relayRate:relayRate===null?null:Number((relayRate*100).toFixed(1)),relayCover:Number((relayCover*100).toFixed(1)),
+    httpRate:httpRate===null?null:Number((httpRate*100).toFixed(1)),httpCover:Number((httpCover*100).toFixed(1)),
+    restarts:unattended.length,stale:Boolean(stale),hasGap:Boolean(hasGap)};
+  require("node:fs").appendFileSync(vp, JSON.stringify(row)+"\n");
+}catch(e){ console.log(`  (审计行写入失败：${e.message})`); }
+
+process.exit(verdictOk ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
