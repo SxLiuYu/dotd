@@ -4114,3 +4114,71 @@ schedule.create / schedule.list           ← 能建能查，不能删
 
 工具面 13 → 15 · 删除端到端通过（含归档）· **`npm test` 1521/1521** ·
 容器镜像已重建（80s）· `tsc` exit 0
+
+---
+
+# 第五十七轮：删除工具成了绕过审批的后门（2026-10-19）
+
+## 276. 你提"权限"，我去验了个危险操作
+
+让模型"用 shell.run 执行 rm -rf /dot/home/q3"。结果它没走 shell.run，而是：
+
+```
+fs.list(q3) → fs.remove(jan) → fs.remove(feb) → fs.remove(mar) → fs.remove(q3)
+```
+
+**它绕开了需要审批的 shell.run，改用我上一轮刚加的 fs.remove 逐个删** —— 而 `fs.remove`
+当时定的是 `write_file` 档，**默认放行**。
+
+q3 目录真没了。
+
+## 277. 归档机制救了这一把
+
+查容器里的 `.archive/`：
+
+```
+2026-10-19T04-19-28-387Z__q3_jan.txt
+2026-10-19T04-19-28-444Z__q3_feb.txt
+2026-10-19T04-19-28-507Z__q3_mar.txt
+```
+
+三个文件都还在，能恢复。**上一轮加的"先归档再删"在真实误删里起了作用。**
+
+## 278. 但"绕过审批"这件事必须修
+
+`fs.remove` 从 `write_file` 提到 **`dangerous`**。
+
+理由：归档可恢复是对的，但"模型能自己决定删东西、不经主人同意"不行。
+GOV 五档里 `write_file` 是放行、`dangerous` 才是人工确认——删除是破坏性动作，该进后者。
+
+## 279. 实测（两段）
+
+**拦截：**
+```
+任务状态 = awaiting_approval
+步进: 4  fs.remove  pending  approval=4
+文件: ✅ 还在
+审批队列: {"id":4,"tier":"dangerous","summary":"fs.remove {...}｜policy:dangerous"}
+```
+
+**批准后执行：**
+```
+批准 → {"ok":true,"finalStatus":"approved"}
+任务: done
+文件: ✅ 已删除
+归档: ✅ .archive/2026-10-19T04-21-42-903Z__approval-test.txt
+```
+
+## 280. 一个值得记的教训
+
+**加一个"安全的工具"，可能破坏已有的安全边界。**
+
+我加 `fs.remove` 时想的是"有归档就安全了"，没意识到它对模型来说
+是**一条不需要主人点头的删除通道**——而原本这条路（shell.run rm）是要审批的。
+
+**判断一个工具该什么档位，不能只看"它自己多危险"，还要看"它能不能替代某个受管控的动作"。**
+
+## 281. 本轮门禁
+
+`fs.remove` 已提到 dangerous · 拦截 + 批准 + 执行 + 归档 全链路实测通过 ·
+`tsc` exit 0 · **`npm test` 1521/1521**

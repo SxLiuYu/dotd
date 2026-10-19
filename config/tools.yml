@@ -29,7 +29,11 @@ tools:
     tier: read
     # EX §7：目录枚举/mtime/size，深度 ≤4
   - name: fs.remove
-    tier: write_file                        # 删除文件：先归档进 .archive/ 再 unlink，可恢复；目录只删空的
+    # **dangerous 而不是 write_file**（2026-10-19 实测改）：
+    # 最初定 write_file，结果模型面对"用 rm -rf 删目录"（shell.run 会触发审批）时
+    # **改用 fs.remove 逐个删**，完全绕过审批。归档可恢复是对的，但"绕过审批"不行。
+    # 删除是破坏性动作，按 GOV 五档该进人工确认。
+    tier: dangerous
   - name: fs.stat
     tier: read
     # EX §7：mtime/size
