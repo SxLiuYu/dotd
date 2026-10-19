@@ -3511,3 +3511,75 @@ reports/、results/ 和几个文档——比之前干净得多。
 
 发现上下文膨胀问题（19878 tokens 纯历史）· 裁剪代码已加但**未证实生效** ·
 `tsc` exit 0 · `npm test` 1516/1516 · 已清理调试代码
+
+---
+
+# 第四十八轮：上下文膨胀的真根因找到了（2026-10-19）
+
+## 227. 接着上轮的悬案
+
+上轮我在 `buildMessages` 里裁了 tool_result，日志证明确实执行了（468→68），
+但实测 prompt 一点没降。这轮加了一个诊断，打印**真正发给模型的 messages**：
+
+```
+DIAG-MESSAGES 条数=534 字节=62801 分布={"text":471,"tool_result":60,"task_end":3}
+```
+
+**看出来了**：`tool_result` 确实裁到 60 条了，但那是**本轮**的结果；
+历史里那 460 条在我这里统计成了 `text`——我裁的根本不是它们。
+
+## 228. 真根因：会话重放传了"任务预算"
+
+追踪 `this.messages` 的来源：
+
+```ts
+const replay = await this.memory.buildSessionReplay(
+  session.threadId, session.id,
+  session.budgetTokens,     // ← 200000
+);
+```
+
+`packSessionReplay` 的实现是**从新到旧累加，直到撞到预算**：
+
+```ts
+for (const m of fromNewest) {
+  if (used + m.tokenEst > budgetTokens) break;   // ← 预算 200000 时永远不 break
+  picked.push(m);
+}
+```
+
+**任务预算是 200000，对"重放历史"来说等于不限**——所以 74685 字节的历史被完整装进去。
+再查线程的摘要状态：`context_summary = null`、`upto_seq = 0`
+——从未做过摘要压缩，历史只增不减。
+
+## 229. 修法：给会话重放独立的小预算
+
+```ts
+const REPLAY_BUDGET_TOKENS = 8_000;
+```
+
+理由：基础开销（system prompt + 工具 schema + 记忆）约 8400 tokens，
+再加 8000 历史总计约 16000，对当前模型是舒适区；超出的由 `packSessionReplay`
+**从最旧开始丢弃**——正好是我们想要的（最近的对话一定保留）。
+
+## 230. 实测效果
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| messages 条数 | 534 | **243** |
+| 字节 | 62801 | **32595** |
+| **prompt tokens** | **28329** | **15867** |
+
+**降了 44%。** 同一个 461 条消息的老线程，回答依然正确。
+
+## 231. 这轮的方法论
+
+上轮我卡住时，没有硬猜哪里改错了，而是**加一个诊断打印真实输入**。
+这次一次性看清了：不是"裁剪没执行"，而是"裁错了对象"。
+
+`console.error` 打出的那行诊断信息，抵得上十次读代码猜。
+
+## 232. 本轮门禁
+
+prompt 28329 → 15867（-44%）· 回答正确性不变 · **`npm test` 1518/1518**
+（+2 条守卫：重放不得用任务预算、预算必须是合理小值）· 诊断代码已清理

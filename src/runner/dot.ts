@@ -90,6 +90,17 @@ import {
  * 2026-10-18 实测校准：E 用例每项重复恰好 3 次才收尾，所以硬阈必须 ≤4；
  * 而"写完再读"是不同工具/不同参数，第 2 次软提醒不会误伤它们（有单测钉住判据）。
  */
+/**
+ * 会话历史重放的 token 预算（2026-10-19）。
+ *
+ * 为什么不能直接用任务预算：任务预算是 200000，对"重放历史"来说等于不限，
+ * 结果长会话每次请求都要背上全部历史。取 8000 是因为：
+ *   - 基础开销（system prompt + 工具 schema + 记忆）约 8400 tokens；
+ *   - 加上 8000 的历史，总计约 16000，对当前模型是舒适区；
+ *   - packSessionReplay 从新到旧累加，超预算丢弃的是**最旧**的那部分。
+ */
+const REPLAY_BUDGET_TOKENS = 8_000;
+
 const REPEAT_SOFT_LIMIT = 2;
 const REPEAT_HARD_LIMIT = 4;
 
@@ -1040,7 +1051,19 @@ export class DotRunner {
     const ctx = new RunContext(session.goal);
     const replay = session.threadId === null
       ? []
-      : await this.memory.buildSessionReplay(session.threadId, session.id, session.budgetTokens);
+      : await this.memory.buildSessionReplay(
+          session.threadId,
+          session.id,
+          // **会话重放要有自己的预算**（2026-10-19 实测发现的上下文膨胀根因）：
+          // 原来直接传 session.budgetTokens（=200000），等于"不限"——
+          // 一个 461 条消息的线程被完整重放，prompt 累积到 28247 tokens，
+          // 其中 19878 是历史，而历史里 460 条是早已作废的工具输出。
+          //
+          // 会话重放只是"让模型知道刚才聊到哪"，不需要把全部历史背下来：
+          // 8000 tokens 足够容纳几十轮对话，超出部分由 packSessionReplay 从最旧开始丢弃
+          // （它是从新到旧累加的，所以丢的永远是最旧的——正好是我们想要的）。
+          REPLAY_BUDGET_TOKENS,
+        );
     for (const m of replay) {
       ctx.push(m);
       if (m.kind === 'tool_result') {
