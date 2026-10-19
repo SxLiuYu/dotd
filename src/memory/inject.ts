@@ -459,25 +459,42 @@ export function packSessionReplay(
   budgetTokens: number,
 ): Message[] {
   const out: Message[] = [];
+  const summary = thread.contextSummary;
+  const hasSummary = summary !== null && summary.length > 0;
+
+  // **摘要的预算要先从总预算里扣掉**（2026-10-19 修）。
+  //
+  // 原来的写法是「先按全预算装最新消息，装完如果还剩预算才加摘要」：
+  //   if (... && used < budgetTokens) { 加摘要 }
+  // —— 这个条件方向是反的：**会话越长，used 越接近 budgetTokens**，
+  // 于是最需要摘要的长会话最可能拿不到摘要。等于"越需要它，越用不上"。
+  //
+  // 正确做法：先给摘要留出位置，剩下来的预算再装最近的消息。
+  // 摘要通常 ≤600 token（§4.4 上限），对 8000 的总预算是小头，
+  // 但换来的是「长会话一定记得住开头」。
+  const summaryTokens = hasSummary ? tokensOfText(summary) : 0;
+  const replayBudget = hasSummary ? Math.max(0, budgetTokens - summaryTokens) : budgetTokens;
+
   let used = 0;
   const fromNewest = [...messages].reverse();
   const picked: Message[] = [];
   for (const m of fromNewest) {
-    if (used + m.tokenEst > budgetTokens) break;
+    if (used + m.tokenEst > replayBudget) break;
     picked.push(m);
     used += m.tokenEst;
   }
   picked.reverse();
-  const summary = thread.contextSummary;
-  if (summary !== null && summary.length > 0 && used < budgetTokens) {
+
+  // 摘要排在最近消息**之前**（它代表的是更早的历史）
+  if (hasSummary) {
     out.push({
       id: `sum_${thread.id}`,
       threadId: thread.id,
       seq: thread.contextSummaryUptoSeq,
       role: 'system',
       kind: 'text',
-      content: summary,
-      tokenEst: tokensOfText(summary),
+      content: summary!,
+      tokenEst: summaryTokens,
       createdAt: thread.lastActiveAt,
     });
   }
