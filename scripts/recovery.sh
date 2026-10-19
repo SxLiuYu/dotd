@@ -105,10 +105,38 @@ fi
 if want relay_down; then
   echo "▶ [relay_down] 让 13065 不可用"
   # 从 WSL 侧无法直接杀 Windows 进程；用 Windows 侧 taskkill 结束 relay（node 跑的那个）
-  powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { \$_.CommandLine -like '*win-relay.mts*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1
-  sleep 3
-  if c_relay; then
-    record relay_down "网关端口不可用" 0 0 "造故障失败：13065 仍可连（可能没杀掉，或 relay 由别的进程提供）"
+  # **杀之前先确认它本来是活的**（2026-10-20 修，真缺陷）。
+  # 现场：单跑 relay_down 报"造故障失败：13065 仍可连"。查下去发现
+  # 上一步 container_stop 之后 relay 已经意外死了（或者刚被别的原因打死），
+  # 脚本对着一个**已经死的**目标执行 kill，然后立刻看到 watchdog 把它拉起来，
+  # 于是误判成"没杀掉"。**造故障失败被记成了验收失败**——两种完全不同的结论。
+  # 修法：杀之前先探活，本来就不通就直接说"前提不成立"，不去杀。
+  if ! c_relay; then
+    echo "  ! [relay_down] 杀之前 13065 就不通 —— 前提不成立，先等它起来"
+    if ! wait_until c_relay >/dev/null; then
+      record relay_down "网关端口不可用" 0 0 "造故障失败：13065 本来就不可用（前提不成立，不是 dotd 的问题）"
+      RELAY_SKIP=1
+    fi
+  fi
+  if [ "${RELAY_SKIP:-0}" != "1" ]; then
+  # **必须"杀掉并确认断了"，不能"杀掉 + sleep 3 后看一眼"**（2026-10-20 修，真缺陷）。
+  # 现场：完整跑三项时 relay_down 报"造故障失败：13065 仍可连（0s）"，
+  # 但同样一条命令手工执行、单独跑本项都能杀成。差别在于——
+  # container_stop 那 47 秒里 watchdog 也在跑（每 2 分钟一轮），
+  # 它发现有环节不对就会把 relay 拉起来；固定 sleep 3 正好撞上刚被拉起的瞬间，
+  # 于是"杀掉了又被拉起"被判成"根本没杀掉"。**造故障失败 ≠ 验收失败**。
+  # 修法：杀掉后**轮询 20 秒确认真的断了**，断了才继续；
+  # 20 秒内一直被拉起 → 明确说"杀不住（watchdog 抢着拉起）"，这是环境问题不是 dotd 问题。
+  RELAY_KILLED=0
+  for _i in $(seq 1 20); do
+    powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { \$_.CommandLine -like '*win-relay.mts*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }" >/dev/null 2>&1
+    sleep 1
+    if ! c_relay; then RELAY_KILLED=1; break; fi
+  done
+  if [ "$RELAY_KILLED" != "1" ]; then
+    record relay_down "网关端口不可用" 0 0 "造故障失败：20 秒内一直被拉起（watchdog 抢跑），不是 dotd 的问题"
+  elif false; then
+    :
   else
     if secs=$(wait_until "timeout 4 bash -c 'exec 3<>/dev/tcp/$GW/13065'"); then
       # 端口回来还不够，模型得真能答
@@ -120,6 +148,7 @@ if want relay_down; then
     else
       record relay_down "网关端口不可用" 0 "$LIMIT" "${LIMIT}s 内 13065 未恢复"
     fi
+  fi
   fi
 fi
 
@@ -163,6 +192,18 @@ if(bad) console.log(`⚠ ${bad} 行残缺，已跳过`);
 const total=ls.length, pass=ls.filter(r=>r.pass).length;
 for (const r of ls) console.log((r.pass?"✔":"✖"), r.id.padEnd(16), String(r.secs+"s").padStart(6), r.name, "|", r.evidence);
 console.log("");
-console.log(`合计 ${pass}/${total} 自愈 = ${(pass/total*100).toFixed(0)}%   判据：3/3 且均在 ${process.env.LIMIT||300}s 内`);
-console.log(pass===total && total===3 ? "结论：✅ 达标" : "结论：❌ 未达标");
-process.exit(pass===total && total===3 ? 0 : 1);'
+// **只跑了部分项时不能说"未达标"**（2026-10-20 修）。
+// 原来硬编码 total===3，于是"只跑 2 项且 2 项全过"也被打成 ❌ ——
+// 那是把"没全测"说成"没通过"，两种完全不同的结论（第⑨类：标签会撒谎）。
+// 正确语义：
+//   · 全过且跑满 3 项 → ✅ 达标，exit 0
+//   · 全过但只跑了 n<3 项 → ⏳ 已跑的 n 项全过，还剩 3-n 项没验，exit 3（区别于失败）
+//   · 有任何一项没过 → ❌ 未达标，exit 1
+const ALL_IDS=["container_stop","relay_down","daemon_kill"];
+const ranIds=new Set(ls.map(r=>r.id));
+const notRun=ALL_IDS.filter(id=>!ranIds.has(id));
+console.log(`合计 ${pass}/${total} 自愈 = ${(pass/total*100).toFixed(0)}%` + (notRun.length?`   本次只验了 ${total}/3 项（未验：${notRun.join(", ")}）`:`   判据：3/3 且均在 ${process.env.LIMIT||300}s 内`));
+if(pass!==total){ console.log("结论：❌ 未达标"); process.exit(1); }
+if(notRun.length){ console.log(`结论：⏳ 已验的 ${total} 项全过，但还差 ${notRun.length} 项没验 —— 这不等于通过`); process.exit(3); }
+console.log("结论：✅ 达标");
+process.exit(0);'
