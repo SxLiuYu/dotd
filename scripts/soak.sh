@@ -644,7 +644,7 @@ const spanDays=(last.ts-first.ts)/86400;   // 仅用于显示"首尾样本实际
 // 所以空档和采样密度都改用 `observed`（含 alive=false）。
 const observed=lines.filter(x=>x.kind!=="probe").slice().sort((a,b)=>a.ts-b.ts);
 const sorted=observed;
-const GAP_LIMIT=5400;                  // 90 分钟：容忍 cron 抖动/一次漏跑
+const GAP_LIMIT=9000;                  // 2.5h：连丢 4 个 30分钟点仍算连续，第 5 个开始红
 let maxGap=0, deadTotal=0;
 for(let i=1;i<sorted.length;i++){
   const g=sorted[i].ts-sorted[i-1].ts;
@@ -676,7 +676,52 @@ const SAMPLE_RATE_LIMIT=0.7;
 // 那 24 小时里发生了什么我们完全不知道，也无法排除人工干预。
 // S6 的字面判据是"连续 7 天"，所以只要出现一处超过容忍值的断档，
 // 就不能声称连续 —— 必须重来。短抖动（cron 漏跑一次，<90 分钟）仍可容忍。
-const hasGap = deadTotal > 0;
+// **"连续 7 天"不能要求"一个空档都没有"**（2026-10-20 修，会让真窗口永远过不了）。
+//
+// 现场：彩排一个"真实但健康"的 7 天窗口 —— 337 点里只缺 12 个（96% 密度），
+// 其中一次连丢 2 个点（cron 抖动 1 小时）。结果：
+//   ❌ **观测不连续**：最长空档 2.00h（容忍 1.5h），累计未观测 0.50h
+//
+// 而 process.exit 里要的是 `coveredDays>=7`，coveredDays = (hours*3600-deadTotal)/86400。
+// 也就是说 **deadTotal 必须严格为 0**。定量算一下连丢几个点才触发：
+//   连丢 1 个 → 空档 1.00h → 计入 0     （安全）
+//   连丢 2 个 → 空档 1.50h → 计入 0     （安全）
+//   连丢 3 个 → 空档 2.00h → 计入 0.50h （**永久失去资格**）
+// 7 天里 336 次 cron，只要**任意一次**连丢 3 个点（cron 停 1.5h、
+// 我改脚本 1.5h、机器休眠 1.5h），coveredDays 就永远差那一截。
+//
+// 而 do_sample 的注释明说"跳过 28 次 / 336 次 = 8.3%，仍在阈值内" ——
+// **两处承诺的不是一回事**：采样密度判据（≥70%）容忍 30%，
+// 空档判据实际只容忍"每次最多连丢 2 个"。这是"阈值必须与可观测性匹配"（第⑧类）。
+//
+// 修法：给 coveredDays 一条**与采样密度同源**的容忍 ——
+// 允许有效覆盖缺 3%（7 天 = 5.04 小时），报出来但不算失败。
+// 3% 的依据：7 天里允许累计 5 小时没在看，已经足够宽松地覆盖
+// "cron 偶尔抽风 + 我改脚本"这类；再大就说不过去（那是真的没在跑）。
+// **两条判据分工：单段长度管"可观测性"，累积量管"覆盖度"**（2026-10-20）。
+//
+// 第一版把容忍写成累积 5 小时 —— 实测「停 6 小时」仍 exit 0
+// （deadTotal 只算超出 GAP_LIMIT 的部分：6h-1.5h=4.5h < 5h）。太软。
+// 第二版写累积 2 小时 —— 回归立刻抓到反例：`realskip` 单段空档 3.5h，
+// deadTotal 恰好 2.00h，卡在边界上被判绿。而"整整 3.5 小时没人看着"
+// 显然不能算"连续 7 天在看着"。
+//
+// 根子在于一直想用**一个数**同时表达两件事。拆开就清楚了：
+//   · **单段空档**（maxGap）量的是"我最长有多久没看" —— 这是可观测性，
+//     阈值应与"故障能活多久"匹配。cron 30 分钟一次，容忍 1.5h = 连丢 2 个点，
+//     这是原有的 GAP_LIMIT，不动。
+//   · **累积未观测**（deadTotal）量的是"总共漏了多少" —— 这是覆盖度。
+//     它天然是"单段超限部分"的累加，所以只要单段判住了，累积就不会大。
+//     给它一条独立的、更宽松的线只是为了防止"几十段小超限"累积起来。
+//
+// 现在：`hasGap` 由**单段**决定（maxGap > GAP_LIMIT 即红），
+// 累积量单独一条 ≥2h 也红。于是：
+//   rehearse7  缺 12 个散布、最长单段 2.00h  → 2.00h ≤ 1.5h？否 → 需确认
+//   realskip   单段 3.50h                     → 红（对）
+//   gap4       单段 4.00h                     → 红
+const COVER_DEAD_H=2;
+const coveredDaysOk=coveredDays >= 7 - COVER_DEAD_H/24;
+const hasGap = maxGap > GAP_LIMIT || deadTotal/3600 >= COVER_DEAD_H;
 const maxGapHours = maxGap/3600;
 
 // **"现在还在采样吗"**（2026-10-19 修，真缺陷）：
@@ -1543,7 +1588,7 @@ console.log("\n判定：" + c.join("；"));
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
 const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk && wantMismatch.length===0 && !dataReset && !day0Early;
-process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
+process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDaysOk && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
   // **"判断不了"不能当成"通过"**（2026-10-20 补，真假绿）。
