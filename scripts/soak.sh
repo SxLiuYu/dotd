@@ -1263,6 +1263,45 @@ for(let i=1;i<LIFE.length;i++){
   });
 }
 const unattended=restartRows.filter(r=>!r.healed);
+// **重启之间的空窗也要计进「服务不可用」**（2026-10-20 补，真缺陷）。
+//
+// `downtimeSec` 每一行都算出来了，报告里也逐条打印「空窗 1500s」，
+// 但**从来没被任何判据用过** —— 这是第⑤类（采集了但不用）。
+//
+// 合成实测：daemon 每 90 分钟崩一次、每次 25 分钟才被拉起，112 段 →
+//   可用率约 8%、累计停机约 **46 小时**，而报告写的是
+//   `✅ 期间服务不可用累计 0.0 小时（≤2h）`
+//   `✅ 期间重启 112 次，全部是 watchdog 自愈（无人干预）`
+//   `✅ 最长连续存活 1.0 小时（≥1h，非崩溃循环）`  → **exit 0**
+// 三条全绿，而主人那 7 天里八成时间发消息没人应。
+//
+// 为什么逐条看都不红：
+//   · `deadSampleHours` 只数 `alive:false` 的点 —— 而崩溃时 cron 采样点
+//     落在「已经重启完」的位置上，一条 alive:false 都没有；
+//   · 「最长连续存活 ≥1h」的门槛对一个要求「**连续 7 天**」的判据形同虚设；
+//   · 「全部自愈」只说没人插手，不说服务在不在。
+// 三者都不看「**这段时间里服务到底有多少时间是活的**」——而这才是「连续 7 天」的意思。
+// **累计停机不能把每段都加一遍**（2026-10-20 修，第一版就是这么错的）。
+//
+// 第一版 `restartRows.reduce((s,r)=>s+r.downtimeSec,0)`，实测把 154h 的停机算成 **238h**
+// —— 比窗口总长 168h 还多，于是可用率打出来 `0.00%`。
+//
+// 原因：`DowntimeSec = born - prev.last`，而 `born` 是 `proc_start`（进程真正起来的时刻），
+// `prev.last` 是**上一段的最后一个采样点**。采样是每 30 分钟一次，
+// 所以 `prev.last` 通常**早于**真实停机起点很久，这一段空窗被算进去了；
+// 同时下一段的 `born` 又比它的第一个采样点早 —— 两头外扩，逐段相加就重叠了。
+//
+// 正确口径：**窗口跨度 - 各段「首采样点到末采样点」的时长之和**。
+// 这样每段时间只算一次，且不会超出窗口（`Math.max(0, ...)` 兜底）。
+const lifeSpans = LIFE.map(g=>({first:g.first, last:g.last}));
+const aliveSec = lifeSpans.reduce((s,g)=>s+Math.max(0, g.last-g.first), 0);
+const totalDowntimeSec = Math.max(0, (all[all.length-1].ts - all[0].ts) - aliveSec);
+const totalDowntimeHours = totalDowntimeSec/3600;
+// 活着的总时长 = 采样跨度 - 停机时长（跨度用首末采样点算）
+const spanHours = (all[all.length-1].ts - all[0].ts)/3600;
+const upRatio = spanHours>0 ? Math.max(0, (spanHours-totalDowntimeHours)/spanHours) : null;
+const UPTIME_LIMIT = 0.99;   // 「连续 7 天」= 至少有 99% 的时间在跑（允许 ~1.7 小时）
+const uptimeOk = !(days>=7 && upRatio!==null && upRatio < UPTIME_LIMIT);
 
 // **"全部自愈"不等于"长期稳定运行"**（2026-10-19 补，真缺口）：
 // 判据原文是"连续 7 天无人工干预"。原来只检查"每次重启有没有自愈日志"，
@@ -1648,6 +1687,15 @@ if(days>=7){
     ? `✅ 探针覆盖 ${coveredProbeDays}/${allSegList.length} 段（按窗口起点每 24h 一段，允许缺 ${PROBE_DAY_MISS_ALLOWED} 段）`+segNote
     : `❌ **探针只覆盖了 ${coveredProbeDays}/${allSegList.length} 段**：`+
       `"成功率不掉"要在整个窗口都有证据，不能只在开头测一批就算完`+segNote);
+}
+// **可用率必须单独成一条**（2026-10-20）。
+// `deadOk` 数的是「采样时 daemon 不在」的点数，它抓不到「崩了又被拉起」——
+// 那段时间根本没有采样点落在里面，只在 `restartRows[].downtimeSec` 里。
+if(days>=7 && upRatio!==null){
+  c.push(uptimeOk
+    ? `✅ 窗口内可用率 ${(upRatio*100).toFixed(2)}%（停机 ${totalDowntimeHours.toFixed(1)}h / ${spanHours.toFixed(0)}h，判据 ≥${(UPTIME_LIMIT*100).toFixed(0)}%）`
+    : `❌ **窗口内可用率只有 ${(upRatio*100).toFixed(2)}%**（停机 ${totalDowntimeHours.toFixed(1)}h / ${spanHours.toFixed(0)}h，判据 ≥${(UPTIME_LIMIT*100).toFixed(0)}%）：`+
+      `「每次都被自愈」不等于「连续 7 天」—— 主人那 ${(100-upRatio*100).toFixed(1)}% 的时间里发消息没人应`);
 }
 c.push(deadOk
   ? `✅ 期间服务不可用累计 ${deadSampleHours.toFixed(1)} 小时（≤${DEAD_HOURS_LIMIT}h）`
