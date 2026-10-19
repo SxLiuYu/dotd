@@ -2862,3 +2862,47 @@ p99 = 146.9s
 ## 169. 本轮门禁
 
 边界理解 3/3 · 真实场景 5/5 · `tsc` exit 0 · `npm test` 1499/1499
+
+---
+
+# 第三十七轮：VOLUME 修复落地 + 一次 WSL 卡死（2026-10-19）
+
+## 170. 修好的 Dockerfile 必须重建镜像才算数
+
+上一轮改了 `exec-image/Dockerfile`（VOLUME 行尾注释），但**镜像还是旧的** ——
+再验证之前先重建：
+
+```
+删旧镜像 → 停容器 → 重启 daemon（boot 自动重建）
+```
+
+重建后验证，修复确实生效：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 镜像声明 VOLUME | 8 个（含 `#`、`/dot/profiles]`、`卷与`…） | **2 个**（`/dot/home`、`/dot/profiles`） |
+| 容器挂载 | 12 个（含 8 个匿名卷） | **4 个**（全是有名字的卷） |
+| `/dot/` 目录 | 含 `profiles]` 畸形目录 | 只有 `home`、`profiles` |
+| 卷总数 | 173 | **45** |
+
+## 171. 顺带踩到一次 WSL 卡死
+
+`docker volume prune` 删掉 129 个卷后，WSL 进入 `Compacting` 状态并**卡了十几分钟**：
+
+```
+Wsl/Service/CreateInstance/E_ILLEGAL_STATE_CHANGE
+```
+
+期间 `wsl --terminate`、`wsl --shutdown`、`Stop-Service LxssManager` 全部无效
+（最后一条是因为没有管理员权限）。`vmmem` CPU 已经是 0，说明压缩其实结束了，
+**卡的是 WSL 的状态机**，不是真的在压缩。
+
+最后它自行超时恢复了。**记录一条经验**：批量删卷前先想清楚 WSL 会不会触发压缩；
+真卡住时先等 10–15 分钟，别急着认为数据丢了 —— vhdx 和 git 历史都完好。
+
+数据安全确认：D 盘项目完整、git 提交齐全。
+
+## 172. 本轮门禁
+
+镜像重建后挂载从 12 → 4 · 卷 173 → 45 · daemon/飞书/容器全部正常 · 端到端 `VERIFY-OK` ·
+`tsc` exit 0 · `npm test` 1499/1501（2 条新增 Dockerfile 守卫）
