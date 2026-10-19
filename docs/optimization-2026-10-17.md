@@ -2419,3 +2419,62 @@ crontabs 表：ct_mvdzuj9aueicvswk | 30 8 * * * | 早间天气提醒 | 下次: 2
 ## 132. 本轮门禁
 
 `tsc` exit 0 · **`npm test` 1496/1496 全绿** · 飞书文件端到端验证通过（PDF 读取三项全对）
+
+---
+
+# 第三十轮：健康体检抓到一个"定时炸弹"（2026-10-19）
+
+## 133. 全面体检：8 项能力一次跑
+
+写了一版 `scripts/health-check.sh`，覆盖文件读写 / 命令 / 联网 / PDF / 定时任务 / 记忆。
+
+**第一次跑：PASS=5 FAIL=3。** 从第 5 项开始全部 `paused`。
+
+日志给出原因：
+
+```
+[dotd] runner: 模型熔断 → paused(circuit_open) tk_...
+（AllEndpointsDownError：ALL_ENDPOINTS_DOWN:全部模型端点均不可用（已试 3 个候选））
+```
+
+## 134. 根因不是网络抖动，是 relay 的"定时自毁"
+
+`win-relay.mts` 末尾写着：
+
+```javascript
+const TTL_MS = Number(process.env.RELAY_TTL_MS ?? 3_600_000);
+if (TTL_MS > 0) setTimeout(() => process.exit(0), TTL_MS);
+```
+
+**默认 1 小时后自己退出**（原本是防僵尸进程的设计）。而我启动它时没设 `RELAY_TTL_MS=0`，
+所以每次开机大约一小时后 relay 准时消失 → 模型全不可用 → 所有任务 paused。
+
+**这不是偶发故障，是每天必然复现的定时炸弹。**
+
+修法：`start-dotd-stack.ps1` 启动前显式 `$env:RELAY_TTL_MS = '0'`。
+relay 只是个 TCP 转发器，常驻不占资源，这才是本场景的正确选择。
+
+## 135. 熔断机制本身表现正确
+
+修好 relay 后观察到（这部分值得记下来，它是对的设计）：
+
+- 熔断在 **85 秒**内自动从 `RESTRICTED` 回到 `NORMAL`，无需人工；
+- 期间 `paused` 的 6 个任务**自动回队并全部跑完**；
+- 故障期间提交的"每天 7 点喝水提醒"**真的建成了**（`ct_mveiob9msziqp50e`，`0 7 * * *`）；
+- 读 PDF 的任务恢复后答出 `HX-2026`（正确）。
+
+## 136. 然后我去验证"这个体检本身可不可信"
+
+8/8 全绿是个漂亮的数字，但按 `verifying-a-measurement` 的规矩，**先问探针能不能返回另一个答案**：
+
+1. **反向断言**：把期望值换成 `IMPOSSIBLE_XYZ_12345` → 不命中 ✅（grep 真在检查内容）
+2. **失败路径**：提交到死端口 → 返回空 → 脚本会报"提交失败" ✅
+3. **最关键的**：`pkill` 停掉 daemon → daemon 探针报 FAIL、提交拿不到 taskId ✅
+
+**第 3 步还揪出我自己的一次假验证**：我本想用 `iptables` 阻断 relay 来注入故障，
+结果 120 秒后 `mode` 仍是 `NORMAL`——**阻断根本没生效**。如果我当时直接跑体检，
+它会显示 PASS，而我会误以为"故障下也验证过了"。换成 `pkill daemon` 才是真注入。
+
+## 137. 本轮门禁
+
+体检 **8/8 全绿**（探针已证明能失败）· `tsc` exit 0 · `npm test` 1496/1496 · 服务全部恢复 NORMAL

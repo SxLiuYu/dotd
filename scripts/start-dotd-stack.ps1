@@ -58,6 +58,11 @@ if (-not $relay) {
     $relayScript = Join-Path $repo 'scripts\win-relay.mts'
     if (Test-Path $relayScript) {
         Write-Log "启动 win-relay..."
+        # **必须设 RELAY_TTL_MS=0**：relay 默认 1 小时后自退（防僵尸进程的设计），
+        # 但它一退，daemon 的所有模型调用就失败 → 触发熔断 → 任务全部 paused。
+        # 2026-10-19 实测：relay 在 08:01 启动、约 09:01 自退，健康检查 3 项全挂。
+        # 常驻是本场景的正确选择（它只是个 TCP 转发器，不占资源）。
+        $env:RELAY_TTL_MS = '0'
         Start-Process -FilePath 'node' `
             -ArgumentList '--import', 'tsx', 'scripts/win-relay.mts' `
             -WorkingDirectory $repo -WindowStyle Hidden
