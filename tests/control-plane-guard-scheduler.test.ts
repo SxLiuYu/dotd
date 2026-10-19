@@ -634,12 +634,12 @@ test('CP §8-S8：路由从降级态恢复 → paused(circuit_open) 批量回 qu
       ],
       '只有 circuit_open 被恢复；watermark 等 guard 解冻路径处理',
     );
-    // 恢复记账：resource_events(kind='watchdog', circuitOpenRecovered)
+    // 恢复记账：resource_events(kind='watchdog', modelRecovered)
     const marks = tmp.db
-      .prepare(`SELECT detail FROM resource_events WHERE kind='watchdog' AND detail LIKE '%circuitOpenRecovered%'`)
+      .prepare(`SELECT detail FROM resource_events WHERE kind='watchdog' AND detail LIKE '%modelRecovered%'`)
       .all() as Array<{ detail: string }>;
     assert.equal(marks.length, 1);
-    assert.equal(JSON.parse(marks[0]!.detail).circuitOpenRecovered, 2);
+    assert.equal(JSON.parse(marks[0]!.detail).modelRecovered, 2);
   } finally {
     cp.shutdown();
   }

@@ -634,21 +634,35 @@ export class Queue {
   }
 
   /**
-   * CP §8-S8 / 契约 T1：路由熔断恢复后把 `paused(stop_reason='circuit_open')`
-   * 的任务批量回 queued（不转 running——CP §4.1 门控 1：重新排入队首等 pop 拿围栏）。
-   * 由 index.ts 订阅 `router.mode_changed`（to 回到可用态）时调用。
-   * 返回恢复的任务数。
+   * CP §8-S8 / 契约 T1：模型可用性恢复后把暂停任务批量回 queued
+   * （不转 running——CP §4.1 门控 1：重新排入队首等 pop 拿围栏）。
+   *
+   * **三种原因都要恢复**（2026-10-19 修）：原来只写了 `stop_reason='circuit_open'`，
+   * 而上一轮把「模型不可用」拆成了三种原因，`endpoints_unreachable`（网关不可达）
+   * 永远不会被这条 SQL 命中 —— 正是要修的那个问题没修完。
+   *
+   * 恢复哪些由调用方决定（不同原因对应不同的恢复信号）：
+   *  - `circuit_open`           ← breaker_changed(to=closed) / mode_changed
+   *  - `endpoints_unreachable`  ← 同上（网关恢复时 breaker 也可能跟着好）
+   *  - `no_qualified_primary`   ← **不自动恢复**（配置问题，改了配置应手动 resume）
+   *
+   * @param reasons 要恢复的 stop_reason 集合，默认前两种
+   * @returns 恢复的任务数
    */
-  resumeCircuitOpenTasks(): number {
+  resumeCircuitOpenTasks(
+    reasons: readonly string[] = ['circuit_open', 'endpoints_unreachable'],
+  ): number {
+    if (reasons.length === 0) return 0;
+    const placeholders = reasons.map(() => '?').join(',');
     const res = this.db
       .prepare(
         `UPDATE tasks SET status='queued', stop_reason=NULL, run_at=NULL, updated_at=?
-         WHERE status='paused' AND stop_reason='circuit_open'`,
+         WHERE status='paused' AND stop_reason IN (${placeholders})`,
       )
-      .run(Date.now());
+      .run(Date.now(), ...reasons);
     if (res.changes > 0) {
-      this.deps.bus.publish('task.state', { to: 'queued', resumed: res.changes, reason: 'circuit_open_recovered' });
-      this.deps.record('watchdog', 'normal', JSON.stringify({ circuitOpenRecovered: res.changes }));
+      this.deps.bus.publish('task.state', { to: 'queued', resumed: res.changes, reason: 'model_recovered' });
+      this.deps.record('watchdog', 'normal', JSON.stringify({ modelRecovered: res.changes, reasons }));
     }
     return Number(res.changes);
   }

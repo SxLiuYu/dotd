@@ -5279,3 +5279,65 @@ daemon: OK  任务: done
 
 **一个状态值如果可能由多种成因产生，它的下游判断必然出错。**
 要么拆细，要么在别处保留成因信息。
+
+---
+
+# 第七十四轮：把上一轮没修完的那一半补上（2026-10-19）
+
+## 371. 上一轮只做了一半
+
+第 73 轮把「模型不可用」拆成三种 `stop_reason`，修好了**标记**。
+但恢复逻辑的 SQL 还写死着旧值：
+
+```sql
+WHERE status='paused' AND stop_reason='circuit_open'
+```
+
+**`endpoints_unreachable`（网关不可达，恰恰是最常见的那个）永远不被恢复。**
+上一轮要解决的问题，只修了一半。
+
+## 372. 修法：恢复哪些由调用方按原因决定
+
+```ts
+resumeCircuitOpenTasks(reasons = ['circuit_open', 'endpoints_unreachable'])
+```
+
+| 原因 | 是否自动恢复 | 由谁触发 |
+|---|---|---|
+| `circuit_open` | ✅ | breaker_changed(to=closed) / mode_changed |
+| `endpoints_unreachable` | ✅ | 同上（网关恢复时端点状态也跟着好） |
+| `no_qualified_primary` | ❌ | **配置问题，改配置后手动 resume** |
+| `watermark` / `budget` / `tool_risk` | ❌ | 各有自己的解冻路径 |
+
+记账字段也从 `circuitOpenRecovered` 改成 `modelRecovered`（涵盖两种原因）。
+
+## 373. 用可控方式验证（不再碰真实环境）
+
+上一轮用 iptables 做实验把 WSL 搞挂了。这轮改用**纯事件驱动**的单元测试：
+
+```ts
+bus.publish('router.breaker_changed', { from: 'open', to: 'closed' });
+// 然后断言三种原因各自的最终状态
+```
+
+三条断言全过：
+- `circuit_open` + `endpoints_unreachable` → 都回 queued、stop_reason 清空
+- `no_qualified_primary` → 仍 paused（配置问题不该被端点恢复顺手拉起）
+- `watermark` / `budget` / `tool_risk` → 仍 paused（各有自己的路径）
+
+## 374. 过程中一个小坑
+
+测试里 `rmSync` 清理临时目录在 Windows 上会 EPERM（sqlite 文件句柄释放有延迟）。
+改成只 `shutdown()` 不删目录 —— 临时目录交给系统清理，比"为了干净而让测试变脆"划算。
+
+## 375. 本轮门禁
+
+恢复逻辑覆盖三种原因 · 3 条行为断言全过 · `tsc` exit 0 ·
+**`npm test` 1560/1560** · daemon 已重启验证
+
+## 376. 这一轮的教训
+
+**"标记修对了"不等于"逻辑跟着改了"。**
+
+拆分 `stop_reason` 时我只改了生产方（标什么原因），忘了消费方（按原因做什么）。
+**一个字段有多个读点时，改它的语义必须把所有读点都搜一遍。**
