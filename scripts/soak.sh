@@ -692,7 +692,34 @@ process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGr
 case "${1:-sample}" in
   sample) do_sample ;;
   probe)  do_probe ;;
-  report) do_report ;;
+  report)
+    # **脚本崩了必须返回非 0**（2026-10-19 补，真坑）：
+    # do_report 里是 `node -e '...'`，一旦脚本有 ReferenceError/TypeError，
+    # node 退出码是 1 —— 但如果外面套了 `| tail` / `| grep`，管道的退出码
+    # 就变成最后那个命令的（几乎总是 0），于是**判据崩了却报"通过"**。
+    # 我自己就踩过：改完变量名漏改一处 → node 崩在 allDayList is not defined，
+    # 而 `| tail` 把 exit 吞成 0。
+    # 这里把"输出"和"退出码"解耦：崩了先明确打印错误、再以非 0 退出。
+    REPORT_OUT=$(mktemp); trap 'rm -f "$REPORT_OUT"' EXIT
+    do_report > "$REPORT_OUT" 2>&1
+    REPORT_RC=$?
+    cat "$REPORT_OUT"
+    if [ "$REPORT_RC" -ne 0 ]; then
+      if grep -qE 'ReferenceError|TypeError|SyntaxError|is not defined|Cannot access' "$REPORT_OUT"; then
+        echo ""
+        echo "❌ report 脚本自身出错（上面是堆栈）—— 这不是\"数据不达标\"，是判据坏了，必须修"
+        exit 2
+      fi
+      exit "$REPORT_RC"
+    fi
+    # 兜底：即使退出码是 0，输出里有堆栈也说明坏了
+    if grep -qE 'ReferenceError|TypeError|SyntaxError|is not defined|Cannot access' "$REPORT_OUT"; then
+      echo ""
+      echo "❌ report 脚本自身出错（退出码却是 0）—— 判据坏了，必须修"
+      exit 2
+    fi
+    exit 0
+    ;;
   install_cron)
     LINE1='*/30 * * * * /root/dotd/scripts/soak.sh sample >/dev/null 2>&1'
     LINE2='0 */6 * * * /root/dotd/scripts/soak.sh probe >/dev/null 2>&1'
