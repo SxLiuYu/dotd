@@ -300,7 +300,16 @@ if(unattended.length){
 if(passRate!==null) c.push(passRate>=0.95? "✅ 成功率 ≥95%" : `❌ 成功率 ${(passRate*100).toFixed(0)}%`);
 if(contRate!==null) c.push(contRate>=0.95? "✅ 容器在线率 ≥95%" : `❌ 容器在线率 ${(contRate*100).toFixed(1)}%（容器长时间不在线）`);
 console.log("\n判定：" + c.join("；"));
-process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && unattended.length===0 && (contRate===null||contRate>=0.95) ? 0 : 1);'
+// **成功率必须参与退出码**（2026-10-19 修，真缺陷）：
+// 原来这一行只算了 days/coveredDays/growth/fdGrowth/unattended/contRate，
+// 唯独漏了 passRate —— 于是"判定"那行明明打印 `❌ 成功率 50%`，
+// 退出码却还是 0，脚本层面会当成通过。合成数据实测：28 次探针全后半失败、
+// 总成功率 50%，exit 仍是 0。这等于 S6 最容易退化的那条判据没有约束力。
+// 语义取"不掉"：有探针时必须 ≥95%；没探针（探针还没跑过）不据此判失败。
+const passOk = passRate===null || passRate>=0.95;
+process.exit(days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2
+  && unattended.length===0 && (contRate===null||contRate>=0.95)
+  && passOk ? 0 : 1);'
 }
 case "${1:-sample}" in
   sample) do_sample ;;
