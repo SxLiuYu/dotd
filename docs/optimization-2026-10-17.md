@@ -3813,3 +3813,55 @@ text=⛔ Dot dot1 已被隔离 | 理由：24h 内容器重建 5 次...
 ## 250. 本轮门禁
 
 两处接线已补 · 隔离通知实测送达 · `tsc` exit 0 · **`npm test` 1521/1521**
+
+---
+
+# 第五十二轮：消除重复的错误分类实现（2026-10-19）
+
+## 251. 扫描的第二个收获
+
+上轮 `scan-orphans.sh` 报 `classifyHttpFailure` 零调用方。查下来不是"接线漏了"，而是**逻辑被抄了一份**：
+
+`transport.ts`：
+```ts
+export function classifyHttpFailure(status, bodyText): FailureKind {
+  if (status === 401 || status === 403) return 'auth';
+  if (status === 402) return 'quota';
+  if (status === 429) { /* 含 quota 文案细分 */ }
+  if (status >= 500) return 'server_error';
+  return 'bad_protocol';
+}
+```
+
+`candidates.ts` 的 `classifyError()` 里：
+```ts
+if (typeof e.status === 'number') {
+  if (e.status === 401 || e.status === 403) return { kind: 'auth', ... };
+  if (e.status === 402) return { kind: 'quota', ... };
+  if (e.status === 429) { /* 同样抄了一遍 quota 正则 */ }
+  if (e.status >= 500) return { kind: 'server_error', ... };
+  return { kind: 'bad_protocol', ... };
+}
+```
+
+**两张 §4.1 分类表，逐条相同。** 分叉风险是实实在在的：改了规范只改一处，另一处静默过期——
+而"错误分类错了"的症状是熔断行为异常，很难从外部看出来。
+
+已改为 `classifyError` 直接复用 `classifyHttpFailure(e.status, e.message ?? '')`。
+
+## 252. 其余几个零调用方，判断是死代码而非缺陷
+
+| 函数 | 判断 |
+|---|---|
+| `restoreToolCallNames` | 真正的还原在 `parseChatBody` 内部（`back.get(rawName)`），这个是重复的死代码 |
+| `parseMemoryMd` | 设计意图是结构化解析 MEMORY.md，但实际注入走 `readMemoryMd` 整篇读——没接上 |
+| `writeCliToken` | 供手动保存 token，无调用方 |
+| `snapshotTask` | `return task`，空壳 |
+| `renderPlan` / `revisionRequestText` | plan 功能的渲染辅助，plan 未启用时用不到 |
+
+**这些不影响运行**，保留是因为删掉要连带清理测试引用，收益不大。
+但记录下来——它们是"设计了但没接上"的地图，以后要用 plan / 结构化记忆时知道去哪儿找。
+
+## 253. 本轮门禁
+
+`tsc` exit 0 · **`npm test` 1521/1521** · 错误分类从两份实现收敛到一份

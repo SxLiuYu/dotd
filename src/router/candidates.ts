@@ -22,6 +22,7 @@ import type {
   Track,
 } from '../shared/contracts.ts';
 import type { ModelTransport, WarmState } from './types.ts';
+import { classifyHttpFailure } from './transport.ts';
 
 /** 本地闸门总预算（§4.2 localGate(ep, 2000)）。 */
 export const LOCAL_GATE_BUDGET_MS = 2000;
@@ -307,19 +308,12 @@ export function classifyError(err: unknown): { kind: FailureKind; retryAfterMs: 
   const e = err as TransportErrorLike | null;
   if (e === null || e === undefined) return { kind: 'network', retryAfterMs: null };
   if (typeof e.status === 'number') {
-    // HttpFailure：429 含 quota 文案细分（§4.1）
-    if (e.status === 401 || e.status === 403) return { kind: 'auth', retryAfterMs: null };
-    if (e.status === 402) return { kind: 'quota', retryAfterMs: null };
-    if (e.status === 429) {
-      const body = e.message ?? '';
-      const quota = /\b(quota|credits?|balance|insufficient|billing)\b/i.test(body);
-      return {
-        kind: quota ? 'quota' : 'rate_limit',
-        retryAfterMs: e.retryAfterMs ?? null,
-      };
-    }
-    if (e.status >= 500) return { kind: 'server_error', retryAfterMs: null };
-    return { kind: 'bad_protocol', retryAfterMs: null };
+    // **复用 classifyHttpFailure**（2026-10-19 全仓库扫零调用方时发现）：
+    // 这里原来把 401/403/402/429/5xx 的判断**逐条抄了一遍**，而 transport.ts 里
+    // classifyHttpFailure() 实现的正是同一张 §4.1 分类表 —— 但那个函数零调用方。
+    // 两份实现的分叉风险是实实在在的：改了规范只改一处，另一处就静默过期。
+    // retryAfterMs 仍从 err 上取（它不参与分类，只影响退避时长）。
+    return { kind: classifyHttpFailure(e.status, e.message ?? ''), retryAfterMs: e.retryAfterMs ?? null };
   }
   if (e.name === 'BadProtocolError') return { kind: 'bad_protocol', retryAfterMs: null };
   // 零用量空壳：与 bad_protocol 分开，见 contracts.ts 里 empty_response 的注释——
