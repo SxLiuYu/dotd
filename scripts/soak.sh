@@ -525,7 +525,39 @@ const probeDensityOk=!(days>=7 && (probeRate===null || probeRate<PROBE_RATE_LIMI
 const probeSegOf=(ts)=>Math.floor((ts-first.ts)/86400);
 const probeSegs=new Set(probesVerified.map(p=>probeSegOf(p.ts)));
 const allSegList=[];
-for(let i=0; i*86400<=nowSec-first.ts; i++) allSegList.push(i);
+// **零长度的尾段不能算进分母**（2026-10-20 修，真误判）。
+//
+// 现场：造「first = now-7*86400」的数据（跨度恰好 7.0000 天），
+// `i*86400 <= nowSec-first.ts` 在 i=7 时 `604800 <= 604800` 成立 →
+// 生成 i=0..7 共 **8 段**，可第 7 段是 `[7.0d, 8.0d)`，**长度为零、根本不存在**。
+// 于是报告说「探针覆盖 7/8 段（允许缺 1 段）」—— 靠余量刚好蒙过去。
+// 再让它更明显一点：造「第 3 天整天没有 probe」（判据设计上明确允许缺 1 段）→
+// 报 `❌ 探针只覆盖了 6/8 段` 直接判红。**一个本来合规的窗口被判失败。**
+// 正确做法：只统计**真正开始过的段**，即半开区间 [i*86400, (i+1)*86400) 与 [0, span] 有交集。
+// 也就是 `i*86400 < span`（严格小于），i=7 时 604800 < 604800 不成立 → 7 段，正确。
+const spanSec=nowSec-first.ts;
+const PROBE_EVERY_SEC=21600;   // 探针每 6 小时一次（PROBE_PER_DAY=4）
+// **太短的段不能计入分母**（2026-10-20 修，这是 S6 裁定时刻必定会踩的坑）。
+//
+// 现场：造「跨度 7.0028 天、第 3 天整天没 probe」的数据 ——
+// 按设计「允许缺 1 段」应该过，实际报 `6/8 段` 判红。
+// 多出来的那一段是**尾段只有 240 秒**：probe 每 6 小时才跑一次，
+// 一个 4 分钟长的段**物理上不可能有 probe**，却被算进分母、还吃掉了唯一的容差。
+//
+// 这不是夹具的问题，是**真窗口一定会遇到的**：
+// day0 是 03:25:20，我在 7 天之后的任意时刻跑 report，跨度都不会正好落在段边界上。
+// 例如在 7.1 天时，尾段只有 2.4 小时 —— 不可能有 probe，
+// 于是「允许缺 1 段」的容差被一个**根本没有机会被覆盖的段**吃掉，
+// 一个真实达标的 7 天窗口会被判成失败。**判据自己会说谎，方向是误杀。**
+//
+// 判据该问的是「该有 probe 的段，是不是都有 probe」。
+// 所以：只有长度 ≥ 一个 probe 周期（6h）的段才算「该有 probe」。
+// 段 i 的实际长度 = min((i+1)*86400, span) - i*86400。
+const segLenOf=(i)=>Math.min((i+1)*86400, spanSec)-i*86400;
+const allSegsRaw=[];
+for(let i=0; i*86400 < spanSec; i++) allSegsRaw.push(i);
+for(const i of allSegsRaw) if(segLenOf(i) >= PROBE_EVERY_SEC) allSegList.push(i);
+const tooShortProbeSegs=allSegsRaw.filter(i=>!allSegList.includes(i));
 const coveredProbeDays=allSegList.filter(i=>probeSegs.has(i)).length;
 const PROBE_DAY_MISS_ALLOWED=1;
 const probeCoverageOk=!(days>=7 && coveredProbeDays < allSegList.length-PROBE_DAY_MISS_ALLOWED);
@@ -1122,10 +1154,16 @@ if(days>=7){
       `"成功率不掉"需要真的测过，不能靠"一次都没测"来满足`);
 }
 if(days>=7){
+  // **说清分母是怎么来的**（2026-10-20）：短尾段已被排除，
+  // 不交代一句，读者看到 "6/7 段" 会自己去数 7 天应该有 7 还是 8 段。
+  const segNote = tooShortProbeSegs.length
+    ? `（另有 ${tooShortProbeSegs.length} 个尾段不足 ${PROBE_EVERY_SEC/3600}h 未计入：`+
+      `探针每 ${PROBE_EVERY_SEC/3600}h 一次，这么短的段不可能被覆盖）`
+    : "";
   c.push(probeCoverageOk
-    ? `✅ 探针覆盖 ${coveredProbeDays}/${allSegList.length} 段（按窗口起点每 24h 一段，允许缺 ${PROBE_DAY_MISS_ALLOWED} 段）`
+    ? `✅ 探针覆盖 ${coveredProbeDays}/${allSegList.length} 段（按窗口起点每 24h 一段，允许缺 ${PROBE_DAY_MISS_ALLOWED} 段）`+segNote
     : `❌ **探针只覆盖了 ${coveredProbeDays}/${allSegList.length} 段**：`+
-      `"成功率不掉"要在整个窗口都有证据，不能只在开头测一批就算完`);
+      `"成功率不掉"要在整个窗口都有证据，不能只在开头测一批就算完`+segNote);
 }
 c.push(deadOk
   ? `✅ 期间服务不可用累计 ${deadSampleHours.toFixed(1)} 小时（≤${DEAD_HOURS_LIMIT}h）`
