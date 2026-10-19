@@ -308,6 +308,18 @@ function makeFeishuMedia(
   downloadImage(
     imageKey: string,
   ): Promise<{ ok: true; media: { path: string; sizeBytes: number; contentType: string } } | { ok: false; error: string }>;
+  /**
+   * 下载文件消息（2026-10-19）：PDF/Excel/Word 等。
+   *
+   * 与图片的区别：飞书用**另一个端点** `im/v1/messages/{message_id}/resources/{file_key}`
+   * 下载文件（不是 im/v1/images），且要带 `type=file` 查询参数。
+   * 文件名用飞书给的 file_name（已做过安全过滤），保留原扩展名——模型靠扩展名判断格式。
+   */
+  downloadFile(
+    fileKey: string,
+    fileName: string,
+    messageId: string,
+  ): Promise<{ ok: true; media: { path: string; sizeBytes: number; contentType: string; fileName: string } } | { ok: false; error: string }>;
 } {
   return {
     async downloadImage(imageKey) {
@@ -360,6 +372,63 @@ function makeFeishuMedia(
           return { ok: false, error: `图片保存失败：${m}` };
         }
         return { ok: true, media: { path: rel, sizeBytes: buf.byteLength, contentType: ct } };
+      } catch (cause) {
+        return { ok: false, error: String(cause) };
+      }
+    },
+
+    /**
+     * 下载文件消息（PDF/Excel/Word 等）—— 2026-10-19。
+     *
+     * 端点与图片**不同**：GET /im/v1/messages/{message_id}/resources/{file_key}?type=file。
+     * 文件名保留（只做危险字符过滤），因为**扩展名决定模型怎么处理**
+     * （.pdf 用 pdftotext，.xlsx 用 python 解 zip）。落盘到 media/ 下，与图片同目录。
+     */
+    async downloadFile(fileKey, fileName, messageId) {
+      try {
+        const tokRes = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const tokJson = (await tokRes.json()) as { code?: number; tenant_access_token?: string };
+        if (tokJson.code !== 0 || typeof tokJson.tenant_access_token !== 'string') {
+          return { ok: false, error: `取飞书 token 失败（code=${tokJson.code ?? '?'}）` };
+        }
+        const url =
+          `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}` +
+          `/resources/${encodeURIComponent(fileKey)}?type=file`;
+        const res = await fetch(url, {
+          headers: { authorization: `Bearer ${tokJson.tenant_access_token}` },
+          signal: AbortSignal.timeout(60_000),
+        });
+        if (!res.ok) return { ok: false, error: `下载文件失败：HTTP ${res.status}` };
+        const ct = res.headers.get('content-type') ?? '';
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.byteLength === 0) return { ok: false, error: '下载到的文件为空' };
+        if (buf.byteLength > 50 * 1024 * 1024) {
+          return { ok: false, error: `文件过大（${buf.byteLength} 字节 > 50MB 上限）` };
+        }
+        if (ct.includes('application/json')) {
+          return { ok: false, error: `飞书返回错误：${buf.toString('utf8').slice(0, 160)}` };
+        }
+        const safe = fileName.replace(/[^\w.\-\u4e00-\u9fa5]/g, '_').slice(-120);
+        const rel = `media/${Date.now()}-${safe}`;
+        const w = await getExec().runTool({
+          call_id: `feishu-file-${Date.now()}`,
+          task_id: 'feishu-inbound-media',
+          dot_id: 'dot1',
+          issued_at: new Date().toISOString(),
+          tool: 'fs.write',
+          args: { path: rel, content_base64: buf.toString('base64') },
+          deadline_ms: 60_000,
+        });
+        if (w.status !== 'ok') {
+          const m = (w.error as { message?: string } | null)?.message ?? '写入失败';
+          return { ok: false, error: `文件保存失败：${m}` };
+        }
+        return { ok: true, media: { path: rel, sizeBytes: buf.byteLength, contentType: ct, fileName } };
       } catch (cause) {
         return { ok: false, error: String(cause) };
       }

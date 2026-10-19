@@ -55,6 +55,10 @@ export type FeishuInboundDecision =
       text: string;
       /** 图片消息才有：飞书 image_key（本体需另外下载，见 feishu-media.ts）。 */
       imageKey?: string;
+      /** 文件消息才有：飞书 file_key、原始文件名、以及下载所必需的 message_id（2026-10-19）。 */
+      fileKey?: string;
+      fileName?: string;
+      messageId?: string;
       raw: RawInbound;
     }
   /** 其余合法事件：落事件流 ack（202），不建任务。 */
@@ -167,9 +171,41 @@ export function classifyFeishuInbound(
         };
       }
     }
+    // **文件消息**（2026-10-19）：主人发 PDF/Excel/Word 时 content 只含 file_key + file_name。
+    // 原来一律 ignore —— 主人发了文件，bot 当没看见，这是对标 OpenAI bot 时的明显缺口。
+    if (msgType === 'file') {
+      try {
+        const parsed = JSON.parse(String(message['content'] ?? '{}')) as {
+          file_key?: unknown;
+          file_name?: unknown;
+        };
+        if (typeof parsed.file_key === 'string' && parsed.file_key.length > 0) {
+          const fileName = typeof parsed.file_name === 'string' && parsed.file_name.length > 0
+            ? parsed.file_name
+            : '未命名文件';
+          return {
+            kind: 'message',
+            dedupKey,
+            eventId,
+            chatId,
+            text: text.length > 0 ? text : `（主人发来一个文件：${fileName}）`,
+            fileKey: parsed.file_key,
+            fileName,
+            messageId: typeof message['message_id'] === 'string' ? message['message_id'] : '',
+            raw: { source: 'http', dotId, text, payload: obj, dedupKey, actor: `feishu:${chatId}` },
+          };
+        }
+      } catch {
+        // 落到下面的 ignore
+      }
+    }
     if (text.length === 0 || (msgType.length > 0 && msgType !== 'text')) {
       // 空文本/非文本消息：ack 不建任务、不进事件管线（防 §6 匹配器误建任务）
-      const why = msgType === 'image' ? '图片消息但取不到 image_key' : msgType.length > 0 ? `消息类型 ${msgType} 非文本` : '文本为空';
+      const why = msgType === 'image'
+        ? '图片消息但取不到 image_key'
+        : msgType === 'file'
+          ? '文件消息但取不到 file_key'
+          : msgType.length > 0 ? `消息类型 ${msgType} 非文本` : '文本为空';
       return { kind: 'ignore', reason: 'non_text', detail: why, eventId };
     }
     const raw: RawInbound = {
@@ -231,6 +267,14 @@ export interface FeishuInboundDeps {
     downloadImage(
       imageKey: string,
     ): Promise<{ ok: true; media: { path: string; sizeBytes: number; contentType: string } } | { ok: false; error: string }>;
+    /** 文件消息下载（2026-10-19，PDF/Excel/Word 等）。不实现 = 文件消息按纯文本处理。 */
+    downloadFile?(
+      fileKey: string,
+      fileName: string,
+      messageId: string,
+    ): Promise<
+      { ok: true; media: { path: string; sizeBytes: number; contentType: string; fileName: string } } | { ok: false; error: string }
+    >;
   };
 }
 
@@ -299,6 +343,25 @@ export async function handleFeishuCallback(
           goalText =
             `${decision.text}\n\n【附件获取失败】主人发来一张图片，但下载失败：${dl.error}。` +
             `请如实告诉主人"图没拿到"以及原因，不要凭空描述图片内容。`;
+        }
+      }
+      // **文件消息**（2026-10-19）：先下载到 home，再把路径写进目标。
+      // 与图片同理：下载失败也要建任务，并如实告知主人"文件没拿到"。
+      if (decision.fileKey !== undefined && deps.media?.downloadFile !== undefined) {
+        const dl = await deps.media.downloadFile(
+          decision.fileKey,
+          decision.fileName ?? '未命名文件',
+          decision.messageId ?? '',
+        );
+        if (dl.ok) {
+          goalText =
+            `${decision.text}\n\n【附件】主人发来一个文件 \`${dl.media.fileName}\`，已保存到 home 内的 \`${dl.media.path}\`` +
+            `（${dl.media.sizeBytes} 字节）。读它请用 shell.run（fs.read 只能读纯文本）：` +
+            `PDF 用 pdftotext、Word/Excel 用 python3 解 zip+xml。`;
+        } else {
+          goalText =
+            `${decision.text}\n\n【附件获取失败】主人发来的文件（${decision.fileName ?? '未命名'}）下载失败：${dl.error}。` +
+            `请如实告诉主人"文件没拿到"及原因，不要凭空推测文件内容。`;
         }
       }
       // 与 /api/messages 相同的任务链（契约 S-1），channel 换 'feishu'

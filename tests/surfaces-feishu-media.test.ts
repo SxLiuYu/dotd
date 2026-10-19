@@ -62,7 +62,8 @@ test('分类：图片消息缺 image_key → 仍然 ignore（不建空任务）'
 });
 
 test('分类：其它非文本（音频/文件）仍然 ignore（不误建任务）', () => {
-  for (const t of ['audio', 'file', 'media', 'sticker']) {
+  // 注意：file 已单独支持（见上面的用例），这里只测仍不支持的媒体类型。
+  for (const t of ['audio', 'media', 'sticker', 'video']) {
     const body = {
       schema: '2.0',
       header: { event_id: `ev_${t}`, event_type: 'im.message.receive_v1' },
@@ -74,4 +75,44 @@ test('分类：其它非文本（音频/文件）仍然 ignore（不误建任务
     const d = classifyFeishuInbound(body, { ownerChatId: 'oc_owner', dotId: 'dot1', trustedTransport: true });
     assert.equal(d.kind, 'ignore', `${t} 应被忽略`);
   }
+});
+
+test('文件消息（PDF/Excel）不再被忽略，而是带 fileKey 的 message', () => {
+  // 2026-10-19：主人发 PDF/Excel 时 content 只有 file_key + file_name，
+  // 原来一律 ignore —— bot 当没看见。这是对标 OpenAI bot 的明显缺口。
+  const body = {
+    schema: '2.0',
+    header: { event_id: 'ev_file_1', event_type: 'im.message.receive_v1' },
+    event: {
+      message: {
+        message_id: 'om_file_1',
+        chat_id: 'oc_owner',
+        message_type: 'file',
+        content: JSON.stringify({ file_key: 'file_v3_abc', file_name: '季度报告.pdf' }),
+      },
+      sender: { sender_type: 'user' },
+    },
+  };
+  const d = classifyFeishuInbound(body, { ownerChatId: 'oc_owner', dotId: 'dot1', trustedTransport: true });
+  assert.equal(d.kind, 'message', `应建任务，实际 ${d.kind}${'reason' in d ? ':' + d.reason : ''}`);
+  if (d.kind === 'message') {
+    assert.equal(d.fileKey, 'file_v3_abc');
+    assert.equal(d.fileName, '季度报告.pdf');
+    assert.equal(d.messageId, 'om_file_1', '下载文件需要 message_id');
+    assert.ok(d.text.includes('季度报告.pdf'), 'text 里应带文件名');
+  }
+});
+
+test('文件消息缺 file_key → ignore（不建空任务）', () => {
+  const body = {
+    schema: '2.0',
+    header: { event_id: 'ev_file_2', event_type: 'im.message.receive_v1' },
+    event: {
+      message: { message_id: 'om2', chat_id: 'oc_owner', message_type: 'file', content: '{}' },
+      sender: { sender_type: 'user' },
+    },
+  };
+  const d = classifyFeishuInbound(body, { ownerChatId: 'oc_owner', dotId: 'dot1', trustedTransport: true });
+  assert.equal(d.kind, 'ignore');
+  if (d.kind === 'ignore') assert.ok(d.detail.includes('file_key'), `detail 应说清原因，实际 ${d.detail}`);
 });
