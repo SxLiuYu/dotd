@@ -237,6 +237,29 @@ const probesLegacy = probes.length - probesVerified.length;
 const TAIL_PROBES=4;
 const tailProbes=probesVerified.slice().sort((a,b)=>a.ts-b.ts).slice(-TAIL_PROBES);
 const tailPassRate=tailProbes.length? tailProbes.filter(p=>p.ok).length/tailProbes.length : null;
+
+// **连续失败时长**（2026-10-19 补，第三次平均值的病根，也是最深的一次）：
+// 总成功率是"整体还行吗"，末尾成功率是"现在还好吗"，
+// 但**两者都挡不住"中间坏了一大段"**。
+// 合成数据实测：200 次探针里第 120-128 连续 9 次全错
+// （**连续 7.7 小时完全不能用**），末尾 4 次全对、总成功率 95.5% 压线 → exit 0。
+// 判据是"成功率不掉"——7 天里整整 7.7 小时全错，这就是"掉"。
+// 阈值 90 分钟：cron 每 6 小时一次，连续 2 次失败之间最多隔 6 小时，
+// 所以"连续 2 次失败"最多代表 12 小时不确定；这里按**失败探针的时间跨度**算，
+// 取 90 分钟不放宽（单次失败跨度 0，两次相邻失败跨度 6 小时 → 会被拦）。
+// 换句话说：**不允许连续 2 次探针失败**。
+let maxFailRun=0, curRun=0, runStart=null, maxFailSpanSec=0;
+const sortedProbes=probesVerified.slice().sort((a,b)=>a.ts-b.ts);
+for(const p of sortedProbes){
+  if(p.ok){ curRun=0; runStart=null; }
+  else {
+    curRun++;
+    if(runStart===null) runStart=p.ts;
+    if(curRun>maxFailRun) maxFailRun=curRun;
+    maxFailSpanSec=Math.max(maxFailSpanSec, p.ts-runStart);
+  }
+}
+const FAIL_RUN_LIMIT=1;   // 连续失败次数上限：1 次可以（偶发），2 次就说明真的坏了
 // 修复前采的样本没有 pid/proc_start 字段（那时还没记录身份），
 // 它们无法参与"生命周期"判断，单独算一类，不混进来算增长。
 // **重复行可以伪造采样密度**（2026-10-19 补，真缺口）：
@@ -330,6 +353,8 @@ const probeCoverageOk=!(days>=7 && coveredProbeDays < allSegList.length-PROBE_DA
 // 末尾成功率判据（这里 days 已算好）
 // 少于 4 个探针算不准，不判定（交给密度/覆盖判据拦）
 const tailOk = !(days>=7 && tailProbes.length>=4 && tailPassRate<0.75);
+// 连续失败判定（这里 days 已算好）
+const failRunOk = !(days>=7 && maxFailRun>FAIL_RUN_LIMIT);
 
 // **daemon 不在跑的时长要进入判定**（2026-10-19 补，真缺口）：
 // 上一版只把 alive=false 打印出来当提醒，不参与判定 ——
@@ -732,6 +757,13 @@ c.push(deadOk
   ? `✅ 期间服务不可用累计 ${deadSampleHours.toFixed(1)} 小时（≤${DEAD_HOURS_LIMIT}h）`
   : `❌ **期间服务不可用累计 ${deadSampleHours.toFixed(1)} 小时**（>${DEAD_HOURS_LIMIT}h）：`+
     `${deadSampleCount} 个采样点记录到 daemon 不在跑 —— "连续 7 天"那 7 天里服务得真的在跑`);
+if(days>=7){
+  c.push(failRunOk
+    ? `✅ 最长连续失败 ${maxFailRun} 次（判据 ≤${FAIL_RUN_LIMIT} 次）`
+    : `❌ **连续 ${maxFailRun} 次探针失败**（判据 ≤${FAIL_RUN_LIMIT} 次），时间跨度 ${(maxFailSpanSec/3600).toFixed(1)} 小时：`+
+      `总成功率 ${passRate!==null?(passRate*100).toFixed(0)+"%":"n/a"}、末尾成功率 ${tailPassRate!==null?(tailPassRate*100).toFixed(0)+"%":"n/a"} 都没盖住这段 —— `+
+      `"成功率不掉"不等于"平均够高"`);
+}
 if(days>=7 && tailProbes.length>=4){
   c.push(tailOk
     ? `✅ 末尾 ${tailProbes.length} 次探针成功率 ${(tailPassRate*100).toFixed(0)}%（判据 ≥75%，防止"最后几天坏掉但被总平均盖住"）`
@@ -793,7 +825,7 @@ console.log("\n判定：" + c.join("；"));
 // 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk;
 process.exit(!stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk
