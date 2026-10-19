@@ -286,8 +286,28 @@ const tailPassRate=tailProbes.length? tailProbes.filter(p=>p.ok).length/tailProb
 // 不全覆盖不等于系统坏了，但等于"这条路径 7 天没有被验证过"——
 // 那就不能声称"成功率不掉"，因为分母里根本没有它。
 const SLOT_NAMES=["纯存活","纯推理","读文件","容器执行"];
+// **slot 和 want 必须自洽**（2026-10-19 补，真缺陷）：
+// 上面的 slotSeen 只统计 `p.slot` 这个**标签**，而 `probe()` 里
+// slot → prompt → want 的对应关系是写死在 case 里的（L119-128）。
+// 也就是说：`slot` 是记录里可以随便填的字段，`want` 也是 —— 两者
+// 从来没有被互相核对过。**报告相信的是标签，不是标签对应的证据。**
+// 合成数据实测：32 次探针，slot 轮转 0/1/2/3 各 8 次，但 want **全部是 "OK"**
+// （实际每次都只是"回复 OK"，只证明了进程还活着）→
+// 报告打印"探针能力覆盖：纯存活 8 / 纯推理 8 / 读文件 8 / 容器执行 8"，
+// **exit 0**。与 slot 和 want 正确配对的健康数据**输出完全一样**。
+// 这是第 26 轮的伪装版：那轮是"32 次全是 slot 0"，被 slotSeen 抓住了；
+// 这轮把标签改对、实际没测，slotSeen 就彻底失效 —— 判据只信任标签本身。
+// 修法：把 case 里的对照表搬进报告，逐条核对 want 是不是这个 slot 该有的答案。
+// 不一致说明记录不可信（要么 poke 改过文件，要么 probe 写错了字段），
+// 而不能当成"这条路径被测过了"。
+const SLOT_WANT={ "0":"OK", "1":"-55", "2":"350", "3":"2176782336" };
 const slotSeen={};
-for(const p of probesVerified) if(p.ok) slotSeen[String(p.slot)]=(slotSeen[String(p.slot)]||0)+1;
+let wantMismatch=[];
+for(const p of probesVerified){
+  const s=String(p.slot), w=String(p.want==null?"":p.want);
+  if(SLOT_WANT[s]!==undefined && w && w!==SLOT_WANT[s]){ wantMismatch.push(p); continue; }
+  if(p.ok) slotSeen[s]=(slotSeen[s]||0)+1;
+}
 const slotMissing=[0,1,2,3].filter(s=>!slotSeen[String(s)]);
 // slotOk 定义在 failRunOk 旁边（那里 days 已算出来），否则 TDZ。
 
@@ -1028,6 +1048,10 @@ if(passRate!==null){
 {
   const dist=[0,1,2,3].map(s=>`${SLOT_NAMES[s]} ${slotSeen[String(s)]||0}`).join(" / ");
   if(probesVerified.length) console.log(`探针能力覆盖：${dist}`+(slotMissing.length?`　**未覆盖：${slotMissing.map(s=>SLOT_NAMES[s]).join("、")}**`:""));
+if(wantMismatch.length)
+  console.log(`⚠ **${wantMismatch.length} 条探针的 want 与 slot 对不上**（这条不计入能力覆盖）：`+
+              wantMismatch.slice(0,4).map(p=>`slot=${p.slot} 该是 "${SLOT_WANT[String(p.slot)]}" 实际 "${p.want}"`).join("；")+
+              (wantMismatch.length>4?" …":""));
 }
 if(day0Compat)
   console.log(`窗口起点核对：day0=${new Date(day0Ts*1000).toISOString().slice(0,16).replace("T"," ")}，`+
@@ -1040,6 +1064,12 @@ if(dataReset)
 if(day0Early)
   c.push(`❌ **数据比 day0 还早 ${((day0Ts-first.ts)/60).toFixed(0)} 分钟**：day0 记错了，`+
          `"连续 7 天"的起点不可信`);
+if(wantMismatch.length)
+  c.push(`❌ **${wantMismatch.length} 条探针的 want 与 slot 对不上**：`+
+         `记录说测的是"${SLOT_NAMES[Number(wantMismatch[0].slot)]||"?"}"，`+
+         `但期望答案写的是 "${wantMismatch[0].want}"（这个 slot 该是 "${SLOT_WANT[String(wantMismatch[0].slot)]||"?"}"）—— `+
+         `说明这条记录不可信，**不能算作"这条路径被测过了"**。`+
+         `能力覆盖相信的是标签，而标签可以被填成任何值`);
 if(!slotOk)
   c.push(`❌ **探针有 ${slotMissing.length} 条能力路径 7 天没测过**：`+
          `${slotMissing.map(s=>SLOT_NAMES[s]).join("、")} —— `+
@@ -1105,7 +1135,7 @@ console.log("\n判定：" + c.join("；"));
 // 判据原话是"成功率**不掉**"。总平均会掩盖下降趋势 ——
 // 合成数据实测：160 次探针里最后 8 次全失败（**最后一天成功率 0%**），
 // 总数 95% 恰好压线 → exit 0。服务其实最后一天已经全坏了。
-const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk && !dataReset && !day0Early;
+const passOk = (passRate===null || passRate>=0.95) && probeDensityOk && probeCoverageOk && tailOk && deadOk && failRunOk && secsOk && slotOk && wantMismatch.length===0 && !dataReset && !day0Early;
 process.exit(!negativeSpan && !stale && !hasGap && days>=7 && coveredDays>=7 && growth<50 && fdGrowth<=2 && fdPeakGrowth<FD_PEAK_LIMIT
   && !isCrashLoop
   && unattended.length===0 && (contRate===null||contRate>=0.95) && contTailOk && contDownOk && contUnattended.length===0
