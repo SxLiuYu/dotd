@@ -263,21 +263,34 @@ const LIFE=[...lifeMap.values()].sort((a,b)=>a.first-b.first);
 
 // **重启归因**（2026-10-19 补）：S6 的字面要求是"无**人工**干预"，
 // 而"重启过几次"本身不区分"自愈救回来的"和"人去手动拉起来的"。
-// 这两者性质完全不同：watchdog 自愈恰恰是长期运行该有的能力，
-// 而人工重启会让"连续 7 天"作废。所以每次重启都要去 watchdog 日志里找证据：
-// 新生命周期开始前 15 分钟内若有"自愈:…已恢复"记录 → 判为自愈；
-// 找不到 → 如实标成"无自愈记录"，不替它圆场。
+// 这两者性质完全不同：自愈恰恰是长期运行该有的能力，
+// 而人工重启会让"连续 7 天"作废。所以每次重启都要去找证据：
+// 新生命周期开始前 15 分钟内若有恢复记录 → 判为自愈；找不到 → 如实标成
+// "无自愈记录"，不替它圆场。
+//
+// **证据有两个来源，缺一不可**（2026-10-19 修，真缺陷）：
+// 原来只读 watchdog 日志。但机器/WSL 重启后是 `dotd-boot.sh` 把 daemon 拉起来的，
+// 那条路径完全不经过 watchdog —— 于是"断电后自动恢复"会被判成
+// "无自愈记录（疑似人工干预）"，把整个 7 天窗口无理由作废。
+// 而这是真实会发生的场景：Windows 侧有 WSL-KeepAlive 定时任务每 2 分钟拉活。
+// 现在把 boot 日志也算作恢复证据，并在输出里标明是哪一条路径救的。
 const WD=process.env.DOTD_WATCHDOG_LOG||"/var/log/dotd-watchdog.log";
-let wdLines=[];
-try{
-  wdLines=fs.readFileSync(WD,"utf8").split("\n").filter(Boolean)
-    .map(l=>{
-      const m=l.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s+(.*)$/);
-      if(!m) return null;
-      return { ts: Math.floor(new Date(`${m[1]}T${m[2]}`).getTime()/1000), text: m[3] };
-    }).filter(Boolean);
-}catch{}
-const healed=wdLines.filter(w=>w.text.includes("已恢复"));
+const BOOTLOG=process.env.DOTD_BOOT_LOG||"/var/log/dotd-boot.log";
+function parseLog(path, label){
+  let out=[];
+  try{
+    out=fs.readFileSync(path,"utf8").split("\n").filter(Boolean)
+      .map(l=>{
+        const m=l.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s+(.*)$/);
+        if(!m) return null;
+        return { ts: Math.floor(new Date(`${m[1]}T${m[2]}`).getTime()/1000), text: m[3], src: label };
+      }).filter(Boolean);
+  }catch{}
+  return out;
+}
+const wdLines=parseLog(WD,"watchdog").concat(parseLog(BOOTLOG,"boot"));
+// watchdog 的"已恢复"、boot 的"daemon 就绪"都算自动恢复。
+const healed=wdLines.filter(w=>w.text.includes("已恢复")||w.text.includes("daemon 就绪"));
 const restartRows=[];
 for(let i=1;i<LIFE.length;i++){
   const prev=LIFE[i-1], cur2=LIFE[i];
@@ -288,7 +301,7 @@ for(let i=1;i<LIFE.length;i++){
   restartRows.push({
     pid:cur2.pid, born,
     healed: near.length>0,
-    evidence: near.map(w=>w.text).join(" / "),
+    evidence: near.map(w=>`[${w.src}] ${w.text}`).join(" / "),
     downtimeSec: Math.max(0, born-prev.last),
   });
 }
@@ -354,7 +367,7 @@ if(lifetimes>1){
     console.log("  重启归因（对照 watchdog 日志）：");
     for(const r of restartRows){
       const when=new Date(r.born*1000).toISOString().replace("T"," ").slice(0,19);
-      if(r.healed) console.log(`    ✔ ${when} pid=${r.pid} 自愈恢复（空窗 ${r.downtimeSec}s）← ${r.evidence}`);
+      if(r.healed) console.log(`    ✔ ${when} pid=${r.pid} 自动恢复（空窗 ${r.downtimeSec}s）← ${r.evidence}`);
       else console.log(`    ✖ ${when} pid=${r.pid} **无自愈记录**（空窗 ${r.downtimeSec}s）—— 疑似人工干预`);
     }
   }
