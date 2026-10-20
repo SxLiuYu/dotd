@@ -135,3 +135,72 @@ export DOTD_MAIL_KEY=$(openssl rand -base64 32)
 ## T6　日历：通用 ICS 只读
 
 ⬜ 未开始
+
+---
+
+## T3 飞书审批卡片
+
+**目标**：危险工具被拦下时，主人能在飞书里**点一下**做出决定，而不是自己去 `/approvals` 看。
+
+### 判据 / 实测 / 结论
+
+| # | 判据 | 实测 | 结论 |
+|---|---|---|---|
+| 1 | 卡片 JSON 结构合法（飞书会拒格式错的卡片） | header + elements + config 齐全，宽屏可更新 | ✅ |
+| 2 | 卡片上有关键信息（收件人/主题/正文/附件/金额） | 6 个字段全在，`tests/approval-card.test.ts` 逐条断言 | ✅ |
+| 3 | 卡片上写明风险与超时策略 | 有「风险」段 + 「按拒绝处理（不会偷偷执行）」 | ✅ |
+| 4 | 按钮 value 能被正确解析回 approvalId + verdict | 两个按钮解析正确，48 条判据里 9 条专门测垃圾输入 | ✅ |
+| 5 | 点击回调**不进任务事件流** | 走独立的 `card_action` 类型，不落 `im.message.receive_v1` | ✅ |
+| 6 | 回调也要过主人闸门（卡片能被转发） | 非主人会话 → reject；未配 owner_chat_id → fail-closed | ✅ |
+| 7 | 落定后卡片改写成结果、去掉按钮 | `buildResolvedCard` + PATCH `im/v1/messages/:id` | ✅ |
+| 8 | 卡片真的发到 HTTP 层 | 假飞书服务器实测 `msg_type=interactive`，两个 verdict 都在 | ✅ |
+| 9 | **同一条审批只推一次** | `approval:created` 订阅者数 = 1，验收脚本锁定这条 | ✅ |
+
+**验收脚本**：`bash scripts/regress/card-criteria.sh` → **21/21，exit 0**
+
+### 做了什么
+
+| 文件 | 内容 |
+|---|---|
+| `src/surfaces/feishu-card.ts`（新增 246 行） | 卡片渲染 + 按钮 value 解析 + 落定卡片 |
+| `src/surfaces/feishu-approval.ts`（新增 122 行） | 推卡片 / 改卡片的编排（**刻意不含订阅**，见下） |
+| `src/surfaces/channels.ts` | `sendCard` / `updateCard` + `apiBase` 可注入 |
+| `src/surfaces/feishu-inbound.ts` | `card.action.trigger` 分支 → `card_action` |
+| `src/surfaces/feishu-outbound.ts` | 卡片优先、文本兜底，复用 `claimAndSend` 去重 |
+| `src/daemon.ts` | 把卡片能力注入 outbound |
+| `tests/approval-card.test.ts`（新增 187 行） | 48 条单元判据 |
+
+### 接入点为什么选"旁听"
+
+`gate.insertApproval()` 结尾早就有 `bus.publish('approval:created')`，所以只订阅那个事件，**治理代码一行没改**。治理是安全边界，动它的风险最大；旁听它是零风险的。
+
+### 一个必须记录的设计错误
+
+第一版我在 `daemon.ts` 里订阅了 `approval:created` 推卡片。但 `feishu-outbound.ts` **早就订阅了同一事件**发纯文本审批通知 —— 同一条审批会推两次。
+
+`grep approval:created` 命中两个订阅者就是证据。修法是**二选一**：把卡片能力注入 outbound，由它判断"能发卡片就发卡片，发不出去才退回纯文本"，复用已有的 `claimAndSend` 去重。`feishu-approval.ts` 里那个会引入第二个订阅者的 `wireApprovalCards` 删掉了，并在原地留了注释说明为什么刻意不封装订阅。
+
+验收脚本里加了一条 `approval:created 只有 1 个订阅者`，锁定这个约束防复发。
+
+### 写测试时撞出来的两个可测试性缺陷
+
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| 飞书 API 地址硬编码在 `fetch()` 里 | 要验"卡片真的发出去长什么样"就得连真飞书，不可能自动化 | 加 `FeishuConfig.apiBase`（生产不传，默认官方地址） |
+| 只改了 `messages` 端点、漏了 `tenant_access_token` 端点 | token 还是发去真飞书，8 条断言全红 | 两个端点都走 `apiBase` |
+
+### 三个踩到的坑
+
+| 坑 | 现象 | 原因 |
+|---|---|---|
+| 猜错 `ApprovalView` 字段名 | tsc 报 `Property 'params' does not exist` | 实际是 `fullParams` / `expiresAt`，而且**没有 `tool` 字段**，要从 `fullParams.tool` 或 `summary` 首段提取 |
+| `taskRef` 缺字段 | tsc 报 `journalStepId is missing` | 不是可选字段 |
+| 按钮 value 是字符串化 JSON | 断言 `'"approvalId":99'` 永远找不到 | 嵌进卡片 JSON 时引号被转义成 `\"`，得按语义匹配 |
+
+### 刻意不做的
+
+- **不做"记住这个审批"按钮**：`approval_rules` 表早就有，但把"永久放行"做成卡片上一个按钮太轻率了。它该是一个需要说明理由的动作，不是顺手一点。
+- **卡片不显示完整命令**：只显示前 150 字符。完整参数在 `/approvals` 里能看，卡片上塞长文本会被折叠掉，反而看不到重点。
+- **不持久化"审批单 ↔ 卡片 message_id"**：进程重启就丢。重启后旧卡片按钮点了会走 gate 的"找不到审批单"路径并被如实拒绝，不会误执行。要持久化得加一张表，当前收益不值。
+
+---

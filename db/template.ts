@@ -32,6 +32,30 @@ import { ensurePragmas, resolveDbPath } from './conn.ts';
 import { getUserVersion, loadPackages, migrate, type MigrationPackage } from './migrate.ts';
 
 /** 引擎真正认的语句种类（`splitStatements()` 的产物）。 */
+/**
+ * 返回语句开头**纯注释**部分的字符数（0 = 没有前导注释）。
+ *
+ * 只认 `--` 行注释：SQLite 的 `/* *\/` 块注释在 DDL 里基本不用，
+ * 而 migrate.ts 的切分器把两种都当注释保留，这里保守只处理 `--`。
+ * `--` 之后到行尾都算注释，逐行跳过空行与注释行。
+ */
+function leadingComment(stmt: string): number {
+  let i = 0;
+  const n = stmt.length;
+  while (i < n) {
+    // 跳空白
+    while (i < n && (stmt[i] === ' ' || stmt[i] === '\t' || stmt[i] === '\n' || stmt[i] === '\r')) i++;
+    if (i + 1 < n && stmt[i] === '-' && stmt[i + 1] === '-') {
+      const end = stmt.indexOf('\n', i);
+      if (end === -1) return n; // 整段都是注释
+      i = end + 1;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
 const CREATE_TABLE_RE = /^\s*CREATE\s+TABLE\b/i;
 const ALTER_TABLE_RE = /^\s*ALTER\s+TABLE\b/i;
 const VIRTUAL_TABLE_RE = /\bVIRTUAL\s+TABLE\b/i;
@@ -60,16 +84,37 @@ export function buildSchemaScript(
   for (const pkg of packages) {
     for (const raw of pkg.ddl) {
       const stmt = withoutTrailingSemicolon(raw);
-      if (CREATE_TABLE_RE.test(stmt)) {
-        if (VIRTUAL_TABLE_RE.test(stmt)) others.push(stmt);
-        else createTables.push(stmt);
+      // ⚠️ 必须先剥掉前导注释再匹配（2026-10-20 修）。
+      //
+      // db/migrate.ts 的 splitStatements() 按分号切分，**注释会粘在它后面那条
+      // 语句前面**。所以一个 DDL 段的开头常常是几行 `-- ...`。
+      // 而下面的 CREATE_TABLE_RE / ALTER_TABLE_RE 都是 `/^\s*CREATE/` 形式的锚定
+      // 正则 —— 遇到以 `--` 开头的段就匹配不上，整段落进 `others`。
+      //
+      // 后果（实测）：带注释的 ALTER 会被当成"其他"，排在所有 CREATE TABLE
+      // 之前执行 → `Error: no such table: <表名>` → 模板库建不出来 →
+      // 所有用模板的测试一起红，而报错信息只指向"表不存在"，完全看不出是注释的锅。
+      //
+      // 150_crontab_once.sql 撞巧躲过：它只有一条 ALTER，落进 others 后
+      // 被追加在末尾，那时表已经建好了。多条 ALTER 就必踩。
+      const lead = leadingComment(stmt);
+      const bare = stmt.slice(lead).trimStart();
+      const comments = lead > 0 ? stmt.slice(0, lead) : '';
+      if (CREATE_TABLE_RE.test(bare)) {
+        // 注释跟建表语句一起留着（人对 DDL 的说明有价值），
+        // 但**判类型和取表名都用裸语句**。
+        const withComments = comments.length > 0 ? `${comments}${bare}` : stmt;
+        if (VIRTUAL_TABLE_RE.test(bare)) others.push(withComments);
+        else createTables.push(withComments);
         continue;
       }
-      const m = ALTER_TABLE_RE.test(stmt) ? ADD_COLUMN_RE.exec(stmt) : null;
+      const m = ALTER_TABLE_RE.test(bare) ? ADD_COLUMN_RE.exec(bare) : null;
       if (m !== null) {
         const table = m[1] ?? m[2] ?? m[3] ?? m[4] ?? '';
         const list = alters.get(table) ?? [];
-        list.push(stmt);
+        // ALTER 的注释丢掉：它只解释"为什么加这列"，而拼接后位置已经变了，
+        // 留着反而误导人以为注释说的是紧邻的那张表。
+        list.push(bare);
         alters.set(table, list);
         continue;
       }

@@ -743,10 +743,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 160）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 170）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 160 });
+    const res = migrate(db, { expectedVersion: 170 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {

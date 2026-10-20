@@ -34,6 +34,7 @@ import type { EventRule, LowBrain } from './match.ts';
 import { Guard } from './guard.ts';
 import type { ExecPorts, GuardDeps } from './guard.ts';
 import { Scheduler } from './scheduler.ts';
+import { shouldPush } from '../surfaces/proactive.ts';
 import type { InternalJobSpec } from './scheduler.ts';
 import { recoverOnStartup } from './recovery.ts';
 import type { ApprovalsReader, RecoveryReport } from './recovery.ts';
@@ -188,12 +189,63 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     bus,
     record,
     fireHeartbeat: (ct, missed) => {
+      /**
+       * T4（2026-10-20）：主动推送判定。
+       *
+       * 任务**照常触发** —— 判定的只是"结果要不要主动告诉主人"。
+       * 为什么不在任务创建前拦：定时任务的价值常常在副作用（写文件、更新记忆），
+       * 不推送不等于不该跑。把两者混一起会让"安静"变成"不干活"。
+       *
+       * 判定结论随 payload 传给下游（Runner 结束时据此决定发不发），
+       * 同时把 last_push_at 落库 —— 放内存的话一次重启就能让节流归零。
+       */
+      const nowMs = Date.now();
+      const decision = shouldPush({
+        proactive: ct.proactive === 1,
+        quietHours: ct.quiet_hours,
+        throttleHours: ct.throttle_hours,
+        lastPushAt: ct.last_push_at,
+        now: nowMs,
+        // 目标会话存在性在下游判（这里拿不到 surfaces 配置）；
+        // 这里只做时域三闸，hasTarget 恒真不误拒。
+        hasTarget: true,
+      });
+
+      if (decision.allowed) {
+        // 立刻记上"推过了"，防同一任务在短窗口内被重复触发时连发。
+        // 用 nowMs 而不是任务完成时刻：节流窗口的语义是"两次打扰之间"，
+        // 从触发时刻算更严格，也更简单。
+        try {
+          db.prepare('UPDATE crontabs SET last_push_at=? WHERE id=?').run(nowMs, ct.id);
+        } catch {
+          // 记不上不影响任务本身；下一次会因为 last_push_at 为旧值而提前放行
+        }
+      } else if (decision.reason !== 'disabled') {
+        // disabled 是主人主动关的，天天记一条日志是噪音。
+        // 其他原因值得记：安静时段/节流说明系统在工作。
+        //
+        // 走 bus 而不是 record()：record 落的是 resource_events 表，
+        // 它的 kind 是资源治理词表（watermark/disk_gc/...），
+        // 把"没推送"塞进去会污染那张表的语义。
+        bus.publish('log', {
+          level: 'info',
+          msg: `crontab ${ct.id} 不主动推送：${decision.detail ?? decision.reason}`,
+        });
+      }
+
       // CP §4.3：触发 = ingestEvent(source='heartbeat', dedupKey='hb:<ct_id>:<next_fire>')
       matcher.ingestEvent({
         source: 'heartbeat',
         dotId: ct.dot_id,
         actor: ct.id,
-        payload: { crontabId: ct.id, title: ct.title, prompt: ct.prompt, missed },
+        payload: {
+          crontabId: ct.id,
+          title: ct.title,
+          prompt: ct.prompt,
+          missed,
+          // 下游据此决定结果发不发主人
+          proactive: decision.allowed,
+        },
         dedupKey: `hb:${ct.id}:${ct.next_fire}`,
       });
     },

@@ -139,6 +139,20 @@ export interface CrontabRow {
   catchup: 'latest' | 'skip';
   /** 一次性任务（迁移 150）：1 = 触发成功后自动停用，不再重复。 */
   once: number;
+  /**
+   * 主动推送开关（迁移 170，T4）。0 = 任务照跑，但结果不推给主人。
+   *
+   * **和 quiet_hours 的区别必须记住**：
+   *   quiet_hours 命中 → 任务**不执行**（scheduler advance 掉，标 skipped_quiet）
+   *   proactive=0     → 任务**照常执行**，只是结果不推送
+   * 后者不可省：有些定时任务的价值在副作用（写文件、更新记忆），
+   * 结果本身不值得打扰主人。把两者并成一个开关，"安静"就变成了"不干活"。
+   */
+  proactive: number;
+  /** 同一任务两次主动推送的最小间隔小时数（迁移 170）。0 = 不节流。 */
+  throttle_hours: number;
+  /** 上次真推出去的时刻（epoch ms，迁移 170）。NULL = 从没推过。 */
+  last_push_at: number | null;
 }
 
 // ── 2. 配置（config/dotd.yml 的 CP 侧投影）────────────────────────────────
