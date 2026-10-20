@@ -2983,3 +2983,45 @@
 - **结论**：S2(b) **已达成**（实证 68 次 `tool.invoke` 实调、`dot.ts` 定稿早于 daemon 启动、两侧 md5 一致）。
   目标文本中的 `❌ 未达成` 已过时 87 轮；`update_goal` 需主人直接确认才能改，已提请注意。
   S6 仍在窗口内：**❌ 未通过**（`exit 1`，还差 6.93 天），`soak.sh` 保持 `98824045` 未改。
+
+  - **第 88 轮：把「7 天里什么会杀死它」逐条排除到只剩一条**
+    - `soak.sh` 仍 `98824045`。第 86 轮我查了环境，但那轮只看了**WSL 内部**的
+      内存/磁盘 —— 而 `.wslconfig` 里记着一件让我后背发凉的事：
+      `2026-10-14 16:50: host commit hit 72.4/73.7GB (98%) and Windows`
+      `Resource-Exhaustion-Detector killed vmmem (WSL2 VM) 4 times today`
+      `(10:27/11:02/15:00/15:22), each time wiping the whole fleet.`
+      **Windows 曾因内存耗尽一天杀掉整个 WSL 虚拟机 4 次**，每次抹掉整个舰队。
+      第 86 轮我说「内存余量 22.9G/24G」是 WSL 内部视角，**真正会被耗尽的是 Windows 侧 commit**。
+    - 于是这轮从宿主侧逐条排除。现在 Windows 有 **63.9GB 物理内存、34.2GB 可用**，
+      commit **37.1GB / 69GB 上限（54%）** —— 对比 10-14 的 98%，余量充足。
+      `.wslconfig` 已把 memory 从 48→32→28→**24GB** 逐步收紧、swap 8→4GB，
+      并把 `autoMemoryReclaim`/`pageReporting` 都试过（这个 WSL build 不认这两个键，已注释掉）。
+    - ② **电源不会断**：`STANDBYIDLE=0`、`HIBERNATEIDLE=0`（均为 0 = 永不），
+      当前是「高性能」方案。7 天里不会因空闲睡眠而断采样。
+    - ③ **自动更新不会重启**：组策略 `NoAutoUpdate=1`，最近装更新是 `2025-01-26`
+      （一年前），`ActiveHoursStart=8 End=17`。7 天内不会因 Windows Update 重启。
+    - ④ **WSL keepalive 链完整**：`WSL-KeepAlive` 计划任务 `Enabled=True`、
+      `StartBoundary=2026-09-24`、Repetition 每 2 分钟；WSL 实例已连续存活 12.13 小时。
+    - ⑤ **把「最坏恢复时长」算清楚了**（第 86 轮只说「远低于 5 分钟」，这轮给了数）：
+      · 容器：单次修复上限 60s（30×sleep 2）+ 最坏发现延迟 120s（cron 每 2 分）= **180s**
+      · daemon：同样 60s + 120s = **180s**
+      · relay：30s（15×sleep 2）+ 120s = **150s**
+      S5 的 `LIMIT=300s` 从**故障注入时刻**起算 → **余量 120 秒**，够。
+    - ⑥ 顺手验了「串行修复顺序会不会出依赖问题」：cron 里顺序是
+      `repair_daemon` → `repair_docker` → `repair_container` → `repair_relay`，
+      daemon 排在容器**前面**。第一眼像 bug（daemon 不是依赖容器吗），
+      查了 `scripts/wsl-daemon-start.sh` 里**一个 `docker` 都没有** ——
+      daemon 只在**执行任务时**才用容器，启动本身不依赖。**顺序没问题，是我多疑了。**
+      但这份怀疑有价值：`ExecService.ts:554` 有显式 `container_not_ready` 分支，
+      并且 `:924` 处注释写明「补一次轻量探测，把真实原因暴露出来」——
+      **容器不在时会明说，不会伪装成网络问题**。这点是好的。
+    - 到这轮为止，「7 天里什么会杀死它」排除到只剩一条：
+      **WSL 冷启动后容器最多裸奔 2 分钟**（容器 `RestartPolicy=no` + `dotd-boot.sh` 不管容器，
+      见第 86 轮 backlog）。它**不违反 S6**（容器在线率判据 ≥95%、累计 ≤2h，2 分钟远够），
+      但会是报告里一条真实的小瑕疵。
+- **结论**：❌ 未通过（窗口 `2026-10-20 06:43:55` 起算，目标 `2026-10-27 06:43:55`，还差 6.93 天）。
+  **本轮零判据改动**（`soak.sh` 保持 `98824045`），从**宿主侧**（Windows）排除三类杀死 S6 的可能：
+  电源(`STANDBYIDLE=0`)、自动更新(`NoAutoUpdate=1`，一年未重启)、内存(commit 37.1/69GB=54%，
+  对比 `.wslconfig` 记录的 10-14 那次 98% 已充足)。并把最坏恢复时长算成数：
+  容器/daemon 各 180s、relay 150s，对 S5 的 300s 余量 120s。
+  另查 `repair_daemon` 排在 `repair_container` 之前「像 bug」，实为误疑（daemon 启动不依赖容器）。
