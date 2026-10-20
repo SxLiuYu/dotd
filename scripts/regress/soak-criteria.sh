@@ -1196,5 +1196,47 @@ else
 fi
 cp -f "$FIX/s2b-bak2.jsonl" docs/acceptance/s2b-reuse.jsonl
 
+# ===== 第 104 轮新增：S6 判据必须存在「能全绿」的样本 =====
+# 教训：195 个用例里，「✅ 探针覆盖 N/M 段」这条**一次都没被断言过**。
+# 如果哪天它变成永远吐 ❌，回归不会告诉我 ——
+# 因为所有用例都只断言「该红的时候红」，没有一条断言「该绿的时候绿」。
+# 这份夹具是第一个 7 天全绿样本：340 采样 + 28 探针 + 1 段，判定行 29 条 ✅ / 0 条 ❌。
+# 夹具：fixtures/allgreen7d.jsonl（生成方式见 README「全绿样本」一节）
+if [ -f "$FIX/allgreen7d.jsonl" ]; then
+  t "$FIX/allgreen7d.jsonl" "$FIX/nowd.log" "全绿7天-必须exit0" 0
+  SOAK="$FIX/allgreen7d.jsonl" SOAK_DAY0="$FIX/allgreen7d.txt" SOAK_VERDICT="$FIX/rgv.jsonl" \
+  DOTD_WATCHDOG_LOG="$FIX/nowd.log" DOTD_BOOT_LOG="$FIX/noboot.log" \
+    bash scripts/soak.sh report >"$FIX/allgreen.out" 2>&1
+  _ag(){ if grep -qa "$1" "$FIX/allgreen.out"; then p=$((p+1)); printf "  ok   %-30s\n" "$2"
+         else f=$((f+1)); printf "  FAIL %-30s\n" "$2"; fi; }
+  _ag '✅ 探针覆盖 7/7 段'        "全绿-探针覆盖7/7段"
+  _ag '✅ 探针密度 ≥70%'          "全绿-探针密度达标"
+  _ag '✅ 末尾 4 次探针成功率'     "全绿-末尾探针也绿"
+  _ag '✅ 窗口内可用率'            "全绿-可用率绿"
+  _ag '✅ daemon 可达率'           "全绿-daemon可达率绿"
+  _ag '✅ 网关连通率'              "全绿-网关连通率绿"
+  _ag '✅ 容器可执行率'            "全绿-容器可执行率绿"
+  _ag '✅ 全窗口 RSS 峰值增长'     "全绿-RSS峰值绿"
+  _ag '✅ 各生命周期内句柄无明显爬升' "全绿-句柄绿"
+  _ag '✅ 采样密度 ≥70%'          "全绿-采样密度绿"
+  _ag '✅ 期间未重启过'            "全绿-未重启"
+  # 「探针能力覆盖」这行是 console.log，**不带 ✅ 前缀**（第 104 轮查出：
+  # 全绿报告里它是一句中性的字，读者判断不了这算不算通过）。
+  # 所以只能断言它的实际形态，并单独断言没有「未覆盖」。
+  _ag '探针能力覆盖：纯存活 7 / 纯推理 7 / 读文件 7 / 容器执行 7' "全绿-能力路径齐全"
+  if grep -qa '未覆盖' "$FIX/allgreen.out"; then
+    f=$((f+1)); printf "  FAIL %-30s 出现了「未覆盖」\n" "全绿-不得有未覆盖"
+  else
+    p=$((p+1)); printf "  ok   %-30s\n" "全绿-不得有未覆盖"
+  fi
+  if grep -qa '❌' "$FIX/allgreen.out"; then
+    f=$((f+1)); printf "  FAIL %-30s 全绿样本里出现了 ❌\n" "全绿-不得有❌"
+  else
+    p=$((p+1)); printf "  ok   %-30s\n" "全绿-不得有❌"
+  fi
+else
+  echo "  ⚠ 缺夹具 $FIX/allgreen7d.jsonl，跳过全绿用例（不是判据坏了）"
+fi
+
 echo "  合计 $p 通过 / $f 失败"
 [ "$f" = "0" ] && exit 0 || exit 1
