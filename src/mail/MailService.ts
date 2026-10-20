@@ -24,7 +24,8 @@ export interface AccountInput {
   imapPort: number;
   smtpHost: string;
   smtpPort: number;
-  /** 明文密码，进来就加密，**不落任何日志** */
+  /** 明文密码，进来就加密，**不落任何日志**。
+   *  直接传密码即可；如已自行拼好 `user\0pass`（旧约定）则原样存储。 */
   password: string;
   starttls?: boolean;
 }
@@ -56,8 +57,14 @@ export class MailService {
   addAccount(dotId: string, input: AccountInput): AccountRow {
     const id = 'ma_' + randomUUID().replace(/-/g, '').slice(0, 16);
     const t = now();
-    // 密码只在这一个表达式里是明文，之后永远是密文
-    const enc = encryptSecret(input.password, this.keyB64);
+    // 密码只在这一个表达式里是明文，之后永远是密文。
+    // 存储约定见 secretOf：解开后是 user\0pass（省一列）。
+    // 2026-10-20 修真缺陷：这个约定此前零文档，调用方传明文密码会在首次收信时
+    // 报"凭证损坏"（实测 163 接入当场踩中）。这里自动拼；已含 \0 的按旧约定原样存。
+    const secret = input.password.includes('\u0000')
+      ? input.password
+      : `${input.email}\u0000${input.password}`;
+    const enc = encryptSecret(secret, this.keyB64);
     this.db
       .prepare(
         'INSERT INTO mail_accounts ' +

@@ -497,3 +497,29 @@ wsl-daemon.sh 每次启动把它拷成 ~/.dotd/config.yml）**没有** T5 新加
 补齐 9 个缺失文件；`docs/acceptance/*.jsonl` **刻意不覆盖** ——
 那是历史验收的真实测量值（例如 recovery 的容器恢复时间，
 WSL 侧记 99s、D 侧记 53s，是不同次运行，谁也不该被谁抹掉）。
+
+
+## 163 接入实战抓到并修复的两个邮件缺陷（2026-10-20）
+
+接第一个真邮箱（yujinze000@163.com，客户端授权码方案，官方帮助中心核实）
+时当场踩中两个缺陷，都已修复并锁进回归（mail-criteria 35→38 条）：
+
+**缺陷一：凭证存储约定零文档**
+`MailService.secretOf()` 约定密文解开后是 `user\0pass`（省一列），但这个约定
+任何地方都没写 —— `addAccount` 原样加密调用方给的密码。任何 agent 或人
+传明文密码，写入成功、首次收信必报「凭证损坏（解密后格式不对）」。
+实测链路：写入 OK → mail.list 炸。
+**修复**：addAccount 无 `\0` 时自动拼 `email\0password`；已含 `\0` 的旧约定原样保留。
+判据：真迁移库上「明文密码自动拼 user\0pass」。
+
+**缺陷二：LOGIN 后不发 ID 命令**
+网易 Coremail 硬要求 LOGIN 后先发 ID（RFC 297）自报客户端身份，
+否则 SELECT 一律回 `NO SELECT Unsafe Login. Please contact kefu@188.com`。
+**修复**：ImapClient.open() 两条路径（TLS 与测试明文）在 LOGIN 后发
+`ID ("name" "dotd" "version" "1.0.0")`，mustOk=false —— 不支持 ID 的服务器
+回 BAD 时容忍，不挡登录。判据：ID 命令存在 + 容忍语义。
+
+**最终实测**：163 真实登录 + SELECT INBOX + 拉最近 5 封（GitHub 通知等真邮件）
+全通；mail-e2e 12/12；mail-criteria 38/38。
+**顺手发现（未修，记下）**：MailSummary 的 from 字段对 RFC 2047 编码
+（`=?UTF-8?B?...?=`）未解码，显示为原始编码形态 —— 纯观感问题。

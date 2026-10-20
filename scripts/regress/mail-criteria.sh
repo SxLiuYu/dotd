@@ -146,6 +146,35 @@ t "没密钥时不注册（表现=工具不存在）"    grep -q '未配置 DOTD
 TSC=$(npx tsc --noEmit 2>&1 | grep -v 'exec-state' | grep -c 'error TS')
 t "tsc 无新增错误"                      test "$TSC" = "0"
 
+# -- 12. 163 接入实战抓到的两个缺陷（2026-10-20，回归必查）------
+# 缺陷一：secretOf 约定存 user\0pass，但约定零文档，addAccount 原样加密
+# 明文密码 -> 首次收信必报"凭证损坏"。修复=addAccount 自动拼，这里验证：
+cat > /tmp/vg-compose.ts <<'NODE'
+import { openDb } from '/root/dotd/db/conn.ts';
+import { migrate } from '/root/dotd/db/migrate.ts';
+import { MailService } from '/root/dotd/src/mail/MailService.ts';
+import { decryptSecret } from '/root/dotd/src/mail/crypto.ts';
+const KEY = 'rWUc3Xk+TSY2P6CTQ0NhDUlxJnfkMfxRifLSSvhLKbQ=';
+// 用真迁移建库：手写建表少列就是坑（2026-10-20 实测缺 last_ok_at）
+const V = Number((require('fs').readFileSync('/root/dotd/src/daemon.ts', 'utf8')
+  .match(/expectedVersion:\s*(\d+)/) || [])[1]);
+const db = openDb('/tmp/vg-compose.db');
+migrate(db, { expectedVersion: V });
+const mail = new MailService(db, KEY);
+mail.addAccount('dot1', { label: 't', email: 'u@163.com', imapHost: 'h', imapPort: 993,
+  smtpHost: 's', smtpPort: 465, password: 'PLAINCODE' });
+const row = db.prepare('SELECT secret_enc FROM mail_accounts').get() as { secret_enc: string };
+const plain = decryptSecret(row.secret_enc, KEY);
+console.log(plain === 'u@163.com\u0000PLAINCODE' ? 'OK' : 'BAD ' + JSON.stringify(plain));
+NODE
+COMP=$(node --import tsx /tmp/vg-compose.ts 2>&1 | tail -1)
+rm -f /tmp/vg-compose.ts /tmp/vg-compose.db
+t "明文密码自动拼 user\0pass"          test "$COMP" = "OK"
+# 缺陷二：网易 Coremail 要求 LOGIN 后先发 ID（RFC 297），否则 SELECT 回
+# Unsafe Login。确认 ID 命令存在且容忍不支持的服务器（mustOk=false）：
+t "LOGIN 后发 ID 自报身份"             grep -q "ID (\"name\" \"dotd\"" src/mail/imap.ts
+t "ID 失败不挡登录（mustOk=false）"     grep -q "await this.cmd('ID .*', false)" src/mail/imap.ts
+
 echo ""
 echo "  合计 $P 通过 / $F 失败"
 [ "$F" = "0" ] && exit 0 || exit 1

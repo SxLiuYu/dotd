@@ -159,6 +159,7 @@ export class ImapClient {
       const g = await r0.readLine();
       if (!/^\*\s+(OK|PREAUTH)/i.test(g)) throw new Error('IMAP 握手失败：' + g);
       await c0.cmd('LOGIN ' + q(cfg.user) + ' ' + q(cfg.pass));
+      await c0.id();
       return c0;
     }
     const sock = cfg.starttls
@@ -190,6 +191,7 @@ export class ImapClient {
       (c as unknown as { r: Reader }).r = new Reader(upgraded);
     }
     await c.cmd(`LOGIN ${q(cfg.user)} ${q(cfg.pass)}`);
+    await c.id();
     return c;
   }
 
@@ -228,6 +230,16 @@ export class ImapClient {
     }
   }
 
+
+  /**
+   * 自报客户端身份（RFC 297 ID 扩展）。
+   * 网易 Coremail 硬要求：LOGIN 后不先发 ID，SELECT 一律回
+   * `NO SELECT Unsafe Login`（2026-10-20 接 163 实测，kefu@188.com 那个提示）。
+   * mustOk=false：不支持 ID 的服务器回 BAD 时容忍，不挡登录。
+   */
+  private async id(): Promise<void> {
+    await this.cmd('ID ("name" "dotd" "version" "1.0.0")', false);
+  }
   /** SELECT 一个文件夹。返回邮件总数。 */
   async select(folder = 'INBOX'): Promise<number> {
     const { data } = await this.cmd(`SELECT ${q(folder)}`);
