@@ -138,3 +138,26 @@
 | 2026-10-21 | 探针（不修） | **slot3「用 shell 算 6 的 12 次方」在概率上稳、结构上不必然**。容器 `/bin/sh` 是 **dash**，`$((6**12))` 直接报 `arithmetic expression: expecting primary`；`shell.run` 走 `bash -c`（`tool-catalog.ts:162`）所以 bash 写法可行，实测 `echo $((6**12))` / `python3 -c "print(6**12)"` / `awk "BEGIN{print 6^12}"` 三种均得 `2176782336`，但 `bc` **未安装**（`bc: command not found`）。若模型坚持用 `bc`，该次 probe 失败；7 天 slot3 约出现 7 次，`FAIL_RUN_LIMIT=1` 意味着连错 2 次即判红。修法：把 slot3 的 prompt 明确成「用 bash 算术」，或换成不依赖外壳写法的题（如 `printf` 求和）。`soak.sh` 冻结中，记此不修。 |
 | 2026-10-21 | 判据（不修） | **RSS 基线的 `baseN` 与取数集合基数不一致**。`soak.sh` L1600 `const baseN=Math.max(1, baseSet.length)` 的 `baseSet` 从 **`all`** 筛（`ts<=baseEndTs`），而 L1601 取数用 **`rssPts`**（筛过 `rssOk`）`.slice(0,baseN)`。两个集合基数不同：若前段有样本缺 `rss_kb`，`baseN` 大于 `rssPts` 实有数，`slice` 会把基线窗口**往后拉长**。实测：7 天数据抹掉前 3 点 `rss_kb` 后，基线名义「最前 5 个样本」，**实际覆盖 3.5 小时**（设计是 2 小时），而文案仍打印「最前 5 个样本中位」——说的和做的不是一回事（第⑨类）。**影响量化**：造 +60MB 泄漏对照，完整 `+59.6MB` / 缺点 `+59.1MB`；+51MB 边缘对照，完整 `+50.7MB` / 前 4 点全缺 `+50.1MB`，**全部仍正确判红，不改变判决**。属记录级缺陷。修法：`baseN` 改用 `rssPts` 计数（`rssPts.filter(s=>s.ts<=baseEndTs).length`）。`soak.sh` 冻结中，记此不修。 |
 | 2026-10-21 | 工具（不修） | **`acceptance.sh --judge` 是只读模式，却有副作用**。`scripts/acceptance.sh` 的归档块（`ARCHIVE=…` + `if [ -s "$RESULTS" ]; then cp … fi`）在 `if [ "${1:-}" = "--judge" ]` **之前**执行，所以每跑一次 `--judge` 就多一份 `results.<时间戳>.jsonl`。实测：跑一次 `--judge`，`results.2026*.jsonl` 从 38 → 39。`results.jsonl` 本身没被动（`mtime` 仍 `03:31:16`、20 行、pass 20 不变），所以**不影响判定结论**，只是污染目录。当前已有 **39 份、452K**，其中 `08:13`-`08:44` 半小时内就有 12 份，内容都是 20 行 pass=20 的重复。修法：把归档块移到 `--judge` 分支的 `fi` 之后、`: > "$RESULTS"` 之前（`--judge` 不需要归档）。**本步是 S6，`acceptance.sh` 属 S3 产物，按执行规则「判据外发现记 backlog，不当场修」处理。** |
+
+## 第 98 轮（2026-10-20）
+
+- **`refresh3.mjs` 只平移 `ts`，没平移 `proc_start`**（判据夹具工具，不在交付物里）
+  - 现象：`nr.jsonl` 段2 的 `proc_start=1792181034`，而同段首点 `ts=1792201951`，**差 20917 秒（5.8 小时）**。
+  - 后果：`soak.sh:1373` 用 `w.ts>=born-900 && w.ts<=born+300` 在 `proc_start` 附近找自愈记录，
+    而 `.wd` 是按 `ts` 写的 → 永远匹配不上 → 报 `❌ 有 1 次重启找不到自愈记录`，是**假红**。
+  - 修法（已做）：对齐 `proc_start` 到该段首点 `ts`。根治应在 `refresh3.mjs` 里同步平移 `proc_start`。
+  - 归类：第㉑类「手工夹具必须同步改所有相关字段」第 4 次复发（R90 起）。
+
+- **boot 日志夹具的两个隐形要求**（判据依赖，未写进文档过）
+  - `parseLog`（`soak.sh:1291`）用 `new Date("YYYY-MM-DDTHH:MM:SS")` 解析，**无时区后缀 = 本地时间（CST）**；
+    `.wd` 与 boot log 都必须写 CST，写 UTC 会差 8 小时、落不进 `born-900…born+300` 窗口。
+  - `healedDaemon`（`soak.sh:1363-1365`）只认文本 `daemon 已恢复` 或 `daemon 就绪`，
+    **`===== WSL 启动 =====` 不算自愈证据**。
+  - 建议：把这两条写进 `docs/acceptance/S6-guardrails.md` 的夹具章节。
+
+- **`scripts/verify-goal.sh` 的已知局限**
+  - S1 的 `npm test` 半边只有加 `--run` 才真跑（默认 ⏳）——因为全量要几分钟，不该每次验收都跑。
+  - S2 只查 `steps` 表计数，**不校验 `tool.create` 造出的工具是否真的能执行**（R87 是人工验的）。
+    若要做到无人值机，应改成「对每个动态工具跑一次 `tool.invoke` 并看 `result_json`」。
+  - S6 只是把 `soak.sh report` 的退出码转述一遍，没有自己独立判断 —— 这是有意的（避免两套判据打架），
+    但也意味着 `soak.sh` 若判错，`verify-goal.sh` 会原样继承。

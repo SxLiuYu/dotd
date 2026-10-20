@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# scripts/verify-goal.sh -- S1..S6 总验收入口 (2026-10-20 第 98 轮新增)
+#
+# 为什么需要它：目标原话是"交付可验收的成品"。
+# 前面 97 轮把六步各自做出来了（npm test / acceptance.sh / honesty.sh /
+# recovery.sh / soak.sh），但没有任何一条命令能一次回答"六步全过了吗"。
+# 验收的人要么读 3400 行 goal-progress.md，要么自己拼 5 条命令 -- 这不是可验收。
+#
+# 设计原则（沿用 soak.sh 的教训）：
+#  1. 只读：默认不跑任何会改数据的动作。acceptance/honesty 会真发任务，
+#     recovery 会真 kill 容器 -- 这些只有显式加 --run 才会执行。
+#  2. 三态：通过 / 不通过 / 还没到判的时候。
+#     "还没到判的时候"绝不能算通过（不进 process.exit 就不算判据）。
+#  3. 不掩盖：任一步不是通过，整体就不是通过，且退出码非 0。
+#  4. 可独立复现：每一行都打印出"它跑了哪条命令"，验收的人能自己重跑。
+#
+# 用法：
+#   bash scripts/verify-goal.sh          # 只读判定（用现有证据）
+#   bash scripts/verify-goal.sh --run    # 先跑 S3/S4/S5 再判定（S6 永远只读）
+#   bash scripts/verify-goal.sh --json   # 附带机器可读输出
+#
+# 退出码：0=六步全过  1=有步骤不通过  3=有步骤还没到判的时候  2=脚本自身出错
+
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 2
+
+RUN=0; JSONOUT=0
+for a in "$@"; do
+  case "$a" in
+    --run) RUN=1 ;;
+    --json) JSONOUT=1 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    *) echo "未知参数：$a（见 --help）" >&2; exit 2 ;;
+  esac
+done
+
+ACC="${DOTD_ACCEPT_DIR:-docs/acceptance}"
+export DOTD_ACCEPT_DIR="$ACC"
+
+ROWS=()
+OVERALL=0
+
+# 记一行。$1=步骤 $2=PASS|FAIL|WAIT $3=摘要 $4=验法
+row() {
+  case "$2" in
+    FAIL) [ "$OVERALL" -eq 0 ] && OVERALL=1 ;;
+    WAIT) [ "$OVERALL" -eq 0 ] && OVERALL=3 ;;
+  esac
+  ROWS+=("$1|$2|$3|$4")
+}
+
+sym() {
+  case "$1" in PASS) echo "✅" ;; FAIL) echo "❌" ;; *) echo "⏳" ;; esac
+}
+
+echo "════════ dotd 目标验收（S1 → S6）════════"
+echo "证据目录：$ACC"
+echo "时间：$(date '+%F %T %Z')"
+if [ "$RUN" -eq 0 ]; then
+  echo "模式：只读（不跑任何会改数据的动作；加 --run 才会真跑 S1/S3/S4/S5）"
+else
+  echo "模式：--run（S1/S3/S4/S5 会真跑；S6 永远只读）"
+fi
+echo ""
+
+# ─── S1 修绿基线：npm test 0 失败 + git status 干净 ───
+S1_ST=PASS; S1_MSG=""
+if [ "$RUN" -eq 1 ]; then
+  echo "▸ S1：跑 npm test …"
+  if npm test >/tmp/verify-goal-npmtest.log 2>&1; then
+    NT=$(grep -aE '^ℹ pass [0-9]+' /tmp/verify-goal-npmtest.log | tail -1 | grep -oE '[0-9]+' | head -1)
+    NF=$(grep -aE '^ℹ fail [0-9]+' /tmp/verify-goal-npmtest.log | tail -1 | grep -oE '[0-9]+' | head -1)
+    S1_MSG="npm test ${NT:-?} 通过 / ${NF:-?} 失败"
+    [ "${NF:-1}" -ne 0 ] && S1_ST=FAIL
+  else
+    S1_ST=FAIL; S1_MSG="npm test 退出码非 0（见 /tmp/verify-goal-npmtest.log）"
+  fi
+else
+  S1_ST=WAIT; S1_MSG="未加 --run，没真跑 npm test"
+fi
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git status --porcelain 2>/dev/null | wc -l)
+  if [ "${DIRTY:-0}" -ne 0 ]; then
+    S1_ST=FAIL; S1_MSG="$S1_MSG；git status 有 $DIRTY 个未提交改动"
+  else
+    S1_MSG="$S1_MSG；git status 干净"
+  fi
+else
+  # WSL 侧 /root/dotd 不是 git 仓库（源码权威在 Windows 的 D:\\toagi\\dotd）。
+  # 这时**不能**当作「干净」放过去 —— 第⑰类：没测到不能编码成合法值。
+  # 保持 ⏳ 并明说去哪验，而不是假装检查过。
+  S1_ST=WAIT
+  S1_MSG="$S1_MSG；**本目录不是 git 仓库**，git 半边没验 —— 请在 D:\\toagi\\dotd 侧跑 `git status --porcelain`"
+fi
+row "S1 修绿基线" "$S1_ST" "$S1_MSG" "npm test + git status"
+
+# ─── S2 自己造工具：(a)(b)(c) ───
+S2_OUT=$(node --disable-warning=ExperimentalWarning -e '
+const { DatabaseSync } = require("node:sqlite");
+const home = process.env.HOME || "/root";
+let db;
+try { db = new DatabaseSync(home + "/.dotd/dotd.db", { readOnly: true }); }
+catch (e) { console.log("ERR|打不开库|0|0"); process.exit(0); }
+const one = (s, ...a) => { try { return db.prepare(s).get(...a); } catch (e) { return null; } };
+const created = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=?", "tool.create") || {}).c || 0;
+const invAll  = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=?", "tool.invoke") || {}).c || 0;
+// status 的真实取值是 succeeded / pending / failed（不是 ok！）
+// 2026-10-20 第 98 轮踩到：第一版写 status="ok" 查出 0 次，误报 S2(b) 未达成。
+const invOk   = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=? AND status=?", "tool.invoke", "succeeded") || {}).c || 0;
+let wl = 0;
+try {
+  const y = require("fs").readFileSync("config/tools.yml", "utf8");
+  wl = (y.match(/^\s*-\s*name:\s*\S+/gm) || []).length;
+} catch (e) {}
+console.log([created, invAll, invOk, wl].join("|"));
+db.close();' 2>/dev/null)
+
+IFS='|' read -r S2_CREATED S2_INVALL S2_INVOK S2_WL <<< "${S2_OUT:-ERR|x|0|0}"
+if [ "${S2_CREATED:-ERR}" = "ERR" ] || [ -z "${S2_CREATED:-}" ]; then
+  row "S2 自己造工具" FAIL "读不到 steps 表（库路径或权限问题）" "sqlite: steps WHERE tool_name=…"
+else
+  S2_ST=PASS; S2_D=""
+  if [ "$S2_CREATED" -gt 0 ]; then S2_D="(a) tool.create $S2_CREATED 次 ✅"
+  else S2_D="(a) tool.create 0 次 ❌"; S2_ST=FAIL; fi
+  if [ "${S2_INVOK:-0}" -gt 0 ]; then S2_D="$S2_D；(b) tool.invoke 成功 $S2_INVOK / 共 $S2_INVALL 次 ✅"
+  else S2_D="$S2_D；(b) tool.invoke 0 次成功 ❌"; S2_ST=FAIL; fi
+  if [ "${S2_WL:-0}" -ge 3 ]; then S2_D="$S2_D；(c) 白名单 $S2_WL 个 ✅"
+  else S2_D="$S2_D；(c) 白名单仅 $S2_WL 个 ❌"; S2_ST=FAIL; fi
+  row "S2 自己造工具" "$S2_ST" "$S2_D" "sqlite: steps WHERE tool_name IN (tool.create,tool.invoke)"
+fi
+
+# ─── S3 能力验收：20 条 ≥19 ───
+if [ "$RUN" -eq 1 ]; then
+  echo "▸ S3：跑 20 条日常场景（约 5-10 分钟）…"
+  DOTD_ACCEPT_DIR="$ACC" bash scripts/acceptance.sh >/tmp/verify-goal-s3.log 2>&1 || true
+fi
+DOTD_ACCEPT_DIR="$ACC" bash scripts/acceptance.sh --judge >/dev/null 2>&1; S3_RC=$?
+S3_SUM=$(node --disable-warning=ExperimentalWarning -e '
+const fs=require("fs");
+const p=process.env.DOTD_ACCEPT_DIR+"/results.jsonl";
+try{
+  const L=fs.readFileSync(p,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+  const ok=L.filter(r=>r.pass).length;
+  console.log(ok+"/"+L.length+(L.length?" = "+(ok/L.length*100).toFixed(1)+"%":""));
+}catch(e){ console.log("无证据（"+p+" 读不出）"); }' 2>/dev/null)
+case "$S3_RC" in
+  0) row "S3 能力验收" PASS "$S3_SUM（判据 ≥19/20）" "acceptance.sh --judge" ;;
+  3) row "S3 能力验收" WAIT "$S3_SUM：覆盖不足 20 条，还不能算达标" "acceptance.sh --judge" ;;
+  *) row "S3 能力验收" FAIL "$S3_SUM：未达 95%" "acceptance.sh --judge" ;;
+esac
+
+# ─── S4 说实话验收：10/10，0 编造 ───
+if [ "$RUN" -eq 1 ]; then
+  echo "▸ S4：跑 10 条做不到的任务…"
+  DOTD_ACCEPT_DIR="$ACC" bash scripts/honesty.sh >/tmp/verify-goal-s4.log 2>&1 || true
+fi
+DOTD_ACCEPT_DIR="$ACC" bash scripts/honesty.sh --judge >/dev/null 2>&1; S4_RC=$?
+S4_SUM=$(node --disable-warning=ExperimentalWarning -e '
+const fs=require("fs");
+const p=process.env.DOTD_ACCEPT_DIR+"/honesty.jsonl";
+try{
+  const L=fs.readFileSync(p,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+  const ok=L.filter(r=>r.pass).length;
+  console.log(ok+"/"+L.length+" 正确承认");
+}catch(e){ console.log("无证据（"+p+" 读不出）"); }' 2>/dev/null)
+case "$S4_RC" in
+  0) row "S4 说实话验收" PASS "$S4_SUM（判据 10/10、0 编造）" "honesty.sh --judge" ;;
+  3) row "S4 说实话验收" WAIT "$S4_SUM：不够 10 条" "honesty.sh --judge" ;;
+  *) row "S4 说实话验收" FAIL "$S4_SUM：有编造或不足" "honesty.sh --judge" ;;
+esac
+
+# ─── S5 故障自恢复：3/3，<5 分钟 ───
+if [ "$RUN" -eq 1 ]; then
+  echo "▸ S5：注入 3 种故障（会真的 stop 容器 / 断网关 / kill daemon）…"
+  DOTD_ACCEPT_DIR="$ACC" bash scripts/recovery.sh >/tmp/verify-goal-s5.log 2>&1 || true
+fi
+DOTD_ACCEPT_DIR="$ACC" bash scripts/recovery.sh --judge >/dev/null 2>&1; S5_RC=$?
+S5_SUM=$(node --disable-warning=ExperimentalWarning -e '
+const fs=require("fs");
+const p=process.env.DOTD_ACCEPT_DIR+"/recovery.jsonl";
+try{
+  const L=fs.readFileSync(p,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
+  const ok=L.filter(r=>r.pass).length;
+  const slow=L.filter(r=>r.pass && Number(r.secs)>300).length;
+  console.log(ok+"/"+L.length+" 恢复成功"+(slow?("，"+slow+" 次超过 5 分钟"):"，全部 <5 分钟"));
+}catch(e){ console.log("无证据（"+p+" 读不出）"); }' 2>/dev/null)
+case "$S5_RC" in
+  0) row "S5 故障自恢复" PASS "$S5_SUM" "recovery.sh --judge" ;;
+  3) row "S5 故障自恢复" WAIT "$S5_SUM：不够 3 种" "recovery.sh --judge" ;;
+  *) row "S5 故障自恢复" FAIL "$S5_SUM" "recovery.sh --judge" ;;
+esac
+
+# ─── S6 长期运行（永远只读）───
+bash scripts/soak.sh report >/tmp/verify-goal-s6.log 2>&1; S6_RC=$?
+S6_SUM=$(grep -aoE '❌ 未满 7 天（还差 [0-9.]+ 天）' /tmp/verify-goal-s6.log | head -1)
+if [ -z "$S6_SUM" ]; then
+  S6_SUM=$(grep -aoE '✅ 已满 7 天[^；]*' /tmp/verify-goal-s6.log | head -1)
+fi
+if [ -z "$S6_SUM" ]; then S6_SUM="详见 /tmp/verify-goal-s6.log"; fi
+S6_RED=$(grep -ac '❌' /tmp/verify-goal-s6.log 2>/dev/null || echo 0)
+S6_WARN=$(grep -ac '⚠' /tmp/verify-goal-s6.log 2>/dev/null || echo 0)
+case "$S6_RC" in
+  0) row "S6 长期运行" PASS "7 天窗口通过（另有 ⚠ $S6_WARN 条提示）" "soak.sh report" ;;
+  3) row "S6 长期运行" WAIT "$S6_SUM" "soak.sh report" ;;
+  *) row "S6 长期运行" FAIL "$S6_SUM（$S6_RED 条 ❌，详见 /tmp/verify-goal-s6.log）" "soak.sh report" ;;
+esac
+
+# ─── 汇总 ───
+echo ""
+echo "────────────────────────────────────────────────────────────────"
+printf "%-18s %-2s %s\n" "步骤" "" "结论"
+echo "────────────────────────────────────────────────────────────────"
+NP=0; NF2=0; NW=0
+for r in "${ROWS[@]}"; do
+  IFS='|' read -r name st msg how <<< "$r"
+  printf "%-18s %-2s %s\n" "$name" "$(sym "$st")" "$msg"
+  printf "%-18s %-2s   ↳ 验法：%s\n" "" "" "$how"
+  case "$st" in PASS) NP=$((NP+1)) ;; FAIL) NF2=$((NF2+1)) ;; *) NW=$((NW+1)) ;; esac
+done
+echo "────────────────────────────────────────────────────────────────"
+echo "合计：✅ $NP   ❌ $NF2   ⏳ $NW   （共 ${#ROWS[@]} 步）"
+if [ "$OVERALL" -eq 0 ]; then
+  echo ""
+  echo "✅ 六步全部通过 = 目标达成：$NP/6"
+elif [ "$OVERALL" -eq 1 ]; then
+  echo ""
+  echo "❌ 有 $NF2 步不通过，目标未达成。"
+else
+  echo ""
+  echo "⏳ 还没到判的时候：$NW 步在等（不是失败，是证据还没长齐）。已过 $NP 步。"
+  if [ "$NW" -gt 0 ] && [ "$NP" -gt 0 ]; then
+    echo "   **⏳ 不算通过** —— 别把「证据还没长齐」读成「差不多了 / 都好了」。"
+  fi
+fi
+
+if [ "$JSONOUT" -eq 1 ]; then
+  echo ""
+  echo "--- JSON ---"
+  node -e '
+const rows=process.argv[1].split("\n").filter(Boolean).map(l=>{
+  const i=l.indexOf("|"), j=l.indexOf("|",i+1), k=l.indexOf("|",j+1);
+  return {step:l.slice(0,i), state:l.slice(i+1,j), msg:l.slice(j+1,k), how:l.slice(k+1)};
+});
+console.log(JSON.stringify({at:new Date().toISOString(), dir:process.argv[3], overall:Number(process.argv[2]), rows},null,2));' \
+    "$(printf '%s\n' "${ROWS[@]}")" "$OVERALL" "$ACC" 2>/dev/null
+fi
+
+case "$OVERALL" in
+  0) exit 0 ;;
+  3) exit 3 ;;
+  *) exit 1 ;;
+esac
