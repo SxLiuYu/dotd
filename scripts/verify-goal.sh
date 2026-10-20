@@ -79,11 +79,20 @@ row() {
   ROWS+=("$1|$2|$3|$4")
 }
 
-sym() {
-  case "$1" in PASS) echo "✅" ;; FAIL) echo "❌" ;; *) echo "⏳" ;; esac
+# **`INFO` 状态（2026-10-20，用户决定「长期运行不用作为一个目标」）**：
+# 只打印、**不参与合计、不影响退出码**。
+# 用它表达「这件事我们观测了、也如实报告现状，但它不是验收判据」。
+# 这是 family ⑩ 的正解：不进 process.exit 的东西不能被读成「通过」，
+# 但也不该被读成「失败」—— 它只是「不是判据」。
+row_info() {
+  ROWS+=("$1|INFO|$2|$3")
 }
 
-echo "════════ dotd 目标验收（S1 → S6）════════"
+sym() {
+  case "$1" in PASS) echo "✅" ;; FAIL) echo "❌" ;; WAIT) echo "⏳" ;; *) echo "▫️" ;; esac
+}
+
+echo "════════ dotd 目标验收（S1 → S5）════════"
 echo "证据目录：$ACC"
 echo "时间：$(date '+%F %T %Z')"
 if [ "$RUN" -eq 0 ]; then
@@ -281,10 +290,18 @@ fi
 if [ -n "$S6_OFFGRID" ]; then
   echo "  ⚠ S6 窗口里有 $S6_OFFGRID —— 不是 cron 产生的（明细见 docs/acceptance/soak-notes.md）" >&2
   S6_SUM="$S6_SUM；⚠ 另有 $S6_OFFGRID"
+# ─── 长期运行观测（**不是判据**，2026-10-20 用户决定「长期运行不用作为一个目标」）───
+# 原来这里是 S6 的硬判据。现在降级为「只报告」：
+#   · 它仍然跑、仍然记录、仍然如实显示当前状态
+#   · 但它**不进 OVERALL、不影响退出码**
+# 理由不是「达不到就改判据」，而是**用户改了口径**：
+# 他要的是「能验收的成品」，7 天连续运行不在交付范围里。
+# 所以正确的表达是「这不是判据」，而不是「它通过了」。
+# **`⚠` 和残留的 `❌` 仍然照原样显示** —— 降级不等于粉饰。
 case "$S6_RC" in
-  0) row "S6 长期运行" PASS "7 天窗口通过（另有 ⚠ $S6_WARN 条提示）" "soak.sh report" ;;
-  3) row "S6 长期运行" WAIT "$S6_SUM" "soak.sh report" ;;
-  *) row "S6 长期运行" FAIL "$S6_SUM（$S6_RED 条 ❌，详见 /tmp/verify-goal-s6.log）" "soak.sh report" ;;
+  0) row_info "长期运行（观测）" "7 天窗口已跑完，判定器无 ❌（另有 ⚠ $S6_WARN 条提示）" "soak.sh report" ;;
+  3) row_info "长期运行（观测）" "$S6_SUM" "soak.sh report" ;;
+  *) row_info "长期运行（观测）" "$S6_SUM（$S6_RED 条 ❌，详见 /tmp/verify-goal-s6.log）" "soak.sh report" ;;
 esac
 
 
@@ -295,18 +312,22 @@ echo ""
 echo "────────────────────────────────────────────────────────────────"
 printf "%-18s %-2s %s\n" "步骤" "" "结论"
 echo "────────────────────────────────────────────────────────────────"
-NP=0; NF2=0; NW=0
+NP=0; NF2=0; NW=0; NI=0
 for r in "${ROWS[@]}"; do
   IFS='|' read -r name st msg how <<< "$r"
   printf "%-18s %-2s %s\n" "$name" "$(sym "$st")" "$msg"
   printf "%-18s %-2s   ↳ 验法：%s\n" "" "" "$how"
-  case "$st" in PASS) NP=$((NP+1)) ;; FAIL) NF2=$((NF2+1)) ;; *) NW=$((NW+1)) ;; esac
+  case "$st" in PASS) NP=$((NP+1)) ;; FAIL) NF2=$((NF2+1)) ;; INFO) NI=$((NI+1)) ;; *) NW=$((NW+1)) ;; esac
 done
 echo "────────────────────────────────────────────────────────────────"
-echo "合计：✅ $NP   ❌ $NF2   ⏳ $NW   （共 ${#ROWS[@]} 步）"
+if [ "$NI" -gt 0 ]; then
+  echo "合计：✅ $NP   ❌ $NF2   ⏳ $NW   （共 $NP/$((NP+NF2+NW)) 步是判据；另 $NI 项只报告不判定）"
+else
+  echo "合计：✅ $NP   ❌ $NF2   ⏳ $NW   （共 ${#ROWS[@]} 步）"
+fi
 if [ "$OVERALL" -eq 0 ]; then
   echo ""
-  echo "✅ 六步全部通过 = 目标达成：$NP/6"
+  echo "✅ 全部判据通过 = 目标达成：$NP/$((NP+NF2+NW))"
 elif [ "$OVERALL" -eq 1 ]; then
   echo ""
   echo "❌ 有 $NF2 步不通过，目标未达成。"
@@ -316,6 +337,13 @@ else
   if [ "$NW" -gt 0 ] && [ "$NP" -gt 0 ]; then
     echo "   **⏳ 不算通过** —— 别把「证据还没长齐」读成「差不多了 / 都好了」。"
   fi
+fi
+if [ "$NI" -gt 0 ]; then
+  echo ""
+  echo "▫️ 另有 $NI 项**只报告不判定**（长期运行观测）——"
+  echo "   它在跑、也在如实记录，但用户已明确「长期运行不用作为一个目标」，"
+  echo "   所以它既不是通过也不是失败，**不参与以上结论**。"
+  echo "   想看它现在什么状态：bash scripts/soak.sh report"
 fi
 
 if [ "$JSONOUT" -eq 1 ]; then
