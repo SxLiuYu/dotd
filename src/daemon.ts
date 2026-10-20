@@ -39,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
 
 import { openDb, resolveDbPath } from '../db/conn.ts';
+import { MailService } from './mail/MailService.ts';
 import { migrate } from '../db/migrate.ts';
 
 import { EventBus } from './shared/bus.ts';
@@ -740,10 +741,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 130）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 160）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 150 });
+    const res = migrate(db, { expectedVersion: 160 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -1042,6 +1043,154 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       },
     };
   });
+  // ── 邮件工具（T1/T2，2026-10-20）──────────────────────────────────
+  //
+  // 为什么在 daemon 里而不是容器里：
+  //   邮箱凭证是**主人的身份**，不能进容器。容器是 agent 的工作区，
+  //   agent 能跑任意 bash —— 把密码放进容器等于让 agent 能读到自己不该读的东西。
+  //   放宿主侧，agent 只能通过这六个工具间接操作邮箱。
+  //
+  // 密钥从哪来：DOTD_MAIL_KEY（32 字节 base64）。
+  //   没配的话**不注册邮件工具** —— 让"没配置"表现为"工具不存在"，
+  //   而不是"工具存在但一调用就崩"。
+  const mailKey = process.env.DOTD_MAIL_KEY ?? '';
+  let mail: MailService | null = null;
+  if (mailKey !== '') {
+    try {
+      mail = new MailService(db, mailKey);
+      const dotOf = () => cfg.dotIds[0] ?? 'dot1';
+
+      exec.registerHostTool('mail.account.add', async (args) => {
+        const a = args as Record<string, unknown>;
+        const need = ['label', 'email', 'imapHost', 'smtpHost', 'password'] as const;
+        for (const k of need) {
+          if (typeof a[k] !== 'string' || (a[k] as string) === '') {
+            return { ok: false as const, code: 'BAD_ARG', message: `缺参数 ${k}` };
+          }
+        }
+        const row = mail!.addAccount(dotOf(), {
+          label: String(a.label),
+          email: String(a.email),
+          imapHost: String(a.imapHost),
+          // 常见默认值：163/QQ/Gmail 都是 993/465
+          imapPort: typeof a.imapPort === 'number' ? a.imapPort : 993,
+          smtpHost: String(a.smtpHost),
+          smtpPort: typeof a.smtpPort === 'number' ? a.smtpPort : 465,
+          password: String(a.password),
+        });
+        return {
+          ok: true as const,
+          value: { id: row.id, label: row.label, email: row.email, note: '凭证已加密存储' },
+        };
+      });
+
+      exec.registerHostTool('mail.account.list', async () => {
+        const rows = mail!.listAccounts(dotOf());
+        return {
+          ok: true as const,
+          value: {
+            count: rows.length,
+            accounts: rows.map((r) => ({
+              id: r.id,
+              label: r.label,
+              email: r.email,
+              imap: `${r.imap_host}:${r.imap_port}`,
+              smtp: `${r.smtp_host}:${r.smtp_port}`,
+              last_ok_at: r.last_ok_at,
+              last_error: r.last_error,
+            })),
+          },
+        };
+      });
+
+      exec.registerHostTool('mail.account.remove', async (args) => {
+        const label = String((args as Record<string, unknown>).account ?? '');
+        const done = mail!.removeAccount(dotOf(), label);
+        return done
+          ? { ok: true as const, value: { removed: label } }
+          : { ok: false as const, code: 'NOT_FOUND', message: `找不到账号 ${label}` };
+      });
+
+      exec.registerHostTool('mail.list', async (args) => {
+        const a = args as Record<string, unknown>;
+        const account = String(a.account ?? '');
+        try {
+          const items = await mail!.list(dotOf(), account, typeof a.limit === 'number' ? a.limit : 20);
+          return { ok: true as const, value: { count: items.length, messages: items } };
+        } catch (e) {
+          return { ok: false as const, code: 'MAIL_ERROR', message: (e as Error).message, retryable: true };
+        }
+      });
+
+      exec.registerHostTool('mail.read', async (args) => {
+        const a = args as Record<string, unknown>;
+        try {
+          const m = await mail!.read(dotOf(), String(a.account ?? ''), String(a.uid ?? ''));
+          if (m === null) return { ok: false as const, code: 'NOT_FOUND', message: '没有这封邮件' };
+          return { ok: true as const, value: m };
+        } catch (e) {
+          return { ok: false as const, code: 'MAIL_ERROR', message: (e as Error).message, retryable: true };
+        }
+      });
+
+      exec.registerHostTool('mail.search', async (args) => {
+        const a = args as Record<string, unknown>;
+        const kw = String(a.keyword ?? '');
+        if (kw === '') return { ok: false as const, code: 'BAD_ARG', message: '缺 keyword' };
+        try {
+          const items = await mail!.search(dotOf(), String(a.account ?? ''), kw, typeof a.limit === 'number' ? a.limit : 20);
+          return { ok: true as const, value: { count: items.length, messages: items } };
+        } catch (e) {
+          return { ok: false as const, code: 'MAIL_ERROR', message: (e as Error).message, retryable: true };
+        }
+      });
+
+      // 起草：只入库，不发。返回 draftId 供后续 mail.send 引用。
+      exec.registerHostTool('mail.draft', async (args) => {
+        const a = args as Record<string, unknown>;
+        const to = Array.isArray(a.to) ? (a.to as string[]) : [];
+        if (to.length === 0) return { ok: false as const, code: 'BAD_ARG', message: '缺收件人 to' };
+        try {
+          const id = mail!.createDraft(dotOf(), String(a.account ?? ''), {
+            to,
+            cc: Array.isArray(a.cc) ? (a.cc as string[]) : [],
+            subject: String(a.subject ?? ''),
+            body: String(a.body ?? ''),
+            inReplyTo: typeof a.inReplyTo === 'string' ? a.inReplyTo : undefined,
+            taskId: typeof a.taskId === 'string' ? a.taskId : undefined,
+          });
+          return {
+            ok: true as const,
+            value: {
+              draftId: id,
+              note: '草稿已生成，**尚未发送**。要发出去需调用 mail.send（需主人审批）。',
+            },
+          };
+        } catch (e) {
+          return { ok: false as const, code: 'MAIL_ERROR', message: (e as Error).message };
+        }
+      });
+
+      // 发送：tier=dangerous，gate 会在执行前拦下来开审批单。
+      // 这里拿到的是**已经批准过**的调用（gate 保证），所以直接发。
+      exec.registerHostTool('mail.send', async (args) => {
+        const draftId = String((args as Record<string, unknown>).draftId ?? '');
+        if (draftId === '') return { ok: false as const, code: 'BAD_ARG', message: '缺 draftId' };
+        const r = await mail!.sendDraft(dotOf(), draftId);
+        if (!r.ok) return { ok: false as const, code: 'SEND_FAILED', message: r.error ?? '发送失败', retryable: true };
+        return { ok: true as const, value: { sent: true, messageId: r.messageId } };
+      });
+
+      log(`[mail] 邮件工具已注册（8 个），凭证加密密钥已加载`);
+    } catch (e) {
+      // 密钥格式不对 → 不注册，但要吼一声。静默降级会让人以为配好了。
+      log(`[mail] 邮件工具未启用：${(e as Error).message}`);
+      mail = null;
+    }
+  } else {
+    log('[mail] 未配置 DOTD_MAIL_KEY，邮件工具不注册（这是预期行为，配了密钥才启用）');
+  }
+
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);
   // failed/orphans 必须见光：阶段一只打 warnings+degraded，占名 409 曾静默瘫痪整个 fleet。

@@ -122,3 +122,43 @@ tools:
 #     spendParams:
 #       required: [amountCents, currency, category]
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── 邮件（2026-10-20，T1/T2：对标 Meta Muse 的「跟进邮件」场景）──────────────
+#
+# 为什么单独一组：Muse 最有价值的实测任务就是"查邮件、判断进度、起草回复"。
+# 这里六个工具，四个只读一个起草一个发送。
+#
+# 为什么通用 IMAP/SMTP 而不是 Gmail API：
+#   IMAP 是 1986 年的标准，163/QQ/Outlook/自建全支持。Gmail API 要 OAuth 审核、
+#   要回调域名、要 refresh token 轮换 —— 换一家邮箱就得重写一遍。
+#
+# 分档依据（GOV §2.2 的"副作用"定义）：
+#   - mail.list / mail.read / mail.search：只读远端，不改变任何状态 ⇒ read
+#   - mail.draft：正文只写进自己的库，**对方收不到** ⇒ read（不起草就发不出，
+#     把它设成高危只会让人误以为"起草"是危险动作）
+#   - mail.send：真的发到别人邮箱，**发出去收不回来** ⇒ dangerous
+#   - mail.account.add/remove：写凭证、改账号 ⇒ write_file
+
+  - name: mail.account.add
+    tier: write_file
+
+  - name: mail.account.list
+    tier: read
+
+  - name: mail.account.remove
+    tier: write_file
+
+  - name: mail.list
+    tier: read
+
+  - name: mail.read
+    tier: read
+
+  - name: mail.search
+    tier: read
+
+  - name: mail.draft
+    tier: read
+
+  - name: mail.send
+    tier: dangerous
