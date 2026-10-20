@@ -364,6 +364,7 @@ function makeFullConfig(feishu: Partial<SurfacesConfig['feishu']> = {}): Surface
     telegram: { botToken: '', allowlist: [], editThrottleMs: 1500 },
     feishu: { appId: '', appSecret: '', verificationToken: VTOKEN, encryptKey: '', ownerChatId: OWNER_CHAT, editThrottleMs: 1500, ...feishu },
     ui: { streamDeltas: true },
+    progress: { enabled: false, everyNSteps: 3, minIntervalMs: 90_000 },
   };
 }
 

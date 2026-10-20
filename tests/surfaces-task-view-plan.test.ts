@@ -40,6 +40,7 @@ function makeConfig(overrides: Partial<SurfacesConfig['http']> = {}): SurfacesCo
     telegram: { botToken: '', allowlist: [], editThrottleMs: 1500 },
     feishu: { appId: '', appSecret: '', verificationToken: '', encryptKey: '', editThrottleMs: 1500 },
     ui: { streamDeltas: true },
+    progress: { enabled: false, everyNSteps: 3, minIntervalMs: 90_000 },
   };
 }
 

@@ -90,6 +90,19 @@ export interface UiConfig {
   streamDeltas: boolean;
 }
 
+/**
+ * 过程可视化（T5，2026-10-20）。
+ *
+ * 为什么单独一段而不是塞进 UiConfig：UiConfig 管的是 Web/SSE 那边的流式行为，
+ * 这个是"往飞书推不推、多频繁"。两者受众不同（浏览器 vs 手机），
+ * 开关也该分开 —— 你可能想看流的输出但不希望手机响。
+ */
+export interface ProgressSurfaceConfig {
+  enabled: boolean;
+  everyNSteps: number;
+  minIntervalMs: number;
+}
+
 /** `~/.dotd/config.yml` 的 `surfaces:` 节全量（SF 拥有 schema，契约 S-4）。 */
 export interface SurfacesConfig {
   http: HttpSurfaceConfig;
@@ -99,6 +112,7 @@ export interface SurfacesConfig {
   telegram: TelegramConfig;
   feishu: FeishuConfig;
   ui: UiConfig;
+  progress: ProgressSurfaceConfig;
 }
 
 // ── §5.1 入站 ────────────────────────────────────────────────────────

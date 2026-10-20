@@ -41,6 +41,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { openDb, resolveDbPath } from '../db/conn.ts';
 import { MailService } from './mail/MailService.ts';
 import { CardRegistry, pushApprovalCard, resolveApprovalCard } from './surfaces/feishu-approval.ts';
+import { startProgressPush } from './surfaces/progress-push.ts';
 import { buildApprovalCard } from './surfaces/feishu-card.ts';
 import { migrate } from '../db/migrate.ts';
 
@@ -1363,6 +1364,23 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
             surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0] ?? null,
         })
       : null;
+
+  // ⑧d 过程可视化（T5，2026-10-20）
+  //
+  // 一个跑 10 分钟的任务，主人在飞书那边原本**什么都看不到** ——
+  // 问"在干嘛"没反应，只能等。而等待和"卡死了"在他眼里是一样的。
+  //
+  // 默认关（surfaces.progress.enabled = false）。打开是显式动作，
+  // 因为"多久说一次"很主观，只有主人自己知道能忍多少条。
+  const stopProgress = startProgressPush({
+    db,
+    bus: { on: (t, h) => bus.on(t, h) },
+    ...(feishuGw !== NULL_FEISHU_GATEWAY && ownerChatForApproval !== ''
+      ? { sender: { send: (chat: string, text: string) => feishuGw.sendText(chat, text) }, chatId: ownerChatForApproval }
+      : {}),
+    cfg: surfCfg.progress,
+    log,
+  });
 
   // ⑨ Runner 常驻协程（CP §12：pop 循环；AbortSignal 让位）
   // `bus` = roadmap P0-2 的会话增量通道：Runner 每步把模型正文增量推到 `chat.delta`。

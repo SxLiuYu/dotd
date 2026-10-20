@@ -262,6 +262,18 @@ const uiSchema = z.object({
   stream_deltas: z.boolean().default(true),
 });
 
+/**
+ * 过程可视化（T5）。默认全关 —— 升级后不会突然开始给主人发进度。
+ *
+ * 用 nonnegative 而不是正数下限：throttle=0 是有意义的（每次都推），
+ * 强制 >=1 会让"我不想节流"这个选择变得说不出口。
+ */
+const progressSchema = z.object({
+  enabled: z.boolean().default(false),
+  every_n_steps: z.coerce.number().int().nonnegative().default(3),
+  min_interval_ms: z.coerce.number().int().nonnegative().default(90_000),
+});
+
 const feishuSchema = z.object({
   app_id: z.string().default(''),
   app_secret: z.string().default(''),
@@ -285,6 +297,7 @@ const surfacesSchema = z.object({
     edit_throttle_ms: 1200,
   }),
   ui: uiSchema.default({ stream_deltas: true }),
+  progress: progressSchema.default({ enabled: false, every_n_steps: 3, min_interval_ms: 90_000 }),
 });
 
 /**
@@ -343,6 +356,11 @@ export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
       editThrottleMs: s.feishu.edit_throttle_ms,
     },
     ui: { streamDeltas: s.ui.stream_deltas },
+    progress: {
+      enabled: s.progress.enabled,
+      everyNSteps: s.progress.every_n_steps,
+      minIntervalMs: s.progress.min_interval_ms,
+    },
   };
 }
 
