@@ -11,18 +11,44 @@
 ## 怎么看
 
 ```bash
-# 一条命令回答六步过没过（只读，不改任何数据）
+# 一条命令回答五步过没过（只读，不改任何数据）
 bash scripts/verify-goal.sh
 
-# 带 --run 会真跑 S3/S4/S5（会发任务、会 kill 容器）
-# ⚠ S6 窗口进行中不要用，见下文
+# ⚠ 在 WSL 侧跑（/root/dotd 不是 git 仓库）时，要告诉它权威仓库在哪：
+DOTD_GIT_REPO=/mnt/d/toagi/dotd bash scripts/verify-goal.sh
+
+# 带 --run 会真跑 S1/S3/S4/S5（会跑 npm test、发任务、kill 容器）
+DOTD_GIT_REPO=/mnt/d/toagi/dotd bash scripts/verify-goal.sh --run
 ```
 
-退出码：`0` = 五步全过（目标达成）；`1` = 有步骤不通过；`3` = 有步骤还没到判的时候；`2` = 脚本自身出错。
+> 退出码：`0` = 五步全过（目标达成）；`1` = 有步骤不通过；`3` = 有步骤还没到判的时候；`2` = 脚本自身出错。
+>
+> **本机实测：`exit=0`，`合计：✅ 5   ❌ 0   ⏳ 0`。**
+
+### S1 的 npm test 有个前提，得说清
+
+`npm test` 必须跑在**拥有 `node_modules` 的那个平台**上。
+这一份的 `node_modules` 是 Windows 装的（esbuild 是 native 二进制），
+所以从 WSL 跨 `/mnt/d` 跑会得到 `pass 0 / fail 118`，全部报：
+
+```
+You installed esbuild for another platform ...
+"@esbuild/win32-x64" is present but this platform needs "@esbuild/linux-x64"
+```
+
+**那个红是假红。** 在 Windows 侧跑同一个 `npm test` 是 1579 / 0。
+
+所以 `verify-goal.sh` 的只读模式读 `docs/acceptance/s1-npmtest.json` 这份证据，
+**并带 24h TTL**（`S1_EVIDENCE_TTL_H` 可调）——证据过期就退回 ⏳，
+不会拿旧数据冒充现在的结论。要刷新：
+
+```powershell
+cd D:\toagi\dotd; npm test    # 然后把 pass/fail 写进 docs/acceptance/s1-npmtest.json
+```
 
 ---
 
-## 六步现状
+## 五步现状
 
 | 步 | 判据（原文） | 实测 | 状态 |
 |---|---|---|---|
@@ -112,7 +138,7 @@ bash scripts/soak.sh report
 
 ---
 
-## 已知的产品级缺陷（不影响上面六步的判定）
+## 已知的产品级缺陷（不影响上面五步的判定）
 
 都记在 `docs/backlog.md`，这里只列会被验收人问到的：
 

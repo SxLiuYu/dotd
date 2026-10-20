@@ -1080,18 +1080,27 @@ _vg(){ SOAK_VERDICT=$FIX/rgv.jsonl bash scripts/verify-goal.sh "${@:3}" >$FIX/vg
   if [ "$e" = "$1" ]; then p=$((p+1)); printf "  ok   %-30s exit=%d\n" "$2" "$e";
   else f=$((f+1)); printf "  FAIL %-30s exit=%d 期望=%s\n" "$2" "$e" "$1"; fi }
 
-# 真实状态：S3/S4/S5 绿、S2 绿、S6 未满 7 天 → 必须是 exit 3（⏳），不是 0
-_vg 3 "总验收-真实态须是等不是过"
+# **2026-10-20 第 108 轮：S6 已移出目标范围，总验收的"真实态"变了。**
+# 原来：S1–S5 绿 + S6 未满 7 天 → exit 3（⏳ "还没到判的时候"）。
+# 现在：S6 只报告不判定 → S1–S5 绿就意味着 exit 0（目标达成）。
+# 判据改了，用例的期望值必须跟着改 —— 否则测的是旧契约。
+#
+# 但**"降级不等于没有出口"**：S6 那行仍然必须显示出来（带 ❌ 或 ⚠），
+# 只是不再影响退出码。下面同时验这两件事。
+_vg 0 "总验收-真实态须是过"
 # --json 不能改变退出码
 if bash scripts/verify-goal.sh --json >$FIX/vgj.out 2>&1; then e=0; else e=$?; fi
-if [ "$e" = "3" ] && grep -qa '"overall": 3' $FIX/vgj.out; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-json不改变判定";
+if [ "$e" = "0" ] && grep -qa '"overall": 0' $FIX/vgj.out; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-json不改变判定";
 else f=$((f+1)); printf "  FAIL %-30s exit=%s\n" "总验收-json不改变判定" "$e"; fi
-# 输出必须逐条给出「验法」，否则验收的人没法自己复现
-if grep -qa '验法：' $FIX/vg.out && [ "$(grep -ac '验法：' $FIX/vg.out)" -ge 6 ]; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-六步都给验法";
-else f=$((f+1)); printf "  FAIL %-30s\n" "总验收-六步都给验法"; fi
-# ⏳ 必须明说「不算通过」，否则会被读成差不多了
-if grep -qa '不算通过' $FIX/vg.out; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-⏳须声明不算过";
-else f=$((f+1)); printf "  FAIL %-30s\n" "总验收-⏳须声明不算过"; fi
+# 输出必须逐条给出「验法」，否则验收的人没法自己复现（5 步判据 + 1 项观测）
+if grep -qa '验法：' $FIX/vg.out && [ "$(grep -ac '验法：' $FIX/vg.out)" -ge 6 ]; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-五步都给验法";
+else f=$((f+1)); printf "  FAIL %-30s\n" "总验收-五步都给验法"; fi
+# **只报告的那一项必须仍然出现**，否则"移出目标"就变成了"悄悄删掉"
+if grep -qa '长期运行（观测）' $FIX/vg.out; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-观测项仍显示";
+else f=$((f+1)); printf "  FAIL %-30s\n" "总验收-观测项仍显示"; fi
+# 并且必须明说它「不参与结论」，否则会被读成通过了
+if grep -qa '只报告不判定' $FIX/vg.out; then p=$((p+1)); printf "  ok   %-30s\n" "总验收-观测项声明不判定";
+else f=$((f+1)); printf "  FAIL %-30s\n" "总验收-观测项声明不判定"; fi
 # 未知参数必须 exit 2（脚本自身错），不能悄悄当成功
 bash scripts/verify-goal.sh --nonsense >/dev/null 2>&1; [ "$?" = "2" ] && { p=$((p+1)); echo "  ok   总验收-未知参数exit2"; } || { f=$((f+1)); echo "  FAIL 总验收-未知参数exit2"; }
 
