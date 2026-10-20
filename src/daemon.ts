@@ -42,6 +42,7 @@ import { openDb, resolveDbPath } from '../db/conn.ts';
 import { MailService } from './mail/MailService.ts';
 import { CardRegistry, pushApprovalCard, resolveApprovalCard } from './surfaces/feishu-approval.ts';
 import { startProgressPush } from './surfaces/progress-push.ts';
+import { listEvents, listConflicts, renderList, renderConflicts } from './calendar/CalendarService.ts';
 import { buildApprovalCard } from './surfaces/feishu-card.ts';
 import { migrate } from '../db/migrate.ts';
 
@@ -1209,6 +1210,42 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       });
 
       log(`[mail] 邮件工具已注册（8 个），凭证加密密钥已加载`);
+
+  // ── 日历只读工具（T6，2026-10-20）──────────────────────────────
+  //
+  // 两个都是 read 档，因为这一版日历**没有任何写入方法**。
+  // 想加"创建日程"必须新开一个写档工具并走审批 ——
+  // 让读写共用同一个工具名等于把审批绕过去了。
+  //
+  // 为什么不需要密钥：读的是本地 .ics 文件。不连 Google/Outlook，
+  // 所以没有 OAuth、没有 token 过期、没有申请审核。
+  const calendarDir = join(cfg.dataDir, 'calendar');
+  try {
+    mkdirSync(calendarDir, { recursive: true });
+  } catch {
+    // 建不出来也不影响启动：listEvents 会如实报"目录不存在"
+  }
+
+  exec.registerHostTool('calendar.list', async (args) => {
+    const a = (args ?? {}) as { window_days?: unknown; source?: unknown };
+    const days =
+      typeof a.window_days === 'number' && a.window_days > 0 ? Math.min(365, Math.floor(a.window_days)) : 7;
+    const source = typeof a.source === 'string' ? a.source : undefined;
+    const r = listEvents({ dir: calendarDir }, Date.now(), days, source);
+    // 结果里总是带上文字版：模型拿到的就是能直接转告主人的人话，
+    // 不用自己再拼一遍（拼错了反而更糟）。
+    return { ok: true, value: { ...r, text: renderList(r) } };
+  });
+
+  exec.registerHostTool('calendar.conflicts', async (args) => {
+    const a = (args ?? {}) as { window_days?: unknown };
+    const days =
+      typeof a.window_days === 'number' && a.window_days > 0 ? Math.min(365, Math.floor(a.window_days)) : 7;
+    const r = listConflicts({ dir: calendarDir }, Date.now(), days);
+    return { ok: true, value: { ...r, text: renderConflicts(r) } };
+  });
+
+  log(`[calendar] 日历工具已注册（2 个，只读），日历目录：${calendarDir}`);
     } catch (e) {
       // 密钥格式不对 → 不注册，但要吼一声。静默降级会让人以为配好了。
       log(`[mail] 邮件工具未启用：${(e as Error).message}`);

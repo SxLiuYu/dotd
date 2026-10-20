@@ -162,3 +162,12 @@ tools:
 
   - name: mail.send
     tier: dangerous
+  # ── 日历（T6，2026-10-20）──────────────────────────────────────
+  #
+  # **两个都是 read 档**，因为这一版日历是纯只读的：没有任何写入方法。
+  # 想加"创建日程"必须新开一个写档工具并走审批 ——
+  # 让"读"和"写"共用同一个工具名，等于把审批绕过去了。
+  - name: calendar.list
+    tier: read
+  - name: calendar.conflicts
+    tier: read
