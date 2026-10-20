@@ -75,6 +75,14 @@ export interface FeishuConfig {
   /** 加密密钥（Encrypt Key）；设了就把请求体视为 AES 加密。 */
   encryptKey?: string;
   editThrottleMs: number;
+  /**
+   * API 根地址（T3，2026-10-20）。
+   * 默认 `https://open.feishu.cn`。存在的唯一理由是**让测试能拦**：
+   * 写这条时想让假服务器接住卡片请求，发现 URL 硬编码在 fetch 里，
+   * 根本没法注入 —— 于是测试只能连真飞书，那就不可能跑了。
+   * 生产永远不传。
+   */
+  apiBase?: string;
 }
 
 /** §3 `surfaces.ui`。 */

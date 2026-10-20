@@ -80,24 +80,15 @@ export async function resolveApprovalCard(
 }
 
 /**
- * 把「订阅 approval:created」这段接起来。
+ * ⚠️ 这里**刻意没有**「订阅 approval:created」的封装。
  *
- * 单独抽成函数而不是写在 daemon 里，是为了能单测：
- * 传一个假 bus 进来就能验"事件到了会不会发卡片"。
+ * 原因（实测踩过）：feishu-outbound.ts 已经订阅了同一个事件发纯文本审批通知。
+ * 我第一版在这里又开了一个订阅，结果同一条审批推两次 ——
+ * grep approval:created 命中两个订阅者就是证据。
+ *
+ * 正确做法：卡片能力**注入**给 feishu-outbound，由它二选一（卡片优先，文本兜底），
+ * 复用它已有的 claimAndSend 去重。见 daemon.ts 的 approvalCardSender。
  */
-export function wireApprovalCards(
-  bus: { on(topic: string, handler: (e: { payload: unknown }) => void | Promise<void>): () => void },
-  deps: ApprovalCardDeps,
-): () => void {
-  const sentCardIds = new Map<number, string>();
-
-  return bus.on('approval:created', async (e) => {
-    const view = e.payload as ApprovalView;
-    if (view === null || typeof view !== 'object' || typeof view.id !== 'number') return;
-    const mid = await pushApprovalCard(deps, view);
-    if (mid !== null) sentCardIds.set(view.id, mid);
-  });
-}
 
 /**
  * 记账：哪个审批单对应哪张卡片。

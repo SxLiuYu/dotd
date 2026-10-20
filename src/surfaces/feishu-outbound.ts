@@ -37,6 +37,19 @@ export interface FeishuSendPort {
 }
 
 export interface FeishuOutboundDeps {
+  /**
+   * T3（2026-10-20）：发审批卡片的能力。
+   * 注入 = 审批用带按钮的卡片；不注入 = 退回纯文本（旧行为）。
+   *
+   * **为什么二选一而不是都发**：
+   * 本文件已经订阅 approval:created 发纯文本。如果卡片另开一个订阅，
+   * 同一条审批会推两次 —— 实测确认过（grep approval:created 命中 daemon 和本文件）。
+   * 所以把卡片能力**注入进来**，在这里做一次判断：能发卡片就发卡片。
+   */
+  approvalCards?: {
+    chatId: string;
+    send(view: ApprovalView): Promise<{ ok: boolean; messageId?: string; error?: string }>;
+  };
   db: DatabaseSync;
   bus: EventBus;
   gateway: FeishuSendPort;
@@ -160,11 +173,38 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
   async function claimAndSend(
     key: string,
     build: () => Promise<{ chatId: string; text: string } | null>,
+    /**
+     * T3：如果给了审批单且装配层提供了卡片能力，就先试卡片。
+     * 卡片带同意/拒绝按钮 —— 这是 Muse 那种"点一下就办"的体验。
+     * 卡片失败才走 build() 的纯文本路径（退路必须留着）。
+     */
+    cardView?: ApprovalView,
   ): Promise<void> {
     if (sent.has(key) || inflight.has(key)) return;
     inflight.add(key);
     let claimed = false;
     try {
+      const cards = deps.approvalCards;
+      if (cardView !== undefined && cards !== undefined) {
+        const cr = await cards.send(cardView);
+        if (cr.ok) {
+          sent.set(key, Date.now());
+          claimed = true;
+          prune();
+          recordOutbound(deps.db, {
+            kind: 'approval_card',
+            dedupKey: key,
+            chatId: cards.chatId,
+            ok: true,
+            error: null,
+            textPreview: `审批 #${cardView.id} 卡片`,
+            at: new Date().toISOString(),
+          });
+          deps.log(`[feishu-outbound] 审批 #${cardView.id} 已发卡片`);
+          return;
+        }
+        deps.log(`[feishu-outbound] 审批 #${cardView.id} 卡片失败（${cr.error ?? '?'}），改发纯文本`);
+      }
       const out = await build();
       if (out === null) return;
       const res = await deps.gateway.sendText(out.chatId, out.text);
@@ -204,7 +244,10 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
 
   const unsubscribeApproval = deps.bus.on<ApprovalView>('approval:created', (ev) => {
     const view = ev.payload;
-    void claimAndSend(`approval:${view.id}`, () => approvalText(view));
+    // 优先发卡片（带同意/拒绝按钮）。发不出去才退回纯文本 —— 退路必须留着：
+    // 卡片接口变更、飞书限流、群 ID 变了，都可能让卡片失败，
+    // 但审批单已经在库里，主人得能通过某种方式知道"有东西要你决定"。
+    void claimAndSend(`approval:${view.id}`, () => approvalText(view), view);
   });
 
   /**

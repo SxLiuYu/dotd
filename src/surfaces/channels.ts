@@ -259,7 +259,9 @@ export class FeishuGateway {
   /** 自建应用鉴权：tenant_access_token（有效期 2h，提前 5min 刷新）。 */
   private async accessToken(): Promise<string> {
     if (this.token !== null && Date.now() < this.tokenExpiresAt - 5 * 60 * 1000) return this.token;
-    const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    const res = await fetch(
+      `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/auth/v3/tenant_access_token/internal`,
+      {
       method: 'POST',
       headers: { 'content-type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ app_id: this.deps.appId, app_secret: this.deps.appSecret }),
@@ -302,19 +304,22 @@ export class FeishuGateway {
   async sendCard(chatId: string, card: unknown): Promise<{ ok: boolean; messageId?: string; error?: string }> {
     try {
       const token = await this.accessToken();
-      const res = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json; charset=utf-8',
-          authorization: `Bearer ${token}`,
+      const res = await fetch(
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/messages?receive_id_type=chat_id`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            receive_id: chatId,
+            msg_type: 'interactive',
+            content: JSON.stringify(card),
+          }),
+          signal: AbortSignal.timeout(10_000),
         },
-        body: JSON.stringify({
-          receive_id: chatId,
-          msg_type: 'interactive',
-          content: JSON.stringify(card),
-        }),
-        signal: AbortSignal.timeout(10_000),
-      });
+      );
       const json = (await res.json()) as {
         code?: number;
         msg?: string;
@@ -338,7 +343,7 @@ export class FeishuGateway {
     try {
       const token = await this.accessToken();
       const res = await fetch(
-        `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
         {
           method: 'PATCH',
           headers: {
@@ -362,7 +367,9 @@ export class FeishuGateway {
   async sendText(chatId: string, text: string): Promise<DeliverResult> {
     try {
       const token = await this.accessToken();
-      const res = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+      const res = await fetch(
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/messages?receive_id_type=chat_id`,
+        {
         method: 'POST',
         headers: {
           'content-type': 'application/json; charset=utf-8',

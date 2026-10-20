@@ -916,31 +916,27 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
 
   // ④-a 审批卡片（T3，2026-10-20）
   //
-  // 为什么在这里：gate.insertApproval 结尾已经 publish('approval:created')，
-  // 旁听它就行，不用改治理代码（治理是安全边界，动它风险最大）。
+  // **注意：这里不订阅 approval:created。**
+  // feishu-outbound.ts 已经订阅了同一个事件发纯文本审批通知。两个订阅者
+  // 会导致同一条审批推两次 —— 实测发现（grep approval:created 见两处）。
   //
-  // 为什么失败只记日志：审批单已经在库里了，卡片发不出去不影响裁决，
-  // 主人还能从 /approvals 处理。把通知失败升级成任务失败是错的 ——
-  // 那会让"飞书挂了"变成"活干不了"。
+  // 所以卡片能力注入给 feishu-outbound，由它**二选一**：
+  //   能发卡片就发卡片（带按钮），发不出去才退回纯文本。
+  // 去重交给它的 claimAndSend（同一 approvalId 只发一次）。
   const cardRegistry = new CardRegistry();
   const ownerChatForApproval =
     surfCfg.feishu.ownerChatId?.split(',').map((x) => x.trim()).filter((x) => x.length > 0)[0] ?? '';
-  if (feishuGw !== NULL_FEISHU_GATEWAY && ownerChatForApproval !== '') {
-    bus.on('approval:created', async (e) => {
-      const view = e.payload as import('./shared/contracts.ts').ApprovalView;
-      if (view === null || typeof view !== 'object' || typeof view.id !== 'number') return;
-      const r = await feishuGw.sendCard(ownerChatForApproval, buildApprovalCard(view));
-      if (r.ok) {
-        if (r.messageId !== undefined) cardRegistry.set(view.id, r.messageId);
-        log(`[approval-card] 审批 #${view.id} 已推送到飞书（${view.tier ?? '?'}）`);
-      } else {
-        log(`[approval-card] 审批 #${view.id} 推送失败：${r.error ?? '?'}（审批单仍在 /approvals 可处理）`);
-      }
-    });
-    log('[approval-card] 审批卡片已启用（危险操作会弹到飞书）');
-  } else {
-    log('[approval-card] 审批卡片未启用（缺飞书凭据或 owner_chat_id），走旧的 /approvals 路径');
-  }
+  const approvalCardSender =
+    feishuGw !== NULL_FEISHU_GATEWAY && ownerChatForApproval !== ''
+      ? {
+          chatId: ownerChatForApproval,
+          send: async (view: import('./shared/contracts.ts').ApprovalView) => {
+            const r = await feishuGw.sendCard(ownerChatForApproval, buildApprovalCard(view));
+            if (r.ok && r.messageId !== undefined) cardRegistry.set(view.id, r.messageId);
+            return r;
+          },
+        }
+      : undefined;
 
   // ④ MR（TaskImpact 由 CP 提供，契约 T2；channels = 上面的 SF 适配器）
   const router = ModelRouter.load({
@@ -1360,6 +1356,8 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           bus,
           gateway: feishuGw,
           log,
+          // T3：能发卡片就发卡片，发不出去才退回纯文本（避免重复推送）
+          ...(approvalCardSender !== undefined ? { approvalCards: approvalCardSender } : {}),
           // 系统级通知（如 dot 被隔离）发到主人默认会话的第一个 chat
           fallbackChatId:
             surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0] ?? null,
