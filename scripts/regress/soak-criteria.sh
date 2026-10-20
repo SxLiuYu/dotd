@@ -1396,5 +1396,38 @@ else
   p=$((p+1)); printf "  ok   %-30s\n" "文档-不得有『现在的』标题"
 fi
 
+# ===== 第 108 轮新增：非 cron 采样必须被看见 =====
+# 教训：`soak.sh:2467` 是 `case "${1:-sample}"` —— **不带参数 = 执行 sample**。
+# 第 108 轮我为了验「cron 的最小环境能不能跑通」，裸跑了一次，
+# 于是窗口里多了一条 11:18:00 的点，采样密度从 100% 虚高到 120%。
+# 数据没删（删就是篡改证据），但必须让验收人看得见。
+# 这条用例锁住：verify-goal.sh 能把「非整点采样」报出来。
+# **不要在一条断言里用 && 串起两个不同文件的判断**（第 108 轮踩到）。
+# 第一版写 `[ -f soak-notes.md ] && grep 11:18:00 && grep '非 cron' NO-ARG-TRAP.md`，
+# 结果 FAIL —— 而前两个条件都是真的，只是 NO-ARG-TRAP.md 里我写的是
+# 「不会报错，不会提示，不会问你要不要」而不是「非 cron」。
+# **断言的用词和文档的用词没对上，而 && 让我看不出是哪个条件挂了。**
+# 拆成两条独立断言，各自只问一件事。
+if [ -f docs/acceptance/soak-notes.md ] \
+&& grep -qa '11:18:00' docs/acceptance/soak-notes.md; then
+  p=$((p+1)); printf "  ok   %-30s\n" "旁注-污染事件有记录"
+else
+  f=$((f+1)); printf "  FAIL %-30s\n" "旁注-污染事件有记录"
+fi
+# `verify-goal.sh` 里必须有这条检测（用 grep 找它的特征字符串，不真跑）
+if grep -qa '非 cron 整点采样' scripts/verify-goal.sh; then
+  p=$((p+1)); printf "  ok   %-30s\n" "旁注-verify-goal会报非整点"
+else
+  f=$((f+1)); printf "  FAIL %-30s\n" "旁注-verify-goal会报非整点"
+fi
+# **裸跑 soak.sh 等于写数据**，这个陷阱必须在文档里写明白
+# 文档必须说清「无参数 = 写一行」，而不只是贴一行代码
+if grep -qa '1:-sample' docs/acceptance/NO-ARG-TRAP.md \
+&& grep -qaE '不带任何参数|追加一行|写一行' docs/acceptance/NO-ARG-TRAP.md; then
+  p=$((p+1)); printf "  ok   %-30s\n" "旁注-裸跑陷阱有文档"
+else
+  f=$((f+1)); printf "  FAIL %-30s\n" "旁注-裸跑陷阱有文档"
+fi
+
 echo "  合计 $p 通过 / $f 失败"
 [ "$f" = "0" ] && exit 0 || exit 1

@@ -251,11 +251,44 @@ fi
 if [ -z "$S6_SUM" ]; then S6_SUM="详见 /tmp/verify-goal-s6.log"; fi
 S6_RED=$(grep -ac '❌' /tmp/verify-goal-s6.log 2>/dev/null || echo 0)
 S6_WARN=$(grep -ac '⚠' /tmp/verify-goal-s6.log 2>/dev/null || echo 0)
+# **旁注：窗口里有没有「非 cron 整点」的采样点**（2026-10-20 第 108 轮补）。
+# 第 108 轮我裸跑了一次 `soak.sh`（`case "${1:-sample}"` 让无参数 = 执行 sample），
+# 于是窗口里多了一条 11:18:00 的点，采样密度从 100% 虚高到 120%。
+# 数据没删（删就是篡改证据），但**必须让验收人看得见**，不能只躺在 soak-notes.md 里。
+S6_OFFGRID=""
+if [ -f docs/acceptance/soak.jsonl ]; then
+  S6_OFFGRID=$(node -e '
+const fs=require("fs");
+try{
+  const L=fs.readFileSync("docs/acceptance/soak.jsonl","utf8").split("\n").filter(Boolean).map(JSON.parse);
+  const s=L.filter(x=>x.kind!=="probe");
+  if(!s.length){ console.log(""); process.exit(0); }
+  s.sort((a,b)=>a.ts-b.ts);
+  // 第一条是窗口起算点（必非整点），跳过；其余应当落在 :00 或 :30 且秒数 <=5
+  const off=s.slice(1).filter(r=>{
+    const d=new Date((r.ts+8*3600)*1000);
+    const m=d.getUTCMinutes(), sec=d.getUTCSeconds();
+    return !((m===0||m===30) && sec<=5);
+  });
+  if(off.length){
+    const f=off[0];
+    const t=new Date((f.ts+8*3600)*1000).toISOString().slice(5,19).replace("T"," ");
+    console.log(off.length+" 条非 cron 整点采样，最早 "+t);
+  } else console.log("");
+}catch(e){ console.log(""); }
+' 2>/dev/null)
+fi
+if [ -n "$S6_OFFGRID" ]; then
+  echo "  ⚠ S6 窗口里有 $S6_OFFGRID —— 不是 cron 产生的（明细见 docs/acceptance/soak-notes.md）" >&2
+  S6_SUM="$S6_SUM；⚠ 另有 $S6_OFFGRID"
 case "$S6_RC" in
   0) row "S6 长期运行" PASS "7 天窗口通过（另有 ⚠ $S6_WARN 条提示）" "soak.sh report" ;;
   3) row "S6 长期运行" WAIT "$S6_SUM" "soak.sh report" ;;
   *) row "S6 长期运行" FAIL "$S6_SUM（$S6_RED 条 ❌，详见 /tmp/verify-goal-s6.log）" "soak.sh report" ;;
 esac
+
+
+fi
 
 # ─── 汇总 ───
 echo ""
