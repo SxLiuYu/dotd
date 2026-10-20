@@ -25,6 +25,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ControlPlane, MemoryPort, RawInbound } from '../shared/contracts.ts';
 import { DEFAULT_DOT_ID } from '../shared/ids.ts';
 import { feishuDedupKey } from './types.ts';
+import { parseCardAction } from './feishu-card.ts';
 import type { FeishuConfig } from './types.ts';
 
 // ── 纯函数：解析 + 判别（可单测，不碰 IO）────────────────────────────
@@ -67,6 +68,22 @@ export type FeishuInboundDecision =
    *  **不进** CP 事件管线——§6 匹配器会照 payload 建 tk_ev_* 重复任务
    *  （WSL 冒烟实测）。 */
   | { kind: 'ignore'; reason: 'bot_echo' | 'non_text'; detail: string; eventId: string }
+  /**
+   * 卡片按钮回调（T3，2026-10-20）。
+   * 和 message 分开是刻意的：审批回调**绝不能**走任务事件流（GOV §铁律：审批回复不进流）。
+   * 走同一条路意味着"点同意"会变成一条聊天消息，然后被当成新任务 —— 荒谬且危险。
+   */
+  | {
+      kind: 'card_action';
+      dedupKey: string;
+      eventId: string;
+      approvalId: number;
+      verdict: 'approve' | 'reject';
+      /** 卡片的 message_id，落定后要拿它改卡片 */
+      cardMessageId: string;
+      chatId: string;
+      operatorId: string;
+    }
   /** 拒绝：reason 进 surf_ingress_rejects。 */
   | { kind: 'reject'; reason: 'auth' | 'allowlist' | 'parse'; detail: string };
 
@@ -120,6 +137,46 @@ export function classifyFeishuInbound(
   const dedupKey = feishuDedupKey(eventId);
   const dotId = cfg.dotId ?? DEFAULT_DOT_ID;
   const actor = `feishu:${eventType || 'event'}`;
+
+  // ── 卡片按钮回调（T3）──────────────────────────────────────────
+  //
+  // 飞书把按钮点击作为 `card.action.trigger` 事件推过来，payload 在 ev.event 里。
+  // **必须在 3 秒内响应**，否则飞书重试 —— 我们在这里只做解析，真正的
+  // decide() 由调用方异步做（handleFeishuCallback 的返回值就是响应内容）。
+  if (eventType === 'card.action.trigger') {
+    const raw = (ev.event ?? {}) as Record<string, unknown>;
+    const operator = (raw['operator'] ?? {}) as Record<string, unknown>;
+    const operatorId = typeof operator['open_id'] === 'string' ? (operator['open_id'] as string) : '';
+    const context = (raw['context'] ?? {}) as Record<string, unknown>;
+    const chatId = typeof context['open_chat_id'] === 'string' ? (context['open_chat_id'] as string) : '';
+    const cardMessageId = typeof context['open_message_id'] === 'string' ? (context['open_message_id'] as string) : '';
+    const action = (raw['action'] ?? {}) as Record<string, unknown>;
+
+    const parsed = parseCardAction(action['value']);
+    if (parsed === null) {
+      return { kind: 'ignore', reason: 'non_text', detail: '卡片回调但不是审批按钮', eventId };
+    }
+
+    // 主人闸门同样要过。卡片能被别人转发出去，不能因为"点了按钮"就跳过校验。
+    if (cfg.ownerChatId === undefined || cfg.ownerChatId.length === 0) {
+      return { kind: 'reject', reason: 'allowlist', detail: 'owner_chat_id 未配置，拒卡片回调' };
+    }
+    const owners = new Set(cfg.ownerChatId.split(',').map((x) => x.trim()).filter((x) => x.length > 0));
+    if (chatId !== '' && !owners.has(chatId)) {
+      return { kind: 'reject', reason: 'allowlist', detail: `chat_id ${chatId} 非主人会话` };
+    }
+
+    return {
+      kind: 'card_action',
+      dedupKey,
+      eventId,
+      approvalId: parsed.approvalId,
+      verdict: parsed.verdict,
+      cardMessageId,
+      chatId,
+      operatorId,
+    };
+  }
 
   if (eventType === 'im.message.receive_v1') {
     const msg = (ev.event ?? {}) as Record<string, unknown>;
@@ -376,6 +433,21 @@ export interface FeishuInboundDeps {
    * 图片下载器（2026-10-18 多模态）。不注入 = 图片消息按纯文本处理（行为与改动前一致）。
    * 装配层传 feishu-media.ts 的实现。
    */
+  /**
+   * 审批回调的处理能力（T3，2026-10-20）。
+   * 不注入 = 卡片按钮回调按 ignore 处理（保持旧行为，不影响未升级的装配）。
+   * 为什么不直接 import decide()：那会让 feishu-inbound 反向依赖 governance，
+   * 而现在它是纯解析层（可单独测）。注入保持了这条边界。
+   */
+  approval?: {
+    decide(
+      approvalId: number,
+      verdict: 'approve' | 'reject',
+      operatorId: string,
+    ): Promise<{ ok: boolean; status?: string; reason?: string }>;
+    /** 落定后改卡片（去掉按钮）。失败不影响裁决本身。 */
+    resolveCard?(cardMessageId: string, approvalId: number): Promise<void>;
+  };
   media?: {
     downloadImage(
       imageKey: string,
@@ -412,6 +484,8 @@ export type FeishuInboundResult =
   | { httpStatus: 200; body: { ignored: true; eventId: string } }
   | { httpStatus: 202; body: { taskId: string; threadId: string } }
   | { httpStatus: 202; body: { eventId: number; dup: false; ack: true } }
+  | { httpStatus: 200; body: { decided: true; approvalId: number; status: string } }
+  | { httpStatus: 200; body: { ignored: true; reason: string } }
   | { httpStatus: 400 | 401 | 403; body: { error: 'parse' | 'auth' | 'allowlist'; message: string } };
 
 /**
@@ -437,6 +511,32 @@ export async function handleFeishuCallback(
         httpStatus: decision.reason === 'auth' ? 401 : decision.reason === 'allowlist' ? 403 : 400,
         body: { error: decision.reason, message: decision.detail },
       };
+    case 'card_action': {
+      // 去重：飞书会重投按钮点击（尤其网络慢时）。同一 event_id 只处理一次。
+      if (!claimFeishuMessage(deps.db, decision.dedupKey, 'feishu:card', Date.now())) {
+        return { httpStatus: 200, body: { ignored: true, reason: 'dup' } };
+      }
+      if (deps.approval === undefined) {
+        // 装配层没接审批能力 —— 如实忽略，不假装点了。
+        return { httpStatus: 200, body: { ignored: true, reason: 'approval_not_wired' } };
+      }
+      const r = await deps.approval.decide(decision.approvalId, decision.verdict, decision.operatorId);
+      if (!r.ok) {
+        return { httpStatus: 200, body: { ignored: true, reason: r.reason ?? 'decide_failed' } };
+      }
+      // 改卡片：把按钮换成结果。失败也不回滚裁决（裁决已经落库了）。
+      if (deps.approval.resolveCard !== undefined && decision.cardMessageId !== '') {
+        try {
+          await deps.approval.resolveCard(decision.cardMessageId, decision.approvalId);
+        } catch {
+          /* 卡片改不动不影响结论 */
+        }
+      }
+      return {
+        httpStatus: 200,
+        body: { decided: true, approvalId: decision.approvalId, status: r.status ?? 'unknown' },
+      };
+    }
     case 'message': {
       // 去重先行（SF 私有表，理由见 claimFeishuMessage）：重投不再建任务。
       if (!claimFeishuMessage(deps.db, decision.dedupKey, decision.raw.actor, Date.now())) {

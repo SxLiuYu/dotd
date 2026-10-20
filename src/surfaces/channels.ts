@@ -293,6 +293,71 @@ export class FeishuGateway {
     }
   }
 
+  /**
+   * 发一张交互卡片（T3）。
+   * 返回 message_id —— 后续要拿它改卡片（审批完把按钮换掉）。
+   * 为什么需要 message_id：不换掉的话主人会对着旧卡片反复点，
+   * 重复点击会被 gate 判成"迟到裁决"，虽然安全但体验很差。
+   */
+  async sendCard(chatId: string, card: unknown): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+    try {
+      const token = await this.accessToken();
+      const res = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const json = (await res.json()) as {
+        code?: number;
+        msg?: string;
+        data?: { message_id?: string };
+      };
+      if (json.code !== 0) {
+        return { ok: false, error: `飞书 code=${json.code} msg=${json.msg ?? '?'}` };
+      }
+      this.lastOkAtMs = Date.now();
+      return { ok: true, messageId: json.data?.message_id };
+    } catch (cause) {
+      return { ok: false, error: String(cause) };
+    }
+  }
+
+  /**
+   * 改写已经发出去的卡片（PATCH /im/v1/messages/:id）。
+   * 审批落定后调它，把"同意/拒绝"按钮换成结果 —— 卡片就不可再点了。
+   */
+  async updateCard(messageId: string, card: unknown): Promise<DeliverResult> {
+    try {
+      const token = await this.accessToken();
+      const res = await fetch(
+        `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ content: JSON.stringify(card) }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const json = (await res.json()) as { code?: number; msg?: string };
+      if (json.code !== 0) return { ok: false, error: `飞书 code=${json.code} msg=${json.msg ?? '?'}` };
+      this.lastOkAtMs = Date.now();
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: String(cause) };
+    }
+  }
+
   /** 发送文本消息（§5.7 同款 3 次快重试由调用方编排，这里只发一次）。 */
   async sendText(chatId: string, text: string): Promise<DeliverResult> {
     try {

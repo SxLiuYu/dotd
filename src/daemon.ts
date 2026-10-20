@@ -40,6 +40,8 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { openDb, resolveDbPath } from '../db/conn.ts';
 import { MailService } from './mail/MailService.ts';
+import { CardRegistry, pushApprovalCard, resolveApprovalCard } from './surfaces/feishu-approval.ts';
+import { buildApprovalCard } from './surfaces/feishu-card.ts';
 import { migrate } from '../db/migrate.ts';
 
 import { EventBus } from './shared/bus.ts';
@@ -910,6 +912,34 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       if (ok) log('[surfaces] 飞书凭证校验通过（求救可走飞书）');
       else log('[surfaces] 飞书凭证预热失败（求救暂落 OUTBOX，待后续成功发送置位）');
     });
+  }
+
+  // ④-a 审批卡片（T3，2026-10-20）
+  //
+  // 为什么在这里：gate.insertApproval 结尾已经 publish('approval:created')，
+  // 旁听它就行，不用改治理代码（治理是安全边界，动它风险最大）。
+  //
+  // 为什么失败只记日志：审批单已经在库里了，卡片发不出去不影响裁决，
+  // 主人还能从 /approvals 处理。把通知失败升级成任务失败是错的 ——
+  // 那会让"飞书挂了"变成"活干不了"。
+  const cardRegistry = new CardRegistry();
+  const ownerChatForApproval =
+    surfCfg.feishu.ownerChatId?.split(',').map((x) => x.trim()).filter((x) => x.length > 0)[0] ?? '';
+  if (feishuGw !== NULL_FEISHU_GATEWAY && ownerChatForApproval !== '') {
+    bus.on('approval:created', async (e) => {
+      const view = e.payload as import('./shared/contracts.ts').ApprovalView;
+      if (view === null || typeof view !== 'object' || typeof view.id !== 'number') return;
+      const r = await feishuGw.sendCard(ownerChatForApproval, buildApprovalCard(view));
+      if (r.ok) {
+        if (r.messageId !== undefined) cardRegistry.set(view.id, r.messageId);
+        log(`[approval-card] 审批 #${view.id} 已推送到飞书（${view.tier ?? '?'}）`);
+      } else {
+        log(`[approval-card] 审批 #${view.id} 推送失败：${r.error ?? '?'}（审批单仍在 /approvals 可处理）`);
+      }
+    });
+    log('[approval-card] 审批卡片已启用（危险操作会弹到飞书）');
+  } else {
+    log('[approval-card] 审批卡片未启用（缺飞书凭据或 owner_chat_id），走旧的 /approvals 路径');
   }
 
   // ④ MR（TaskImpact 由 CP 提供，契约 T2；channels = 上面的 SF 适配器）
