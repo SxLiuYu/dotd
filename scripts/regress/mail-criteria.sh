@@ -39,12 +39,18 @@ t "IMAP 客户端存在"                   test -f src/mail/imap.ts
 t "SMTP 客户端存在"                   test -f src/mail/smtp.ts
 t "服务层存在"                        test -f src/mail/MailService.ts
 
-# ── 2. 迁移能真跑到 160 ────────────────────────────────────────
+# ── 2. 迁移能真跑到 daemon 声明的版本 ────────────────────────────
 cat > /tmp/vg-schema.ts <<'NODE'
 import { openDb } from '/root/dotd/db/conn.ts';
 import { migrate } from '/root/dotd/db/migrate.ts';
 const db = openDb('/tmp/vg-schema.db');
-migrate(db, { expectedVersion: 160 });
+// 版本号从 daemon.ts 读，不硬编码 —— 否则每加一个迁移包就要回来改这个脚本
+const V = (() => {
+  const src = require('fs').readFileSync('src/daemon.ts', 'utf8');
+  const m = /expectedVersion:\s*(\d+)/.exec(src);
+  return m === null ? -1 : Number(m[1]);
+})();
+migrate(db, { expectedVersion: V });
 const v = db.prepare('PRAGMA user_version').get() as { user_version: number };
 const tables = ['mail_accounts','mail_drafts','mail_messages'];
 let bad = 0;
@@ -53,12 +59,12 @@ for (const t of tables) {
   if (r.n === 0) bad++;
 }
 db.close();
-console.log(v.user_version === 160 && bad === 0 ? 'OK' : 'BAD');
+console.log(v.user_version === V && bad === 0 ? 'OK' : 'BAD ' + v.user_version + ' vs ' + V);
 NODE
 rm -f /tmp/vg-schema.db
 SCHEMA_OUT=$(node --import tsx /tmp/vg-schema.ts 2>/dev/null | tail -1)
 
-t "迁移跑到 user_version=160"          test "$SCHEMA_OUT" = "OK"
+t "迁移跑到 daemon 声明的版本"        test "$SCHEMA_OUT" = "OK"
 t "三张邮件表都建出来了"                test -n "$SCHEMA_OUT"
 
 # ── 3. 工具已登记（tools.yml）──────────────────────────────────
@@ -122,12 +128,14 @@ const mail = y.tools.filter((t) => String(t.name).startsWith('mail.'));
 const want = ['mail.account.add','mail.account.list','mail.account.remove',
               'mail.list','mail.read','mail.search','mail.draft','mail.send'];
 const sorted = mail.map((m) => m.name).sort();
-console.log(y.tools.length === 27 && sorted.length === 8 &&
+// 总数只做下界检查：工具会持续增加（T6 加了 2 个日历工具），
+// 写死具体数字只会让这个判据每加一个工具就红一次。
+console.log(y.tools.length >= 27 && sorted.length === 8 &&
   want.every((w) => sorted.includes(w)) ? 'OK' : 'BAD ' + y.tools.length + ' ' + sorted.join(','));
 NODE
 YAML_OUT=$(node .vg-yaml.mjs 2>&1 | tail -1)
 rm -f .vg-yaml.mjs
-t "tools.yml 可解析且总数=27"           test "$YAML_OUT" = "OK"
+t "tools.yml 可解析且含 8 个邮件工具"  test "$YAML_OUT" = "OK"
 t "8 个邮件工具都在目录里"              test "${YAML_OUT%% *}" = "OK"
 
 # ── 10. daemon 真跑起来时会打这行日志 ──────────────────────────
