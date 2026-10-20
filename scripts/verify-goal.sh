@@ -17,6 +17,13 @@
 # 用法：
 #   bash scripts/verify-goal.sh          # 只读判定（用现有证据）
 #   bash scripts/verify-goal.sh --run    # 先跑 S3/S4/S5 再判定（S6 永远只读）
+#
+# ⚠ **`--run` 会破坏正在进行的 S6 观测**（2026-10-20 第 103 轮补，真风险）。
+#   它内含 recovery.sh，会真的 `docker stop` 容器、`kill -9` daemon。
+#   如果此刻 S6 的 7 天窗口正在计时，那这些动作就是**人工制造的中断**：
+#   窗口里会多出重启记录，而 soak.sh 会要求它们都能找到自愈证据才认"无人工干预"。
+#   所以：**S6 窗口进行中只用默认（只读）模式**；`--run` 留到窗口开始之前，
+#   或者明知道要重来一次窗口的时候再用。
 #   bash scripts/verify-goal.sh --json   # 附带机器可读输出
 #
 # 退出码：0=六步全过  1=有步骤不通过  3=有步骤还没到判的时候  2=脚本自身出错
@@ -36,6 +43,29 @@ done
 
 ACC="${DOTD_ACCEPT_DIR:-docs/acceptance}"
 export DOTD_ACCEPT_DIR="$ACC"
+
+# ── `--run` 的护栏（第 103 轮补）──
+# `--run` 里有 recovery.sh，会真的停容器、kill daemon。
+# 如果正在做 7 天窗口观测，这就是人为制造的中断，而且事后很难解释。
+# 所以：默认**拒绝**在「窗口已开始且未满 7 天」时跑 --run，
+# 除非显式设置 DOTD_ALLOW_DISRUPT=1（表示"我知道，我要重来"）。
+if [ "$RUN" -eq 1 ] && [ "${DOTD_ALLOW_DISRUPT:-0}" != "1" ]; then
+  _d0f="$ACC/soak-day0.txt"
+  if [ -f "$_d0f" ]; then
+    _d0=$(cut -d' ' -f3 "$_d0f" 2>/dev/null)
+    _now=$(date +%s)
+    if [ -n "$_d0" ] && [ "$_now" -ge "$_d0" ] && [ $(( _now - _d0 )) -lt $(( 7*86400 )) ]; then
+      _el=$(awk -v e=$(( _now - _d0 )) 'BEGIN{printf "%.2f", e/86400}')
+      echo "❌ 拒绝执行 --run：S6 的 7 天窗口正在进行（已走 ${_el} 天 / 7 天）。" >&2
+      echo "   --run 会跑 recovery.sh，真的停容器、kill daemon —— 那会成为窗口里的人为中断。" >&2
+      echo "   · 只想看现在六步什么状态 → 去掉 --run（默认只读）：" >&2
+      echo "       bash scripts/verify-goal.sh" >&2
+      echo "   · 确定要重来一次 7 天窗口 → 显式确认：" >&2
+      echo "       DOTD_ALLOW_DISRUPT=1 bash scripts/verify-goal.sh --run" >&2
+      exit 2
+    fi
+  fi
+fi
 
 ROWS=()
 OVERALL=0
@@ -182,9 +212,19 @@ case "$S4_RC" in
 esac
 
 # ─── S5 故障自恢复：3/3，<5 分钟 ───
-if [ "$RUN" -eq 1 ]; then
+if [ "$RUN" -eq 1 ] && [ "${DOTD_ALLOW_DISRUPT:-0}" = "1" ]; then
+  # **第二道护栏**（第 103 轮补，因为我自己踩了）。这里才是真的会 kill 东西的地方。
+  # 外层护栏拦的是"窗口进行中 + --run"，但只要 DOTD_ALLOW_DISRUPT=1 就放行了 ——
+  # 而第 103 轮我为了让"放行逻辑能验到"，真的写了 DOTD_ALLOW_DISRUPT=1，
+  # 于是 recovery.sh 当场开始杀容器。
+  # 教训：**危险动作的确认粒度不能等于"我想验证它没写错"**。
+  # 看放行与否，用 `DOTD_DRYRUN_S5=1` —— 它只打印、不执行。
+  if [ "${DOTD_DRYRUN_S5:-0}" = "1" ]; then
+    echo "  ⏭ S5 试运行（DOTD_DRYRUN_S5=1）：本来会跑 recovery.sh，现在只打印" >&2
+  else
   echo "▸ S5：注入 3 种故障（会真的 stop 容器 / 断网关 / kill daemon）…"
   DOTD_ACCEPT_DIR="$ACC" bash scripts/recovery.sh >/tmp/verify-goal-s5.log 2>&1 || true
+  fi
 fi
 DOTD_ACCEPT_DIR="$ACC" bash scripts/recovery.sh --judge >/dev/null 2>&1; S5_RC=$?
 S5_SUM=$(node --disable-warning=ExperimentalWarning -e '
