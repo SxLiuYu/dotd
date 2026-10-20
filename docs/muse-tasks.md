@@ -204,3 +204,88 @@ export DOTD_MAIL_KEY=$(openssl rand -base64 32)
 - **不持久化"审批单 ↔ 卡片 message_id"**：进程重启就丢。重启后旧卡片按钮点了会走 gate 的"找不到审批单"路径并被如实拒绝，不会误执行。要持久化得加一张表，当前收益不值。
 
 ---
+
+---
+
+## T4 主动发起对话
+
+**目标**：dotd 能在主人没说话时主动发起对话，但**不烦人**。
+
+### 判据 / 实测 / 结论
+
+| # | 判据 | 实测 | 结论 |
+|---|---|---|---|
+| 1 | 定时任务的结果能主动发到飞书 | 2026-10-19 的 `fallbackChatId` 已覆盖（非飞书会话改投主人默认会话） | ✅ 既有 |
+| 2 | 有**开/关**，且升级后不会突然开始发消息 | `proactive` 默认 0，验收脚本实测新插入的行默认关 | ✅ |
+| 3 | 安静时段内不推 | `'23:00-07:30'` 跨午夜实测：23:30 在内、03:00 在内、07:29 在内、07:30 出界 | ✅ |
+| 4 | 同话题不在 N 小时内重复推 | `last_push_at` + `throttle_hours`（默认 6h），实测 2h 前推过 → 拒；7h 前 → 放行 | ✅ |
+| 5 | 节流重启后不失效 | `last_push_at` 落库不是放内存 | ✅ |
+| 6 | 格式错的安静时段不误伤 | `parseQuietHours` 返回 null → 按"没有安静时段"处理 | ✅ |
+| 7 | 拒绝时给人话解释 | 四种拒绝理由都有 `detail`，验收脚本断言 | ✅ |
+
+**验收脚本**：`bash scripts/regress/proactive-criteria.sh` → **19/19，exit 0**
+**单元判据**：`tests/proactive.test.ts` → **30/30**
+
+### 关键设计：不推送 ≠ 不执行
+
+这是 T4 最容易做错的地方。
+
+| 情形 | 任务执行 | 结果推送 |
+|---|---|---|
+| `quiet_hours` 命中 | ❌ 不执行（`advance` 掉，标 `skipped_quiet`，既有行为） | ❌ |
+| `proactive = 0` | ✅ **照常执行** | ❌ 不推 |
+| `throttle_hours` 内已推过 | ✅ **照常执行** | ❌ 不推 |
+
+为什么必须区分：定时任务的价值常常在**副作用**（写文件、更新记忆、刷新缓存），结果本身不值得打扰主人。如果把"不推送"实现成"不执行"，沉默就变成了功能缺失 —— 主人关掉推送后发现事情也没做。
+
+### 三道闸的顺序
+
+```
+① 有没有目标会话  → no_target
+② 开关开没开      → disabled
+③ 在不在安静时段  → quiet_hours
+④ 节流窗口过没过  → throttled
+```
+
+顺序是刻意的：先查最便宜、最常见的拒绝理由。这样日志里"为什么没推"总是指向**最根本**的原因 —— 一个没开主动推送的任务，不该留下"被节流"这种让人误会的话。
+
+### 做了什么
+
+| 文件 | 内容 |
+|---|---|
+| `db/migrations/170_proactive.sql` | `crontabs` 加 `proactive`（默认 0）/ `throttle_hours`（默认 6）/ `last_push_at`，加部分索引 |
+| `src/surfaces/proactive.ts`（新增 140 行） | 三道闸的纯函数，`now` 传参所以可测 |
+| `src/control-plane/types.ts` | `CrontabRow` 加 3 字段 + 语义注释 |
+| `src/control-plane/index.ts` | `fireHeartbeat` 里判定并落 `last_push_at`，结论随 payload 传给下游 |
+| `src/daemon.ts` | `expectedVersion` 160 → 170 |
+| `tests/proactive.test.ts`（新增 165 行） | 30 条，重点盯跨午夜 |
+| `scripts/regress/proactive-criteria.sh`（新增 19 条） | 含"迁移从 0 跑到 170 且字段齐"、"默认关"两条端到端 |
+
+### 顺手修的一个既有 bug（花了三小时）
+
+`db/template.ts` 的 `buildSchemaScript()` 用 `/^\s*ALTER\s+TABLE/` 匹配语句来给建表语句归组，但 `db/migrate.ts` 的 `splitStatements()` 按分号切分、**注释会粘在它后面那条语句前面**。
+
+于是带注释的 `ALTER` 匹配不上 → 整段落进 `others` → 排到所有 `CREATE TABLE` 之前执行 → `Error: no such table: crontabs` → 模板库建不出来 → **所有用模板的测试一起红**，而报错只指向"表不存在"，完全看不出是注释的锅。
+
+`150_crontab_once.sql` 撞巧躲过：它只有一条 `ALTER`，落进 `others` 后被追加在末尾，那时表已经建好。170 有三条 `ALTER` 就必踩。
+
+修法：`buildSchemaScript()` 先用 `leadingComment()` 剥掉前导注释，再匹配和取表名。这个 helper 也加了注释解释为什么需要它。
+
+### 踩到的坑
+
+| 坑 | 现象 | 原因 |
+|---|---|---|
+| 注释粘语句 | `no such table: crontabs`，26 张表后再也建不出来 | `splitStatements` 保留注释，`buildSchemaScript` 的正则锚定在语句首部 |
+| `SELECT 1;` 占位没用 | 注释仍粘到第一条 ALTER | 切分点是分号，注释跨过分号就跟到下一段 |
+| `record()` 签名 | `Expected 3 arguments, but got 1` | 是 `record(kind, level, detail)`，且 `kind` 是资源治理词表，不适合放普通日志 |
+| 猜错 `record` 用途 | 想把"没推送"记进 `resource_events` | 那张表是水位/GC/看门狗专用，塞进去污染语义。改用 `bus.publish('log', ...)` |
+| 改 `expectedVersion` 漏了测试 | 3 个测试文件硬编码 150 | `daemon-assembly` / `db-template` / `memory-fts` |
+
+### 刻意不做的
+
+- **不做"每天都推一条早安"这种默认行为**：默认关，主人显式开。
+- **不做按话题聚合去重**："同话题"需要语义判断，误判代价是把真正重要的消息当重复吞掉。用任务级节流（同一个定时任务）是明确无歧义的。
+- **不把 `proactive` 做成全局开关**：主人可能希望"提醒吃药"每次都推、"检查磁盘"一天一次。粒度放任务级。
+- **不做退订链接**：飞书卡片里加"以后别推了"按钮听起来贴心，但那会让"关掉"变成一次误触就能做到的事。关推送应该在配置里改。
+
+---
