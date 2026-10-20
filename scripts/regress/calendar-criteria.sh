@@ -56,6 +56,18 @@ t "daemon 注册了 calendar.list"       grep -qF "registerHostTool('calendar.li
 t "daemon 注册了 calendar.conflicts"  grep -qF "registerHostTool('calendar.conflicts'" src/daemon.ts
 t "daemon 建了日历目录"               grep -qF 'join(cfg.dataDir, '"'"'calendar'"'"')' src/daemon.ts
 
+# ⚠️ 回归守卫（2026-10-20 踩过）：日历注册一度被嵌进 mail 的 if (mailKey) 分支，
+# 于是线上没配 DOTD_MAIL_KEY 时日历工具**静默不注册**，而 tsc 和单测全绿。
+# 判据：日历注册所在行必须**晚于** mail else 分支的收尾 —— 早于就说明还在闸门里。
+CAL_LINE=$(grep -nF "registerHostTool('calendar.list'" src/daemon.ts | head -1 | cut -d: -f1)
+MAIL_LINE=$(grep -nF "未配置 DOTD_MAIL_KEY" src/daemon.ts | head -1 | cut -d: -f1)
+t "日历注册不在 mail 密钥闸门内"        test -n "$CAL_LINE" -a -n "$MAIL_LINE" -a "$CAL_LINE" -gt "$MAIL_LINE"
+# 也不在 mail 的 try/catch 里（catch 收尾同样要早于日历注册）
+CATCH_LINE=$(grep -nF "邮件工具未启用" src/daemon.ts | head -1 | cut -d: -f1)
+t "日历注册不在 mail 的 try/catch 里"   test -n "$CATCH_LINE" -a "$CAL_LINE" -gt "$CATCH_LINE"
+# 日历目录建不出来时也不能阻断：mkdirSync 必须包在 try 里且 catch 不 rethrow
+t "建目录失败不阻断启动"                grep -qF '建不出来也不影响启动' src/daemon.ts
+
 # ── E. 行为：真读一个 .ics 文件 ─────────────────────────────
 mkdir -p /tmp/t6cal
 cat > /tmp/t6cal/work.ics <<'ICS'

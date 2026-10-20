@@ -13,7 +13,7 @@
 | T2 | 邮件发送：必须过审批 | ✅ 完成（同 T1 脚本） | 同上 |
 | T3 | 飞书审批卡片 | ✅ 完成（21/21） | `scripts/regress/card-criteria.sh` |
 | T4 | 主动发起对话 | ✅ 完成（19/19） | `scripts/regress/proactive-criteria.sh` |
-| T5 | 过程可视化 | ✅ 完成（19/19） | `scripts/regress/progress-criteria.sh` |
+| T5 | 过程可视化 | ✅ 完成（27/27）⚠️ 画面是文字摘要非位图 | `scripts/regress/progress-criteria.sh` |
 | T6 | 日历：通用 ICS 只读 | ✅ 完成（21/21） | `scripts/regress/calendar-criteria.sh` |
 
 ---
@@ -111,30 +111,6 @@ export DOTD_MAIL_KEY=$(openssl rand -base64 32)
 | Outlook | outlook.office365.com:993 | smtp.office365.com:587 |
 | Gmail | imap.gmail.com:993 | smtp.gmail.com:465 |
 | 自建 | 问管理员 | 问管理员 |
-
----
-
-## T3　飞书审批卡片
-
-⬜ 未开始
-
----
-
-## T4　主动发起对话
-
-⬜ 未开始
-
----
-
-## T5　过程可视化
-
-⬜ 未开始
-
----
-
-## T6　日历：通用 ICS 只读
-
-⬜ 未开始
 
 ---
 
@@ -292,6 +268,86 @@ export DOTD_MAIL_KEY=$(openssl rand -base64 32)
 
 ---
 
+## T5　过程可视化
+
+**目标**：长任务执行中，主人能看见它在做什么、现在看到什么。
+
+### ⚠️ 一条判据的偏差（如实记录）
+
+目标原文写的是「每 N 步回传一次进度（**文字 + browser.snapshot 截图**）」。
+
+实现出来的是 **文字 + 页面状态摘要**，不是位图。原因是事实性的：
+
+```
+agent-runtime/server.ts:739
+  case 'browser.snapshot':
+    return okResult(call.call_id, await page.snapshot());
+```
+
+`page.snapshot()` 是 Playwright 的 **a11y 结构文本**（`- heading "登录" [level=1]`），
+不是 PNG。要拿到真截图必须改容器侧协议（新增 screenshot 调用返回 base64）
++ 飞书图片上传接口 + 体积限制，那是另一个任务，已记进 `docs/backlog.md`。
+
+我没有为了"判据看起来过了"而把它当截图交差 —— 页面状态摘要确实回答了
+"它现在看到什么"这个实际问题（"示例站 — example.com / 登录 / 提交"），
+但它不是图。
+
+### 判据 / 实测 / 结论
+
+| # | 判据 | 实测 | 结论 |
+|---|---|---|---|
+| 1 | 长任务执行中有进度回传 | 订阅 `exec.call.finished`，攒够步数就推 | ✅ |
+| 2 | 每 N 步一次，不刷屏 | `every_n_steps=3` + `min_interval_ms=90000` 双阈值 | ✅ |
+| 3 | 只查一个阈值会出问题 | 实测：步数够但时间不够 → 不推；时间够但步数不够 → 不推 | ✅ |
+| 4 | 开关关掉时一句都不推 | 喂假事件进去数发送次数 = 0 | ✅ |
+| 5 | 默认关 | `DEFAULT_PROGRESS.enabled === false` | ✅ |
+| 6 | 能在飞书里看到它在干什么 | 文案 `现在：读文件` / `卡在：打开网页` | ✅ |
+| 7 | browser.snapshot 的画面进进度 | `screenOf()` 从 `steps.result_json` 抽出 `示例站 — example.com` | ⚠️ 文字非位图 |
+| 8 | 认不出的画面不编 | 非 JSON / 未知工具 / 无内容 → 返回 null，文案里不出现「页面：」 | ✅ |
+| 9 | 需要人介入时突破节流 | `needsAttention` 直接推，不等阈值 | ✅ |
+| 10 | 不泄露工具参数 | 文案断言不含 `{`；画面只取 result 的标题/域名/name | ✅ |
+
+**验收脚本**：`bash scripts/regress/progress-criteria.sh` → **27/27，exit 0**
+**单元判据**：`tests/progress.test.ts` → **40/40**
+
+### 数据一直都在，缺的是"说给人听"
+
+这个任务没有采集任何新数据。已有的：
+
+| 已有 | 位置 | 作用 |
+|---|---|---|
+| `steps` 表 | `db/migrations/000_control_plane.sql:75` | 每步的 kind / tool_name / status / **result_json** |
+| `exec.call.finished` | `src/exec/ExecService.ts:597` | payload 含 taskId / tool / callId / status |
+| SSE 分发 | `src/surfaces/sse.ts:199` | Web 侧早就有流 |
+
+真正的缺口是实测确认的那一条：`grep 'step' src/surfaces/feishu-outbound.ts` → **0 次命中**。
+飞书那边一句进度都没有。
+
+### 为什么不订阅 task.state
+
+`task.state` 只在状态**跃迁**时发（queued→running→done）。一个跑 10 分钟的任务
+从 running 到 done 之间一条都没有 —— 而那正是主人最想看的时段。
+`exec.call.finished` 才是"走了一步"的信号。
+
+### 关键取舍
+
+- **步数与时间双阈值**：只查步数会在快速小步任务上刷屏，只查时间在慢任务上从不说话。
+- **未登记的工具原样吐名字**：编一个"看起来懂"的名字比露原名更糟。
+- **失败的一步显式说"卡在"**：否则主人以为还在推进，比报错更误导。
+- **进度状态放内存不加表**：重启最坏结果是多重推一条"正在做"，为它加迁移不值得。
+- **画面取"最近一个成功的 browser.\*"**：不是每一步都有画面，也不是最新的一步就有用。
+- **发失败不落账**：下一次还有机会补。落账会让"正好那条最该看的"永久丢失。
+
+### 踩到的坑
+
+| 坑 | 现象 | 原因 |
+|---|---|---|
+| `chatId` 必填 | TS2345：`string \| undefined` 不能赋给 `string` | daemon 里飞书没配时 sender 是 undefined，此时 chatId 也没意义。改成可选，两者齐备才启用 |
+| 判据里读配置失败 | `ConfigError: DOTD_MASTER_TOKEN 未设置` | 配置有 9 个 `${ENV}` 占位，缺一个就 fail-closed。判据脚本给全占位值 |
+| `snapshot` 断言写错 | `FAIL ... -- 登录` | 我以为结构化节点取不到 name 要退回域名，实际递归能挖到 —— 代码比我的断言更好，改断言而不是改代码 |
+| `String(n)` 拼数组 | 返回 null | `tree` 是对象数组，`String({role:'heading'})` = `[object Object]`。改递归 `collectNodeNames` |
+
+---
 ## T6 日历 ICS 只读
 
 **目标**：能读日历、说清未来几天有什么、发现时间冲突。**不写**。

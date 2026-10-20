@@ -1211,7 +1211,16 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
 
       log(`[mail] 邮件工具已注册（8 个），凭证加密密钥已加载`);
 
-  // ── 日历只读工具（T6，2026-10-20）──────────────────────────────
+    } catch (e) {
+      // 密钥格式不对 → 不注册，但要吼一声。静默降级会让人以为配好了。
+      log(`[mail] 邮件工具未启用：${(e as Error).message}`);
+      mail = null;
+    }
+  } else {
+    log('[mail] 未配置 DOTD_MAIL_KEY，邮件工具不注册（这是预期行为，配了密钥才启用）');
+  }
+
+  // ── 日历只读工具（T6，2026-10-20）──────────────────────────────────────────────
   //
   // 两个都是 read 档，因为这一版日历**没有任何写入方法**。
   // 想加"创建日程"必须新开一个写档工具并走审批 ——
@@ -1246,14 +1255,6 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   });
 
   log(`[calendar] 日历工具已注册（2 个，只读），日历目录：${calendarDir}`);
-    } catch (e) {
-      // 密钥格式不对 → 不注册，但要吼一声。静默降级会让人以为配好了。
-      log(`[mail] 邮件工具未启用：${(e as Error).message}`);
-      mail = null;
-    }
-  } else {
-    log('[mail] 未配置 DOTD_MAIL_KEY，邮件工具不注册（这是预期行为，配了密钥才启用）');
-  }
 
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);

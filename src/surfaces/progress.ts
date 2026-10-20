@@ -56,6 +56,14 @@ export interface ProgressInput {
   lastPushStep: number | null;
   /** 任务是否刚刚进入"需要人"的状态（审批/失败）。这种必推，不受节流限制。 */
   needsAttention: boolean;
+  /**
+   * 浏览器画面摘要（T5 判据里"browser.snapshot"那一条）。
+   *
+   * ⚠️ **不是位图**：browser.snapshot 走的是 Playwright 的 page.snapshot()，
+   * 返回 a11y 结构文本。真截图要改容器侧协议 + 飞书发图，记在 docs/backlog.md。
+   * 这里给的是"它在看的那个页面现在有什么"，能回答"看到啥了"这个实际问题。
+   */
+  screen?: string | null;
 }
 
 export type ProgressDecision =
@@ -149,6 +157,13 @@ function renderProgress(input: ProgressInput, attention: boolean): string {
   }
 
   lines.push(`已经 ${input.stepCount} 步`);
+
+  // 画面：浏览器任务最有价值的一句是"它现在看到什么"。
+  // 限长 200 字符 —— 飞书在手机上一屏就那么大，超了等于没有。
+  if (input.screen !== undefined && input.screen !== null && input.screen !== '') {
+    lines.push('');
+    lines.push('页面：' + input.screen);
+  }
 
   if (attention) {
     lines.push('');

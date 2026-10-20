@@ -7,6 +7,7 @@
  *   3. "需要人介入"必须**突破节流**（这种消息漏掉比多推一条糟得多）
  */
 import { decideProgress, humanizeTool, DEFAULT_PROGRESS } from '../src/surfaces/progress.ts';
+import { screenOf } from '../src/surfaces/progress-push.ts';
 import type { ProgressInput } from '../src/surfaces/progress.ts';
 
 let pass = 0;
@@ -158,6 +159,58 @@ const mk = (over: Partial<ProgressInput> = {}): ProgressInput => ({
     ON,
   );
   ok('失败步骤说"卡在"', stuck.push && stuck.text.includes('卡在'), stuck.push ? stuck.text.split('\n')[1] : '');
+}
+
+
+// ── 10. 画面摘要（T5 判据的 browser.snapshot 那一半）──────────
+{
+  const openRes = JSON.stringify({ url: 'https://example.com/a/b?x=1', title: '示例站首页' });
+  const a = screenOf('browser.open', openRes);
+  ok('browser.open → 标题 + 域名', a === '示例站首页 — example.com', a ?? 'null');
+
+  const actRes = JSON.stringify({ url: 'https://shop.example.org/cart', ok: true, action: 'click' });
+  const b = screenOf('browser.act', actRes);
+  ok('browser.act → 说在哪个站做了什么', b !== null && b.includes('shop.example.org'), b ?? 'null');
+
+  // 结构化节点带 name 时优先报内容，比域名有用
+  const snapRes = JSON.stringify({ url: 'https://x.com', tree: [{ role: 'heading', name: '登录' }] });
+  const c = screenOf('browser.snapshot', snapRes);
+  ok('snapshot 结构化节点抽出 name', c === '登录', c ?? 'null');
+
+  // 真取不到任何可读内容时才退回域名 —— 至少主人知道它在看哪个站
+  const emptyRes = JSON.stringify({ url: 'https://x.com', tree: [{ role: 'generic', children: [] }] });
+  const c2 = screenOf('browser.snapshot', emptyRes);
+  ok('snapshot 无可读内容时退回域名', c2 === 'x.com', c2 ?? 'null');
+
+  // 深层嵌套也能挖到（递归 + 深度上限）
+  const deepRes = JSON.stringify({
+    url: 'https://x.com',
+    tree: [{ role: 'document', children: [{ role: 'list', children: [{ role: 'listitem', name: '订单 #42' }] }] }],
+  });
+  const c3 = screenOf('browser.snapshot', deepRes);
+  ok('snapshot 深层节点的 name 被挖到', c3 === '订单 #42', c3 ?? 'null');
+
+  const ariaRes = JSON.stringify({ url: 'https://x.com', tree: '- heading "登录" [level=1]\n- button "提交"' });
+  const d = screenOf('browser.snapshot', ariaRes);
+  ok('aria 文本被抽成短语', d !== null && d.includes('登录') && d.includes('提交'), d ?? 'null');
+
+  // 坏输入一律 null，不编
+  ok('非 JSON 返回 null', screenOf('browser.open', 'not json') === null);
+  ok('未知工具返回 null', screenOf('fs.read', openRes) === null);
+  ok('无标题无域名返回 null', screenOf('browser.open', JSON.stringify({})) === null);
+
+  // 超长要截断（飞书一屏）
+  const long = screenOf('browser.open', JSON.stringify({ title: 'x'.repeat(500), url: 'https://a.b' }));
+  ok('画面摘要被截到 200 内', long !== null && long.length <= 200, String(long?.length));
+}
+
+// ── 11. 文案里带页面 ─────────────────────────────────────────
+{
+  const d = decideProgress(mk({ lastPushStep: 5, stepCount: 10, screen: '示例站首页 — example.com' }), ON);
+  ok('有画面时文案写"页面："', d.push && d.text.includes('页面：示例站首页'), d.push ? d.text : 'not pushed');
+
+  const n = decideProgress(mk({ lastPushStep: 5, stepCount: 10, screen: null }), ON);
+  ok('无画面时不写"页面："', n.push && !n.text.includes('页面：'));
 }
 
 console.log('\n  合计 ' + pass + ' 通过 / ' + fail + ' 失败\n');

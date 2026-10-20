@@ -38,6 +38,95 @@ interface TaskProgressState {
 }
 
 /**
+ * 从 browser.* 步骤的 result_json 里抽一句"现在看到什么"。
+ *
+ * 三种结果形态：
+ *   browser.open      → { url, title }           → "标题 — 域名"
+ *   browser.snapshot  → Playwright a11y 结构文本  → 前若干个叶子节点名
+ *   browser.act       → { url, ok, action }      → "已<动作>，在<域名>"
+ *
+ * 解析不了就返回 null（宁可不说，不说错的）。
+ */
+export function screenOf(tool: string, resultJson: string): string | null {
+  let v: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(resultJson) as unknown;
+    // okResult 可能把业务值包在 value 里，也可能直接就是值
+    v =
+      parsed !== null && typeof parsed === 'object' && 'value' in (parsed as Record<string, unknown>)
+        ? ((parsed as Record<string, unknown>).value as Record<string, unknown>)
+        : (parsed as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+  if (v === null || typeof v !== 'object') return null;
+
+  if (tool === 'browser.open') {
+    const title = typeof v['title'] === 'string' ? (v['title'] as string).trim() : '';
+    const host = hostOf(typeof v['url'] === 'string' ? (v['url'] as string) : '');
+    if (title !== '') return (title + (host !== '' ? ' — ' + host : '')).slice(0, 200);
+    return host !== '' ? host : null;
+  }
+
+  if (tool === 'browser.act') {
+    const host = hostOf(typeof v['url'] === 'string' ? (v['url'] as string) : '');
+    const act = typeof v['action'] === 'string' ? (v['action'] as string) : '';
+    const who = host !== '' ? host : '页面';
+    return (`已在 ${who}` + (act !== '' ? `（刚做了 ${act.slice(0, 30)}）` : '')).slice(0, 200);
+  }
+
+  if (tool === 'browser.snapshot') {
+    // snapshot 的形态有两种（取决于运行时）：
+    //   Playwright 的 a11y 文本：  `- heading "登录" [level=1]`
+    //   结构化节点数组：          [{ role:'heading', name:'登录', children:[...] }]
+    // 两种都试，认不出来退回域名 —— 至少主人知道"它在看哪个站"。
+    const tree = v['tree'] ?? v['snapshot'] ?? v['aria'] ?? v;
+    const names: string[] = [];
+    if (typeof tree === 'string') collectAriaNames(tree, names);
+    else collectNodeNames(tree, names);
+    if (names.length > 0) return names.join(' / ').slice(0, 200);
+    const url = typeof v['url'] === 'string' ? (v['url'] as string) : '';
+    return url !== '' ? hostOf(url) : null;
+  }
+  return null;
+}
+
+/** 递归收 a11y 节点的 name（深度上限防环，数量上限防刷屏）。 */
+function collectNodeNames(node: unknown, out: string[], depth = 0): void {
+  if (out.length >= 4 || depth > 6) return;
+  if (typeof node === 'string') {
+    collectAriaNames(node, out);
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const n of node) collectNodeNames(n, out, depth + 1);
+    return;
+  }
+  if (node === null || typeof node !== 'object') return;
+  const o = node as Record<string, unknown>;
+  const name = typeof o['name'] === 'string' ? o['name'].trim() : '';
+  if (name !== '' && !out.includes(name)) out.push(name);
+  collectNodeNames(o['children'], out, depth + 1);
+}
+
+/** 从 Playwright aria 文本里取引号内的名字。 */
+function collectAriaNames(text: string, out: string[]): void {
+  for (const line of text.split('\n')) {
+    if (out.length >= 4) return;
+    const m = /"[^"]+"|'[^']+'/.exec(line);
+    if (m === null) continue;
+    const name = m[0].slice(1, -1).trim();
+    if (name !== '' && !out.includes(name)) out.push(name);
+  }
+}
+
+/** 取 URL 的域名部分（主人认域名比认整条 URL 快）。 */
+function hostOf(url: string): string {
+  const m = /^https?:\/\/([^/?#]+)/i.exec(url);
+  return m !== null ? (m[1] ?? '') : '';
+}
+
+/**
  * 启动进度推送。返回 stop。
  *
  * 注意：**默认不启用**（ProgressConfig.enabled 默认 false）。
@@ -71,6 +160,7 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     let stepCount = 0;
     let recent: Array<{ kind: 'llm' | 'tool'; toolName: string | null; status: string }> = [];
     let title = '';
+    let screen: string | null = null;
     try {
       const row = deps.db
         .prepare('SELECT count(*) AS c FROM steps WHERE task_id=?')
@@ -78,10 +168,25 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
       stepCount = row?.c ?? 0;
       const rows = deps.db
         .prepare(
-          'SELECT kind, tool_name AS toolName, status FROM steps WHERE task_id=? ORDER BY seq DESC LIMIT 5',
+          'SELECT kind, tool_name AS toolName, status, result_json AS resultJson FROM steps WHERE task_id=? ORDER BY seq DESC LIMIT 5',
         )
-        .all(taskId) as Array<{ kind: 'llm' | 'tool'; toolName: string | null; status: string }>;
-      recent = rows;
+        .all(taskId) as Array<{
+        kind: 'llm' | 'tool';
+        toolName: string | null;
+        status: string;
+        resultJson: string | null;
+      }>;
+      recent = rows.map((r) => ({ kind: r.kind, toolName: r.toolName, status: r.status }));
+      // 画面：取最近一个成功的 browser.* 步骤的结果摘要
+      for (const r of rows) {
+        if (r.toolName === null || !r.toolName.startsWith('browser.')) continue;
+        if (r.status !== 'succeeded' || r.resultJson === null) continue;
+        const sc = screenOf(r.toolName, r.resultJson);
+        if (sc !== null) {
+          screen = sc;
+          break;
+        }
+      }
       const t = deps.db.prepare('SELECT title FROM tasks WHERE id=?').get(taskId) as
         | { title?: string }
         | undefined;
@@ -105,6 +210,7 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
         lastPushAt: st.lastPushAt,
         lastPushStep: st.lastPushStep,
         needsAttention,
+        screen,
       },
       cfg,
     );
