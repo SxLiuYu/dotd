@@ -362,6 +362,115 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     failures: 'tool_not_found（没这个工具，先用 tool.list 确认）、超时（默认 60s）。' +
       '工具有 stderr 且 exitCode≠0 时，把 stderr 原样告诉主人，别自己编原因。',
   },
+      {
+        name: 'mail.account.add',
+        description:
+          '接入一个邮箱账号（IMAP 收信 + SMTP 发信），凭证 AES-256-GCM 加密入库。' +
+          '主人说"把我的 163 邮箱接进来/帮我把 QQ 邮箱配上"时用它。' +
+          '网易 163/126/yeah 这类国内邮箱**不能用登录密码**，要网页版设置里开的' +
+          '「客户端授权码」；QQ 邮箱同理是授权码。密码只出现在这次调用里，' +
+          '之后库里只有密文，日志和回复里都不会再出现。加完账号不会立刻验证，' +
+          '第一次 mail.list 才是真验证。',
+        params: {
+          label: '账号显示名，之后所有 mail.* 都用它指代这个账号。简短好认：如 "163"、"工作邮箱"。',
+          email: '邮箱地址，如 user@163.com。也是 IMAP/SMTP 的登录用户名。',
+          imapHost: '收信服务器，如 imap.163.com、imap.qq.com。',
+          smtpHost: '发信服务器，如 smtp.163.com、smtp.qq.com。',
+          password: '密码或客户端授权码。网易 163 必须用授权码（网页版 设置 → POP3/SMTP/IMAP → 开启并新增授权密码），登录密码会直接被拒。',
+          imapPort: '可选。IMAP 端口，缺省 993（SSL）。',
+          smtpPort: '可选。SMTP 端口，缺省 465（SSL）。',
+        },
+        returns: '返回 JSON：id（账号 id）、label、email，确认凭证已加密存储。',
+        failures:
+          'BAD_ARG（缺参数）。添加本身不会试连——连不上/凭证错会在第一次 mail.list 时报错，把 error 原话告诉主人。',
+      },
+      {
+        name: 'mail.account.list',
+        description:
+          '列出已接入的邮箱账号：label、email、IMAP/SMTP 服务器和端口。' +
+          '主人问"我接了哪些邮箱"、或你要替它调 mail.list 之前不确定 label 叫什么时用它。' +
+          '不联网、纯查库，永远安全。',
+        params: {},
+        returns: '返回 JSON：count 和 accounts 数组（id/label/email/imap/smtp/status）。',
+        failures: '几乎不失败。列表为空说明还没接过任何邮箱，建议主人用 mail.account.add 接入。',
+      },
+      {
+        name: 'mail.account.remove',
+        description:
+          '移除一个已接入的邮箱账号，连同它的加密凭证一起删。' +
+          '主人说"把 xx 邮箱移除/别再连那个邮箱了"时用。' +
+          '不确定 label 叫什么就先 mail.account.list 看一眼，别按猜测的名字删。',
+        params: { account: '要移除的账号 label 或 id。' },
+        returns: '返回 JSON：removed: true/false。false = 没找到这个账号。',
+        failures: 'BAD_ARG（缺 account）。',
+      },
+      {
+        name: 'mail.list',
+        description:
+          '列出某邮箱收件箱**最近**的邮件（主题/发件人/日期/UID），不读正文。' +
+          '主人说"看看有什么邮件/收件箱有什么新的"就用它；要读某一封的正文再用 mail.read。' +
+          '第一次对某账号调用时会做真实 IMAP 登录——这一步就是凭证验证。',
+        params: {
+          account: '账号 label 或 id，如 "163"。',
+          limit: '可选。拉几封，缺省 20，最多 50。主人只要"最近的几封"就传 5。',
+        },
+        returns: '返回 JSON：邮件数组（uid/subject/from/date/seen）。按时间倒序。',
+        failures:
+          '账号不存在（先 mail.account.list）；IMAP 登录失败——凭证错或被服务商风控（163 报 Unsafe Login 之外的拒绝时如实转述）。',
+      },
+      {
+        name: 'mail.read',
+        description:
+          '读一封邮件的完整内容：正文（纯文本）+ 附件名列表。' +
+          '必须先有 mail.list 或 mail.search 给的 uid。' +
+          '主人说"读一下那封 xx/第一封说了什么"时，先 list 拿 uid 再 read。',
+        params: {
+          account: '账号 label 或 id。',
+          uid: '邮件 UID，从 mail.list / mail.search 的结果里原样拿，别自己编。',
+        },
+        returns: '返回 JSON：完整邮件（subject/from/to/date/text 正文/attachments 附件名）。',
+        failures: 'BAD_ARG；uid 不存在（换 mail.list 重新拿）。正文过长时会被截断。',
+      },
+      {
+        name: 'mail.search',
+        description:
+          '在某邮箱里按关键词搜邮件。适合"找一下 xx 发给我的那封/搜一下发票"' +
+          '这类不是"最近几封"而是"找特定邮件"的场景。搜完要读正文就接着用 mail.read。',
+        params: {
+          account: '账号 label 或 id。',
+          keyword: '关键词。会去匹配主题/发件人/正文。主人给的是人名就传人名，是项目名就传项目名。',
+          limit: '可选。最多返回几封，缺省 20。',
+        },
+        returns: '返回 JSON：命中的邮件数组（uid/subject/from/date），同 mail.list 形状。',
+        failures: 'BAD_ARG（缺 keyword）；账号不存在（先 mail.account.list）。',
+      },
+      {
+        name: 'mail.draft',
+        description:
+          '起草一封邮件（**不发送**）：建一份草稿存进库里，返回草稿 id。' +
+          '主人说"帮我给 xx 写个邮件说 yy"，先起稿给他/她过目；' +
+          '要真的发出去必须再走 mail.send（那是 dangerous 工具，会弹审批卡片）。' +
+          '正文写前先想清楚称呼、正文、落款；主人没给的信息别编。',
+        params: {
+          account: '用哪个账号发（label 或 id）。没有就先问主人用哪个邮箱发。',
+          to: '收件人邮箱数组，如 ["a@b.com"]。多个收件人就传多个。',
+          subject: '主题。一句话说清来意，别空着。',
+          body: '正文（纯文本）。分段落写，结尾按主人的习惯落款。',
+        },
+        returns: '返回 JSON：draftId、to、subject，确认草稿已存。',
+        failures: 'BAD_ARG（缺参数/to 为空）。',
+      },
+      {
+        name: 'mail.send',
+        description:
+          '把一份草稿**真正发出去**。dangerous：邮件发出去收不回来，收件人是外部的人。' +
+          '只在主人明确说"发"之后调用；系统的审批闸门会先弹卡片给主人确认，' +
+          '你被批准后才会真正发送。发完把结果（message-id）告诉主人。',
+        params: { draftId: '草稿 id，从 mail.draft 的返回里拿。' },
+        returns: '返回 JSON：sent: true、messageId（SMTP 收据）。',
+        failures:
+          '草稿不存在或已发送；SMTP 认证失败（授权码不对/端口错）——如实转述 error，别假装发出去了。',
+      },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
@@ -503,7 +612,8 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
 4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
-   7. 造工具：tool.create / tool.list / tool.invoke。
+   7. 邮件：mail.account.list 看接了哪些 → mail.list / mail.search / mail.read 收、搜、读 → mail.draft 起稿 → mail.send 真发（dangerous，必过主人审批）；接入 mail.account.add，移除 mail.account.remove。
+   8. 造工具：tool.create / tool.list / tool.invoke。
       **写脚本前先看有没有「你已有的自造工具」**：对口就 tool.invoke，别重写。
       没对口但以后会重复 → tool.create 造一个。
 通用约定：

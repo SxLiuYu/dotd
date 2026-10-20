@@ -1405,7 +1405,13 @@ export class DotRunner {
     //
     // 注意 `req` **两条路径共用同一份对象**：除 `stream` 标记外没有任何字段差异，
     // 这样"无总线时行为不变"是可对照的（tests/runner-stream.test.ts 断言了请求体）。
-    const tools = await this.toolSpecs(task);
+    // 原地打转护栏已触发过 → 这一轮**不给任何工具**（清单清空）：
+    // 实测模型连"不许再调工具"的强令都会无视，继续发工具调用直到产品侧收口
+    // （2026-10-20 整理 163 邮箱连打转 3 次，主人只收到系统收口说明、收不到正式回复）。
+    // 把工具从清单里拿掉是唯一的物理强制 —— 模型只能写文字结论，正是护栏要的。
+    // repeatSkipsByTask 的键是 task.id（= 主循环里的 session.id，见收口日志）。
+    const repeatSkips = this.repeatSkipsByTask.get(task.id) ?? 0;
+    const tools = repeatSkips > 0 ? [] : await this.toolSpecs(task);
     // 先问"能不能流式"，再定请求体：`stream` 标记只在确实走流式时才出现（complete 请求逐字不变）。
     const useStream = this.useStream();
     // 多模态：在**投影之后**的 ChatMessage 数组上挂图片。

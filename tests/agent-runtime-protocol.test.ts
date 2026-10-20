@@ -111,7 +111,12 @@ const _driftProof: [
 test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sideEffect）', () => {
   // 宿主侧工具（schedule.* 等）不进容器：它们由 daemon 直接执行，
   // 容器能力目录里不该有。所以对比时只比"容器内工具"。
-  const HOST_SIDE_ONLY = new Set(['schedule.create', 'schedule.list', 'schedule.remove']);
+  const HOST_SIDE_ONLY = new Set([
+    'schedule.create', 'schedule.list', 'schedule.remove',
+    // mail 8 件套（2026-10-20）：同样只在 daemon 里跑，不进容器
+    'mail.account.add', 'mail.account.list', 'mail.account.remove',
+    'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send',
+  ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),
     [...HOST_TOOL_NAMES].filter((n) => !HOST_SIDE_ONLY.has(n)),

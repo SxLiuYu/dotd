@@ -175,6 +175,13 @@ t "明文密码自动拼 user\0pass"          test "$COMP" = "OK"
 t "LOGIN 后发 ID 自报身份"             grep -q "ID (\"name\" \"dotd\"" src/mail/imap.ts
 t "ID 失败不挡登录（mustOk=false）"     grep -q "await this.cmd('ID .*', false)" src/mail/imap.ts
 
+# -- 13. 模型可见性（2026-10-20 实战：host 工具注册了但模型看不见 = 全白搭）----
+# 约束链：CAPABILITY_CATALOG 有规范 + HOST_SIDE_TOOLS 有名字 → getCapabilities
+# 合并 → toolSpecs → 模型工具清单。缺任何一环模型就报"没有邮件工具"。
+t "mail 在能力目录里（模型可见）"        grep -q "name: 'mail.list'," src/exec/protocol.ts
+t "mail 全部记入 HOST_SIDE_TOOLS"       grep -q "'mail.list', 'mail.read', 'mail.search'" src/exec/ExecService.ts
+t "mail 有模型说明书（ToolDoc）"        grep -q "name: 'mail.list'," src/runner/tool-catalog.ts
+
 echo ""
 echo "  合计 $P 通过 / $F 失败"
 [ "$F" = "0" ] && exit 0 || exit 1

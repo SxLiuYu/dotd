@@ -523,3 +523,41 @@ WSL 侧记 99s、D 侧记 53s，是不同次运行，谁也不该被谁抹掉）
 全通；mail-e2e 12/12；mail-criteria 38/38。
 **顺手发现（未修，记下）**：MailSummary 的 from 字段对 RFC 2047 编码
 （`=?UTF-8?B?...?=`）未解码，显示为原始编码形态 —— 纯观感问题。
+
+
+## 「飞书说话没人理」连环排障（2026-10-20 晚）
+
+主人一句话暴露四层问题，从底到顶：
+
+**① 容器被隔离态困死（ops 修复，代码缺口未修）**
+recreate 计数 4 > 3/24h → `quarantined`。设计上隔离要人来决定，但**人的入口没实现**：
+`periodicHealthCheck` 探活通过也只救 `unhealthy` 不救 `quarantined`；`recreate` 一进来
+count++ 立刻再次隔离 —— 死锁。容器本身 13:04 recreate 后是健康的，纯被计数困住。
+**ops 处方**（已做）：`UPDATE containers SET state='unhealthy', recreate_count=0` →
+探活循环自动走 `unhealthy→booting→ready`（真实探活，状态机合法路径）。
+**待办**：给 periodicHealthCheck 加"探活连续 N 次通过 + quarantined → 救回 + 计数清零"，
+或做管理端点。做之前这是单人 knowledge。
+
+**② mail 工具注册了但模型看不见（已修，f 系列提交）**
+约束链：CAPABILITY_CATALOG 规范 + HOST_SIDE_TOOLS 名字 → getCapabilities 合并 →
+toolSpecs → 模型清单。T1 只做了 host 注册和 tools.yml 分层，漏了目录和说明书两层，
+模型报"我没有邮件工具"。已补 8 条规范 + 8 篇 ToolDoc + TOOLS_GUIDE 引导行 +
+SYSTEM_PROMPT_BUDGET 4000→4200。回归：mail-criteria +3（41 条）、tool-catalog 测试更新。
+
+**③ 出站静默跳过（已修）**
+护栏"产品侧收口"的任务没有 assistant 正文（产品刻意不替模型写结论），出站查不到
+就静默 return —— 主人两次发消息全部石沉大海。修复：无正文时回退用收口 stopReason
+发一条，明确标注"系统收口说明，非模型回答"。
+
+**④ 模型打转不收敛（已修）**
+整理邮件的任务连打转 3 次：list→read 6 封→再 list→再 read→…，无视"不许再调工具"
+的强令，最后只能产品侧收口。修复：护栏触发过之后，下一轮 LLM **清空工具清单**
+（物理强制只能写文字）。修复后同任务一次收敛，模型自己产出完整分类摘要。
+
+**插曲**：WSL 当晚 21:01 整机重启一次（/tmp 全丢、daemon/日志/后台测试全灭）。
+标准链路 dotd-daemon-start.sh 一条命令恢复。模型网关 (Windows:13065) 无恙，
+重启后首次 LLM 调用撞上桥未就绪报 AllEndpointsDownError → 任务 paused；
+网关本身健在，重派即过。paused 任务（tk_mvgn9pz1evilmd / tk_mvgp03asc3qtkv /
+tk_mvgow7taoew2sg）无人认领，属已知行为：启动恢复只处理"在途"，不处理 paused。
+**最终实测**：重派任务一次收敛，飞书收到 30 封邮件的分类整理（安全告警/值得一读/
+可忽略三档），出站成功送达 oc_e764…。

@@ -331,6 +331,116 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     ),
     sideEffect: 'unknown',
   },
+  {
+    /** 宿主侧工具：接入一个邮箱（IMAP/SMTP + 授权码，加密存储）。 */
+    name: 'mail.account.add',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        label: str('账号显示名，如 "163"、"工作邮箱"'),
+        email: str('邮箱地址，如 user@163.com'),
+        imapHost: str('IMAP 服务器，如 imap.163.com'),
+        smtpHost: str('SMTP 服务器，如 smtp.163.com'),
+        password: str('密码或客户端授权码（网易163要用授权码）。只加密存储，不会出现在日志或回复里'),
+        imapPort: { type: 'integer', description: 'IMAP 端口，缺省 993（SSL）' },
+        smtpPort: { type: 'integer', description: 'SMTP 端口，缺省 465（SSL）' },
+      },
+      ['label', 'email', 'imapHost', 'smtpHost', 'password'],
+    ),
+    sideEffect: 'unknown',
+  },
+  {
+    /** 宿主侧工具：列出已接入的邮箱账号。 */
+    name: 'mail.account.list',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj({}, []),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧工具：移除一个邮箱账号（含其加密凭证）。 */
+    name: 'mail.account.remove',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      { account: str('要移除的账号 label 或 id') },
+      ['account'],
+    ),
+    sideEffect: 'replayable',
+  },
+  {
+    /** 宿主侧工具：列某账号收件箱最近的邮件（不读正文）。 */
+    name: 'mail.list',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        account: str('账号 label 或 id，如 "163"'),
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '拉几封，缺省 20' },
+      },
+      ['account'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧工具：读一封邮件的正文与附件名。 */
+    name: 'mail.read',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        account: str('账号 label 或 id'),
+        uid: str('邮件 UID，从 mail.list / mail.search 的结果里拿'),
+      },
+      ['account', 'uid'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧工具：按关键词搜邮件。 */
+    name: 'mail.search',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        account: str('账号 label 或 id'),
+        keyword: str('关键词，匹配主题/发件人/正文'),
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '返回几封，缺省 20' },
+      },
+      ['account', 'keyword'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧工具：起草一封邮件（不发送）。 */
+    name: 'mail.draft',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        account: str('用哪个账号发（label 或 id）'),
+        to: { type: 'array', items: { type: 'string' }, description: '收件人邮箱列表' },
+        subject: str('主题'),
+        body: str('正文（纯文本）'),
+      },
+      ['account', 'to', 'subject', 'body'],
+    ),
+    // 重放只会多一份草稿，不破坏既有数据（与 schedule.create 同判）
+    sideEffect: 'replayable',
+  },
+  {
+    /** 宿主侧工具：把草稿真正发出去。dangerous：发出去收不回来。 */
+    name: 'mail.send',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      { draftId: str('草稿 id，从 mail.draft 的返回里拿') },
+      ['draftId'],
+    ),
+    // 一封真实外发邮件，绝不能自动重放
+    sideEffect: 'unknown',
+  },
 ];
 
 /**

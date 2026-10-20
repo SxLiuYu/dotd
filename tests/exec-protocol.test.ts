@@ -102,8 +102,8 @@ test('端点表：八个 RUNTIME_PATHS 与契约逐字对应', () => {
   assert.equal(endpointUrl('172.18.0.3', 9223), 'http://172.18.0.3:9223');
 });
 
-test('能力目录：18 名工具、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
-  assert.equal(CAPABILITY_CATALOG.length, 18);
+test('能力目录：26 名工具（18 容器 + 8 宿主 mail）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
+  assert.equal(CAPABILITY_CATALOG.length, 26);
   const by = new Map(CAPABILITY_CATALOG.map((c) => [c.name, c]));
   const expect: Record<string, [string, number, string]> = {
     'fs.read': ['sync', 60_000, 'safe'],
@@ -117,6 +117,15 @@ test('能力目录：18 名工具、mode/max_deadline/sideEffect 逐条与契约
     'browser.close': ['async', 60_000, 'safe'],
     'net.get': ['async', 60_000, 'safe'],
     'net.post': ['async', 60_000, 'unknown'],
+    // 宿主侧 mail 8 件套（2026-10-20 进目录；模型可见性靠 HOST_SIDE_TOOLS + 本目录）
+    'mail.account.add': ['sync', 60_000, 'unknown'],
+    'mail.account.list': ['sync', 60_000, 'safe'],
+    'mail.account.remove': ['sync', 60_000, 'replayable'],
+    'mail.list': ['sync', 60_000, 'safe'],
+    'mail.read': ['sync', 60_000, 'safe'],
+    'mail.search': ['sync', 60_000, 'safe'],
+    'mail.draft': ['sync', 60_000, 'replayable'],
+    'mail.send': ['sync', 60_000, 'unknown'],
   };
   for (const [name, [mode, max, se]] of Object.entries(expect)) {
     const c = by.get(name);
@@ -506,7 +515,8 @@ test('getCapabilities：容器 /capabilities 优先，回退宿主 catalog；形
     const svc = new ExecServiceImpl({ db: t.db, bus: t.bus, cfg: { tokenDir: t.root } });
     await svc.boot(['dot-a']);
     const caps = await svc.getCapabilities('dot-a');
-    assert.equal(caps.length, 18);
+    // 26 = 18 容器工具 + 8 宿主 mail（回退路径整目录可见）
+    assert.equal(caps.length, 26);
     for (const c of caps) {
       assert.ok(['safe', 'replayable', 'unknown'].includes(c.sideEffect));
       assert.ok(['sync', 'async'].includes(c.mode));

@@ -298,8 +298,32 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
     const body = lastAssistantText(deps.db, task.thread_id, p.taskId);
     if (p.to === 'done') {
       if (body === null) {
-        deps.log(`飞书出站跳过：${p.taskId} 完成但无 assistant 正文`);
-        return null;
+        // 2026-10-20 修真缺陷：护栏"产品侧收口"的任务没有 assistant 正文（产品
+        // 刻意不替模型写结论），此前这里直接静默跳过 —— 主人在飞书说话后收不到
+        // 任何回应（163 接入当天实测连坑两次：tk_mvgn9pz1evilmd / tk_mvgp3nylxfznit）。
+        // 回退：用收口 stopReason 发一条，并明确标注这是系统收口、不是模型的回答。
+        const row = deps.db
+          .prepare(
+            "SELECT content FROM mem_messages WHERE thread_id = ? AND task_id = ? AND role = 'system' " +
+              "AND content LIKE '%\"outcome\"%' ORDER BY rowid DESC LIMIT 1",
+          )
+          .get(task.thread_id, p.taskId) as { content: string } | undefined;
+        let stop = '';
+        if (row !== undefined) {
+          try {
+            stop = String((JSON.parse(row.content) as { stopReason?: unknown }).stopReason ?? '');
+          } catch {
+            // JSON 坏了就当没有，走下面的静默跳过
+          }
+        }
+        if (stop === '') {
+          deps.log(`飞书出站跳过：${p.taskId} 完成但无 assistant 正文也无收口说明`);
+          return null;
+        }
+        return {
+          chatId,
+          text: `${stop}\n\n（系统收口说明：模型收尾前反复调用同一个工具、没有产出正式回复；以上面已完成的动作结果为准。可以让它再试一次。）`,
+        };
       }
       return {
         chatId,
