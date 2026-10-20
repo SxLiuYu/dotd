@@ -37,6 +37,30 @@ export SOAK
 #      "当前数据是否覆盖得住 day0"，这已经能挡住清空重来）
 # 只在跑真实窗口时生效（合成数据测试用 SOAK= 覆盖，没有 day0 文件，跳过）。
 DAY0_FILE="${SOAK_DAY0:-$OUTDIR/soak-day0.txt}"
+# **每个采样点自己带上「采它的是哪一版脚本」**（2026-10-21 补，S6 最根本的一条）。
+#
+# S6 要的是「连续 7 天」。这话里两个词，一个被反复审视，一个没有：
+#   · 「7 天」—— coveredDays / upRatio / maxGap 五六条判据盯着；
+#   · 「连续」—— 指观测连续，但没人问过「**用同一把尺子**量的吗」。
+#
+# 现场：这 7 天的数据横穿 **8 次 soak.sh 提交**（第 73~81 轮，每轮都在修判据），
+# 报告正文一个字都没提。`exit 0` 只是「最后一版判据认为合格」——
+# 前 6 天的数据没被最后一版看过，可能漏掉早期版本的盲区
+# （第 77 轮前没有 uptime 判据，第 80 轮前没有累计不可用判据）。
+#
+# **前两版都做错了**，记在这里：
+#   ① 从 `soak-verdict.jsonl` 读 md5 —— 那个文件每次 report 追加一行，与「哪份
+#      soak 数据」无关；测试时指向 /tmp，累积几十份假窗口的审计，拿它判真实窗口
+#      = 张冠李戴，实测让 35 条回归变红。
+#   ② 改成问 git —— 但 `/root/dotd` 不是 git 仓库（永远 ⚠，S6 永远过不了），
+#      而测试夹具的假窗口会落进真仓库的 7 天历史（88 次提交，健康夹具全红）。
+#
+# **正确做法：让数据自己回答。** 每个点带上采集时的脚本指纹，
+# 「这段窗口里有几种尺子」就只是数不同取值的个数 —— 不依赖任何外部状态。
+# 老数据没这个字段 → 报告必须说「判断不了」，不能当成「只有一把尺子」。
+SCRIPT_VER=$(md5sum "${SOAK_SELF:-$0}" 2>/dev/null | cut -c1-8)
+[ -z "$SCRIPT_VER" ] && SCRIPT_VER="unknown"
+export SCRIPT_VER
 export DAY0_FILE
 
 PID_DAEMON() { pgrep -f 'src/daemon.ts' | head -1; }
@@ -228,9 +252,9 @@ const o={ts:Number(process.argv[1]),alive:true,
   pid:Number(process.argv[7]),proc_start:Number(process.argv[8]),
   container_ok:Number(process.argv[9]),
   relay_up:Number(process.argv[10]),
-  http_ok:Number(process.argv[11])};
+  http_ok:Number(process.argv[11]),sv:process.argv[12]||""};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}" "${relay_ok:-0}" "${http_ok:-0}"
+    "$ts" "$rss_kb" "$fd" "$n_threads" "$cont" "${db_kb:-0}" "$pid" "${proc_start:-0}" "${cont_ok:-0}" "${relay_ok:-0}" "${http_ok:-0}" "$SCRIPT_VER"
   printf '%s ok ts=%s\n' "$(date +%s)" "$ts" >>"$HB" 2>/dev/null || true
   echo "sample: rss=${rss_kb}KB fd=$fd threads=$n_threads container_up=$cont container_ok=$cont_ok db=${db_kb}KB pid=$pid"
 }
@@ -365,9 +389,9 @@ const o={ts:Number(process.argv[1]),kind:"probe",ok:process.argv[2]==="1",
   // **把两个子判据分别记下来**（2026-10-19 补）：ok 是"答对 且 发到飞书"的合成结果，
   // 只存 ok 的话，7 天里某次失败事后完全分不清是"模型答错了"还是"飞书没发出去"，
   // 而这两种的处置完全不同。7 天要跑 168 小时，出问题必须能事后归因。
-  out:process.argv[8]||"",ws:process.argv[9]||""};
+  out:process.argv[8]||"",ws:process.argv[9]||"",sv:process.argv[10]||""};
 fs.appendFileSync(process.env.SOAK, JSON.stringify(o)+"\n");' \
-    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}" "${OUT_OK:-}" "${WS_OK:-}"
+    "$ts" "$ok" "$tid" "${st:-}" "$(( $(date +%s) - t0 ))" "${PROBE_SLOT:-}" "${PROBE_WANT:-}" "${OUT_OK:-}" "${WS_OK:-}" "$SCRIPT_VER"
   echo "probe: slot=${PROBE_SLOT:-?} want=${PROBE_WANT:-?} ok=$ok status=${st:-none} 飞书出站=${OUT_OK:-?} 飞书入站=${WS_OK:-?} secs=$(( $(date +%s) - t0 ))"
 }
 
@@ -1163,7 +1187,47 @@ const contUpCapable=all.some(s=>s.container_up!==undefined);
 // 一份 7 天数据里网关和 daemon 可达性一次没测，不能算交付合格。
 // 也不能判 ❌（没有证据说它坏），所以单列一个 unknown 标记，
 // 由退出码要求「没有 ❌ **且** 没有未知项」。
-const unknownOk = !(relayUnknown || httpUnknown || contOkUnknown);
+// **这段窗口里用过几把尺子**（2026-10-21 补，S6 最根本的一条）。
+//
+// S6 要的是「连续 7 天」。这话里两个词，一个被反复审视，一个没有：
+//   · 「7 天」—— coveredDays / upRatio / maxGap 五六条判据盯着；
+//   · 「连续」—— 指观测连续，但没人问过「**用同一把尺子**量的吗」。
+//
+// 现场：这 7 天的数据横穿 **8 次 soak.sh 提交**（第 73~81 轮，每轮都在修判据），
+// 报告正文一个字都没提。`exit 0` 只是「最后一版判据认为合格」——
+// 前 6 天的数据没被最后一版看过，可能漏掉早期版本的盲区。
+//
+// **前两版都做错了**：
+//   ① 从 `soak-verdict.jsonl` 读 md5 —— 那文件每次 report 追加一行，与「哪份
+//      soak 数据」无关；测试时指向 /tmp，累积几十份假窗口的审计，拿它判真实窗口
+//      = 张冠李戴，实测 **35 条回归变红**。
+//   ② 改成问 git —— 但 `/root/dotd` 不是 git 仓库（永远 ⚠，**S6 永远过不了**），
+//      而测试夹具的假窗口落进真仓库 7 天历史（88 次提交，健康夹具全红）。
+//
+// **两次错在同一个地方：拿外部的、跟数据无关的东西当证据。**
+// 正确做法是让数据自己回答 —— 每个采样点自带采集时的脚本指纹（`sv` 字段），
+// 「这段窗口里有几种尺子」就只是数不同取值的个数。
+const scriptVersions=(()=>{
+  const pts=all.filter(s=>s.sv!==undefined && s.sv!=="");
+  if(pts.length===0) return {known:false, versions:[], missing:all.length};
+  const m=new Map();
+  for(const s of pts){
+    const k=String(s.sv);
+    if(!m.has(k)) m.set(k,{sv:k,first:s.ts,last:s.ts,n:0});
+    const e=m.get(k); e.last=s.ts; e.n++;
+  }
+  const versions=[...m.values()].sort((x,y)=>x.first-y.first);
+  return {known:true, versions, withField:pts.length, missing:all.length-pts.length};
+})();
+const SCRIPT_CHURN_SETTLE_H=24;
+// 「最后一版判据已经跑了多久」= 现在 - 它**第一次出现**的时间。
+// **不能减它的最后一次时间点**（那是窗口末尾，永远 ≈0，于是 ⏳ 永远不结束）——
+// 这是第 79 轮「数字对了但读错了时刻」的同一个病，换了地方复发。
+const _svCur = scriptVersions.known ? scriptVersions.versions[scriptVersions.versions.length-1] : null;
+const _svAgeH = _svCur ? (Date.now()/1000-_svCur.first)/3600 : 0;
+const scriptChurnPending = !!(days>=7 && scriptVersions.known && scriptVersions.versions.length>1 && _svAgeH < SCRIPT_CHURN_SETTLE_H);
+const scriptChurnUnknown = !scriptVersions.known && days>=7;
+const unknownOk = !(relayUnknown || httpUnknown || contOkUnknown || scriptChurnPending || scriptChurnUnknown);
 // **`relay_up`/`http_ok` 也必须有同样的「有没有能力采」判断**（2026-10-20 补，真假绿）。
 // 上面 `contUpCapable` 是第 50 轮修出来的正确做法：区分
 //   ① 老数据压根没这个字段 → 不追究
@@ -1693,6 +1757,29 @@ console.log(`容器在线率 ${contRate===null?"n/a":(contRate*100).toFixed(1)+"
             (contDown.length? `（${contDown.length} 个采样点容器不在线）` : ""));
 
 const c=[];
+
+// **这段窗口用过几把尺子** —— 必须在报告和判定行里说。
+if(days<7){
+  c.push(`⏳ 判据版本核对：窗口才 ${days.toFixed(2)} 天，这条还没到判的时候`+
+    (scriptVersions.known? `（当前已见 ${scriptVersions.versions.length} 个版本）` : `（数据里暂无 sv 字段）`));
+}else if(!scriptVersions.known){
+  c.push(`⚠ **判据版本无法核对**：${all.length} 个采样点里没有一条带 \`sv\` 字段`+
+    `（这批数据是在加入该字段之前采的）—— 无法确认这 ${days.toFixed(1)} 天是同一把尺子量的，这条判断不了`);
+}else if(scriptVersions.versions.length===1){
+  const v0=scriptVersions.versions[0];
+  c.push(`✅ 判据全程同一个版本（${v0.sv}，${v0.n}/${scriptVersions.withField} 点）：这 ${days.toFixed(1)} 天是同一把尺子量的`);
+}else{
+  const vs=scriptVersions.versions;
+  const agesH=(Date.now()/1000-vs[vs.length-1].first)/3600;
+  const bits=vs.slice(0,3).map(v=>`${v.sv}(x${v.n})`).join(" → ")+(vs.length>3?` → …共 ${vs.length} 个`:"");
+  c.push(scriptChurnPending
+    ? `⏳ 这段窗口用过 ${vs.length} 个判据版本（${bits}；最近一版才跑了 ${agesH.toFixed(1)}h）：**判定还没稳定**，`+
+      `最后一版要跑满 ${SCRIPT_CHURN_SETTLE_H} 小时再判`
+    : `⚠ **这段窗口用过 ${vs.length} 个判据版本**（${bits}）：`+
+      `前段数据没被最后一版判据看过，可能漏掉早期版本的盲区；`+
+      `最后一版已跑 ${agesH.toFixed(0)} 小时，之后的样本足够代表交付状态`+
+      (scriptVersions.missing>0? `；另有 ${scriptVersions.missing} 个老采样点没有 sv 字段，未计入` : ""));
+}
 
 // **能推 ❌ 的判据必须写在 `c[]` 之后**（2026-10-20，TDZ 第四次）。
 // 这一轮把「退出码只看 c[]」定下来之后，我给两条原本沉默的判据

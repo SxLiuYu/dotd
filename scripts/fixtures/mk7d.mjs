@@ -16,7 +16,10 @@ export function mk7d(file, opts={}){
       relay_up:(opts.relayUp?opts.relayUp(i,N):1),
       http_ok:(opts.httpOk?opts.httpOk(i,N):1),
       db_kb:17000, pid:opts.pid||999,
-      proc_start:(opts.procStart?opts.procStart(i,N,first):first)};
+      proc_start:(opts.procStart?opts.procStart(i,N,first):first),
+      // 采集这批数据的脚本指纹。默认全程同一版本（=「这 7 天用同一把尺子」）。
+      // 要模拟「中途换了判据」就传 opts.sv=(i,N)=> i<100?"aaaaaaaa":"bbbbbbbb"。
+      sv:(opts.sv?opts.sv(i,N):"aaaaaaaa")};
     if(opts.extra) Object.assign(r, opts.extra(i,N));
     out.push(r);
   }
