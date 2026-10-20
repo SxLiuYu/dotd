@@ -44,11 +44,16 @@ done
 ACC="${DOTD_ACCEPT_DIR:-docs/acceptance}"
 export DOTD_ACCEPT_DIR="$ACC"
 
-# ── `--run` 的护栏（第 103 轮补）──
+# ── `--run` 的护栏（第 103 轮补，第 108 轮按用户决定调整）──
 # `--run` 里有 recovery.sh，会真的停容器、kill daemon。
-# 如果正在做 7 天窗口观测，这就是人为制造的中断，而且事后很难解释。
-# 所以：默认**拒绝**在「窗口已开始且未满 7 天」时跑 --run，
-# 除非显式设置 DOTD_ALLOW_DISRUPT=1（表示"我知道，我要重来"）。
+# 第 103 轮加这道护栏，是因为当时「连续 7 天」还是硬判据 ——
+# 中途打断就等于把那个窗口毁了，事后很难解释。
+#
+# **2026-10-20 用户明确「长期运行不用作为一个目标」，S6 已移出验收范围。**
+# 那个观测窗口现在只是「参考数据」，不再是判据，所以：
+#   · 默认**不再拒绝** `--run`（否则连正常验收都做不了）
+#   · 但仍然**会警告**：跑 --run 会让那份观测数据出现人为中断
+#   · 想安静地重来一个干净观测窗口，用 DOTD_ALLOW_DISRUPT=1 表示"我知道"
 if [ "$RUN" -eq 1 ] && [ "${DOTD_ALLOW_DISRUPT:-0}" != "1" ]; then
   _d0f="$ACC/soak-day0.txt"
   if [ -f "$_d0f" ]; then
@@ -56,13 +61,11 @@ if [ "$RUN" -eq 1 ] && [ "${DOTD_ALLOW_DISRUPT:-0}" != "1" ]; then
     _now=$(date +%s)
     if [ -n "$_d0" ] && [ "$_now" -ge "$_d0" ] && [ $(( _now - _d0 )) -lt $(( 7*86400 )) ]; then
       _el=$(awk -v e=$(( _now - _d0 )) 'BEGIN{printf "%.2f", e/86400}')
-      echo "❌ 拒绝执行 --run：S6 的 7 天窗口正在进行（已走 ${_el} 天 / 7 天）。" >&2
-      echo "   --run 会跑 recovery.sh，真的停容器、kill daemon —— 那会成为窗口里的人为中断。" >&2
-      echo "   · 只想看现在六步什么状态 → 去掉 --run（默认只读）：" >&2
-      echo "       bash scripts/verify-goal.sh" >&2
-      echo "   · 确定要重来一次 7 天窗口 → 显式确认：" >&2
-      echo "       DOTD_ALLOW_DISRUPT=1 bash scripts/verify-goal.sh --run" >&2
-      exit 2
+      echo "⚠ 注意：长期运行观测窗口还在计时（已走 ${_el} 天 / 7 天）。" >&2
+      echo "   --run 会跑 recovery.sh（真停容器、kill daemon），那份观测数据会多出人为中断。" >&2
+      echo "   · 这**不影响验收结论**（S6 已不在目标范围内），继续跑。" >&2
+      echo "   · 想要干净的观测数据，先 DOTD_ALLOW_DISRUPT=1 再来，或干脆停掉 soak 的 cron。" >&2
+      echo "" >&2
     fi
   fi
 fi
@@ -117,19 +120,28 @@ if [ "$RUN" -eq 1 ]; then
 else
   S1_ST=WAIT; S1_MSG="未加 --run，没真跑 npm test"
 fi
-if git rev-parse --git-dir >/dev/null 2>&1; then
-  DIRTY=$(git status --porcelain 2>/dev/null | wc -l)
+# **git 侧优先看「权威仓库」**（2026-10-20 第 108 轮补）：
+# 源码权威在 Windows 的 `D:\toagi\dotd`，而 daemon 跑在 WSL 的 `/root/dotd`（不是 git 仓库）。
+# 原来只在**当前目录**判断，于是在 WSL 里跑永远只得 ⏳ —— 交付物看起来"验不了"。
+# 现在：如果 `$DOTD_GIT_REPO` 指到一个真仓库，就用它判。
+# 这**不是**把"没测到"降级成 PASS：它仍然要求真的跑一遍 `git status --porcelain`。
+# 只是把"在哪儿跑"这件事交给调用方说清楚。
+GITDIR="${DOTD_GIT_REPO:-$(pwd)}"
+if git -C "$GITDIR" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$GITDIR" status --porcelain 2>/dev/null | wc -l)
   if [ "${DIRTY:-0}" -ne 0 ]; then
-    S1_ST=FAIL; S1_MSG="$S1_MSG；git status 有 $DIRTY 个未提交改动"
+    S1_ST=FAIL; S1_MSG="$S1_MSG；git status 有 $DIRTY 个未提交改动（在 $GITDIR）"
   else
-    S1_MSG="$S1_MSG；git status 干净"
+    S1_MSG="$S1_MSG；git status 干净（在 $GITDIR）"
+    # 若 npm test 没真跑（没加 --run），至少把 git 这半边点亮，
+    # 但仍然保持 ⏳ —— 因为 npm test 那半边还没测。
   fi
 else
   # WSL 侧 /root/dotd 不是 git 仓库（源码权威在 Windows 的 D:\\toagi\\dotd）。
   # 这时**不能**当作「干净」放过去 —— 第⑰类：没测到不能编码成合法值。
   # 保持 ⏳ 并明说去哪验，而不是假装检查过。
   S1_ST=WAIT
-  S1_MSG="$S1_MSG；**本目录不是 git 仓库**，git 半边没验 —— 请在 D:\\toagi\\dotd 侧跑 `git status --porcelain`"
+  S1_MSG="$S1_MSG；**没找到 git 仓库**（试过 ${DOTD_GIT_REPO:-$(pwd)}），git 半边没验"" —— 用 `DOTD_GIT_REPO=D:\\toagi\\dotd bash scripts/verify-goal.sh` 或在 D: 侧跑"
 fi
 row "S1 修绿基线" "$S1_ST" "$S1_MSG" "npm test + git status"
 
