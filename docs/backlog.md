@@ -456,8 +456,13 @@
 过程可视化已接线（默认关，主人可在 config 开）；飞书长连接就绪；0 错误栈；
 原先那 1 个 paused 任务保持 paused。
 
-**遗留**：`DOTD_MAIL_KEY` 仍未设置，邮件工具线上仍不注册。
-配法：`openssl rand -base64 32` → 写进 daemon 环境（_tokens_src.env）后重启。
+**遗留已清（2026-10-20 18:40）**：`DOTD_MAIL_KEY` 已生成（openssl rand -base64 32）
+写入 `_tokens_src.env`（权限收紧 600），daemon 重启后日志实测
+`[mail] 邮件工具已注册（8 个），凭证加密密钥已加载`；
+用 daemon 同款 crypto 代码做了加密→解密往返验证（v1.<nonce>.<tag>.<ct>）。
+163 接入方案已核实（官方帮助中心）：客户端授权码，非登录密码；
+imap.163.com:993 / smtp.163.com:465 从 daemon 网络实测连通。
+**现在只等主人在 163 网页版生成授权码**，即可 mail.account.add。
 
 **顺带发现（树漂移的又一形态）**：live 配置源 `_config_src.yml`（git 不跟踪，
 wsl-daemon.sh 每次启动把它拷成 ~/.dotd/config.yml）**没有** T5 新加的
