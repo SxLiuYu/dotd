@@ -1238,5 +1238,77 @@ else
   echo "  ⚠ 缺夹具 $FIX/allgreen7d.jsonl，跳过全绿用例（不是判据坏了）"
 fi
 
+# ===== 第 105 轮新增：短窗口的外推必须被拒绝 =====
+# 教训：真实窗口 9 个点、3.77 小时，RSS 206.0→213.9（+7.8MB）。
+# 线性拟合 1.67MB/h，外推 168h = 280MB，看着像必死。
+# 但翻了归档发现同一进程（pid=196833）7.1 小时的区间是 201.9–221.7MB，
+# **峰值增长 0.0MB** —— 锯齿，不是斜坡。
+# 我自己的文档里早写着「不要用短窗口 RSS 预测趋势线」，却还是算了斜率。
+# 这条用例锁住：短窗口 + 锯齿输入，判据必须**不判死也不判活**（现在是 ⚠ 证据不足）。
+node -e '
+const fs=require("fs");
+const now=Math.floor(Date.now()/1000);
+const d0=now-3600*6;              // 只有 6 小时窗口
+const out=[];
+// 锯齿：202→222 来回，最后落在中间
+const saw=[202,215,222,205,210,202,218,213];
+for(let i=0;i<saw.length;i++){
+  out.push({ts:d0+i*2100,alive:true,rss_kb:saw[i]*1024,fd:27,threads:11,
+    container_up:1,container_ok:1,relay_up:1,http_ok:1,db_kb:17500,
+    pid:999,proc_start:d0,sv:"98824045"});
+}
+fs.writeFileSync(process.env.FIX+"/sawtooth6h.jsonl", out.map(x=>JSON.stringify(x)).join("\n")+"\n");
+fs.writeFileSync(process.env.FIX+"/sawtooth6h.txt", "x "+d0+"\n");
+'
+# 6 小时窗口：未满 7 天 → 必须 exit 1（未满 7 天那条 ❌），
+# 但**不能**出现「RSS 增长 >=50MB」这种基于外推的判死。
+SOAK="$FIX/sawtooth6h.jsonl" SOAK_DAY0="$FIX/sawtooth6h.txt" SOAK_VERDICT="$FIX/rgv.jsonl" \
+DOTD_WATCHDOG_LOG="$FIX/nowd.log" DOTD_BOOT_LOG="$FIX/noboot.log" \
+  bash scripts/soak.sh report >"$FIX/sawtooth.out" 2>&1
+if grep -qa '❌ RSS 增长' "$FIX/sawtooth.out" || grep -qa '❌ \*\*全窗口 RSS 峰值增长' "$FIX/sawtooth.out"; then
+  f=$((f+1)); printf "  FAIL %-30s 锯齿被当成泄漏\n" "锯齿-不得判成RSS泄漏"
+else
+  p=$((p+1)); printf "  ok   %-30s\n" "锯齿-不得判成RSS泄漏"
+fi
+# 且必须能看出峰值增长很小
+if grep -qaE '峰值增长 \+?[0-9]\.?[0-9]*MB' "$FIX/sawtooth.out"; then
+  p=$((p+1)); printf "  ok   %-30s\n" "锯齿-峰值增长有输出"
+else
+  f=$((f+1)); printf "  FAIL %-30s\n" "锯齿-峰值增长有输出"
+fi
+
+# 反向配套：真斜坡**必须**判红（否则上面那条「锯齿不判死」就是在替泄漏背书）
+# 7 天、RSS 200→280MB，判据必须同时给出两条 ❌（段内增长 + 全窗口峰值增长）。
+node -e '
+const fs=require("fs");
+const now=Math.floor(Date.now()/1000);
+const d0=now-7*86400-3600+300;
+const out=[];
+for(let i=0;i<340;i++){
+  const ts=d0+i*1780;
+  if(ts>now-300) break;
+  const p=i/340;
+  out.push({ts,alive:true,rss_kb:(200+p*80)*1024,fd:27,threads:11,
+    container_up:1,container_ok:1,relay_up:1,http_ok:1,db_kb:17500,
+    pid:999,proc_start:d0,sv:"98824045"});
+}
+for(let i=0;i<28;i++){
+  const ts=d0+i*21600+600;
+  if(ts>now-300) break;
+  out.push({ts,kind:"probe",ok:true,taskId:"t"+i,status:"done",secs:5,
+    slot:String(i%4),want:["OK","-55","350","2176782336"][i%4],out:"1",ws:"1",sv:"98824045"});
+}
+out.sort((a,b)=>a.ts-b.ts);
+fs.writeFileSync(process.env.FIX+"/rampleak7d.jsonl", out.map(x=>JSON.stringify(x)).join("\n")+"\n");
+fs.writeFileSync(process.env.FIX+"/rampleak7d.txt", "x "+d0+"\n");
+'
+SOAK="$FIX/rampleak7d.jsonl" SOAK_DAY0="$FIX/rampleak7d.txt" SOAK_VERDICT="$FIX/rgv.jsonl" \
+DOTD_WATCHDOG_LOG="$FIX/nowd.log" DOTD_BOOT_LOG="$FIX/noboot.log" \
+  bash scripts/soak.sh report >"$FIX/rampleak.out" 2>&1
+_ramp(){ if grep -qa "$1" "$FIX/rampleak.out"; then p=$((p+1)); printf "  ok   %-30s\n" "$2"
+         else f=$((f+1)); printf "  FAIL %-30s\n" "$2"; fi; }
+_ramp '❌ RSS 增长'                    "斜坡-段内增长判红"
+_ramp '❌ \*\*全窗口 RSS 峰值增长'      "斜坡-峰值增长判红"
+
 echo "  合计 $p 通过 / $f 失败"
 [ "$f" = "0" ] && exit 0 || exit 1
