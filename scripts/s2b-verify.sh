@@ -38,9 +38,30 @@ const r=L[L.length-1];
 const four=[r.a_invoke, r.b_no_shell, r.c_no_new_tool, r.d_answer_right];
 const pass=four.filter(Boolean).length;
 const detail=`① invoke=${r.a_invoke?"✅":"❌"} ② 无shell.run=${r.b_no_shell?"✅":"❌"} ③ 工具数不变=${r.c_no_new_tool?"✅":"❌"} ④ 答案对=${r.d_answer_right?"✅":"❌"}`;
-if(pass===4){ console.log(`✅ S2(b) 通过（4/4）：${detail}；工具序列 [${r.seq||""}]`); process.exit(0); }
-console.log(`❌ S2(b) 未通过（${pass}/4）：${detail}；理由：${(r.reasons||"").trim()||"未记录"}`);
-process.exit(1);' 2>&1
+
+// **证据会过期**（2026-10-20 第 100 轮补，真缺陷）。
+// 原来不看到底是哪天跑的：一份 3 天前的 4/4 照样让 verify-goal 打 ✅，
+// 而模型/工具/环境这三天里都可能变了 —— 那个 ✅ 描述的是三天前的事实。
+// 这与 soak.sh 的 STALE_LIMIT 是同一件事（第⑮类：判据的输入可以是陈旧的）。
+// 24 小时的口径来自 soak.sh 的 SCRIPT_CHURN_SETTLE_H；S2(b) 不像 S6 要连续观测，
+// 一天一次复验足够，所以取 24h 当"还算当前"的界。
+const STALE_H = Number(process.env.S2B_STALE_H || 24);
+const atMs = Date.parse(r.at || "");
+if (!Number.isFinite(atMs)) {
+  console.log(`⚠ S2(b) 证据没有可解析的时间戳（at=${r.at}）—— 判断不了是不是当前的，不算通过`);
+  process.exit(3);
+}
+const ageH = (Date.now() - atMs) / 3600000;
+const ageTxt = ageH < 1 ? `${Math.round(ageH*60)} 分钟` : `${ageH.toFixed(1)} 小时`;
+if (ageH > STALE_H) {
+  // 既不判过也不判红：三天前的 4/4 是真的，但它不能替今天背书
+  console.log(`⏳ S2(b) 证据已过期：最后一次是 ${ageTxt} 前（>${STALE_H}h），当时的结论是 ${pass}/4`);
+  console.log(`   这不算通过 —— 它描述的是 ${ageTxt}前 的事实。请重跑一次：bash scripts/s2b-verify.sh`);
+  process.exit(3);
+}
+if(pass===4){ console.log(`✅ S2(b) 通过（4/4，${ageTxt}前实测）：${detail}；工具序列 [${r.seq||""}]`); process.exit(0); }
+console.log(`❌ S2(b) 未通过（${pass}/4，${ageTxt}前实测）：${detail}；理由：${(r.reasons||"").trim()||"未记录"}`);
+process.exit(1);'
   exit $?
 fi
 set -a; . ./_tokens_src.env; set +a
