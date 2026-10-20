@@ -1208,8 +1208,17 @@ const contUpCapable=all.some(s=>s.container_up!==undefined);
 // 正确做法是让数据自己回答 —— 每个采样点自带采集时的脚本指纹（`sv` 字段），
 // 「这段窗口里有几种尺子」就只是数不同取值的个数。
 const scriptVersions=(()=>{
-  const pts=all.filter(s=>s.sv!==undefined && s.sv!=="");
-  if(pts.length===0) return {known:false, versions:[], missing:all.length};
+  // **分母只能是采样点，不能把探针算进来**（第 83 轮修，真缺陷）。
+  // 原来 `pts=all.filter(...)` 而 `missing=all.length-pts.length`，
+  // 但 `all` 里还有 probe 记录 —— 探针**从来不写 sv 字段**。
+  // 于是 `missing` 恒等于「探针数」，约 28。真实场景 3 个老点 + 28 个探针
+  // → 报告会说「另有 31 个采样点没有 sv 字段」，把 28 个探针叫成采样点。
+  // 实测：彩排夹具 340 采样 + 28 探针，`missing` 算出 31 而不是 3。
+  // 这类「分母里混进了不该算的东西」和 R35（contOkRate 分母）、
+  // R75（contRate 分母）是同一个病。
+  const samples=all.filter(s=>s.kind!=="probe");
+  const pts=samples.filter(s=>s.sv!==undefined && s.sv!=="");
+  if(pts.length===0) return {known:false, versions:[], withField:0, missing:samples.length};
   const m=new Map();
   for(const s of pts){
     const k=String(s.sv);
@@ -1217,7 +1226,7 @@ const scriptVersions=(()=>{
     const e=m.get(k); e.last=s.ts; e.n++;
   }
   const versions=[...m.values()].sort((x,y)=>x.first-y.first);
-  return {known:true, versions, withField:pts.length, missing:all.length-pts.length};
+  return {known:true, versions, withField:pts.length, missing:samples.length-pts.length};
 })();
 const SCRIPT_CHURN_SETTLE_H=24;
 // 「最后一版判据已经跑了多久」= 现在 - 它**第一次出现**的时间。
@@ -1767,7 +1776,15 @@ if(days<7){
     `（这批数据是在加入该字段之前采的）—— 无法确认这 ${days.toFixed(1)} 天是同一把尺子量的，这条判断不了`);
 }else if(scriptVersions.versions.length===1){
   const v0=scriptVersions.versions[0];
-  c.push(`✅ 判据全程同一个版本（${v0.sv}，${v0.n}/${scriptVersions.withField} 点）：这 ${days.toFixed(1)} 天是同一把尺子量的`);
+  c.push(`✅ 判据全程同一个版本（${v0.sv}，${v0.n}/${scriptVersions.withField} 点）：这 ${days.toFixed(1)} 天是同一把尺子量的`+
+    // **被排除的点必须说出来**（第 83 轮修）。
+    // 走 ⚠ 分支时会写「另有 N 个老采样点没有 sv 字段」，但 ✅ 分支原来**不写** ——
+    // 真实场景里恰好有 3 个老点（加 sv 字段之前采的）会被排除，
+    // 而报告只显示绿色的 `337/337`，读者无从知道**有 3 个点被静默丢掉了**。
+    // 这不是数字错（337/337 确实是「带 sv 的点全同版本」），
+    // 是**分母被缩小了却不交代** —— 与第 79 轮「句柄爬升速率两个声音」同一类。
+    // 分母变了而读者以为没变，等于用沉默换绿色。
+    (scriptVersions.missing>0? `；另有 ${scriptVersions.missing} 个采样点没有 sv 字段（加入该字段之前采的），未计入` : ""));
 }else{
   const vs=scriptVersions.versions;
   const agesH=(Date.now()/1000-vs[vs.length-1].first)/3600;
