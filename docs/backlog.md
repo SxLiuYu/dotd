@@ -161,3 +161,25 @@
     若要做到无人值机，应改成「对每个动态工具跑一次 `tool.invoke` 并看 `result_json`」。
   - S6 只是把 `soak.sh report` 的退出码转述一遍，没有自己独立判断 —— 这是有意的（避免两套判据打架），
     但也意味着 `soak.sh` 若判错，`verify-goal.sh` 会原样继承。
+
+## 第 99 轮（2026-10-20）
+
+- **S2(b) 的判据④长期误报红**（已修，记在此备查）
+  - `scripts/s2b-verify.sh` 写死 `d = "/dot/home/tools/char-count"`，而容器里实际只有 `word-count`。
+  - 后果：`EXPECT` 永远为空 → `✖ ④ 算不出基准值` → `VERDICT: FAIL（3/4）`，
+    **而模型其实每次都答对了**（27 个字符，与 `word-count` 的 `total_chars` 一致）。
+  - 修法：遍历 `/dot/home/tools/` 取第一个能给出字符数的工具，不写死名字。
+  - 遗留：`s2b-verify.sh` 用「回答里 grep 得到那个数字」判对错 ——
+    若模型答「27 个字符，其中 4 个汉字」，grep 到 27 就过；若它先说个错的再纠正，也会过。
+    **更严的做法是校验整句只有一个数字且等于 EXPECT。** 未做。
+
+- **`scripts/s2b-verify.sh` 会真的发任务**
+  - 它不像 `acceptance.sh --judge` 那样天然只读；`--judge` 是这轮才加的。
+  - 在 S6 窗口内**不要**跑不带 `--judge` 的版本 —— 会往库里写任务、可能触发审批。
+  - 本轮跑的那两次（`tk_mvg1oi56oz5z2i` / `tk_mvg1p6n2u56nd2`）是刻意的，
+    都属于「修判据必须真跑一次」的成本，但**在 7 天窗口里属于外部扰动**，需在 S6 报告里如实说明。
+
+- **`verify-goal.sh` 的 S2(b) 现在依赖 `s2b-reuse.jsonl` 的新鲜度，但没有过期判据**
+  - 若这个文件是 6 天前跑的，`--judge` 仍会 exit 0，`verify-goal.sh` 照样打 ✅。
+  - 这与 `soak.sh` 的 `STALE_LIMIT` 思路不一致。**应加一个「证据超过 N 小时即算 ⏳」**。
+    未做（避免这轮再动判据）。

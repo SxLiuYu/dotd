@@ -95,42 +95,54 @@ fi
 row "S1 修绿基线" "$S1_ST" "$S1_MSG" "npm test + git status"
 
 # ─── S2 自己造工具：(a)(b)(c) ───
+# (a) 造工具：tool.create 真造过
+# (b) 复用：**不靠数 tool.invoke 的次数**，而是读 s2b-verify.sh 的落盘证据
+#     （2026-10-20 第 99 轮修：原来只数 steps 表里 tool.invoke 有多少行，
+#      那只能证明"调用过"，证明不了"同类任务主动选了它、且没手写重来、且答案对"。
+#      目标是三选一里最严的那条，就必须用最严的证据。）
+# (c) 三工具六环：白名单条数
 S2_OUT=$(node --disable-warning=ExperimentalWarning -e '
 const { DatabaseSync } = require("node:sqlite");
 const home = process.env.HOME || "/root";
 let db;
 try { db = new DatabaseSync(home + "/.dotd/dotd.db", { readOnly: true }); }
-catch (e) { console.log("ERR|打不开库|0|0"); process.exit(0); }
+catch (e) { console.log("ERR|0|0|0"); process.exit(0); }
 const one = (s, ...a) => { try { return db.prepare(s).get(...a); } catch (e) { return null; } };
 const created = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=?", "tool.create") || {}).c || 0;
 const invAll  = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=?", "tool.invoke") || {}).c || 0;
-// status 的真实取值是 succeeded / pending / failed（不是 ok！）
-// 2026-10-20 第 98 轮踩到：第一版写 status="ok" 查出 0 次，误报 S2(b) 未达成。
-const invOk   = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=? AND status=?", "tool.invoke", "succeeded") || {}).c || 0;
 let wl = 0;
 try {
   const y = require("fs").readFileSync("config/tools.yml", "utf8");
   wl = (y.match(/^\s*-\s*name:\s*\S+/gm) || []).length;
 } catch (e) {}
-console.log([created, invAll, invOk, wl].join("|"));
+console.log([created, invAll, wl].join("|"));
 db.close();' 2>/dev/null)
 
-IFS='|' read -r S2_CREATED S2_INVALL S2_INVOK S2_WL <<< "${S2_OUT:-ERR|x|0|0}"
+IFS='|' read -r S2_CREATED S2_INVALL S2_WL <<< "${S2_OUT:-ERR|0|0}"
 if [ "${S2_CREATED:-ERR}" = "ERR" ] || [ -z "${S2_CREATED:-}" ]; then
-  row "S2 自己造工具" FAIL "读不到 steps 表（库路径或权限问题）" "sqlite: steps WHERE tool_name=…"
+  row "S2 自己造工具" FAIL "读不到 steps 表（库路径或权限问题）" "sqlite + s2b-verify.sh --judge"
 else
   S2_ST=PASS; S2_D=""
   if [ "$S2_CREATED" -gt 0 ]; then S2_D="(a) tool.create $S2_CREATED 次 ✅"
   else S2_D="(a) tool.create 0 次 ❌"; S2_ST=FAIL; fi
-  if [ "${S2_INVOK:-0}" -gt 0 ]; then S2_D="$S2_D；(b) tool.invoke 成功 $S2_INVOK / 共 $S2_INVALL 次 ✅"
-  else S2_D="$S2_D；(b) tool.invoke 0 次成功 ❌"; S2_ST=FAIL; fi
+
+  # (b) 用 s2b-verify.sh --judge 的结论，不看有多少次调用
+  bash scripts/s2b-verify.sh --judge >/tmp/verify-goal-s2b.log 2>&1; S2B_RC=$?
+  case "$S2B_RC" in
+    0) S2_D="$S2_D；(b) 复用实测 4/4 ✅" ;;
+    3) S2_D="$S2_D；(b) 还没有 S2(b) 证据 ⏳"; [ "$S2_ST" = "PASS" ] && S2_ST=WAIT ;;
+    *) S2_D="$S2_D；(b) 复用未达标 ❌"; S2_ST=FAIL ;;
+  esac
+
   if [ "${S2_WL:-0}" -ge 3 ]; then S2_D="$S2_D；(c) 白名单 $S2_WL 个 ✅"
   else S2_D="$S2_D；(c) 白名单仅 $S2_WL 个 ❌"; S2_ST=FAIL; fi
-  row "S2 自己造工具" "$S2_ST" "$S2_D" "sqlite: steps WHERE tool_name IN (tool.create,tool.invoke)"
+  row "S2 自己造工具" "$S2_ST" "$S2_D" "sqlite steps + s2b-verify.sh --judge + config/tools.yml"
 fi
 
 # ─── S3 能力验收：20 条 ≥19 ───
 if [ "$RUN" -eq 1 ]; then
+  echo "▸ S2(b)：真跑一次复用判据（会发任务）…"
+  DOTD_ACCEPT_DIR="$ACC" bash scripts/s2b-verify.sh >/tmp/verify-goal-s2b-run.log 2>&1 || true
   echo "▸ S3：跑 20 条日常场景（约 5-10 分钟）…"
   DOTD_ACCEPT_DIR="$ACC" bash scripts/acceptance.sh >/tmp/verify-goal-s3.log 2>&1 || true
 fi
