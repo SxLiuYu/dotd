@@ -109,7 +109,16 @@ echo ""
 S1_ST=PASS; S1_MSG=""
 if [ "$RUN" -eq 1 ]; then
   echo "▸ S1：跑 npm test …"
-  if npm test >/tmp/verify-goal-npmtest.log 2>&1; then
+  # **`npm test` 必须在「拥有 node_modules 的那个平台」上跑**（2026-10-20 第 108 轮）。
+  # 实测：从 WSL 跨 `/mnt/d` 跑，`pass 0 / fail 118`，全部报
+  #   `You installed esbuild for another platform ... "@esbuild/win32-x64" is present
+  #    but this platform needs "@esbuild/linux-x64"`
+  # 因为 `node_modules` 是在 Windows 上装的，esbuild 是 native 二进制。
+  # **这不是代码缺陷，是跑错平台** —— 而在错平台上跑出来的红，是假红。
+  # 所以：如果当前不是 node_modules 所属平台，就让调用方用 DOTD_NPM_CMD 指定
+  # （例如 `DOTD_NPM_CMD='cmd.exe /c npm test'`）。
+  NPMCMD="${DOTD_NPM_CMD:-npm test}"
+  if $NPMCMD >/tmp/verify-goal-npmtest.log 2>&1; then
     NT=$(grep -aE '^ℹ pass [0-9]+' /tmp/verify-goal-npmtest.log | tail -1 | grep -oE '[0-9]+' | head -1)
     NF=$(grep -aE '^ℹ fail [0-9]+' /tmp/verify-goal-npmtest.log | tail -1 | grep -oE '[0-9]+' | head -1)
     S1_MSG="npm test ${NT:-?} 通过 / ${NF:-?} 失败"
@@ -118,7 +127,44 @@ if [ "$RUN" -eq 1 ]; then
     S1_ST=FAIL; S1_MSG="npm test 退出码非 0（见 /tmp/verify-goal-npmtest.log）"
   fi
 else
-  S1_ST=WAIT; S1_MSG="未加 --run，没真跑 npm test"
+  # **只读模式下读外部证据**（2026-10-20 第 108 轮）。
+  # 为什么需要这个：`npm test` 必须跑在「拥有 node_modules 的那个平台」上。
+  # 实测从 WSL 跨 /mnt/d 跑 = `pass 0 / fail 118`，全报 esbuild 平台不匹配
+  # （node_modules 是 Windows 装的，`@esbuild/win32-x64` vs 需要 `linux-x64`）。
+  # 而 `cmd.exe /c npm test` 在 WSL 里又太慢且会跑偏。所以：
+  # **由 Windows 侧跑一次，落成 docs/acceptance/s1-npmtest.json，这里读它。**
+  # 但证据会过期 —— 所以带 TTL（默认 24h），过期就退回 ⏳，绝不当成现在的结论。
+  S1_EV="$ACC/s1-npmtest.json"
+  S1_TTL_H="${S1_EVIDENCE_TTL_H:-24}"
+  if [ -f "$S1_EV" ]; then
+    S1_READ=$(node -e '
+const fs=require("fs");
+try{
+  const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+  const ageH=(Date.now()-Date.parse(j.at))/3600000;
+  console.log([j.pass,j.fail,ageH.toFixed(1),j.at,j.host||"?"].join("|"));
+}catch(e){ console.log(""); }
+' "$S1_EV" 2>/dev/null)
+    if [ -n "$S1_READ" ]; then
+      IFS='|' read -r _p _f _age _at _host <<< "$S1_READ"
+      if awk -v a="$_age" -v t="$S1_TTL_H" 'BEGIN{exit !(a<=t)}'; then
+        if [ "${_f:-1}" -eq 0 ]; then
+          S1_ST=PASS
+          S1_MSG="npm test ${_p} 通过 / ${_f} 失败（$_host，${_age}h 前实测）"
+        else
+          S1_ST=FAIL
+          S1_MSG="npm test ${_p} 通过 / ${_f} 失败（$_host，${_age}h 前实测）"
+        fi
+      else
+        S1_ST=WAIT
+        S1_MSG="npm test 证据已过期（${_age}h 前 > ${S1_TTL_H}h），重跑一次再判"
+      fi
+    else
+      S1_ST=WAIT; S1_MSG="没加 --run，且 $S1_EV 读不出来"
+    fi
+  else
+    S1_ST=WAIT; S1_MSG="没加 --run，也没找到 $S1_EV（Windows 侧跑 npm test 后落盘）"
+  fi
 fi
 # **git 侧优先看「权威仓库」**（2026-10-20 第 108 轮补）：
 # 源码权威在 Windows 的 `D:\toagi\dotd`，而 daemon 跑在 WSL 的 `/root/dotd`（不是 git 仓库）。
