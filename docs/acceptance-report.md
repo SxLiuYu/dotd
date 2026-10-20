@@ -1,5 +1,10 @@
 # S3 能力验收报告
 
+
+> ⚠ **本文有时效性**（2026-10-20 第 106 轮补）。
+> 文中数字是当时那一次运行的快照，**不是当前状态**。
+> 当前状态一律以 `bash scripts/verify-goal.sh` 的输出为准（见 [ACCEPTANCE.md](ACCEPTANCE.md)）。
+> 证据文件里的原始记录不会过期，本文的**摘要**会。
 > 判据：20 条日常场景成功率 ≥ 95%（≥19/20）。执行：`bash scripts/acceptance.sh`
 > 环境：真 daemon（WSL /root/dotd）+ 真模型（deepseek-v4.1-flash）+ 真容器（dotd-dot-dot1）
 > 时间：2026-10-19

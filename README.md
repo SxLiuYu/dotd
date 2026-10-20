@@ -4,6 +4,10 @@
 
 **英文版见 [README.en.md](README.en.md)。** 细节以本文件为准。
 
+> **想直接知道"做完了没有"？** 看 [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) ——
+> 一页纸的六步验收结论 + 每条判据的证据文件 + 怎么自己重跑一遍。
+> 或者直接跑 `bash scripts/verify-goal.sh`（只读，退出码即结论）。
+
 ---
 
 ## 这是什么

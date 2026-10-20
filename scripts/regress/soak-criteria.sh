@@ -1202,6 +1202,38 @@ cp -f "$FIX/s2b-bak2.jsonl" docs/acceptance/s2b-reuse.jsonl
 # 因为所有用例都只断言「该红的时候红」，没有一条断言「该绿的时候绿」。
 # 这份夹具是第一个 7 天全绿样本：340 采样 + 28 探针 + 1 段，判定行 29 条 ✅ / 0 条 ❌。
 # 夹具：fixtures/allgreen7d.jsonl（生成方式见 README「全绿样本」一节）
+# **夹具必须现生成，不能存成静态 jsonl**（第 106 轮踩到）。
+# 第一版我把它存成 fixtures/allgreen7d.jsonl，340 点 × 1780s 只覆盖 6.98 天，
+# 末尾留了 1.3h 空隙 —— 生成时没事，**12 分钟后**就超过 STALE_LIMIT=5400 而变红。
+# 这是 R83–R86 那族「夹具过期」的第 N 次。
+# 现在改成每次跑都按 now 现生成：末点正好落在 now-300，永远新鲜。
+node -e '
+const fs=require("fs");
+const now=Math.floor(Date.now()/1000);
+const span=7*86400+3600;              // 7 天零 1 小时
+const d0=now-300-span;                // 末点正好 now-300
+const out=[];
+const N=342;
+const step=Math.floor(span/(N-1));
+for(let i=0;i<N;i++){
+  const ts=d0+i*step;
+  if(ts>now-300) break;
+  out.push({ts,alive:true,rss_kb:210*1024,fd:27,threads:11,
+    container_up:1,container_ok:1,relay_up:1,http_ok:1,db_kb:17500,
+    pid:777,proc_start:d0,sv:"98824045"});
+}
+// 探针：每 21600s 一个，覆盖全部 7 段
+for(let i=0;i<29;i++){
+  const ts=d0+i*21600+600;
+  if(ts>now-300) break;
+  out.push({ts,kind:"probe",ok:true,taskId:"t"+i,status:"done",secs:5,
+    slot:String(i%4),want:["OK","-55","350","2176782336"][i%4],out:"1",ws:"1",sv:"98824045"});
+}
+out.sort((a,b)=>a.ts-b.ts);
+fs.writeFileSync(process.env.FIX+"/allgreen7d.jsonl", out.map(x=>JSON.stringify(x)).join("\n")+"\n");
+fs.writeFileSync(process.env.FIX+"/allgreen7d.txt", "x "+d0+"\n");
+console.log("    全绿夹具现生成 "+out.length+" 行，末点 "+(now-300-d0)+"s 处");
+'
 if [ -f "$FIX/allgreen7d.jsonl" ]; then
   t "$FIX/allgreen7d.jsonl" "$FIX/nowd.log" "全绿7天-必须exit0" 0
   SOAK="$FIX/allgreen7d.jsonl" SOAK_DAY0="$FIX/allgreen7d.txt" SOAK_VERDICT="$FIX/rgv.jsonl" \
@@ -1223,7 +1255,19 @@ if [ -f "$FIX/allgreen7d.jsonl" ]; then
   # 「探针能力覆盖」这行是 console.log，**不带 ✅ 前缀**（第 104 轮查出：
   # 全绿报告里它是一句中性的字，读者判断不了这算不算通过）。
   # 所以只能断言它的实际形态，并单独断言没有「未覆盖」。
-  _ag '探针能力覆盖：纯存活 7 / 纯推理 7 / 读文件 7 / 容器执行 7' "全绿-能力路径齐全"
+  # **不要硬编码每个 slot 的计数**（第 106 轮踩到）。
+  # 第一版断言「纯存活 7 / 纯推理 7 / 读文件 7 / 容器执行 7」，
+  # 而现生成 29 个探针时 slot0 会拿到 8 次 —— 同一条判据，数字随夹具长度变。
+  # 这条判据真正要问的是「四条能力路径**都覆盖到了没有**」，不是「各几次」。
+  # 所以断言：四个 slot 名都出现，且后面的数字 >= 1。
+  if grep -qaE '探针能力覆盖：纯存活 [1-9]' "$FIX/allgreen.out" \
+  && grep -qaE '纯推理 [1-9]' "$FIX/allgreen.out" \
+  && grep -qaE '读文件 [1-9]'  "$FIX/allgreen.out" \
+  && grep -qaE '容器执行 [1-9]' "$FIX/allgreen.out"; then
+    p=$((p+1)); printf "  ok   %-30s\n" "全绿-能力路径齐全"
+  else
+    f=$((f+1)); printf "  FAIL %-30s\n" "全绿-能力路径齐全"
+  fi
   if grep -qa '未覆盖' "$FIX/allgreen.out"; then
     f=$((f+1)); printf "  FAIL %-30s 出现了「未覆盖」\n" "全绿-不得有未覆盖"
   else
@@ -1309,6 +1353,48 @@ _ramp(){ if grep -qa "$1" "$FIX/rampleak.out"; then p=$((p+1)); printf "  ok   %
          else f=$((f+1)); printf "  FAIL %-30s\n" "$2"; fi; }
 _ramp '❌ RSS 增长'                    "斜坡-段内增长判红"
 _ramp '❌ \*\*全窗口 RSS 峰值增长'      "斜坡-峰值增长判红"
+
+# ===== 第 106 轮新增：验收文档不能变成谎言 =====
+# 教训：docs/ 下四份报告是 10-19 19:37 写的快照，而这轮发现
+# soak-report.md 的标题还写着「现在的真实状态（2026-10-19 19:35）」
+# —— 而真实 7 天窗口是 10-20 06:43:55 才起算的。**读者会以为那份就是现在。**
+# 文档会腐烂，而且腐烂时不会报错。这条用例锁住三件事：
+#   ① ACCEPTANCE.md 存在
+#   ② 四份报告都带了「本文有时效性」的声明
+#   ③ ACCEPTANCE.md 里写的证据文件路径真实存在
+if [ -f docs/ACCEPTANCE.md ]; then
+  p=$((p+1)); printf "  ok   %-30s\n" "文档-ACCEPTANCE存在"
+else
+  f=$((f+1)); printf "  FAIL %-30s\n" "文档-ACCEPTANCE存在"
+fi
+for _r in acceptance-report honesty-report recovery-report soak-report; do
+  if grep -qa '本文有时效性' "docs/$_r.md" 2>/dev/null; then
+    p=$((p+1)); printf "  ok   %-30s\n" "文档-${_r}有时效声明"
+  else
+    f=$((f+1)); printf "  FAIL %-30s\n" "文档-${_r}有时效声明"
+  fi
+done
+# ACCEPTANCE.md 里提到的证据文件必须真的在（防止写了不存在的路径）
+for _e in docs/acceptance/s2b-reuse.jsonl docs/acceptance/results.jsonl \
+          docs/acceptance/honesty.jsonl docs/acceptance/recovery.jsonl; do
+  if grep -qa "$_e" docs/ACCEPTANCE.md && [ -f "$_e" ]; then
+    p=$((p+1)); printf "  ok   %-30s\n" "文档-引用真实存在:$(basename $_e)"
+  else
+    f=$((f+1)); printf "  FAIL %-30s 文档提到的证据文件不存在或没提到\n" "文档-引用真实存在:$(basename $_e)"
+  fi
+done
+# 「现在的真实状态」这种会骗人的标题不许再出现
+# 范围要精确：只查四份**验收报告**。
+# 第一版写成 `docs/*.md`，结果命中了 optimization-2026-10-17.md 的
+# 「## 27. 现在的真实状态」—— 那份标题带日期，本来就不骗人。
+# 判据范围过宽 = 误报，而误报是我自己造成的（R94）。
+if grep -qaE '^## .*现在的真实状态' \
+     docs/acceptance-report.md docs/honesty-report.md \
+     docs/recovery-report.md docs/soak-report.md 2>/dev/null; then
+  f=$((f+1)); printf "  FAIL %-30s 有会被误读成当下的标题\n" "文档-不得有『现在的』标题"
+else
+  p=$((p+1)); printf "  ok   %-30s\n" "文档-不得有『现在的』标题"
+fi
 
 echo "  合计 $p 通过 / $f 失败"
 [ "$f" = "0" ] && exit 0 || exit 1
