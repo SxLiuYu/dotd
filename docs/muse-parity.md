@@ -71,7 +71,8 @@ calendar-criteria.sh    49 通过 / 0 失败   ← 修了 3 条假红判据
 | DB 字段 | `crontabs.proactive` / `quiet_hours` / `throttle_hours` / `last_push_at`（`170_proactive.sql:45`） |
 | 判定 | `src/surfaces/proactive.ts` 的 `shouldPush()`：开关 → 安静时段 → 节流 |
 | 接线 | `control-plane/index.ts:204,247` |
-| 当前值 | **5 条 crontab 全部 `proactive=0`**（实测查询） |
+| 当前值 | **「早间日程提醒」已 `proactive=1`（throttle=20h）**，其余 4 条仍 0 |
+| 消费端 | `feishu-outbound.ts` 的 `shouldAnnounce()`（2026-10-21 补，此前判定无人读） |
 
 ```bash
 node -e "const {DatabaseSync}=require('node:sqlite');
@@ -79,7 +80,27 @@ const db=new DatabaseSync('/root/.dotd/dotd.db');
 console.log(db.prepare('SELECT proactive,enabled FROM crontabs').all());"
 ```
 
-**这是「做完但关着」，不是「没做」。** 默认关是刻意的：升级不能自己开始给主人发消息。
+**这是「做完但开着」，不再是「关着」。** 默认关仍是刻意的（升级不能自己开始发消息），
+但本轮已对一条真实任务打开，并实测三道闸逐个生效。
+
+### 3.2 三道闸实测（2026-10-21）
+
+同刻触发三条，只差一道闸：
+
+| crontab | 配置 | `last_fire_status` | `last_push_at` | 飞书实收 |
+|---|---|---|---|---|
+| 安静时段 | `quiet_hours=00:00-23:59` | **`skipped_quiet`** | null | 无 |
+| 节流 | `throttle_hours=99` 且刚推过 | `fired` | 未更新（保持旧值） | 无 |
+| 对照 | 全放开 | `fired` | **已更新** | **Q-OK** |
+
+两条结论值得记住：
+
+1. **安静时段在调度层就拦住**（`last_fire_status=skipped_quiet`，任务根本没建），
+   而**节流让任务照跑、只是不推**（`fired` + 任务 done，无出站）。
+   这个区别是有意的：安静时段是"别吵我"，节流是"说过一次了"。
+2. 任务 `done` 与是否推送**完全解耦**。上一轮修的缺陷正是这里 ——
+   此前 `taskStateText` 对所有任务结束都回复，不看 `proactive`，
+   导致「关着的任务照样天天打扰」（`surf_outbound_log` 811/812 两条同刻推送）。
 
 设计上比 Muse 更克制的地方：闸门放在**发送之前**而不是任务创建时——
 任务照跑（结果进记忆/文件），只是不打扰人。
