@@ -642,7 +642,7 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '抓取网页正文（真实浏览器渲染后取文本）。' +
       '**读文章/公告/文档优先用它**，特别是 JS 渲染的页面——net.get 这类纯 HTTP ' +
       '抓取对它们只能拿到空壳。',
-    params: { url: '要读取的地址，http(s)' },
+    params: { url: '要读取的页面地址，必须 http(s)；省略不了，这是必填项' },
     returns: '{ output }：页面正文纯文本，超长会截断并标注。',
     failures:
       '输出为空：页面需要登录或是纯前端空壳 —— 改用 web.snapshot 看结构；' +
@@ -801,11 +801,13 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
    · PDF：\`pdftotext 文件.pdf -\` 直接打出文本；\`pdfinfo 文件.pdf\` 看页数/元信息
    · Word(.docx) / Excel(.xlsx)：本质是 zip+xml，用 python3 解（zipfile 读内部 xml，正则或 ElementTree 取文本）
    · 纯文本/代码/日志：fs.read 就够
-4. 网页：browser.open → browser.snapshot（看结构）→ browser.screenshot（要给主人看画面：PNG 存 screenshots/，随回复自动推）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
-5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
+4. 网页：**首选 web.*（不弹审批）**。web.read 读正文（JS 页面也能读；net.get 只有空壳）；
+       web.snapshot 取「元素+@eN 引用」→ web.act 用 @eN 点/填（做完自动回新清单，引用比选择器稳）。
+       看画面用 browser.screenshot；容器内 browser.open/browser.snapshot/browser.act/browser.close 是旧路径
+5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
    7. 邮件：mail.account.list 看接了哪些 → mail.list / mail.search / mail.read 收、搜、读 → mail.draft 起稿 → mail.send 真发（dangerous，必过主人审批）；接入 mail.account.add，移除 mail.account.remove。
-   8. 日历：calendar.add 记日程 → calendar.edit 改 → calendar.delete 删（写的是本地日历；订阅 .ics 只读）。约时间前先 calendar.conflicts 查冲突。
+   8. 日历：calendar.add 记 → calendar.edit 改 → calendar.delete 删（写本地日历；订阅 .ics 只读）。约时间前先 calendar.conflicts 查冲突。
    9. 连接器：github.notifications（GitHub 通知）/ github.issues / github.pulls（仓库 issue/PR 清单）/ rss.read（抓 RSS/Atom 源）。都是只读；没配 DOTD_GITHUB_TOKEN 时 GitHub 只能查公开仓。/ vault.sites（保险库条目名清单，配合 $vault:site:user 占位符用）。
    10. 造工具：tool.create / tool.list / tool.invoke。
       **写脚本前先看有没有「你已有的自造工具」**：对口就 tool.invoke，别重写。

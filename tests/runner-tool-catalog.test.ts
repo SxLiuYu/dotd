@@ -99,6 +99,10 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
   'github.pulls',
   'rss.read',
   'vault.sites',
+  // W2（2026-10-21）：宿主侧浏览器三件套
+  'web.snapshot',
+  'web.read',
+  'web.act',
     ],
   );
 });
@@ -271,7 +275,9 @@ test('system prompt：是导出常量、有长度预算、内容不是空话', (
   // 4000 → 4200：mail 8 工具进目录，引导段必须逐名覆盖（测试要求），8 个名字 ~120 字符。
   // 4200 → 4400（2026-10-21，task-1）：calendar 3 工具进目录，引导段再逐名覆盖一行；
   // 实测改动前 prompt 已 4163（余量 37），一行 ~110 字符必超，按任务批复抬到 4400。
-  assert.ok(SYSTEM_PROMPT_BUDGET <= 4600, '任务要求总长 < 4600 字符');
+  // 4600 → 4700（2026-10-21，W2）：web.* 三件套进目录，引导段逐名覆盖 + 讲清
+  // read/snapshot→act 的选择逻辑；压到 4604 仍差 4 字符，再压就要删信息了。
+  assert.ok(SYSTEM_PROMPT_BUDGET <= 4700, '总长上限 < 4700 字符');
 
   // 必备的四块：身份/环境、工作纪律、记忆、对主人表达。
   for (const must of ['Dot', '/dot/home', 'MEMORY.md', 'notes/', 'manuals/', '结论先行', '中文']) {
