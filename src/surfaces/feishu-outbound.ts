@@ -155,7 +155,17 @@ export function isLowValueReply(text: string): boolean {
 export function clipForFeishu(text: string, maxChars = FEISHU_REPLY_MAX_CHARS): string {
   if (text.length <= maxChars) return text;
 
-  const head = text.slice(0, maxChars);
+  // 2026-10-21 修：尾部提示语本身就占长度，不能"先留满 maxChars 再往上加"。
+  // 实测 601 字 → 655 字，比原文还长 —— 折叠反而让消息变大。
+  // 做法：先按最长的提示语预留空间，裁完再用真实数字生成提示，
+  // 最后再校一次总长（提示语里的数字位数会变，所以要循环收敛）。
+  const tailFor = (left: number): string =>
+    `\n\n…（还有 ${left} 字，完整内容见 Web 会话，或用 dotd task <id> --verbose 查看）`;
+
+  // 预留一个"看起来像真的"的位数上限，之后按实际收敛
+  const reserved = tailFor(maxChars).length;
+  const budget = Math.max(0, maxChars - reserved);
+  const head = text.slice(0, budget);
   // 优先在段落处断，其次句号/问号/叹号，最后换行
   let cut = -1;
   for (const sep of ['\n\n', '\n', '。', '！', '？', '. ', '! ', '? ']) {
@@ -165,9 +175,19 @@ export function clipForFeishu(text: string, maxChars = FEISHU_REPLY_MAX_CHARS): 
       break;
     }
   }
-  const kept = cut > 0 ? text.slice(0, cut).trimEnd() : head.trimEnd();
+  let kept = cut > 0 ? text.slice(0, cut).trimEnd() : head.trimEnd();
+  // 收敛：提示语里的数字位数会变（9 → 10 → 100…），所以最多再校两轮。
+  for (let i = 0; i < 3; i++) {
+    const left = text.length - kept.length;
+    const out = kept + tailFor(left);
+    if (out.length <= maxChars) return out;
+    const over = out.length - maxChars;
+    kept = kept.slice(0, Math.max(0, kept.length - over)).trimEnd();
+  }
+  // 兜底：极端情况下宁可只发提示，不发一句被截一半的话。
   const left = text.length - kept.length;
-  return `${kept}\n\n…（还有 ${left} 字，完整内容见 Web 会话，或用 dotd task <id> --verbose 查看）`;
+  const out = kept + tailFor(left);
+  return out.length <= maxChars ? out : tailFor(text.length).slice(0, maxChars);
 }
 
 export function shouldAnnounce(db: DatabaseSync, taskId: string): boolean {

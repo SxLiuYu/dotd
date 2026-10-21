@@ -44,6 +44,32 @@ console.log('  一、长文折叠（clipForFeishu）');
 
 ok('短回复原样返回，不加任何尾巴', clipForFeishu('好的，已完成。') === '好的，已完成。');
 ok('恰好等于上限也原样', clipForFeishu('x'.repeat(FEISHU_REPLY_MAX_CHARS)).length === FEISHU_REPLY_MAX_CHARS);
+// 2026-10-21 修：601 字曾裁成 655 字 —— 比原文还长。
+// 原因是"先留满 600 字，再加 55 字提示语"。折叠反而让消息变大。
+// 下面几条把"永远不超过上限"钉死。
+ok(
+  '刚过上限也绝不超上限',
+  clipForFeishu('\u5b57'.repeat(601)).length <= FEISHU_REPLY_MAX_CHARS,
+  '实际 ' + clipForFeishu('\u5b57'.repeat(601)).length + ' 字',
+);
+ok(
+  '刚过上限不会比原文更长',
+  clipForFeishu('\u5b57'.repeat(601)).length <= 601,
+  '原文 601 / 实发 ' + clipForFeishu('\u5b57'.repeat(601)).length,
+);
+{
+  // 边界扫描：上限附近每个长度都不能超
+  let worst = 0;
+  let worstAt = 0;
+  for (let n = 599; n <= 700; n++) {
+    const got = clipForFeishu('\u5b57'.repeat(n)).length;
+    if (got > worst) {
+      worst = got;
+      worstAt = n;
+    }
+  }
+  ok('599..700 全部不超上限', worst <= FEISHU_REPLY_MAX_CHARS, '最大 ' + worst + ' 字（原文 ' + worstAt + '）');
+}
 
 const long = '第一段结论。\n\n' + '细节内容。'.repeat(300);
 const clipped = clipForFeishu(long);

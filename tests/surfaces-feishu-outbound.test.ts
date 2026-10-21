@@ -166,10 +166,15 @@ test('超长正文截断到上限并标注；非终态与无 thread 任务不动
       assert.ok(call);
       // 2026-10-21：上限从 3800 收到 600 并改为「折叠 + 指路」。
       // 这串 A 没有句子边界，所以走硬切 —— 断言的就是硬切的下限行为。
-      assert.ok(call.text.startsWith('A'.repeat(600)), '前 600 字原样保留');
+      // 2026-10-21 二次修正：原断言是 startsWith('A'.repeat(600))。
+      // 那条断言会让「601 字裁成 655 字」通过 —— 因为前 600 字
+      // 确实原样保留了，只是后面又加了 55 字提示语，总长反而超过原文。
+      // 折叠的第一要务是「别让消息变大」，所以先预留提示语空间（约 55 字），
+      // 正文保留约 545 字。这里断言真正的不变量，而不是某次实现的细节。
+      assert.ok(call.text.startsWith('A'.repeat(540)), '正文保留大部分（预留提示语空间后）');
       assert.ok(call.text.includes('还有'), '要说清还有多少字没发');
       assert.ok(call.text.includes('dotd task'), '要指路去哪看全文');
-      assert.ok(call.text.length < 700, '整体不回到千字级');
+      assert.ok(call.text.length <= 600, '不超上限（这才是折叠的定义）');
     } finally {
       stop();
     }
