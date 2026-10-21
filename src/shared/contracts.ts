@@ -1106,6 +1106,20 @@ export interface GovernanceApi {
       ttlMs?: number;
     },
   ): Promise<{ approvalId: number }>;
+  /**
+   * §3.3.6 `executing → executed / failed`（2026-10-21 补）。
+   *
+   * 为什么必须接：claim() 把审批推进到 `executing` 之后，**没有任何人被要求**
+   * 报告执行结果。实测后果 —— 库里 126 条审批全部停在 `executing`，
+   * 一条都没进终态；而 gate.ts:372 对 `executing` 是直接
+   * `deny('execution in flight')`，同一张单子因此永久不可再用。
+   *
+   * 调用方：Runner 在审批续跑那一步的工具执行完之后。
+   */
+  resolveExecution(
+    approvalId: number,
+    outcome: { ok: boolean; resultDigest?: string },
+  ): Promise<{ ok: boolean; status?: ApprovalStatus; reason?: string }>;
 }
 
 /**

@@ -34,7 +34,7 @@ import { DotRunner } from '../src/runner/dot.ts';
 import type { RunnerOptions } from '../src/runner/dot.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
-import { createGovernance, initGovernance, decide, evaluate, claim, forceApproval } from '../src/governance/gate.ts';
+import { createGovernance, initGovernance, decide, evaluate, claim, forceApproval, resolveExecution } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
 import type { GovDeps } from '../src/governance/types.ts';
 import type { GovDefaults } from '../src/governance/config.ts';
@@ -269,6 +269,7 @@ async function fixture(opts: {
         },
         claim: (approvalId) => claim(approvalId, rt),
         forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+        resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
       },
     },
     opts.runnerOpts,
@@ -508,10 +509,15 @@ test('审批：dangerous(shell.run+rm) → awaiting_approval → approve_once �
     .all(callId) as unknown as Array<Record<string, unknown>>;
   assert.equal(execRows.length, 1, '同 call_id 在 exec ledger 只有一行');
 
-  // claim() 把 final_params_json 固化（GOV §3.3.6）；executing→executed 的终态回写
-  // 归治理 decide/执行面回收（Runner 只负责执行前认领），故此处断 executing。
+  // claim() 把 final_params_json 固化（GOV §3.3.6）。
+  //
+  // 2026-10-21 修正：这里原本断言 `executing`，并注释说“终态回写归治理 decide/执行面回收”。
+  // 但那个“回收者”根本不存在 —— resolveExecution 定义了却全项目无人调用，
+  // 结果库里 126 条审批全卡在 executing、一条终态都没有；
+  // 而 gate.ts:372 对 executing 是 deny('execution in flight')，同一张单子永久不可用。
+  // 现在 Runner 执行完就回报，故此处与下面一起断终态。
   const apRow = tmp.db.prepare('SELECT * FROM approvals WHERE id=?').get(approvalId) as Record<string, unknown>;
-  assert.equal(apRow['status'], 'executing', 'claim 后应为 executing');
+  assert.equal(apRow['status'], 'executed', '审批执行完应落终态 executed（不能停在 executing）');
   assert.ok(String(apRow['final_params_json']).includes('rm -rf'), 'claim 固化 final_params_json');
 
   // WRITE-SEAL 一次
@@ -838,6 +844,7 @@ test('WRITE-SEAL：sealTask 抛错不得登记去重键（后续同键收口仍�
         evaluate: async () => ({ kind: 'deny', decisionId: 'd', reason: 'no tools' }),
         claim: async () => ({ ok: false }),
         forceApproval: async () => ({ approvalId: 0 }),
+        resolveExecution: () => Promise.resolve({ ok: true }),
       },
     },
     { sealOnFinish: true },
@@ -947,6 +954,7 @@ function loopHarness(opts: { pop: () => unknown }): {
         evaluate: async () => ({ kind: 'deny', decisionId: 'd', reason: 'x' }),
         claim: async () => ({ ok: false }),
         forceApproval: async () => ({ approvalId: 0 }),
+        resolveExecution: () => Promise.resolve({ ok: true }),
       } as unknown as GovernanceApi,
     },
     { idlePollMs: 5, log: (m) => log.push(m) },
@@ -1078,6 +1086,7 @@ test('C：onFatal 里 finish 失败必须补 failTask，任务不能停在 runni
         evaluate: async () => ({ kind: 'deny', decisionId: 'd', reason: 'x' }),
         claim: async () => ({ ok: false }),
         forceApproval: async () => ({ approvalId: 0 }),
+        resolveExecution: () => Promise.resolve({ ok: true }),
       } as unknown as GovernanceApi,
     },
     { idlePollMs: 5, log: () => {} },

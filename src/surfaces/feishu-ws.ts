@@ -33,6 +33,20 @@ export interface FeishuWsDeps {
   dotId?: string;
   /** daemon 日志通道（[dotd] 前缀已在外面拼好）。 */
   log(msg: string): void;
+  /**
+   * 审批卡片的**回调决策**（2026-10-21 补，主人报「点同意没反应」）。
+   *
+   * 不注入 = 点击到达后直接 `{ignored:true, reason:'approval_not_wired'}` 丢弃，
+   * 审批停在 pending、任务卡在 awaiting_approval —— 这正是此前的现场。
+   */
+  approval?: {
+    decide(
+      approvalId: number,
+      verdict: 'approve' | 'reject',
+      operatorId: string,
+    ): Promise<{ ok: boolean; status?: string; reason?: string }>;
+    resolveCard?(cardMessageId: string, approvalId: number): Promise<void>;
+  };
   /** 图片下载器（2026-10-18 多模态）；不注入 = 图片按纯文本处理。 */
   media?: {
     downloadImage(
@@ -92,6 +106,30 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
     } catch {
       deps.log(`飞书长连接收到事件 ${eventType}（载荷结构异常，无法摘要）`);
     }
+
+    // 卡片回调单独转储原始载荷（2026-10-21）。
+    // 现场：主人报「点了没反应」，日志只有 `chat=- sender=-:- type=- len=0`，
+    // 因为那行摘要读的是 message/sender 字段，而卡片回调用的是
+    // context.open_chat_id / operator.open_id —— 打在错的地方，看不出失败在哪步。
+    // 只转储这一类事件，且截断，避免刷日志。
+    if (eventType === 'card.action.trigger') {
+      try {
+        deps.log(`飞书卡片回调原始载荷：${JSON.stringify(frame).slice(0, 1500)}`);
+      } catch {
+        deps.log('飞书卡片回调原始载荷：无法序列化');
+      }
+    }
+    // 卡片回调单独转储原始载荷（2026-10-21）。
+    // 为什么需要：主人报「点了没反应」，日志只有 `chat=- sender=-:- type=- len=0`，
+    // 消息事件的摘要字段在卡片回调里全是空的 —— 看不出到底解析到哪一步失败。
+    // 只转储这一类事件，且截断，避免刷日志。
+    if (eventType === 'card.action.trigger') {
+      try {
+        deps.log(`飞书卡片回调原始载荷：${JSON.stringify(frame).slice(0, 1200)}`);
+      } catch {
+        deps.log('飞书卡片回调原始载荷：无法序列化');
+      }
+    }
     const envelope = wsFrameToEnvelope(typeof frame['event_id'] === 'string' ? frame['event_id'] : undefined, eventType, frame);
     try {
       const out = await handleFeishuCallback(envelope, {
@@ -103,7 +141,18 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
         dotId,
         trustedTransport: true,
         ...(deps.media === undefined ? {} : { media: deps.media }),
+        // 2026-10-21：审批回调的决策能力。
+        // 漏这一行的后果实测过：daemon 明明传了 approval，
+        // 但这里手工挑字段时没带上，于是点击仍然返回
+        // `{"ignored":true,"reason":"approval_not_wired"}` ——
+        // 日志里看得一清二楚，只是此前这行结果日志根本不存在。
+        ...(deps.approval === undefined ? {} : { approval: deps.approval }),
       });
+      // 2026-10-21：任何结果都要落一行。
+      // 现场：主人点「同意」没反应，日志里只有"事件到了"和"原始载荷"，
+      // 之后再无输出 —— 因为这里只记 error/taskId，`ignored`/`decided` 静默丢弃。
+      // 排查时看不出逻辑走到哪一步，只能反复猜。
+      deps.log(`飞书长连接事件结果 ${eventType}：${JSON.stringify(out.body).slice(0, 400)}`);
       if ('error' in out.body) {
         deps.log(`飞书长连接事件被拒（${out.body.error}）：${out.body.message}`);
       } else if ('taskId' in out.body) {

@@ -41,7 +41,7 @@ import { DotRunner } from '../src/runner/dot.ts';
 import type { RunnerOptions } from '../src/runner/dot.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
-import { createGovernance, initGovernance, decide, evaluate, claim, forceApproval } from '../src/governance/gate.ts';
+import { createGovernance, initGovernance, decide, evaluate, claim, forceApproval, resolveExecution } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
 import type { GovDeps } from '../src/governance/types.ts';
 import type { GovDefaults } from '../src/governance/config.ts';
@@ -452,6 +452,7 @@ async function planFixture(opts: {
         evaluate: (ctx, call, evaluateOpts) => evaluate(ctx, call, evaluateOpts ?? {}, rt),
         claim: (approvalId) => claim(approvalId, rt),
         forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+        resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
       },
     },
     { log: () => {}, ...opts.runnerOpts },
@@ -711,6 +712,7 @@ test('计划轮模型报错（如熔断）→ 不炸主循环，任务继续', a
         evaluate: (ctx, call, o) => evaluate(ctx, call, o ?? {}, rt),
         claim: (a) => claim(a, rt),
         forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+        resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
       },
     },
     { log: () => {}, plan: true } as RunnerOptions,

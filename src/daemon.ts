@@ -92,6 +92,7 @@ import {
   forceApproval as govForceApproval,
   getApproval as govGetApproval,
   listPending as govListPending,
+  resolveExecution as govResolveExecution,
 } from './governance/gate.ts';
 import type { GovDeps } from './governance/types.ts';
 import { ExecServiceImpl } from './exec/ExecService.ts';
@@ -635,6 +636,7 @@ function govApiOf(): GovernanceApi {
     evaluate: (ctx, call, opts) => govEvaluate(ctx, call, opts ?? {}),
     claim: (approvalId) => govClaim(approvalId),
     forceApproval: (taskId, req) => govForceApproval(taskId, req),
+    resolveExecution: (approvalId, outcome) => govResolveExecution(approvalId, outcome),
   };
 }
 
@@ -1587,6 +1589,53 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           // 落盘位置是**容器内**的 /dot/home（宿主不直接持有 home 卷），
           // 所以下载走容器的 fs.write 工具更合适——见下方 media 实现。
           media: makeFeishuMedia(() => exec, { appId: surfCfg.feishu.appId, appSecret: surfCfg.feishu.appSecret }),
+          // ── 2026-10-21：审批卡片的**回调决策**（主人报「点同意没反应」）──
+          //
+          // 现场：卡片发得出去（surf_outbound_log 记 approval_card），主人点了也
+          // 确实到服务端（日志 `飞书长连接收到事件 card.action.trigger` 出现 7 次），
+          // 但 `handleFeishuCallback` 里 `deps.approval === undefined` → 直接
+          // `{ignored:true, reason:'approval_not_wired'}`，静默丢弃。
+          // 于是审批永远停在 pending，任务卡在 awaiting_approval。
+          //
+          // 这里把 GOV 的 decide() 接上（契约 S-2：唯一裁决写路径在 GOV）。
+          // 卡片按钮给的是 'approve'/'reject'，GOV §3.3.1 要
+          // 'approve_once'/'approve_remember'/'reject' —— 卡片只有一次性和拒绝两个
+          // 按钮，所以 'approve' 一律映射成 'approve_once'（不擅自"记住"，
+          // 记住是主人的决定，不该由一次点击替他做）。
+          approval: {
+            decide: async (approvalId, verdict, operatorId) => {
+              const v = verdict === 'approve' ? 'approve_once' : 'reject';
+              const r = await govDecide(approvalId, 'web', v, operatorId);
+              return r.ok
+                ? { ok: true, ...(r.finalStatus !== undefined ? { status: r.finalStatus } : {}) }
+                : { ok: false, ...(r.reason !== undefined ? { reason: r.reason } : {}) };
+            },
+            resolveCard: async (cardMessageId, approvalId) => {
+              // 改卡片：把按钮换成结论，避免主人重复点。失败不影响裁决。
+              // 复用 feishu-approval.ts 已有的 resolveApprovalCard（含"找不到就不改"）。
+              const mid = cardMessageId.length > 0 ? cardMessageId : cardRegistry.get(approvalId);
+              if (typeof mid !== 'string' || mid.length === 0) return;
+              await resolveApprovalCard(
+                {
+                  sender: feishuGw,
+                  chatId: ownerChatForApproval,
+                  log,
+                  // 同步查最新状态：resolveApprovalCard 的 getApprovalView 是同步签名，
+                  // 而 govGetApproval 返回 Promise。这里只要 status/verdict 用于改卡片文案。
+                  getApprovalView: (id) => {
+                    const row = db
+                      .prepare('SELECT id, seq, status FROM approvals WHERE id = ?')
+                      .get(id) as { id: number; seq: number; status: string } | undefined;
+                    if (row === undefined) return null;
+                    return { id: row.id, seq: row.seq, status: row.status } as unknown as ApprovalView;
+                  },
+                },
+                mid,
+                approvalId,
+                '飞书',
+              );
+            },
+          },
         })
       : null;
 

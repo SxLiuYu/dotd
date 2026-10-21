@@ -34,7 +34,7 @@ import { DotRunner, MEMORY_REDO_PROMPT } from '../src/runner/dot.ts';
 import type { RunnerOptions } from '../src/runner/dot.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
-import { createGovernance, initGovernance, evaluate, claim, forceApproval } from '../src/governance/gate.ts';
+import { createGovernance, initGovernance, evaluate, claim, forceApproval, resolveExecution } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
 import type { GovDeps } from '../src/governance/types.ts';
 import type {
@@ -238,6 +238,7 @@ async function makeRig(opts: {
     evaluate: (ctx, call, o) => evaluate(ctx, call, o ?? {}, rt),
     claim: (id) => claim(id, rt),
     forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+    resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
   };
 
   await exec.boot(['dot1']);

@@ -62,7 +62,7 @@ import { ModelRouter } from '../src/router/ModelRouter.ts';
 import type { ModelTransport, ChatCall, ChatOutcome, GetOutcome, Usage } from '../src/router/types.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
-import { createGovernance, initGovernance, decide, evaluate, claim, forceApproval } from '../src/governance/gate.ts';
+import { createGovernance, initGovernance, decide, evaluate, claim, forceApproval, resolveExecution } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
 import type { GovDeps } from '../src/governance/types.ts';
 import type { GovDefaults } from '../src/governance/config.ts';
@@ -454,6 +454,7 @@ async function fixture(opts: {
         evaluate: (ctx, call, evaluateOpts) => evaluate(ctx, call, evaluateOpts ?? {}, rt),
         claim: (approvalId) => claim(approvalId, rt),
         forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+        resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
       },
     },
     runnerOpts,
@@ -554,6 +555,7 @@ async function fixtureSingleEndpoint(turn: { chatError?: Error }): Promise<Fixtu
         evaluate: (ctx, call, evaluateOpts) => evaluate(ctx, call, evaluateOpts ?? {}, rt),
         claim: (approvalId) => claim(approvalId, rt),
         forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+        resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
       },
     },
     // 不注入 bus → 走 complete()，与流式路径形成对照

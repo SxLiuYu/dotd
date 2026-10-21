@@ -2325,6 +2325,24 @@ export class DotRunner {
     const res = await this.exec.runTool(toolCall(task, callId, toolName, args, this.toolDeadlineMsFor(toolName)));
     const ok = res.status === 'ok';
     const result = ok ? res.result : res.error;
+    // §3.3.6 执行结果必须回报（2026-10-21 补）。
+    //
+    // 不接的后果实测过：claim() 把审批推到 `executing` 就再没人管，
+    // 库里 126 条审批全停在 executing、一条终态都没有；而 gate.ts:372
+    // 对 executing 是 `deny('execution in flight')` —— 同一张单子永久不可用。
+    //
+    // 失败只记日志，不改任务走向：审批终态是审计信息，
+    // 但它不该让已经跑完的工具结果作废（此处 result 已经拿到手了）。
+    if (target.approvalId !== null) {
+      try {
+        await this.governance.resolveExecution(target.approvalId, {
+          ok,
+          ...(ok ? { resultDigest: digestPreview(JSON.stringify(result ?? null)) } : {}),
+        });
+      } catch (err) {
+        this.log(`runner: resolveExecution 失败 approval#${target.approvalId}：${errText(err)}`);
+      }
+    }
     this.cp.journal.endTool(task.id, epoch, seq, ok ? 'succeeded' : 'failed', result ?? null);
     // 续跑执行的结果同样要回喂给模型：否则下一轮 LLM 只看到"主人批了"，看不到批的动作到底
     // 出了什么结果（approve_once 之后模型往往还要基于这个结果收尾）。

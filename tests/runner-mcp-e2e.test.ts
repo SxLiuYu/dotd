@@ -28,7 +28,7 @@ import { DotRunner } from '../src/runner/dot.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
 import { McpClient } from '../src/exec/mcp-client.ts';
-import { createGovernance, initGovernance, evaluate, claim, forceApproval, decide } from '../src/governance/gate.ts';
+import { createGovernance, initGovernance, evaluate, claim, forceApproval, resolveExecution, decide } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
 import type { GovDeps } from '../src/governance/types.ts';
 import type {
@@ -172,6 +172,7 @@ async function fixture(script: Array<{ content: string; toolCalls?: Array<{ id: 
     evaluate: (ctx, call, o) => evaluate(ctx, call, o ?? {}, rt),
     claim: (id) => claim(id, rt),
     forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+    resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
   };
 
   const runner = new DotRunner({

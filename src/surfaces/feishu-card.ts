@@ -262,9 +262,17 @@ function formatDeadline(iso: string | null | undefined): string {
  */
 export function parseCardAction(raw: unknown): CardAction | null {
   let obj: unknown = raw;
-  if (typeof raw === 'string') {
+  // 2026-10-21 真实点击抓到的载荷：`action.value` **被编码了两层**。
+  //
+  //   飞书推来：  "{\"kind\":\"approval\",\"approvalId\":134,\"verdict\":\"approve\"}"
+  //   解一层得到：'{"kind":"approval",...}'  ← 还是字符串
+  //
+  // 旧实现只解一层，于是 obj 仍是 string，`typeof obj !== 'object'` → return null
+  // → 判别成 ignore → **点同意毫无反应**（主人报的就是这个）。
+  // 现在最多解三层（防御未来再套一层），每层都必须解出字符串才继续。
+  for (let depth = 0; depth < 3 && typeof obj === 'string'; depth++) {
     try {
-      obj = JSON.parse(raw);
+      obj = JSON.parse(obj);
     } catch {
       return null;
     }

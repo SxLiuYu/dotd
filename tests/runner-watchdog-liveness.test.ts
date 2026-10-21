@@ -28,7 +28,7 @@ import { ControlPlaneWatchdog } from '../src/control-plane/scheduler.ts';
 import { DotRunner } from '../src/runner/dot.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
-import { createGovernance, initGovernance, evaluate, claim, forceApproval } from '../src/governance/gate.ts';
+import { createGovernance, initGovernance, evaluate, claim, forceApproval, resolveExecution } from '../src/governance/gate.ts';
 import { loadCatalog } from '../src/governance/catalog.ts';
 import type { GovDeps } from '../src/governance/types.ts';
 import { DEFAULT_EXEC_CONFIG } from '../src/exec/types.ts';
@@ -233,6 +233,7 @@ async function makeRig(opts: { stallAfter?: number | null; script: Array<{ conte
     evaluate: (ctx, call, o) => evaluate(ctx, call, o ?? {}, rt),
     claim: (id) => claim(id, rt),
     forceApproval: (taskId, req) => forceApproval(taskId, req, rt),
+    resolveExecution: (id, outcome) => resolveExecution(id, outcome, rt),
   };
 
   const runner = new DotRunner({
