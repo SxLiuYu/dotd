@@ -519,3 +519,12 @@ Muse 的演示里 agent 是"替你操作浏览器"的：登录过的网站它接
 
 **踩坑记录**：`scrubSecrets` 最初只依赖调用方传入"长在前"的列表——测试直接传乱序就暴露了，
 改为函数内部防御式排序（短串是长串子串时，先洗短串会把长串洗剩一半）。
+
+### 保险库条目（2026-10-21 实机）
+
+| site | user | 用途 |
+|---|---|---|
+| `github.com` | `token` | GitHub PAT，daemon 启动时注入 `DOTD_GITHUB_TOKEN`，GitHub 连接器带真凭据 |
+
+装法：`dotd vault add github.com token`（隐藏输入）→ 重启 daemon 生效。
+实测：`github.notifications` 走 daemon 调用 succeeded（709ms）；`api.github.com/user` 返回 200，身份 `SxLiuYu`。
