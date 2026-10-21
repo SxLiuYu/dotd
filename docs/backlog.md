@@ -359,6 +359,9 @@
   - 第 106 轮实测：340 点 × 1780s 只覆盖 6.98 天，生成 12 分钟后就超过 `STALE_LIMIT=5400`。
   - 已改成回归里按 `now` 现生成。`scripts/regress/fixtures/allgreen7d.jsonl` 现在**没有引用者**。
   - 建议删掉（保留会让人以为它是必需的）。**删文件是破坏性操作，等你点头。**
+  - **2026-10-21 再次确认（两树对比时）**：D: 侧已无 `scripts/regress/fixtures/`，只有 WSL 侧残留一份 `allgreen7d.jsonl`（+ `.txt`）。
+    两侧 `soak-criteria.sh` 是同一份（`FIX="${DOTD_FIXTURES:-/tmp}"`），运行时按 `now` 现生成到 `/tmp`，**那份静态副本确实无引用者**。
+    所以它不该“收回仓库”，反而该删。已与 WSL 侧 12 个 `\r` 幽灵副本一并移入 `/root/dotd-sync-quarantine-20261021/`（移出而非删除，可回滚）。
 
 - **`soak-criteria.sh` 的断言里还有硬编码的具体数字**
   - 第 106 轮踩到一次：`探针能力覆盖：纯存活 7 / 纯推理 7 / …` 里的 7 是夹具长度的函数。

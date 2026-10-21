@@ -56,6 +56,29 @@ tail -f /tmp/dotd-wsl.log
   set -a; . /root/dotd/_tokens_src.env; set +a
   ```
 
+### ⚠ `tail /tmp/dotd-wsl.log` 可能在看一个**死进程**的日志（2026-10-21 实测）
+
+`wsl-daemon.sh` 启动那一刻会 `mv` 归档旧日志再新建，所以**重复启动会把真日志挤到 `.prev`**：
+
+| 场景 | `/tmp/dotd-wsl.log` | `/tmp/dotd-wsl.log.prev` |
+|---|---|---|
+| 最后一次启动**成功** | **活进程的日志** | 上一次启动 |
+| 最后一次启动**失败**（如 EADDRINUSE） | 死进程，末行是 `启动失败` | **活进程的日志** |
+
+实测现场：`.log` 只有 16 行、结尾 `listen EADDRINUSE: 127.0.0.1:7788`，
+而活着的 daemon `fd1 -> /tmp/dotd-wsl.log.prev`。
+
+**别用文件名猜，先确认你盯的是活的那个**：
+
+```bash
+for p in $(pgrep -f 'src/daemon.ts'); do ls -l /proc/$p/fd/1 /proc/$p/fd/2; done
+```
+
+`fd1` 指向哪个就是哪个。EADDRINUSE 的成因是**上一条 daemon 没死透就重启**：
+`dotd-daemon-start.sh` 开头探测 `/dev/tcp/7788`，端口还占着就直接 `exit 0`（当作"已在运行"），
+于是你以为重启了、其实还是老进程——**而老进程加载的是老代码**。
+确认换代码生效看 `pgrep` 的 pid 变没变，不要只看脚本回了"就绪"。
+
 ### CLI（没有 `tasks` 命令，别猜）
 
 ```bash
