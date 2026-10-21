@@ -124,12 +124,14 @@ export class ImageManager {
     };
 
     try {
-      onLine(`Step 1/6 : FROM mcr.microsoft.com/playwright:v${cfg.pwVersion}-noble`);
-      onLine('Step 2/6 : RUN apt-get install xvfb bash');
-      onLine('Step 3/6 : COPY agent-runtime/ /opt/agent-runtime/');
-      onLine('Step 4/6 : RUN npm ci --include=dev && tsc -p . && npm prune --omit=dev');
-      onLine('Step 5/6 : RUN userdel ubuntu + useradd dot/shell + mkdir/chown（腾 uid 1000、挂载点预建，§3.1/§7.1）');
-      onLine(`Step 6/6 : USER dot / EXPOSE ${cfg.runtimePort}`);
+      // 这几行是构建开始前的摘要，不是 docker 的真实输出（真实输出由 buildImage
+      // 逐行推过来）。2026-10-21 换基座时它们全错了——还写着 playwright、xvfb、
+      // userdel ubuntu，实际早就不是那样。摘要一旦和 Dockerfile 脱节，排障时会
+      // 把人带到错方向，所以改成照实描述当前 Dockerfile 的形状。
+      onLine('Step 1/4 : FROM node:24-slim（基座，2026-10-21 换掉 playwright 基座）');
+      onLine('Step 2/4 : RUN apt-get install bash poppler-utils git python3');
+      onLine('Step 3/4 : COPY agent-runtime/ → npm ci + tsc + prune');
+      onLine(`Step 4/4 : userdel node + useradd dot(1000)/shell(1001) → USER dot / EXPOSE ${cfg.runtimePort}`);
       const r = await this.deps.backend.buildImage(tag, cfg.pwVersion, onLine);
       const finishedAt = new Date().toISOString();
       this.deps.db

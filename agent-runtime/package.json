@@ -13,11 +13,6 @@
     "start": "node dist/server.js"
   },
   "dependencies": {},
-  "optionalDependencies": {
-    "playwright": "1.49.1",
-    "playwright-extra": "4.3.6",
-    "puppeteer-extra-plugin-stealth": "2.11.2"
-  },
   "devDependencies": {
     "@types/node": "^26.6.5",
     "typescript": "^5.9.3"

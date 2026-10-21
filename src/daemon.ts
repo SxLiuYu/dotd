@@ -1432,7 +1432,7 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       hostWrap(await legacyBrowser(name, (args ?? {}) as Record<string, unknown>, taskId)),
     );
   }
-  log('[web] browser.* 已覆盖为 agent-browser（容器内 playwright 实现保留作回滚）');
+  log('[web] browser.* 已由宿主 agent-browser 承接（容器内实现已于 2026-10-21 删除）');
 
   // A2-C 收尾（2026-10-21）：GitHub token 从保险库注入（site='github.com', user='token'）。
   // 没配就维持 public-only 降级模式，不报错不挡启动。

@@ -30,7 +30,6 @@ import {
 } from '../agent-runtime/protocol.ts';
 import { FsTools } from '../agent-runtime/fs.ts';
 import type { SpawnAdapter, SpawnOutcome } from '../agent-runtime/shell.ts';
-import { XvfbManager, type XvfbSpawn } from '../agent-runtime/xvhfd.ts';
 
 // ── 脚手架 ───────────────────────────────────────────────────────────
 
@@ -87,33 +86,6 @@ function fakeSpawn(log: Array<Record<string, unknown>>): SpawnAdapter {
   };
 }
 
-/** 假 Xvfb（不起真二进制；接口见 xvhfd.ts 的 XvfbSpawn）。 */
-class FakeXvfb implements XvfbSpawn {
-  aliveFlag = true;
-  stops = 0;
-  private readonly cbs: Array<(info: { code: number | null; signal: NodeJS.Signals | null }) => void> = [];
-  start(): boolean {
-    return true;
-  }
-  stop(): void {
-    this.stops += 1;
-    this.aliveFlag = false;
-  }
-  alive(): boolean {
-    return this.aliveFlag;
-  }
-  onExit(cb: (info: { code: number | null; signal: NodeJS.Signals | null }) => void): void {
-    this.cbs.push(cb);
-  }
-  /** 测试用：模拟崩溃。 */
-  crash(): void {
-    this.aliveFlag = false;
-    for (const cb of this.cbs) cb({ code: 1, signal: null });
-  }
-}
-
-const fakeXvfbSpawn = new FakeXvfb();
-
 function noopLog(): void {}
 
 /**
@@ -140,7 +112,6 @@ async function makeRuntime(
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     shellTools: undefined,
     spawnAdapter: fakeSpawn(spawnLog),
-    xvfbSpawn: fakeXvfbSpawn,
     ...over,
   });
   await rt.start();
@@ -266,7 +237,6 @@ test('A: POST /jobs/{id}/cancel 有句柄可调（JobEntry.cancel 已接线）',
     log: noopLog,
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: slowSpawn,
-    xvfbSpawn: fakeXvfbSpawn,
   });
   t.after(() => rt.stop());
   await rt.start();
@@ -503,7 +473,6 @@ test('B: shell 降级（canSetUid=false）发 exec.shell.uid_degraded 事件到 
     log: (line) => lines.push(line),
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: fakeSpawn(spawnLog),
-    xvfbSpawn: fakeXvfbSpawn,
   });
   t.after(() => rt.stop());
   await rt.start();
@@ -542,7 +511,6 @@ test('B 反面：有 setuid 能力（canSetUid=true）→ 不发降级事件、u
     log: (line) => lines.push(line),
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: fakeSpawn(spawnLog),
-    xvfbSpawn: fakeXvfbSpawn,
   });
   t.after(() => rt.stop());
   await rt.start();
@@ -557,31 +525,6 @@ test('B 反面：有 setuid 能力（canSetUid=true）→ 不发降级事件、u
   assert.equal(spawnLog[0]!.uid, 1001, '不降级时 uid 用 SHELL_UID 1001');
   const res = r.result as { degraded?: boolean } | undefined;
   assert.notEqual(res?.degraded, true);
-});
-
-// ── O：Xvfb 进程组（审码 issue O —— detached/进程组 kill）─────────────
-
-test('O: XvfbManager.stop 调 spawnImpl.stop（真实实现里杀整个进程组）', (t) => {
-  const s = new FakeXvfb();
-  const m = new XvfbManager({ spawnImpl: s });
-  m.start();
-  m.stop();
-  assert.equal(s.stops, 1, 'stop 必须真的下发到 spawn 实现');
-  assert.equal(m.alive, false);
-  // 进程组杀的真实实现断言在 xvhfd.ts 的 NodeXvfbSpawn.stop：
-  // `process.kill(-child.pid, 'SIGTERM')` + detached 进程组（审码 issue O 的落点）。
-});
-
-test('O: Xvfb 崩溃事件可观察（crashed），且不自行重开（视同 runtime 崩溃）', () => {
-  const s = new FakeXvfb();
-  const m = new XvfbManager({ spawnImpl: s });
-  const crashed: unknown[] = [];
-  m.on('crashed', (d) => crashed.push(d));
-  m.start();
-  s.crash();
-  assert.equal(crashed.length, 1);
-  assert.deepEqual(crashed[0], { display: ':99' });
-  assert.equal(m.alive, false);
 });
 
 // ── P：jobs Map 有界（2026-10-17 修：DELETE /jobs 无调用方 → 只增不减）─────
@@ -599,7 +542,6 @@ test('P: 已结束 job 只留一小段环形缓冲，running 的一条都不动'
     log: noopLog,
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: fakeSpawn([]),
-    xvfbSpawn: fakeXvfbSpawn,
   });
   const jobs = rt as unknown as {
     jobs: Map<string, { state: string }>;

@@ -48,7 +48,6 @@ import { Ledger } from './ledger.ts';
 import { FsTools } from './fs.ts';
 import { ToolStore } from './tools.ts';
 import { ShellTools, type SpawnAdapter } from './shell.ts';
-import { XvfbManager, type XvfbSpawn } from './xvhfd.ts';
 import {
   defaultFetch,
   NET_TOOLS_DEFAULT_MODE,
@@ -98,7 +97,6 @@ export interface RuntimeConfig {
    * 测试里唯一那条失败就是这么来的。
    */
   canSetUid?: () => boolean;
-  xvfbSpawn?: XvfbSpawn;
   /**
    * net.* 的出网策略。**缺省 = 读 `DOTD_NET_TOOLS`，未设即 off（默认关闭）**，
    * 见 agent-runtime/net.ts 头注「默认策略」。显式传此字段优先于环境变量（测试用）。
@@ -131,7 +129,6 @@ export class AgentRuntime {
   /** 自造工具（S2）：tools/ 目录下的可复用脚本 */
   readonly toolStore: ToolStore;
   readonly shell: ShellTools;
-  readonly xvfb: XvfbManager;
   /** net.* 生效策略（默认 off；拼错的值按 off 并打 warning，绝不意外放开）。 */
   readonly netTools: NetToolsMode;
   private readonly fetchImpl: FetchLike | null | undefined;
@@ -185,9 +182,6 @@ export class AgentRuntime {
         onDegrade: (detail) => this.log(`[event] ${detail.kind} ${JSON.stringify(detail)}`),
       });
 
-    this.xvfb = new XvfbManager({
-      ...(cfg.xvfbSpawn !== undefined ? { spawnImpl: cfg.xvfbSpawn } : {}),
-    });
   }
 
 
@@ -195,10 +189,9 @@ export class AgentRuntime {
   // 它们存在的唯一理由是给容器内 playwright 补 snapshot()（CDP AX 树）。
   // browser.* 改由宿主 agent-browser 执行后，这里没有浏览器可驱动了。
 
-  /** 启动：Xvfb → ledger 中断清理 → HTTP listen。 */
+  /** 启动：ledger 中断清理 → HTTP listen。 */
   async start(): Promise<void> {
     this.ledger.recoverInterrupted();
-    this.xvfb.start();
     await new Promise<void>((resolve) => {
       const server = createServer((req, res) => void this.handle(req, res));
       server.listen(this.cfg.port, this.cfg.host, () => resolve());
@@ -210,7 +203,6 @@ export class AgentRuntime {
   }
 
   async stop(): Promise<void> {
-    this.xvfb.stop();
     this.jobsCancels.clear();
     const server = this.server;
     this.server = null;
