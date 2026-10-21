@@ -1,19 +1,22 @@
 import type { ComponentType } from 'react';
 import { ChatView } from './views/ChatView.tsx';
 import { QueueView } from './views/QueueView.tsx';
+import { ActivityView } from './views/ActivityView.tsx';
 import { ApprovalsView } from './views/ApprovalsView.tsx';
 import { EventsView } from './views/EventsView.tsx';
 import { ModelsView } from './views/ModelsView.tsx';
 import { LogsView } from './views/LogsView.tsx';
 
 /**
- * web-ui/src/views.tsx —— 六视图登记表（surfaces.md §7 主视图集）。
+ * web-ui/src/views.tsx —— 七视图登记表（surfaces.md §7 主视图集）。
  *
  * 每个视图的数据源与 http.ts 的实现逐条对齐（不是我方注释的臆测）：
  * - 聊天 Chat：POST /api/messages（http.ts:483）+ GET /api/conversations?thread=（http.ts:542）
  *   + SSE /api/stream?topics=chat（§4.5）
  * - 队列 Queue：GET /api/queue?status=<csv>（http.ts:508）+ POST /api/queue/:id/cancel（http.ts:529）
  *   + SSE topics=queue
+ * - 活动 Activity（2026-10-21 新增）：GET /api/activity?limit=&status=
+ *   只读、无 SSE —— 活动是已结束的事实，不会自己变（理由见 ActivityView 文件头）。
  * - 审批 Approvals：GET /api/approvals?state=pending（http.ts:557）
  *   + POST /api/approvals/:id/decision（http.ts:587；verdict ∈ approve_once|approve_remember|reject）
  *   + SSE topics=approval
@@ -46,6 +49,12 @@ export const VIEWS: ViewDef[] = [
     title: '队列',
     source: 'GET /api/queue?status=<csv> → cp.list() 投影；POST /api/queue/:id/cancel；SSE topics=queue',
     Component: QueueView,
+  },
+  {
+    id: 'activity',
+    title: '活动',
+    source: 'GET /api/activity?limit=&status= → tasks + 全库状态计数（只读，无 SSE）',
+    Component: ActivityView,
   },
   {
     id: 'approvals',

@@ -71,6 +71,25 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 // ── 类型（与 http.ts 各 handler 的响应形状逐字段对齐） ─────────────────
 
+/**
+ * 活动总览的一行（GET /api/activity，2026-10-21 9.3 新增）。
+ *
+ * 与 QueueRow 的区别：QueueRow 说「在途的现在怎么样」，
+ * ActivityRow 说「已经发生的事各自结果如何」—— 后者是主体。
+ */
+export interface ActivityRow {
+  id: string;
+  title: string;
+  status: QueueRow['status'];
+  priority: number;
+  attempt: number;
+  /** epoch 毫秒（服务端存字符串，这里按 number 用）。 */
+  createdAt: string | number;
+  updatedAt: string | number;
+  stepCount: number;
+  failedSteps: number;
+}
+
 export interface QueueRow {
   id: string;
   title: string;
@@ -137,6 +156,16 @@ export const api = {
     request<{ queue: QueueRow[] }>('GET', `/api/queue?status=${encodeURIComponent(statuses)}&limit=200`),
 
   cancelTask: (id: string) => request<{ ok: boolean; taskId: string }>('POST', `/api/queue/${encodeURIComponent(id)}/cancel`),
+
+  /** 活动总览（「最近都干了什么」）。counts 是全库按状态分组，不受 limit 影响。 */
+  activity: (limit = 30, status?: string) => {
+    const q = status === undefined ? `limit=${limit}` : `limit=${limit}&status=${encodeURIComponent(status)}`;
+    return request<{
+      tasks: ActivityRow[];
+      counts: Array<{ status: string; n: number }>;
+      limit: number;
+    }>('GET', `/api/activity?${q}`);
+  },
 
   approvals: () => request<{ approvals: ApprovalRow[] }>('GET', '/api/approvals?state=pending&limit=100'),
 
