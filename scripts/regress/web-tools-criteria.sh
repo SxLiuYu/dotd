@@ -30,7 +30,7 @@ t() {
 
 echo "① 逻辑层单测"
 t "node --import tsx --test tests/web-tools.test.ts >/dev/null 2>&1" \
-  "web-tools 10 条（URL/action 白名单、截断、错误话术）全过"
+  "web-tools 24 条（白名单/截断/兼容层/会话继承）全过"
 
 echo "② 五层接线"
 t "grep -q \"name: 'web.snapshot'\" src/exec/protocol.ts" "能力目录有 web.snapshot"
@@ -42,17 +42,33 @@ t "grep -q 'web.read' config/tools.yml" "tools.yml 有 web.read"
 t "grep -q \"registerHostTool('web.act'\" src/daemon.ts" "daemon 已注册 web.act"
 t "grep -q 'web.snapshot' tests/agent-runtime-protocol.test.ts" "宿主侧清单已登记（防漂移）"
 
-echo "③ 真浏览器端到端（agent-browser 可用时）"
+echo "③ browser.* 统一到 agent-browser"
+t "grep -q 'legacyBrowser' src/exec/webtools.ts" "兼容层存在（老名字照旧能用）"
+t "grep -q \"'browser.open',\" src/daemon.ts" "browser.* 已在宿主侧注册（覆盖容器）"
+t "grep -q 'lastIdentityByTask' src/exec/webtools.ts" "会话继承（否则 snapshot 看到空白页）"
+t "grep -q 'taskId?: string' src/exec/ExecService.ts" "handler 能拿到 taskId"
+t "grep -q 'identityOf' src/exec/webtools.ts" "identity 在宿主侧重算（与 runner 同规则）"
+
+echo "④ 真浏览器端到端（agent-browser 可用时）"
 if command -v agent-browser >/dev/null 2>&1; then
   t "agent-browser read https://example.com 2>&1 | grep -qi 'documentation'" \
     "web.read 真实抓取 example.com 拿到正文"
-  t "agent-browser snapshot -i 2>&1 | grep -q 'ref=e'" \
+  # 反向验证：没有 open 过的匿名会话里取快照，本来就该是空的。这条钉住
+  # "会话继承不是可选优化，而是必须"这个事实——将来谁把继承去掉，上面那条会红。
+  t "agent-browser --session crit-empty snapshot -i 2>&1 | grep -q 'no interactive elements'" \
+    "空会话取快照确实为空（证明 session 继承是必须的）"
+  # 快照必须在"打开过页面的那个 session"里取：agent-browser 的 session 决定看的是
+  # 哪个浏览器实例，裸跑 snapshot -i 用的是默认匿名会话（里面没页面），只会返回
+  # "(no interactive elements)"。这既是用法的真相，也正是 browser.snapshot
+  # 会话继承那条修复要保证的事。
+  t "agent-browser --session crit open https://example.com >/dev/null 2>&1; \
+     agent-browser --session crit snapshot -i 2>&1 | grep -q 'ref=e'" \
     "web.snapshot 真实返回带 @eN 引用的元素"
 else
   echo "  SKIP agent-browser 未安装（npm i -g agent-browser && agent-browser install --with-deps）"
 fi
 
-echo "④ tsc"
+echo "⑤ tsc"
 t "! npx tsc --noEmit 2>&1 | grep -q 'error TS'" "tsc 无错误"
 
 echo "  ══════════════════════════"
