@@ -549,6 +549,14 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     ),
     sideEffect: 'safe',
   },
+  {
+    /* A2（2026-10-21）：保险库条目名清单——只有 site/user，值永远不出宿主。 */
+    name: 'vault.sites',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj({}, []),
+    sideEffect: 'safe',
+  },
 ];
 
 /**

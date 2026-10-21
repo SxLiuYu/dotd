@@ -31,6 +31,8 @@ import type {
   ExecToolCall,
   ExecToolResult,
 } from '../shared/contracts.ts';
+import { scrubSecrets, substituteVaultArgs } from '../vault/substitute.ts';
+import { vaultGet } from '../vault/vault.ts';
 import { DiskGardener } from './disk.ts';
 import { McpClient } from './mcp-client.ts';
 import { Fleet, createDockerBackend, createStubBackend } from './fleet.ts';
@@ -258,7 +260,7 @@ export interface ExecServiceDeps {
  * 所以容器返回的能力目录里天然没有它们 —— getCapabilities 必须把它们合并进去，
  * 否则模型根本看不见（2026-10-18 实测：主人让设提醒，模型答"schedule.create 不在列表里"）。
  */
-const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read']);
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read', 'vault.sites']);
 
 export class ExecServiceImpl implements ExecService {
   readonly cfg: ExecConfig;
@@ -447,7 +449,70 @@ export class ExecServiceImpl implements ExecService {
     this.hostTools.set(name, handler);
   }
 
+  /**
+   * A2（2026-10-21）：`$vault:` 占位符在进入任何执行路径（宿主工具/容器）之前
+   * 替换；回包按本次用到的明文清洗（result/error 都不落明文）。journal 的 args
+   * 在 runTool 之前已落库（control-plane/journal.ts startStep），落的是占位符原文。
+   */
   async runTool(call: ExecToolCall): Promise<ExecToolResult> {
+    const pre = this.preprocessVault(call);
+    if (pre.error !== undefined) return pre.error;
+    const r = await this.runToolInner(pre.call);
+    return scrubSecrets(r, pre.secrets);
+  }
+
+  /** 有占位符才读保险库；缺条目/没配钥匙都 fail-closed，绝不把占位符发给目标。 */
+  private preprocessVault(call: ExecToolCall): {
+    call: ExecToolCall;
+    secrets: string[];
+    error?: ExecToolResult;
+  } {
+    if (!JSON.stringify(call.args ?? {}).includes('$vault:')) return { call, secrets: [] };
+    const key = process.env.DOTD_MAIL_KEY ?? '';
+    if (key.length === 0) {
+      return {
+        call,
+        secrets: [],
+        error: {
+          call_id: call.call_id,
+          status: 'error',
+          error: {
+            code: 'vault_unconfigured',
+            message: '用了 $vault: 占位符但没配 DOTD_MAIL_KEY——拒绝把占位符原样发给目标',
+            retryable: false,
+          },
+          finished_at: new Date().toISOString(),
+        },
+      };
+    }
+    const dir = process.env.DOTD_VAULT_DIR ?? '/root/.dotd';
+    const sub = substituteVaultArgs(call.args ?? {}, (site, user) => {
+      try {
+        return vaultGet(dir, key, site, user);
+      } catch {
+        return null; // 钥匙/文件坏 → 视同缺条目（fail-closed，不猜）
+      }
+    });
+    if (sub.missing.length > 0) {
+      return {
+        call,
+        secrets: [],
+        error: {
+          call_id: call.call_id,
+          status: 'error',
+          error: {
+            code: 'vault_missing',
+            message: `保险库没有这些条目：${sub.missing.join('、')}（主人在 CLI：dotd vault add <site> <user>）`,
+            retryable: false,
+          },
+          finished_at: new Date().toISOString(),
+        },
+      };
+    }
+    return { call: { ...call, args: sub.args as Record<string, unknown> }, secrets: sub.secrets };
+  }
+
+  private async runToolInner(call: ExecToolCall): Promise<ExecToolResult> {
     const at = new Date().toISOString();
 
     // ⓪ 宿主侧工具优先：不进容器、不占容器额度

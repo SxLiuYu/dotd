@@ -89,6 +89,9 @@ export type Route =
   | 'approvals'
   | 'approval_by_id'
   | 'approval_decision'
+  | 'vault_list'
+  | 'vault_put'
+  | 'vault_delete'
   | 'events'
   | 'guard'
   | 'breaker'
@@ -132,6 +135,11 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   if (m === 'GET' && p === '/api/queue') return { route: 'queue', params: {} };
   if (m === 'GET' && p === '/api/conversations') return { route: 'conversations', params: {} };
   if (m === 'GET' && p === '/api/approvals') return { route: 'approvals', params: {} };
+  // A2 保险库（2026-10-21）：列条目名 / 写入（secret 只走回环 + master token）/ 删除。
+  // 写路径只有 daemon（D2 单写者），CLI 是瘦客户端。
+  if (m === 'GET' && p === '/api/vault') return { route: 'vault_list', params: {} };
+  if (m === 'POST' && p === '/api/vault/entries') return { route: 'vault_put', params: {} };
+  if (m === 'DELETE' && p === '/api/vault/entries') return { route: 'vault_delete', params: {} };
   if (m === 'POST' && p === '/api/approvals/decision') {
     // 便捷别名（无 :id 时不合法，仍路由过去由 handler 报错）
     return { route: 'approval_decision', params: {} };
@@ -344,6 +352,13 @@ export interface MemoryArchiveEntry {
   sizeBytes: number;
 }
 
+/** A2 保险库端口（2026-10-21）：daemon 装配；未装配 = daemon 缺 DOTD_MAIL_KEY。 */
+export interface VaultPort {
+  list(): Array<{ site: string; user: string }>;
+  put(site: string, user: string, secret: string): void;
+  remove(site: string, user: string): boolean;
+}
+
 export interface HttpDeps {
   db: DatabaseSync;
   bus: EventBus;
@@ -353,6 +368,8 @@ export interface HttpDeps {
   router: RouterPort;
   channels: NotificationChannels | null;
   sse: SseBus;
+  /** A2：保险库（可选；缺省 = 未配钥匙，写路径报 501）。 */
+  vault?: VaultPort;
   cfg: SurfacesConfig;
   /**
    * §5.7 求救投递顺序与兜底文件（由装配层从 ModelRouter.alertsRoute() 取真值）。
@@ -702,6 +719,56 @@ export function createHttpServer(deps: HttpDeps): Server {
           return;
         }
         json(res, 200, { approval: view });
+        return;
+      }
+
+      case 'vault_list': {
+        json(res, 200, { entries: deps.vault?.list() ?? [] });
+        return;
+      }
+
+      case 'vault_put': {
+        if (deps.vault === undefined) {
+          json(res, 501, { error: 'not_implemented', message: '保险库未装配（daemon 缺 DOTD_MAIL_KEY）' });
+          return;
+        }
+
+        const vbody = await readJson(req, res);
+        if (vbody === null) return;
+        const vb = vbody as { site?: unknown; user?: unknown; secret?: unknown };
+        if (
+          typeof vb.site !== 'string' || vb.site.length === 0 ||
+          typeof vb.user !== 'string' || vb.user.length === 0 ||
+          typeof vb.secret !== 'string'
+        ) {
+          json(res, 400, { error: 'schema', message: '需要 site/user/secret 三个字符串（secret 允许空串）' });
+          return;
+        }
+
+        try {
+          deps.vault.put(vb.site, vb.user, vb.secret);
+        } catch (cause) {
+          json(res, 500, { error: 'vault_error', message: String(cause) });
+          return;
+        }
+        json(res, 200, { ok: true });
+        return;
+      }
+
+      case 'vault_delete': {
+        if (deps.vault === undefined) {
+          json(res, 501, { error: 'not_implemented', message: '保险库未装配' });
+          return;
+        }
+
+        const dbody = await readJson(req, res);
+        if (dbody === null) return;
+        const db = dbody as { site?: unknown; user?: unknown };
+        if (typeof db.site !== 'string' || typeof db.user !== 'string') {
+          json(res, 400, { error: 'schema', message: '需要 site/user 两个字符串' });
+          return;
+        }
+        json(res, 200, { ok: deps.vault.remove(db.site, db.user) });
         return;
       }
 

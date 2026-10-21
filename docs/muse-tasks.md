@@ -487,3 +487,35 @@ Muse 的演示里 agent 是"替你操作浏览器"的：登录过的网站它接
 3. **undici FormData 被飞书拒**：`FormData+Blob` 上传 `/im/v1/images` 报 230001 invalid parameter，同一 PNG 用 `curl -F` 成功 → channels.ts 改为手工拼 RFC2046 边界体（与 curl 逐字节对齐），live 通过。
 
 **顺带发现（backlog 候选）**：browser.snapshot 在容器 playwright 上 `page.snapshot is not a function`（新版 API 是 ariaSnapshot）；gov 对每个 browser.* 步骤都发审批卡（一台本地测试页也要批一次）——后续考虑给 safe 档 browser.* 记忆式放行。
+
+
+## A2 密码保险库 + C 收尾（2026-10-21，lead）
+
+**A2 设计取舍**：
+- 静止即密文：AES-256-GCM，钥匙**复用 DOTD_MAIL_KEY**（不引入第二把钥匙的托管问题）；
+  `~/.dotd/vault.json` 落盘 mode 600，tmp+rename 原子写。文件里搜不到任何明文（实机 grep 验证）。
+- **模型永远只见占位符**：`$vault:<site>:<user>`；替换点在 `ExecService.runTool` 顶部，
+  这一刀的位置是关键——journal 的 `startStep` 在 runTool **之前**落原始 args，
+  所以落库的必然是占位符原文；容器/宿主工具拿到的是明文；回包再按本次用到的明文清洗
+  （`$vault:redacted`），结果不进 journal 明文、不进模型上下文。原始 args 对象不做原地改。
+- fail-closed 三态：有占位符但没配钥匙 → `vault_unconfigured`；条目不存在 → `vault_missing`
+  （绝不为"猜一个"而把占位符原样发给目标网站）；钥匙不对 → 解密抛错（GCM 认证标签兜住）。
+- 写路径单点：只有 daemon 写 vault.json（D2 单写者精神）；`/api/vault` 三个端点 +
+  CLI `dotd vault add|list|rm`（交互不回显，TTY raw mode；非交互整行读）。
+- `vault.sites` 只回 site/user，值不进模型可见面（第五层接线照旧全套）。
+
+**C 收尾**：daemon 启动时从保险库读 `site=github.com, user=token` 注入
+`process.env.DOTD_GITHUB_TOKEN`——装好真 PAT 后重启即从 public-only 升级到完整模式，
+不装就维持降级、不报错。保险库本身成为"所有站点凭证"的统一入口，不只是 GitHub。
+
+**验证**：
+- `scripts/regress/vault-criteria.sh` 6/6 PASS（往返 / 静止无明文 / list 形状 / 替换+清洗 /
+  缺条目 / 五层接线）。
+- `tests/vault.test.ts` 7 项 + `tests/exec-vault.test.ts` 3 项（真 ExecServiceImpl +
+  宿主探针：明文到手、回包已洗、原始 args 未改、vault_missing、vault_unconfigured）。
+- 实机：POST 写入 → GET 清单 → 文件 grep 无明文（-rw-------）→ node 侧同钥匙解密成功
+  → CLI add/list/rm 全链 → DELETE 清理。
+- 判据同步：`calendar-criteria.sh` 镜像守卫前缀加 `vault`，`OK 19/19`，tools.yml 下界 36。
+
+**踩坑记录**：`scrubSecrets` 最初只依赖调用方传入"长在前"的列表——测试直接传乱序就暴露了，
+改为函数内部防御式排序（短串是长串子串时，先洗短串会把长串洗剩一半）。

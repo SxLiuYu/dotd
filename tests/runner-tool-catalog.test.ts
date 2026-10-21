@@ -98,6 +98,7 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
   'github.issues',
   'github.pulls',
   'rss.read',
+  'vault.sites',
     ],
   );
 });

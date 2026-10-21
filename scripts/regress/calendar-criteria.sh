@@ -209,7 +209,7 @@ t "写回端到端 9 项全过"               test "${W%% *}" = "OK"
 t "calendar.add 在能力目录"           grep -qF "name: 'calendar.add'," src/exec/protocol.ts
 t "calendar.edit 在能力目录"          grep -qF "name: 'calendar.edit'," src/exec/protocol.ts
 t "calendar.delete 在能力目录"        grep -qF "name: 'calendar.delete'," src/exec/protocol.ts
-t "目录尾部收口（最后一批是连接器，rss.read 收尾）"  bash -c "grep -B10 '^];' src/exec/protocol.ts | grep -qF \"name: 'rss.read',\""
+t "目录尾部收口（最后一批是连接器+保险库，vault.sites 收尾）"  bash -c "grep -B10 '^];' src/exec/protocol.ts | grep -qF \"name: 'vault.sites',\""
 t "3 名记入 HOST_SIDE_TOOLS"          grep -qF "'calendar.add', 'calendar.edit', 'calendar.delete'" src/exec/ExecService.ts
 t "ToolDoc：calendar.add"             grep -qF "name: 'calendar.add'," src/runner/tool-catalog.ts
 t "ToolDoc：calendar.edit"            grep -qF "name: 'calendar.edit'," src/runner/tool-catalog.ts
@@ -227,7 +227,7 @@ const daemon = readFileSync('src/daemon.ts', 'utf8');
 const names = [...cat.matchAll(/name: '([a-z][a-z0-9.]*)'/g)].map((m) => m[1]);
 const m = /HOST_SIDE_TOOLS = new Set\(\[([^\]]+)\]\)/.exec(exec);
 const set = m === null ? [] : m[1].split(',').map((s) => s.trim().replaceAll("'", '')).filter(Boolean);
-const hostPrefix = /^(schedule|mail|calendar|github|rss)\./;
+const hostPrefix = /^(schedule|mail|calendar|github|rss|vault)\./;
 const hostInCatalog = names.filter((n) => hostPrefix.test(n));
 const forward = hostInCatalog.every((n) => set.includes(n));
 const backward = set.every((n) => names.includes(n));
@@ -236,7 +236,7 @@ console.log(forward && backward && handlers ? 'OK ' + set.length + '/' + hostInC
 NODE
 MIRROR=$(node .vg-mirror.mjs 2>&1 | tail -1)
 rm -f .vg-mirror.mjs
-t "宿主侧工具目录↔Set 双向镜像+全有处理器"  test "$MIRROR" = "OK 18/18"
+t "宿主侧工具目录↔Set 双向镜像+全有处理器"  test "$MIRROR" = "OK 19/19"
 
 # ── I. tools.yml：可解析 + 分档正确（安全判据，不能放松）────
 cat > .vg-yaml.mjs <<'NODE'
@@ -248,7 +248,7 @@ const want = { 'calendar.list': 'read', 'calendar.conflicts': 'read',
                'calendar.add': 'write_file', 'calendar.edit': 'write_file', 'calendar.delete': 'write_file' };
 const got = Object.fromEntries(cal.map((t) => [t.name, t.tier]));
 const ok = Object.keys(want).every((k) => got[k] === want[k]);
-console.log(ok && y.tools.length >= 35 ? 'OK ' + y.tools.length : 'BAD ' + JSON.stringify(got));
+console.log(ok && y.tools.length >= 36 ? 'OK ' + y.tools.length : 'BAD ' + JSON.stringify(got));
 NODE
 YAML=$(node .vg-yaml.mjs 2>&1 | tail -1)
 rm -f .vg-yaml.mjs

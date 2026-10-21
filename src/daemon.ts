@@ -117,6 +117,10 @@ import {
 } from './surfaces/channels.ts';
 import { startFeishuWs } from './surfaces/feishu-ws.ts';
 import { startFeishuOutbound } from './surfaces/feishu-outbound.ts';
+import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
+
+/** A2：保险库目录（DOTD_VAULT_DIR 可覆盖；缺省 /root/.dotd——钥匙也在那台机上）。 */
+const vaultDir = (): string => process.env.DOTD_VAULT_DIR ?? '/root/.dotd';
 import { githubNotifications, githubIssues, githubPulls } from './connectors/github.ts';
 import { fetchFeed } from './connectors/rss.ts';
 import { DotRunner } from './runner/dot.ts';
@@ -1368,6 +1372,26 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     return connectorWrap(await fetchFeed(typeof a['url'] === 'string' ? a['url'] : ''));
   });
 
+  // A2（2026-10-21）：vault.sites —— 模型只能看到「有哪些条目」（site/user），
+  // 永远看不到值；值只经 runTool 的 $vault: 替换进执行路径。
+  exec.registerHostTool('vault.sites', async () => {
+    return { ok: true as const, value: { entries: vaultList(vaultDir()) } };
+  });
+
+  // A2-C 收尾（2026-10-21）：GitHub token 从保险库注入（site='github.com', user='token'）。
+  // 没配就维持 public-only 降级模式，不报错不挡启动。
+  try {
+    if (process.env.DOTD_GITHUB_TOKEN === undefined && process.env.DOTD_MAIL_KEY !== undefined) {
+      const gh = vaultGet(vaultDir(), process.env.DOTD_MAIL_KEY, 'github.com', 'token');
+      if (gh !== null && gh.length > 0) {
+        process.env.DOTD_GITHUB_TOKEN = gh;
+        log('[vault] GitHub token 已从保险库注入（连接器完整模式）');
+      }
+    }
+  } catch {
+    // 保险库不可用不挡启动
+  }
+
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);
   // failed/orphans 必须见光：阶段一只打 warnings+degraded，占名 409 曾静默瘫痪整个 fleet。
@@ -1467,6 +1491,19 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     router: router as unknown as RouterPort,
     channels,
     sse: sseBus,
+    // A2 保险库（2026-10-21）：文件只由 daemon 进程写（D2 单写者）；
+    // secret 走本机回环 + master token，vault.json 静止即 AES-256-GCM 密文。
+    vault: {
+      list: () => vaultList(vaultDir()),
+      put: (site, user, secret) => {
+        const key = process.env.DOTD_MAIL_KEY;
+        if (key === undefined || key.length === 0) {
+          throw new Error('vault_unconfigured：daemon 缺 DOTD_MAIL_KEY');
+        }
+        vaultPut(vaultDir(), key, site, user, secret);
+      },
+      remove: (site, user) => vaultDelete(vaultDir(), site, user),
+    },
     cfg: surfCfg,
     webRoot: cfg.webRoot,
     // §5.7 求救自检要真值：顺序/兜底文件直接从 router 的 alerts 配置取，

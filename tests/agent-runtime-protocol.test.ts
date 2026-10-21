@@ -119,6 +119,7 @@ test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sid
     // 日历写 3 件套（2026-10-21，task-1）：同样只在 daemon 里跑，不进容器
     'calendar.add', 'calendar.edit', 'calendar.delete',
     'github.notifications', 'github.issues', 'github.pulls', 'rss.read',
+  'vault.sites',
   ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),

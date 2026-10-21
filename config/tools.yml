@@ -196,3 +196,6 @@ tools:
     tier: read
   - name: rss.read
     tier: read
+  # A2（2026-10-21）：保险库条目名清单；值不进模型，browser.act 用 $vault:site:user 占位。
+  - name: vault.sites
+    tier: read

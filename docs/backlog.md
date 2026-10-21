@@ -565,3 +565,7 @@ tk_mvgow7taoew2sg）无人认领，属已知行为：启动恢复只处理"在�
 - [候选] browser.snapshot 适配：容器 playwright 的 Page 无 `.snapshot()`（新版为 ariaSnapshot），模型尝试即 browser_crashed —— 换 API 或改 ToolDoc 描述（2026-10-21 实机）。
 - [候选] browser.* 每步审批疲劳：gov 对每个 browser.* 步骤都发审批卡，本地测试页也要批 —— 给 safe 档 browser.* 加「批准并记住」（approve_remember 已有动词，差入口引导）。
 - [候选] FEISHU_OWNER_CHAT_ID 环境值在 _tokens_src.env 里形态可疑（source 后长度 71），daemon 实际用的值正常 —— 排查是否行尾污染。
+
+- [已知慢测] `tests/exec-container-concurrency.test.ts` 第 10 个用例（生产路径容器闸）在容器/daemon
+  同时运行时耗时可达 ~280s（内部 400×5ms 轮询 + pollIntervalMs:2 空转），会把全量套件从 ~4min
+  拉到 20min+。功能正确（9 pass 0 fail），但判据脚本需要给单文件超时上限或隔离该用例（2026-10-21 实测）。

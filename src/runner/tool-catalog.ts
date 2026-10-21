@@ -606,6 +606,18 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       'http_404 / http_403：源挂了或反爬 —— 换源或稍后再试；' +
       'timeout / network：15s 超时或网络不通 —— 稍后重试。',
   },
+  {
+    name: 'vault.sites',
+    description:
+      '列出保险库里已保存的网站条目（只有 site 和 user，密码值永远不给模型）。' +
+      '在 browser.act 的参数里写 $vault:site:user 占位符，宿主执行时会换成真值——' +
+      '密码不进对话也不进日志。',
+    params: {},
+    returns: '{ entries }：每条 { site, user }。没有条目时是空数组。',
+    failures:
+      '用 $vault: 占位符但保险库里没有该条目 → 工具调用直接 vault_missing，' +
+      '请让主人在 CLI 用 dotd vault add 添加。',
+  },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
@@ -749,7 +761,7 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
    7. 邮件：mail.account.list 看接了哪些 → mail.list / mail.search / mail.read 收、搜、读 → mail.draft 起稿 → mail.send 真发（dangerous，必过主人审批）；接入 mail.account.add，移除 mail.account.remove。
    8. 日历：calendar.add 记日程 → calendar.edit 改 → calendar.delete 删（写的是本地日历；订阅 .ics 只读）。约时间前先 calendar.conflicts 查冲突。
-   9. 连接器：github.notifications（GitHub 通知）/ github.issues / github.pulls（仓库 issue/PR 清单）/ rss.read（抓 RSS/Atom 源）。都是只读；没配 DOTD_GITHUB_TOKEN 时 GitHub 只能查公开仓。
+   9. 连接器：github.notifications（GitHub 通知）/ github.issues / github.pulls（仓库 issue/PR 清单）/ rss.read（抓 RSS/Atom 源）。都是只读；没配 DOTD_GITHUB_TOKEN 时 GitHub 只能查公开仓。/ vault.sites（保险库条目名清单，配合 $vault:site:user 占位符用）。
    10. 造工具：tool.create / tool.list / tool.invoke。
       **写脚本前先看有没有「你已有的自造工具」**：对口就 tool.invoke，别重写。
       没对口但以后会重复 → tool.create 造一个。

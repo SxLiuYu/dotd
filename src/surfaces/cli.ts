@@ -57,6 +57,48 @@ export function resolveBaseUrl(explicit?: string): string {
   return DEFAULT_BASE_URL;
 }
 
+/**
+ * A2（2026-10-21）：不回显读一行。TTY 用 raw mode（逐字符收，Ctrl-C 退出）；
+ * 非交互（管道）整行读。密码别走参数、别进 shell history。
+ */
+function promptHidden(prompt: string): Promise<string> {
+  return new Promise((resolvePw) => {
+    process.stdout.write(prompt);
+    const stdin = process.stdin;
+    if (stdin.isTTY === true && typeof stdin.setRawMode === 'function') {
+      let buf = '';
+      const onData = (ch: Buffer): void => {
+        const c = ch.toString('utf8');
+        if (c === '\r' || c === '\n') {
+          stdin.removeListener('data', onData);
+          stdin.setRawMode(false);
+          stdin.pause();
+          process.stdout.write('\n');
+          resolvePw(buf);
+          return;
+        }
+        if (c === '\u0003') {
+          process.stdout.write('\n');
+          process.exit(130);
+        }
+        if (c === '\u007f' || c === '\b') {
+          buf = buf.slice(0, -1);
+          return;
+        }
+        buf += c;
+      };
+      stdin.resume();
+      stdin.on('data', onData);
+    } else {
+      let all = '';
+      stdin.on('data', (c: Buffer) => {
+        all += c.toString('utf8');
+      });
+      stdin.on('end', () => resolvePw(all.replace(/\r?\n$/, '')));
+    }
+  });
+}
+
 export interface CliOptions {
   token?: string;
   url?: string;
@@ -77,7 +119,7 @@ export type ApiResult<T = unknown> =
   | { ok: false; kind: 'unreachable' | 'http' | 'parse'; status?: number; message: string };
 
 async function api<T>(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'DELETE',
   path: string,
   body: unknown | undefined,
   opts: CliOptions,
@@ -362,6 +404,55 @@ export function buildCli(opts: CliOptions = {}): Command {
   };
   decision(program.command('approve').description('批准（once|remember）'), 'once');
   decision(program.command('deny').description('拒绝'), 'reject');
+
+  // A2（2026-10-21）：保险库三件事。secret 只走本机回环 + master token；
+  // 交互输入不回显；--secret 供管道/脚本（注意 shell history）。
+  const vaultCmd = program.command('vault').description('密码保险库：add|list|rm（值只存 daemon 侧密文）');
+  vaultCmd
+    .command('add <site> <user>')
+    .description('写入/覆盖一条；交互模式下密码不回显')
+    .option('--secret <text>', '非交互直给（脚本用；交互别用）')
+    .action(async (site: string, user: string, vo: { secret?: string }) => {
+      const o = merged();
+      const token = resolveToken(o.token);
+      if (token === null) {
+        return fail(o, '没有 token（--token / DOTD_MASTER_TOKEN / ~/.dotd/cli_token）', 2);
+      }
+      let secret = vo.secret;
+      if (secret === undefined) {
+        secret = await promptHidden(`  ${site} / ${user} 的密码（输入不回显）：`);
+        if (secret.length === 0) return fail(o, '空密码没存（要删用 vault rm）', 2);
+      }
+      const r = await api('POST', '/api/vault/entries', { site, user, secret }, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      emit(o, `已存 ${site} / ${user}（agent 侧引用：$vault:${site}:${user}）`);
+    });
+  vaultCmd
+    .command('list')
+    .description('列出条目（只有 site/user，永远没有值）')
+    .action(async () => {
+      const o = merged();
+      const token = resolveToken(o.token);
+      if (token === null) return fail(o, '没有 token', 2);
+      const r = await api<{ entries: Array<{ site: string; user: string }> }>(
+        'GET', '/api/vault', undefined, o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      const es = r.body?.entries ?? [];
+      if (es.length === 0) return emit(o, '（保险库是空的）');
+      emit(o, es.map((e) => `${e.site} / ${e.user}`).join('\n'));
+    });
+  vaultCmd
+    .command('rm <site> <user>')
+    .description('删除一条')
+    .action(async (site: string, user: string) => {
+      const o = merged();
+      const token = resolveToken(o.token);
+      if (token === null) return fail(o, '没有 token', 2);
+      const r = await api('DELETE', '/api/vault/entries', { site, user }, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      emit(o, `已删 ${site} / ${user}`);
+    });
 
   program
     .command('watch')
