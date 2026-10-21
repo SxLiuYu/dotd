@@ -415,7 +415,23 @@ export async function evaluate(
     return { kind: 'deny', decisionId, reason };
   }
 
-  const loginSensitive = isLoginSensitive(call);
+  // 2026-10-21（主人要求"浏览器控制不需要审批，重大决定才需要"）：
+  // 「带登录身份浏览」本身不是决策点。契约 G1 的 isLoginSensitive 是"这个调用触碰
+  // 了登录态"的**标记**，不是"必须人工批"的**结论** —— 原实现把标记直接当结论，
+  // 于是 browser.open/browser.snapshot（tier=read、无副作用）每调一次都弹卡，
+  // 网页能力事实上不可用。这里改成：只读且 catalog 判无副作用的调用，即便带身份
+  // 也走下面的快速路径；真正会改外部状态的（browser.act/submit、危险工具）仍然
+  // 需要人批。identity 本身照旧进 decision 记录，审计不失真。
+  // 只读浏览动作显式点名，而不是靠推断：这份清单之外的 browser.* 一律仍按登录态
+  // 审批（browser.act 会点/填/提交，可能下单、改设置、发消息 —— 必须人看）。
+  const READ_ONLY_BROWSER = new Set([
+    'browser.open',
+    'browser.snapshot',
+    'browser.screenshot',
+    'browser.close',
+  ]);
+  const readOnlyBrowser = tier === 'read' && READ_ONLY_BROWSER.has(call.tool);
+  const loginSensitive = isLoginSensitive(call) && !readOnlyBrowser;
   if (loginSensitive) {
     const loginReason = 'login-sensitive';
     const a = insertApproval(rt, ctx, call, {
@@ -723,10 +739,20 @@ export function upgradeHit(def: ToolDefT, params: Record<string, unknown>): bool
   return def.upgrade.whenContains.some((w) => lc.includes(w.toLowerCase()));
 }
 
-/** §3.1 快速路径的 needsReview：URL 形态 / spend 参数形态出现 ⇒ 不走快速路径。 */
+/**
+ * §3.1 快速路径的 needsReview：出现"可能需要人看一眼"的参数形态 ⇒ 不走快速路径。
+ *
+ * 2026-10-21 调整（主人明确要求"浏览器控制不需要审批，重大决定才需要"）：
+ * URL 本身不再是 review 信号。原判据是"params 里含 http:// 或 https:// 就 review"，
+ * 而 browser.open / browser.act 的正常参数就是 URL —— 这条等于让每一次网页操作都
+ * 弹审批卡，browser.* 全系列事实上不可用（实测 tier=read 的 browser.open 照样被拦）。
+ * 导航到某个地址不是决策，点进去之后做什么才是；后者由 tier 与下面的凭据类信号把关。
+ *
+ * 仍然保留的信号：password / token / cookie 字样 —— 它们出现在参数里意味着模型
+ * 正在摆弄凭据，值得人看一眼（真正的凭据本该走 $vault: 占位符，不进 args）。
+ */
 function needsReview(catalog: Catalog, call: ToolCall): boolean {
   const s = safeJson(call.params).toLowerCase();
-  if (s.includes('http://') || s.includes('https://')) return true;
   if (s.includes('password') || s.includes('token') || s.includes('cookie')) return true;
   return false;
 }
