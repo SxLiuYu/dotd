@@ -2983,7 +2983,7 @@ export function matchToolForGoal(
   return best === null ? null : { name: best.name, why: best.why };
 }
 
-function toolCall(
+export function toolCall(
   task: Task,
   callId: string,
   tool: string,
@@ -3013,13 +3013,16 @@ function toolCall(
     if (tool === 'browser.open') browserIdentityByTask.set(task.id, resolved);
   }
   if (tool === 'browser.close') browserIdentityByTask.delete(task.id);
-  // A1：身份由顶层 call.identity 承载（契约 G1）；容器侧 args schema 是
-  // additionalProperties:false，args.identity 留在 args 里会被容器 400 拒。
-  if (tool.startsWith('browser.') && call.args.identity !== undefined) {
-    const rest: Record<string, unknown> = { ...call.args };
-    delete rest.identity;
-    call.args = rest;
-  }
+  // A1（2026-10-21 修正）：**不要在这里剥 args.identity**。
+  //
+  // 剥的理由本来是「容器侧 args schema 是 additionalProperties:false，留着会被 400 拒」，
+  // 但 2026-10-21 起 browser.* 已由宿主 agent-browser 承接（daemon.ts registerHostTool），
+  // **根本不进容器**；而宿主侧 legacyBrowser 的身份 100% 从 args 读
+  // （webtools.ts identityOf(args, taskKey) —— call.identity 不会进 args，
+  //   见 ExecService.runToolInner: host(call.args, call.task_id)）。
+  //
+  // 在这里剥的后果：runner 决议出 mybank，宿主却只看到 undefined → 退回匿名 session，
+  // 登录态静默丢失。剥离改到容器派发层做（ExecService.dispatch），那里才知道"真的要去容器"。
   return call;
 }
 

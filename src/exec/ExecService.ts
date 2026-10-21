@@ -262,6 +262,28 @@ export interface ExecServiceDeps {
  */
 const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read', 'vault.sites', 'web.snapshot', 'web.read', 'web.act']);
 
+/**
+ * A1（2026-10-21）：`args.identity` 是给**宿主侧** browser.* 读的，不是给容器读的。
+ *
+ * 容器侧 args schema 是 `additionalProperties: false`，多带一个 identity 会被 400 拒；
+ * 而宿主侧 legacyBrowser 的身份 100% 来自 args（`webtools.identityOf(args, taskKey)`，
+ * 因为 `runToolInner` 只把 `call.args` 交给宿主，`call.identity` 不进 args）。
+ *
+ * 两边需求正好相反，所以**剥离必须发生在"确认要去容器"之后**（dispatch）：
+ * 放在 runner 的 toolCall() 里会把宿主那份一起剥掉 → runner 决议出 mybank、
+ * 宿主只看到 undefined → 静默退回匿名登录态。这个坑踩过一次。
+ *
+ * 顺带对齐落库口径：journal 里留剥过的 args，即"容器真正收到的东西"。
+ */
+export function stripIdentityForContainer(call: ExecToolCall): ExecToolCall {
+  if (!call.tool.startsWith('browser.')) return call;
+  const args = call.args as Record<string, unknown> | undefined;
+  if (args === undefined || args['identity'] === undefined) return call;
+  const rest: Record<string, unknown> = { ...args };
+  delete rest['identity'];
+  return { ...call, args: rest };
+}
+
 export class ExecServiceImpl implements ExecService {
   readonly cfg: ExecConfig;
   readonly fleet: Fleet;
@@ -723,9 +745,10 @@ export class ExecServiceImpl implements ExecService {
   private async dispatch(
     endpoint: string,
     token: string,
-    call: ExecToolCall,
+    callIn: ExecToolCall,
     mode: 'sync' | 'async',
   ): Promise<ExecToolResult> {
+    const call = stripIdentityForContainer(callIn);
     const client = this.requireRuntime();
     if (mode === 'sync') {
       const res = await client.callSync(endpoint, token, call);

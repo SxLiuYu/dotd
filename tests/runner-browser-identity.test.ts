@@ -5,7 +5,8 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveBrowserIdentity, siteIdentityOf } from '../src/runner/dot.ts';
+import type { Task } from '../src/shared/contracts.ts';
+import { resolveBrowserIdentity, siteIdentityOf, toolCall } from '../src/runner/dot.ts';
 
 describe('A1 siteIdentityOf：网址 → 站点身份', () => {
   it('https 网址派生 site:<host>', () => {
@@ -54,5 +55,37 @@ describe('A1 resolveBrowserIdentity：派发与治理共用的判定', () => {
   });
   it('显式身份连 act 也生效（模型显式 anon → 无痕）', () => {
     assert.equal(resolveBrowserIdentity('browser.act', { identity: 'anon' }, 'site:a.com'), 'anon');
+  });
+});
+
+/**
+ * A1 端到端（2026-10-21 补）：identity 在两条路径上必须**各得其所**。
+ *
+ * 踩过的真实现场：曾在 toolCall() 里统一剥掉 args.identity（理由是"容器 schema
+ * additionalProperties:false 会 400 拒"）。但 browser.* 已由宿主 agent-browser
+ * 承接、根本不进容器，而宿主侧身份 100% 从 args 读（webtools.identityOf），
+ * 于是 runner 决议出 mybank、宿主却只看到 undefined → 静默退回匿名登录态。
+ *
+ * 这组用例钉住：宿主拿得到、容器收不到。
+ */
+describe('A1 身份分配：宿主吃 args，容器不吃', () => {
+  const task = { id: 't1', dotId: 'dot1' } as unknown as Task;
+
+  it('toolCall() 不剥 args.identity（宿主侧要靠它派生 session）', () => {
+    const c = toolCall(task, 'c1', 'browser.open', { url: 'https://a.com', identity: 'mybank' }, 5000);
+    assert.equal(c.args['identity'], 'mybank', 'toolCall 剥掉就等于宿主拿不到身份');
+    assert.equal(c.identity, 'mybank', '顶层 identity 仍按契约 G1 承载');
+  });
+
+  it('缺省派发的 site:<host> 只落顶层，不往 args 里塞', () => {
+    const c = toolCall(task, 'c2', 'browser.open', { url: 'https://a.com/x' }, 5000);
+    assert.equal(c.identity, 'site:a.com');
+    assert.equal(c.args['identity'], undefined, '不该凭空往 args 加字段');
+  });
+
+  it('非 browser.* 工具完全不碰 args', () => {
+    const args = { path: '/x', identity: 'whatever' };
+    const c = toolCall(task, 'c3', 'fs.read', args, 5000);
+    assert.deepEqual(c.args, args, '非浏览器工具不该被动过');
   });
 });
