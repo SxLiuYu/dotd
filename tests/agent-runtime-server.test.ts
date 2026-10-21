@@ -2,7 +2,7 @@
  * tests/agent-runtime-server.test.ts —— server.ts 派发/端点层单测（审码 issue A/E/F/G/H/I/J 的回归防线）。
  *
  * 隔离策略（与 browser 测试同哲学）：不起真 HTTP 端口、不起真 chromium、不碰真 /opt/agent-state。
- * - FsTools/ShellTools/BrowserHolder 全部走构造函数注入（homeRoot 指临时目录、factory 是进程内假工厂）。
+ * - FsTools/ShellTools 全部走构造函数注入（homeRoot 指临时目录、factory 是进程内假工厂）。
  * - HTTP 层用 `start()` 监听 127.0.0.1 的随机端口，用 fetch 打真请求（Bearer 鉴权、路由、状态码都覆盖到）。
  *
  * 覆盖的审码问题：
@@ -30,15 +30,6 @@ import {
 } from '../agent-runtime/protocol.ts';
 import { FsTools } from '../agent-runtime/fs.ts';
 import type { SpawnAdapter, SpawnOutcome } from '../agent-runtime/shell.ts';
-import {
-  BrowserHolder,
-  MAX_PAGES_PER_CTX,
-  identityHash,
-  type BrowserContextLike,
-  type BrowserLike,
-  type BrowserPage,
-  type ChromiumFactory,
-} from '../agent-runtime/browser.ts';
 import { XvfbManager, type XvfbSpawn } from '../agent-runtime/xvhfd.ts';
 
 // ── 脚手架 ───────────────────────────────────────────────────────────
@@ -96,111 +87,6 @@ function fakeSpawn(log: Array<Record<string, unknown>>): SpawnAdapter {
   };
 }
 
-// ── 假浏览器（进程内，零外部依赖）────────────────────────────────────
-
-class FakePage implements BrowserPage {
-  url_ = 'about:blank';
-  title_ = '';
-  closed = false;
-  constructor(private readonly ctx: FakeCtx) {}
-  async goto(url: string): Promise<void> {
-    this.url_ = url;
-    this.title_ = `title(${url})`;
-  }
-  async click(): Promise<void> {}
-  async fill(): Promise<void> {}
-  async press(): Promise<void> {}
-  async selectOption(): Promise<void> {}
-  async waitForTimeout(): Promise<void> {}
-  async scroll(): Promise<void> {}
-  async title(): Promise<string> {
-    return this.title_;
-  }
-  url(): string {
-    return this.url_;
-  }
-  async snapshot(): Promise<{ text: string; html?: string }> {
-    return { text: `snap:${this.url_}` };
-  }
-  async close(): Promise<void> {
-    this.closed = true;
-    // 与 playwright 一致：页面关闭后 ctx.pages() 不再含它
-    this.ctx.openPages.splice(this.ctx.openPages.indexOf(this), 1);
-  }
-}
-
-class FakeCtx implements BrowserContextLike {
-  readonly openPages: FakePage[] = [];
-  closed = false;
-  dead = false;
-  readonly kind: 'persistent' | 'ephemeral';
-  constructor(kind: 'persistent' | 'ephemeral') {
-    this.kind = kind;
-  }
-  async pages(): Promise<BrowserPage[]> {
-    return this.openPages;
-  }
-  async newPage(): Promise<BrowserPage> {
-    const p = new FakePage(this);
-    this.openPages.push(p);
-    return p;
-  }
-  async close(): Promise<void> {
-    this.closed = true;
-  }
-  /** 测试用：标记 context 已死（chromium process exit 的等价物）。 */
-  kill(): void {
-    this.dead = true;
-  }
-}
-
-/** 带 isConnected 探针的 FakeCtx（BrowserHolder.alive 走这条路）。 */
-class ProbeCtx extends FakeCtx {
-  constructor(kind: 'persistent' | 'ephemeral') {
-    super(kind);
-  }
-  isConnected(): boolean {
-    return !this.dead;
-  }
-}
-
-interface FakeFactoryLog {
-  persistent: string[];
-  ephemeral: number;
-  ctxs: FakeCtx[];
-}
-
-function makeFakeFactory(): { factory: ChromiumFactory; log: FakeFactoryLog } {
-  const log: FakeFactoryLog = { persistent: [], ephemeral: 0, ctxs: [] };
-  let shared: BrowserLike | null = null;
-  return {
-    log,
-    factory: {
-      async launchPersistentContext(userDataDir: string): Promise<BrowserContextLike> {
-        log.persistent.push(userDataDir);
-        const c = new ProbeCtx('persistent');
-        log.ctxs.push(c);
-        return c;
-      },
-      async launch(): Promise<BrowserLike> {
-        log.ephemeral += 1;
-        shared ??= {
-          async newContext(): Promise<BrowserContextLike> {
-            const c = new ProbeCtx('ephemeral');
-            log.ctxs.push(c);
-            return c;
-          },
-          async close(): Promise<void> {},
-          isConnected(): boolean {
-            return true;
-          },
-        } satisfies BrowserLike;
-        return shared;
-      },
-    },
-  };
-}
-
 /** 假 Xvfb（不起真二进制；接口见 xvhfd.ts 的 XvfbSpawn）。 */
 class FakeXvfb implements XvfbSpawn {
   aliveFlag = true;
@@ -240,10 +126,9 @@ let portSeq = 19_200;
 async function makeRuntime(
   tmp: Tmp,
   over: Partial<RuntimeConfig> = {},
-): Promise<{ rt: AgentRuntime; factoryLog: FakeFactoryLog; spawnLog: Array<Record<string, unknown>>; base: string; stop(): Promise<void> }> {
+): Promise<{ rt: AgentRuntime; spawnLog: Array<Record<string, unknown>>; base: string; stop(): Promise<void> }> {
   portSeq += 1;
   const spawnLog: Array<Record<string, unknown>> = [];
-  const { factory, log } = makeFakeFactory();
   const rt = new AgentRuntime({
     token: 'test-token-000',
     port: portSeq,
@@ -255,7 +140,6 @@ async function makeRuntime(
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     shellTools: undefined,
     spawnAdapter: fakeSpawn(spawnLog),
-    browserFactory: factory,
     xvfbSpawn: fakeXvfbSpawn,
     ...over,
   });
@@ -263,7 +147,6 @@ async function makeRuntime(
   const port = (rt as unknown as { cfg: { port: number } }).cfg.port;
   return {
     rt,
-    factoryLog: log,
     spawnLog,
     base: `http://127.0.0.1:${port}`,
     stop: () => rt.stop(),
@@ -373,7 +256,6 @@ test('A: POST /jobs/{id}/cancel 有句柄可调（JobEntry.cancel 已接线）',
       return new Promise((resolve) => setTimeout(() => resolve({ code: 0, signal: null, stdout: '', stderr: '', killed: false }), 3000));
     },
   };
-  const { factory, log } = makeFakeFactory();
   const rt = new AgentRuntime({
     token: 'test-token-000',
     port: (portSeq += 1),
@@ -384,13 +266,11 @@ test('A: POST /jobs/{id}/cancel 有句柄可调（JobEntry.cancel 已接线）',
     log: noopLog,
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: slowSpawn,
-    browserFactory: factory,
     xvfbSpawn: fakeXvfbSpawn,
   });
   t.after(() => rt.stop());
   await rt.start();
   const base = `http://127.0.0.1:${(rt as unknown as { cfg: { port: number } }).cfg.port}`;
-  void log;
 
   const started = await req(base, 'POST', '/jobs/start', call('jc', 'shell.run', { cmd: 'sleep 1', timeout_ms: 5000 }));
   const jobId = (started.body as { job_id?: string }).job_id as string;
@@ -417,124 +297,6 @@ test('A: /jobs/start 拒绝 sync 工具（应走 /tools/call）', async (t) => {
   const r = await req(env.base, 'POST', '/jobs/start', call('s1', 'fs.read', { path: 'a.md' }));
   assert.equal((r.body as { error?: { code?: string } }).error?.code, ERROR_CODES.wrong_endpoint_for_mode);
 });
-
-// ═══════════════════════════════════════════════════════════════════
-// E：每 profile 并发页面上限（审码 issue E —— CtxEntry.pages 恒 0）
-// ═══════════════════════════════════════════════════════════════════
-
-test('E: 并发页面达到 MAX_PAGES_PER_CTX → too_many_pages（acquire 不再只看 enter 计数）', async (t) => {
-  const tmp = makeTmp();
-  t.after(() => tmp.cleanup());
-  const env = await makeRuntime(tmp);
-  t.after(() => env.stop());
-
-  // 前 MAX_PAGES_PER_CTX 次：每次把上一页 close 掉（FakePage.close → openPages 移除），
-  // 于是 pages() 为空 → 每次都走 newPage 分支 → 每次都撞页数记账。
-  for (let i = 0; i < MAX_PAGES_PER_CTX; i++) {
-    const r = await asyncCall(env.base, call(`p${i}`, 'browser.open', { url: 'https://x.test/' }, 'alice'));
-    assert.equal(r.status, 'ok', `第 ${i + 1} 次 open 应成功`);
-    const opened = env.factoryLog.ctxs[0]!.openPages;
-    assert.equal(opened.length, 1, `第 ${i + 1} 次调用新开了一页（上一页已关）`);
-    // 关掉刚开的页，但**不关 context**：CtxEntry.pages 的记账仍在
-    await opened[0]!.close();
-    assert.equal(env.factoryLog.ctxs[0]!.openPages.length, 0, '页面关闭后 ctx.pages() 为空');
-  }
-  assert.equal(env.rt.browser.pageCount(identityHash('alice')), MAX_PAGES_PER_CTX, 'notePage 记账到上限');
-
-  // 第 N+1 次：pages() 为空 → 走 newPage 分支 → 页数已满 → 拒绝
-  const over = await asyncCall(env.base, call('pover', 'browser.open', { url: 'https://x.test/' }, 'alice'));
-  assert.equal(over.status, 'error');
-  assert.equal(
-    over.error?.code,
-    ERROR_CODES.too_many_pages,
-    `超过 ${MAX_PAGES_PER_CTX} 个并发页面必须拒绝（EX §6.1）`,
-  );
-
-  // 记账确实按身份分开：换身份（新 context）又能开
-  const other = await asyncCall(env.base, call('pother', 'browser.open', { url: 'https://x.test/' }, 'bob'));
-  assert.equal(other.status, 'ok', '页数按身份分别记账');
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// F：in-flight 不泄漏（审码 issue F —— enter 两次、exit 一次）
-// ═══════════════════════════════════════════════════════════════════
-
-test('F: browserCall 前后 enter/exit 配对，in-flight 归零（busy 判据可用）', async (t) => {
-  const tmp = makeTmp();
-  t.after(() => tmp.cleanup());
-  const env = await makeRuntime(tmp);
-  t.after(() => env.stop());
-
-  for (let i = 0; i < 4; i++) {
-    const r = await asyncCall(env.base, call(`f${i}`, 'browser.open', { url: 'https://x.test/' }, 'alice'));
-    assert.equal(r.status, 'ok');
-  }
-  const stats = env.rt.browser.stats();
-  const key = identityHash('alice');
-  assert.equal(stats.inflight[key], 0, '四次调用后 in-flight 必须归零（否则 LRU/老化/hardReset 的 busy 判据全失效）');
-  assert.equal(stats.contexts, 1);
-  assert.equal(stats.pages[key], 1, '四次调用复用同一个页面（pages() 非空 → 不 newPage）');
-});
-
-test('F: 调用抛错时 finally 也 exit（异常路径不泄漏 in-flight）', async (t) => {
-  const tmp = makeTmp();
-  t.after(() => tmp.cleanup());
-  const env = await makeRuntime(tmp);
-  t.after(() => env.stop());
-
-  // browser.open 不带 url → browserCall 内 return errorResult，finally 仍要 exit
-  const r = await asyncCall(env.base, call('ferr', 'browser.open', {}, 'alice'));
-  assert.equal(r.error?.code, ERROR_CODES.bad_args);
-  const stats = env.rt.browser.stats();
-  for (const v of Object.values(stats.inflight)) assert.equal(v, 0);
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// G：崩溃 context 自动重开（审码 issue G —— isConnected 存在却没用）
-// ═══════════════════════════════════════════════════════════════════
-
-test('G: context 崩溃后下一次 browser.* 自动重开，不返回同一个已死 context', async (t) => {
-  const tmp = makeTmp();
-  t.after(() => tmp.cleanup());
-  const env = await makeRuntime(tmp);
-  t.after(() => env.stop());
-
-  const first = await asyncCall(env.base, call('g1', 'browser.open', { url: 'https://x.test/' }, 'alice'));
-  assert.equal(first.status, 'ok');
-  assert.equal(env.factoryLog.ctxs.length, 1, '首次 acquire 起一个 persistent context');
-
-  // 杀掉它（chromium process exit 的等价物）
-  const dead = env.factoryLog.ctxs[0]!;
-  dead.kill();
-
-  const second = await asyncCall(env.base, call('g2', 'browser.open', { url: 'https://x.test/' }, 'alice'));
-  assert.equal(second.status, 'ok', '崩溃后应自动重开并成功');
-  assert.equal(env.factoryLog.ctxs.length, 2, '必须 launch 一个新 context（而不是复用已死的）');
-  assert.notEqual(env.factoryLog.ctxs[1], dead);
-  assert.equal(dead.closed, true, '旧 context 被 closeEntry 收掉');
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// H：契约 G1 fail-closed（审码 issue H —— 缺 identity 被当成 ephemeral）
-// ═══════════════════════════════════════════════════════════════════
-
-test('H: browser.* 缺顶层 identity → identity_required，不降级为匿名档', async (t) => {
-  const tmp = makeTmp();
-  t.after(() => tmp.cleanup());
-  const env = await makeRuntime(tmp);
-  t.after(() => env.stop());
-
-  const r = await asyncCall(env.base, call('h1', 'browser.open', { url: 'https://x.test/' }));
-  assert.equal(r.error?.code, ERROR_CODES.identity_required);
-  assert.equal(env.factoryLog.ctxs.length, 0, 'fail-closed：一个 context 都不起');
-
-  // 'anon' 是显式匿名档（合法），与"缺失"不同
-  const anon = await asyncCall(env.base, call('h2', 'browser.open', { url: 'https://x.test/' }, 'anon'));
-  assert.equal(anon.status, 'ok');
-  assert.equal(env.factoryLog.ephemeral, 1, 'anon 走 ephemeral 分支');
-});
-
-// ═══════════════════════════════════════════════════════════════════
 // I：args_hash 比对（审码 issue I —— 重派路径从不比对）
 // ═══════════════════════════════════════════════════════════════════
 
@@ -727,7 +489,6 @@ test('B: shell 降级（canSetUid=false）发 exec.shell.uid_degraded 事件到 
   t.after(() => tmp.cleanup());
   const lines: string[] = [];
   const spawnLog: Array<Record<string, unknown>> = [];
-  const { factory, log: flog } = makeFakeFactory();
   const rt = new AgentRuntime({
     token: 'test-token-000',
     port: (portSeq += 1),
@@ -742,13 +503,11 @@ test('B: shell 降级（canSetUid=false）发 exec.shell.uid_degraded 事件到 
     log: (line) => lines.push(line),
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: fakeSpawn(spawnLog),
-    browserFactory: factory,
     xvfbSpawn: fakeXvfbSpawn,
   });
   t.after(() => rt.stop());
   await rt.start();
   const base = `http://127.0.0.1:${(rt as unknown as { cfg: { port: number } }).cfg.port}`;
-  void flog;
 
   // 容器外（Windows）process.getuid 不存在 → canSetUid()=false → 降级事件必须发出。
   // shell.run 是 async → 走 /jobs/start 轮询终态。
@@ -772,7 +531,6 @@ test('B 反面：有 setuid 能力（canSetUid=true）→ 不发降级事件、u
   t.after(() => tmp.cleanup());
   const lines: string[] = [];
   const spawnLog: Array<Record<string, unknown>> = [];
-  const { factory } = makeFakeFactory();
   const rt = new AgentRuntime({
     token: 'test-token-000',
     port: (portSeq += 1),
@@ -784,7 +542,6 @@ test('B 反面：有 setuid 能力（canSetUid=true）→ 不发降级事件、u
     log: (line) => lines.push(line),
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: fakeSpawn(spawnLog),
-    browserFactory: factory,
     xvfbSpawn: fakeXvfbSpawn,
   });
   t.after(() => rt.stop());
@@ -842,7 +599,6 @@ test('P: 已结束 job 只留一小段环形缓冲，running 的一条都不动'
     log: noopLog,
     fsTools: new FsTools({ homeRoot: tmp.homeRoot }),
     spawnAdapter: fakeSpawn([]),
-    browserFactory: makeFakeFactory().factory,
     xvfbSpawn: fakeXvfbSpawn,
   });
   const jobs = rt as unknown as {

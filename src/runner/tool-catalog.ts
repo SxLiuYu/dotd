@@ -801,9 +801,9 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
    · PDF：\`pdftotext 文件.pdf -\` 直接打出文本；\`pdfinfo 文件.pdf\` 看页数/元信息
    · Word(.docx) / Excel(.xlsx)：本质是 zip+xml，用 python3 解（zipfile 读内部 xml，正则或 ElementTree 取文本）
    · 纯文本/代码/日志：fs.read 就够
-4. 网页：**首选 web.*（不弹审批）**。web.read 读正文（JS 页面也能读；net.get 只有空壳）；
-       web.snapshot 取「元素+@eN 引用」→ web.act 用 @eN 点/填（做完自动回新清单，引用比选择器稳）。
-       看画面用 browser.screenshot；容器内 browser.open/browser.snapshot/browser.act/browser.close 是旧路径
+4. 网页（**不弹审批**）：读正文用 web.read（JS 页面也读得到；net.get 只有空壳）。
+       操作页面用 web.snapshot 取「元素+@eN 引用」→ web.act 用 @eN 点/填，做完自动回新清单。
+       老名字 browser.open/browser.snapshot/browser.act/browser.close/browser.screenshot 同一条引擎，照样能用。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
    7. 邮件：mail.account.list 看接了哪些 → mail.list / mail.search / mail.read 收、搜、读 → mail.draft 起稿 → mail.send 真发（dangerous，必过主人审批）；接入 mail.account.add，移除 mail.account.remove。

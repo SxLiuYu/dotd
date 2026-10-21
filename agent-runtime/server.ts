@@ -48,7 +48,6 @@ import { Ledger } from './ledger.ts';
 import { FsTools } from './fs.ts';
 import { ToolStore } from './tools.ts';
 import { ShellTools, type SpawnAdapter } from './shell.ts';
-import { BrowserHolder, MAX_PAGES_PER_CTX, identityHash, browserCrashed, isPersistentIdentity } from './browser.ts';
 import { XvfbManager, type XvfbSpawn } from './xvhfd.ts';
 import {
   defaultFetch,
@@ -69,56 +68,6 @@ export const RUNTIME_VERSION = '0.1.0';
  * 留一小段环形缓冲：够覆盖"终态后的迟到轮询"，又把 Map 钉在有界水位。
  */
 export const FINISHED_JOBS_KEEP = 64;
-
-/**
- * playwright 的最小形状（只覆盖我们用到的两个入口）。
- * 真实类型来自镜像内的 `playwright@1.49.1`（§9.6 严格锁）；此处不引该包的类型，
- * 使容器外 typecheck 不依赖 playwright 安装。
- */
-/** 真实 playwright Page 的结构子集（W1：只为补 snapshot() 用）。 */
-interface PlaywrightPageLike {
-  context(): { newCDPSession(page: unknown): Promise<PlaywrightCdpSession> };
-}
-
-/** 真实 playwright Context 的结构子集。 */
-interface PlaywrightContextLike {
-  pages(): Promise<PlaywrightPageLike[]>;
-  newPage(): Promise<PlaywrightPageLike>;
-  close(): Promise<void>;
-  kind?: 'persistent' | 'ephemeral';
-}
-
-/** 真实 playwright Browser 的结构子集。 */
-interface PlaywrightBrowserLike {
-  newContext(opts?: Record<string, unknown>): Promise<unknown>;
-  close(): Promise<void>;
-  isConnected(): boolean;
-}
-
-/** CDP 会话（playwright newCDPSession 返回值的结构子集）。 */
-interface PlaywrightCdpSession {
-  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
-  detach(): Promise<void>;
-}
-
-/** CDP Accessibility 节点（只声明本项目用到的字段）。 */
-interface AxNode {
-  nodeId: string;
-  parentId?: string;
-  childIds?: string[];
-  ignored?: boolean;
-  role?: { value?: string };
-  name?: { value?: string };
-  backendDOMNodeId?: number;
-}
-
-interface PlaywrightChromium {
-  launchPersistentContext(
-    userDataDir: string,
-    opts: Record<string, unknown>,
-  ): Promise<unknown>;
-  launch(opts: Record<string, unknown>): Promise<unknown>;
-}
 
 /** token 只读 bind 路径（EX §5.1 / Dockerfile ENV DOTD_TOKEN_PATH）。 */
 export const DEFAULT_TOKEN_PATH = '/run/dotd/token';
@@ -149,7 +98,6 @@ export interface RuntimeConfig {
    * 测试里唯一那条失败就是这么来的。
    */
   canSetUid?: () => boolean;
-  browserFactory?: BrowserHolder extends never ? never : import('./browser.ts').ChromiumFactory;
   xvfbSpawn?: XvfbSpawn;
   /**
    * net.* 的出网策略。**缺省 = 读 `DOTD_NET_TOOLS`，未设即 off（默认关闭）**，
@@ -183,7 +131,6 @@ export class AgentRuntime {
   /** 自造工具（S2）：tools/ 目录下的可复用脚本 */
   readonly toolStore: ToolStore;
   readonly shell: ShellTools;
-  readonly browser: BrowserHolder;
   readonly xvfb: XvfbManager;
   /** net.* 生效策略（默认 off；拼错的值按 off 并打 warning，绝不意外放开）。 */
   readonly netTools: NetToolsMode;
@@ -241,128 +188,12 @@ export class AgentRuntime {
     this.xvfb = new XvfbManager({
       ...(cfg.xvfbSpawn !== undefined ? { spawnImpl: cfg.xvfbSpawn } : {}),
     });
-    this.browser = new BrowserHolder({
-      factory: this.requireBrowserFactory(cfg),
-      memProbe: {
-        usedMb: () =>
-          Math.round((process.memoryUsage().rss + process.memoryUsage().heapUsed) / 1024 / 1024),
-      },
-      budgetMb: cfg.memBudgetMb ?? 1536,
-      onEvent: (kind, detail) => this.log(`[event] exec.browser.${kind} ${JSON.stringify(detail)}`),
-    });
   }
 
 
-  /**
-   * 把真实 playwright context 适配成 BrowserContextLike（W1，2026-10-21）。
-   *
-   * 为什么需要这层：`BrowserPage.snapshot()` 是 browser.ts 里声明的契约，但
-   * playwright-core 1.49.1 的 Page 上**没有** snapshot()，也没有 ariaSnapshot()
-   * （实测 getOwnPropertyNames 两者皆无；ariaSnapshot 是 1.49 之后才加的）。
-   * 之前直接 `as unknown as BrowserContextLike` 强转，类型上通过、运行时一调就
-   * browser_crashed —— 契约和实现之间是断的。
-   *
-   * 这里给每个 page 补一个真正的 snapshot()：走 CDP 的
-   * Accessibility.getFullAXTree，这正是 ariaSnapshot 内部的同一数据源，
-   * 等于手工实现官方新 API，零新依赖。其余方法原样转发。
-   */
-  private adaptContext(ctx: PlaywrightContextLike): import('./browser.ts').BrowserContextLike {
-    const wrapPage = (p: PlaywrightPageLike): import('./browser.ts').BrowserPage =>
-      new Proxy(p as unknown as import('./browser.ts').BrowserPage, {
-        get: (target, prop, receiver) => {
-          if (prop === 'snapshot') {
-            return async () => this.axSnapshot(p);
-          }
-          return Reflect.get(target, prop, receiver);
-        },
-      });
-    return {
-      pages: async () => (await ctx.pages()).map((p) => wrapPage(p)),
-      newPage: async () => wrapPage(await ctx.newPage()),
-      close: () => ctx.close(),
-      kind: ctx.kind ?? 'ephemeral',
-    };
-  }
-
-  /** 取可读快照：CDP AX 树 → 缩进文本（见 adaptContext 注释）。 */
-  private async axSnapshot(page: PlaywrightPageLike): Promise<{ text: string; html?: string }> {
-    const cdp = await page.context().newCDPSession(page);
-    try {
-      await cdp.send('Accessibility.enable', {});
-      const { nodes } = (await cdp.send('Accessibility.getFullAXTree', {})) as {
-        nodes: AxNode[];
-      };
-      const byId = new Map<string, AxNode>();
-      for (const n of nodes) byId.set(n.nodeId, n);
-      const lines: string[] = [];
-      const emit = (node: AxNode, depth: number): void => {
-        const role = node.role?.value ?? '';
-        const name = (node.name?.value ?? '').replace(/\s+/g, ' ').trim();
-        // 跳过的四类，共同点是"自身不产出信息"，但**子节点必须继续下探**：
-        //  - ignored：Chrome 标记为对辅助技术不可见的中间层，实际内容全在其下
-        //    （实测 RootWebArea 的子节点就是 ignored:none，整棵页面都挂在它下面，
-        //    早期版本在这里直接 return，导致快照只剩一行 RootWebArea）。
-        //  - none / generic / InlineTextBox：纯排版容器与文本盒，无语义。
-        //  - StaticText：其文本已被父节点（heading/button/link…）的 name 覆盖，
-        //    再输出一遍就是重复。
-        // StaticText 的取舍要更细：父节点已有同名 name 时它是重复（heading: X
-        // 下面再挂一条 StaticText: X），但 listitem/cell/paragraph 这类父节点
-        // 自身没有 name，文字就全在 StaticText 里 —— 一律跳过会把正文吞掉。
-        const parent = node.parentId === undefined ? undefined : byId.get(node.parentId);
-        const parentName = (parent?.name?.value ?? '').replace(/\s+/g, ' ').trim();
-        const redundantText = role === 'StaticText' && parentName !== '' && parentName === name;
-        const skip =
-          node.ignored === true ||
-          role === '' ||
-          role === 'none' ||
-          role === 'generic' ||
-          role === 'InlineTextBox' ||
-          redundantText;
-        let next = depth;
-        if (!skip) {
-          const shown = name.length > 120 ? `${name.slice(0, 117)}…` : name;
-          lines.push(`${'  '.repeat(depth)}${role}${shown === '' ? '' : `: ${shown}`}`);
-          next = depth + 1;
-        }
-        for (const childId of node.childIds ?? []) {
-          const child = byId.get(childId);
-          if (child !== undefined) emit(child, next);
-        }
-      };
-      for (const root of nodes.filter((n) => n.parentId === undefined)) emit(root, 0);
-      return { text: lines.join('\n') };
-    } finally {
-      await cdp.detach().catch(() => undefined);
-    }
-  }
-
-  private requireBrowserFactory(cfg: RuntimeConfig): import('./browser.ts').ChromiumFactory {
-    if (cfg.browserFactory !== undefined) return cfg.browserFactory;
-    // 容器内：动态加载 playwright（design §9.6：严格锁 1.49.1，锁进 package-lock）。
-    // 用间接 specifier（变量）避开 TS 对未安装包的静态解析——容器外 typecheck
-    // 与容器外测试都不需要 playwright；真实容器里这条路径照常工作。
-    const spec = 'playwright';
-    return {
-      launchPersistentContext: async (dir, opts) => {
-        const mod = (await import(/* @vite-ignore */ spec)) as unknown as {
-          chromium: PlaywrightChromium;
-        };
-        return (await mod.chromium.launchPersistentContext(dir, {
-          ...opts,
-          env: { ...this.xvfb.envPatch() },
-        })) as unknown as import('./browser.ts').BrowserContextLike;
-      },
-      launch: async (opts) => {
-        const mod = (await import(/* @vite-ignore */ spec)) as unknown as {
-          chromium: PlaywrightChromium;
-        };
-        return (await mod.chromium.launch({
-          ...opts,
-          env: { ...this.xvfb.envPatch() },
-        })) as unknown as import('./browser.ts').BrowserLike;
-      },
-    };
-  }
+  // 2026-10-21：adaptContext / axSnapshot / requireBrowserFactory 已删除。
+  // 它们存在的唯一理由是给容器内 playwright 补 snapshot()（CDP AX 树）。
+  // browser.* 改由宿主 agent-browser 执行后，这里没有浏览器可驱动了。
 
   /** 启动：Xvfb → ledger 中断清理 → HTTP listen。 */
   async start(): Promise<void> {
@@ -381,7 +212,6 @@ export class AgentRuntime {
   async stop(): Promise<void> {
     this.xvfb.stop();
     this.jobsCancels.clear();
-    await this.browser.closeAll();
     const server = this.server;
     this.server = null;
     if (server !== null) {
@@ -612,10 +442,8 @@ export class AgentRuntime {
     this.jobsCancels.set(jobId, job);
     this.beginJob(jobId, call.call_id, call.tool, () => {
       job.cancelled = true;
-      // 浏览器页面 close（§5.2：协作式取消的一种）
-      if (call.tool.startsWith('browser.')) {
-        void this.browser.closeIdentity(call.identity ?? 'ephemeral').catch(() => undefined);
-      }
+      // 2026-10-21：浏览器已移到宿主（agent-browser）。取消一个 browser.* 调用不再
+      // 需要在容器里关 context —— 宿主侧每次调用是独立进程，超时自然收场。
     });
     const ack = this.dispatch(call, jobId); // 不 await：后台跑
     void ack
@@ -746,7 +574,6 @@ export class AgentRuntime {
 
   /** 工具体路由（容器内唯一执行点）。 */
   private async execute(call: ToolCall, jobId?: string): Promise<ToolResult> {
-    const key = isPersistentIdentity(call.identity) ? identityHash(call.identity as string) : 'ephemeral';
     switch (call.tool) {
       case 'fs.read':
         return this.fs.read(call.call_id, call.args);
@@ -787,7 +614,15 @@ export class AgentRuntime {
       case 'browser.snapshot':
       case 'browser.screenshot':
       case 'browser.close':
-        return this.browserCall(call, key, jobId);
+        // 2026-10-21：容器内 playwright 实现已移除，browser.* 全部由宿主
+        // （agent-browser CLI）执行。走到这里说明宿主侧没注册成功——那是装配
+        // 问题，不该由容器悄悄兜底跑一套旧实现，所以显式报出来。
+        return errorResult(
+          call.call_id,
+          'host_owned_tool',
+          `browser.* 由宿主执行，容器不提供实现（${call.tool}）`,
+          false,
+        );
       case 'net.get':
       case 'net.post':
         return runNetCall(
@@ -808,146 +643,10 @@ export class AgentRuntime {
     }
   }
 
-  /**
-   * 浏览器工具体（EX §6）。
-   * 崩溃语义（§6.2）：chromium process exit → context 标脏，下一次 browser.*
-   * 调用前自动重开；当前调用返回 error{code:'browser_crashed', retryable:true}。
-   *
-   * in-flight 记账：**只 enter 一次**（acquire 前后配对），页数由
-   * `browser.notePage()` 单独累计。原实现在 newPage 后又 enter 一次而 finally
-   * 只 exit 一次，导致 in-flight 只增不减——LRU 驱逐、老化回收、hardReset
-   * 的 busy 判据全部失效（审码 issue F）。
-   */
-  private async browserCall(call: ToolCall, key: string, jobId?: string): Promise<ToolResult> {
-    const cancelJob = jobId !== undefined ? this.jobsCancels.get(jobId) : undefined;
-    this.browser.enter(key);
-    try {
-      const ctx = await this.browser.acquire(call.identity);
-      const pages = await ctx.pages();
-      if (call.tool === 'browser.close') {
-        await this.browser.closeIdentity(call.identity);
-        return okResult(call.call_id, { closed: true });
-      }
-      let page = pages[0];
-      if (page === undefined) {
-        // EX §6.1：每 profile 并发页面上限 MAX_PAGES_PER_CTX。
-        // 达到上限就不再新开页，直接报错（不驱逐别人的页）。
-        const used = await this.browser.pageCount(key);
-        if (used >= MAX_PAGES_PER_CTX) {
-          return errorResult(
-            call.call_id,
-            ERROR_CODES.too_many_pages,
-            `该身份已有 ${used} 个并发页面（上限 ${MAX_PAGES_PER_CTX}）；请先关闭旧页或换身份`,
-            false,
-          );
-        }
-        page = await ctx.newPage();
-        this.browser.notePage(key);
-      }
-      // 协作式取消（EX §5.2）：cancel 已置位则不再真的驱动页面
-      if (cancelJob?.cancelled === true) {
-        return cancelledResult(call.call_id, jobId);
-      }
-      const url = typeof call.args.url === 'string' ? call.args.url : undefined;
-      switch (call.tool) {
-        case 'browser.open': {
-          if (url === undefined) {
-            return errorResult(call.call_id, ERROR_CODES.bad_args, 'browser.open 需要 url', false);
-          }
-          await page.goto(url, { timeoutMs: Math.min(call.deadline_ms, 30_000) });
-          return okResult(call.call_id, { url: page.url(), title: await page.title() });
-        }
-        case 'browser.act':
-          return this.browserAct(call, page);
-        case 'browser.snapshot':
-          return okResult(call.call_id, await page.snapshot());
-        case 'browser.screenshot': {
-          // A3（2026-10-21）：截图落 home 卷（/dot/home/screenshots，持久），
-          // 结果只带元数据 —— base64 不进结果 → 模型上下文零污染、journal 不膨胀。
-          // 出站推送时宿主再经 fs.read base64 取回（feishu-outbound）。
-          if (typeof page.screenshot !== 'function') {
-            return errorResult(
-              call.call_id,
-              ERROR_CODES.bad_args,
-              '该页面不支持截图（测试桩未实现 screenshot）',
-              false,
-            );
-          }
-          const png = await page.screenshot();
-          const safeCall = call.call_id.replace(/[^A-Za-z0-9._-]/g, '_');
-          const dir = `${this.cfg.homeRoot ?? '/dot/home'}/screenshots`;
-          await mkdir(dir, { recursive: true });
-          const file = `${dir}/${call.task_id.replace(/[^A-Za-z0-9._-]/g, '_')}-${safeCall}.png`;
-          await writeFile(file, png);
-          return okResult(call.call_id, {
-            path: file,
-            bytes: png.byteLength,
-            sha256: createHash('sha256').update(png).digest('hex'),
-          });
-        }
-        default:
-          return errorResult(call.call_id, ERROR_CODES.unknown_tool, 'unreachable', false);
-      }
-    } catch (e) {
-      return browserCrashed(call.call_id, e);
-    } finally {
-      this.browser.exit(key);
-    }
-  }
-
-  private async browserAct(
-    call: ToolCall,
-    page: import('./browser.ts').BrowserPage,
-  ): Promise<ToolResult> {
-    const action = call.args.action;
-    const selector = typeof call.args.selector === 'string' ? call.args.selector : undefined;
-    const value = typeof call.args.value === 'string' ? call.args.value : undefined;
-    const t = Math.min(call.deadline_ms, 30_000);
-    switch (action) {
-      case 'click':
-        if (selector === undefined) return this.needSelector(call);
-        await page.click(selector, { timeoutMs: t });
-        return okResult(call.call_id, { clicked: selector });
-      case 'type':
-        if (selector === undefined || value === undefined) return this.needSelector(call, 'value');
-        await page.fill(selector, value, { timeoutMs: t });
-        return okResult(call.call_id, { filled: selector });
-      case 'press':
-        if (selector === undefined || value === undefined) return this.needSelector(call, 'value');
-        await page.press(selector, value, { timeoutMs: t });
-        return okResult(call.call_id, { pressed: selector, key: value });
-      case 'select':
-        if (selector === undefined || value === undefined) return this.needSelector(call, 'value');
-        await page.selectOption(selector, value);
-        return okResult(call.call_id, { selected: selector, value });
-      case 'scroll': {
-        const dy = typeof call.args.dy === 'number' ? call.args.dy : 800;
-        await page.scroll(dy);
-        return okResult(call.call_id, { scrolled: dy });
-      }
-      case 'wait': {
-        const ms = typeof call.args.timeout_ms === 'number' ? call.args.timeout_ms : 1000;
-        await page.waitForTimeout(ms);
-        return okResult(call.call_id, { waited_ms: ms });
-      }
-      default:
-        return errorResult(
-          call.call_id,
-          ERROR_CODES.bad_args,
-          `browser.act 的 action 必须是 click|type|wait|press|select|scroll（收到 ${String(action)}）`,
-          false,
-        );
-    }
-  }
-
-  private needSelector(call: ToolCall, also?: 'value'): ToolResult {
-    return errorResult(
-      call.call_id,
-      ERROR_CODES.bad_args,
-      also === undefined ? 'browser.act 需要 selector' : 'browser.act 需要 selector 与 value',
-      false,
-    );
-  }
+  // 2026-10-21：容器内浏览器实现已整体移除（browserCall / browserAct /
+  // adaptContext / axSnapshot / requireBrowserFactory 以及 agent-runtime/browser.ts）。
+  // 现在 browser.* 与 web.* 全部走宿主的 agent-browser CLI，见 src/exec/webtools.ts。
+  // 两条路径并存时模型不知道该信哪个，且容器那套只能猜 CSS 选择器，所以合成一条。
 
   // ── job 视图 ──────────────────────────────────────────────────────
 

@@ -141,7 +141,7 @@ export class XvfbManager extends EventEmitter {
     return this.display;
   }
 
-  /** 供 BrowserHolder / shell env 注入。 */
+  /** 供 shell env 注入（浏览器已移到宿主，不再需要它）。 */
   envPatch(): Record<string, string> {
     return { DISPLAY: this.display };
   }
