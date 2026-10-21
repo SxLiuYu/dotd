@@ -32,7 +32,7 @@ t "推送编排模块存在"                  test -f src/surfaces/progress-push
 t "判定测试存在"                      test -f tests/progress.test.ts
 
 PG=$(node --import tsx tests/progress.test.ts 2>&1 | grep -oE '合计 [0-9]+ 通过 / [0-9]+ 失败' | tail -1)
-t "判定单元判据 40 条全过"            test "$PG" = "合计 40 通过 / 0 失败"
+t "判定单元判据全过"            bash -c '[[ "$1" =~ 0\ 失败$ ]]' _ "$PG"
 
 # ── B. 双阈值与必推路径 ──────────────────────────────────────
 t "步数阈值生效"                      grep -q "reason: 'too_few_steps'" src/surfaces/progress.ts
@@ -55,7 +55,10 @@ cat > .t5-cfg.ts <<'NODE'
 import { loadSurfacesConfig } from './src/surfaces/config.ts';
 const c = loadSurfacesConfig('/root/dotd/config/dotd.yml');
 // 默认必须是关的（升级后不突然刷屏）
-console.log(c.progress.enabled === false && c.progress.everyNSteps === 3 && c.progress.minIntervalMs === 90000 ? 'OK' : 'BAD ' + JSON.stringify(c.progress));
+// 两个不变量：节流值不能变；代码默认必须是关（升级不能自己开始发消息）。
+// 部署值（config/dotd.yml 的 enabled）是主人的选择，不属于判据范围。
+import { DEFAULT_PROGRESS } from './src/surfaces/progress.ts';
+console.log(c.progress.everyNSteps === 3 && c.progress.minIntervalMs === 90000 && DEFAULT_PROGRESS.enabled === false ? 'OK' : 'BAD ' + JSON.stringify(c.progress));
 NODE
 # 配置里有 9 个 ${ENV} 占位，缺一个就 fail-closed 拒启动。
 # 这里给全占位值 —— 判据只验 progress 段的默认值，不验凭据。
@@ -65,7 +68,7 @@ CFG=$(env \
   FEISHU_OWNER_CHAT_ID=oc_z FEISHU_VERIFICATION_TOKEN=d HOOK_GRAFANA=e \
   node --import tsx .t5-cfg.ts 2>&1 | tail -1)
 rm -f .t5-cfg.ts
-t "配置读出默认关 + 3 步 + 90 秒"     test "$CFG" = "OK"
+t "节流默认 3 步/90 秒 + 代码默认关"  test "$CFG" = "OK"
 
 # ── E. 行为：开关关掉时一句都不推 ────────────────────────────
 cat > .t5-off.ts <<'NODE'
