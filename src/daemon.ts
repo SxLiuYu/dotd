@@ -1619,6 +1619,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           bus,
           gateway: feishuGw,
           log,
+          // 2026-10-21：Web 发起的任务不再镜像到飞书（实测 32/50 任务来自 Web，
+          // 44 条回复全推了飞书 —— 人在 Web 看结果，手机又收一遍）。
+          mirrorWebToFeishu: surfCfg.feishu.mirrorWebToFeishu ?? false,
           // T3：能发卡片就发卡片，发不出去才退回纯文本（避免重复推送）
           ...(approvalCardSender !== undefined ? { approvalCards: approvalCardSender } : {}),
           // 系统级通知（如 dot 被隔离）发到主人默认会话的第一个 chat

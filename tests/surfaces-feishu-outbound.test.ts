@@ -164,9 +164,12 @@ test('超长正文截断到上限并标注；非终态与无 thread 任务不动
       assert.equal(gw.calls.length, 1);
       const call = gw.calls[0];
       assert.ok(call);
-      assert.ok(call.text.startsWith('A'.repeat(3800)));
-      assert.ok(call.text.endsWith('（已截断）'));
-      assert.ok(call.text.length < 4000);
+      // 2026-10-21：上限从 3800 收到 600 并改为「折叠 + 指路」。
+      // 这串 A 没有句子边界，所以走硬切 —— 断言的就是硬切的下限行为。
+      assert.ok(call.text.startsWith('A'.repeat(600)), '前 600 字原样保留');
+      assert.ok(call.text.includes('还有'), '要说清还有多少字没发');
+      assert.ok(call.text.includes('dotd task'), '要指路去哪看全文');
+      assert.ok(call.text.length < 700, '整体不回到千字级');
     } finally {
       stop();
     }

@@ -56,6 +56,11 @@ export interface FeishuOutboundDeps {
   gateway: FeishuSendPort;
   log(msg: string): void;
   /**
+   * Web 发起的任务结果要不要也推到飞书。默认 false（见 config.ts 同名说明）。
+   * 不传 = false：宁可少发，也不要重复打扰 —— 漏发能在 Web 看到，重复发只能忍。
+   */
+  mirrorWebToFeishu?: boolean;
+  /**
    * 不绑定 thread 的系统级通知（隔离、异常）发到哪（2026-10-19）。
    * 取 surfaces.feishu.owner_chat_id 的第一个；未配置则跳过这类通知。
    */
@@ -66,9 +71,6 @@ export interface FeishuOutboundDeps {
    */
   screenshotPush?: ScreenshotPushDeps;
 }
-
-/** 飞书纯文本消息实际上限很宽，但长报告截到这里，避免整篇刷屏。 */
-const MAX_REPLY_CHARS = 3800;
 
 /** 幂等表剪枝窗口：24h 前的已发记录清掉（与审批 TTL 同量级）。 */
 const SENT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -93,6 +95,81 @@ interface TaskStatePayload {
  *
  * 只有明确 proactive === false 才返回 false（静默）。
  */
+/**
+ * 飞书一条回复最多带多少字。
+ *
+ * 2026-10-21 实测：24 小时 44 条回复里 28 条顶到 200 字上限，
+ * 库里的 assistant 正文最长 1364 字、111 条超 500 字。
+ * 而这里原本是 3800 —— 等于把整篇长文原样塞进飞书。
+ * 主人原话是「推送的太多了」。
+ *
+ * 取 600：够说完结论 + 一两条理由，再长就该去 Web 看。
+ * 完整正文一个字都不丢，存在 mem_messages 里，`dotd task <id> --verbose` 可看。
+ */
+export const FEISHU_REPLY_MAX_CHARS = 600;
+
+/**
+ * 判断这条回复是不是「没有信息量的自我否定」。
+ *
+ * 现场（24h 实测）：飞书里堆着一串
+ *   「I don't have `browser.open` …」
+ *   「我无法执行这个请求：我的工具里没有 browser.open」
+ *   「你的消息里中文变成了问号」
+ * 这些**不是回答，是报错**。主人在手机上读到它们只会更困惑，
+ * 而且同一件事会反复出现（同一个配置缺陷，每次触发都说一遍）。
+ *
+ * 判据刻意保守：只认"整条回复就是一句否认/无法执行"的开头句式。
+ * **不含**任何实际结论 —— 宁可漏静音，不可吞掉真回答。
+ * 宁可多发一条，也不要把有用的东西埋掉：这是这个函数的设计红线。
+ */
+const NOISE_PATTERNS: RegExp[] = [
+  /^I (?:don't|do not|can't|cannot) (?:do|have|access|perform|execute)/i,
+  /^I'm (?:not able|unable)/i,
+  /^(?:我|本人)(?:没法|无法|不能|做不了|做不到|没有)/,
+  /^我(?:这边)?(?:看不到|读不出|没有)/,
+  /^(?:抱歉|对不起)[，,]?\s*我(?:没法|无法|不能)/,
+];
+
+export function isLowValueReply(text: string): boolean {
+  const raw = text.trim();
+  if (raw.length === 0) return true;
+  // 长回复一定不静音：能写 400 字说明有内容，哪怕开头是否认句
+  if (raw.length > 200) return false;
+
+  // 转折词 = 模型在否认之后还是补了东西。
+  // 这条判据是测试逼出来的：第一版只看「开头是否认句」，
+  // 把「我无法连接那个站点，**但**我查了缓存，标题是 Example」也吞了 ——
+  // 那是漏杀：人有用的信息被静音掉，比多发一条糟得多。
+  const CONTRAST = /但|不过|然而|可是| nonetheless | however | but /i;
+  if (CONTRAST.test(raw)) return false;
+
+  return NOISE_PATTERNS.some((re) => re.test(raw));
+}
+
+/**
+ * 把正文压到飞书能舒服读下的长度，并告诉主人全文在哪。
+ *
+ * 切点选在段落/句子边界，不硬切半个词：飞书里一句断在词中间比截断更难受。
+ * 找不到合适的边界才退回硬切。
+ */
+export function clipForFeishu(text: string, maxChars = FEISHU_REPLY_MAX_CHARS): string {
+  if (text.length <= maxChars) return text;
+
+  const head = text.slice(0, maxChars);
+  // 优先在段落处断，其次句号/问号/叹号，最后换行
+  let cut = -1;
+  for (const sep of ['\n\n', '\n', '。', '！', '？', '. ', '! ', '? ']) {
+    const i = head.lastIndexOf(sep);
+    if (i > maxChars * 0.5) {
+      cut = i + sep.length;
+      break;
+    }
+  }
+  const kept = cut > 0 ? text.slice(0, cut).trimEnd() : head.trimEnd();
+  const left = text.length - kept.length;
+  return `${kept}\n\n…（还有 ${left} 字，完整内容见 Web 会话，或用 dotd task <id> --verbose 查看）`;
+}
+
 export function shouldAnnounce(db: DatabaseSync, taskId: string): boolean {
   try {
     const row = db
@@ -113,6 +190,34 @@ export function shouldAnnounce(db: DatabaseSync, taskId: string): boolean {
     // 读不出来就照常回复：吞掉回答比多发一条糟糕得多
     return true;
   }
+}
+
+/** 线程渠道；读不到返回 null。 */
+function threadChannel(db: DatabaseSync, threadId: string): string | null {
+  try {
+    const row = db.prepare('SELECT channel FROM mem_threads WHERE id = ?').get(threadId) as
+      | { channel?: string }
+      | undefined;
+    return typeof row?.channel === 'string' ? row.channel : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 这个线程的结果要不要镜像到飞书？
+ *
+ * web 线程 + mirror=false → 不镜像（人在 Web 看着，手机上不该再收一遍）。
+ * 其余一律 true：飞书里说的要回、定时任务的走 shouldAnnounce、读不到渠道时要回
+ * —— 「读不到」绝不能当成「不用发」，那会静默掉主人的回答。
+ */
+export function shouldMirrorToFeishu(
+  db: DatabaseSync,
+  threadId: string,
+  mirrorWebToFeishu: boolean,
+): boolean {
+  if (mirrorWebToFeishu) return true;
+  return threadChannel(db, threadId) !== 'web';
 }
 
 /** 从 mem_threads 解析飞书回复目标；非 feishu 渠道/无 external_ref → null。 */
@@ -364,6 +469,17 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
       deps.log(`飞书出站跳过：${p.taskId} 来自 proactive=0 的定时任务（结果只记日志）`);
       return null;
     }
+
+    // ── 2026-10-21：Web 发起的任务不再镜像到飞书 ──
+    //
+    // 实测：24 小时 50 个任务里 32 个来自 Web，但 44 条回复全推了飞书。
+    // 人在 Web 上看着结果，手机又收一遍 —— 这是重复，不是通知。
+    // 飞书里说的（channel=feishu）照常回，那是应答。
+    // 定时任务（channel=event）走上面的 shouldAnnounce 判定，不受这里影响。
+    if (shouldMirrorToFeishu(deps.db, task.thread_id, deps.mirrorWebToFeishu ?? false) === false) {
+      deps.log(`飞书出站跳过：${p.taskId} 来自 Web 会话（结果在 Web 看，不镜像到飞书）`);
+      return null;
+    }
     if (threadChat === null) {
       deps.log(`飞书出站：${p.taskId} 非飞书会话，改投默认会话 ${chatId}`);
     }
@@ -397,10 +513,14 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
           text: `${stop}\n\n（系统收口说明：模型收尾前反复调用同一个工具、没有产出正式回复；以上面已完成的动作结果为准。可以让它再试一次。）`,
         };
       }
-      return {
-        chatId,
-        text: body.length > MAX_REPLY_CHARS ? `${body.slice(0, MAX_REPLY_CHARS)}\n…（已截断）` : body,
-      };
+      // 2026-10-21：长文折叠 + 无信息量回复静音。
+      // 此前 MAX_REPLY_CHARS=3800 等于原样全发（实测 28/31 条顶格），
+      // 而「我没有 xx 工具」这类自我否定占了不少份额 —— 它们不是回答，是报错。
+      if (isLowValueReply(body)) {
+        deps.log(`飞书出站跳过：${p.taskId} 回复无信息量（只落库，可用 dotd task ${p.taskId} --verbose 看）`);
+        return null;
+      }
+      return { chatId, text: clipForFeishu(body) };
     }
     return { chatId, text: `任务未完成（${task.title.slice(0, 40)}）` };
   }

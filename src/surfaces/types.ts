@@ -83,6 +83,8 @@ export interface FeishuConfig {
    * 生产永远不传。
    */
   apiBase?: string;
+  /** Web 发起的任务结果要不要也推到飞书。默认 false（见 config.ts）。 */
+  mirrorWebToFeishu?: boolean;
 }
 
 /** §3 `surfaces.ui`。 */

@@ -281,6 +281,15 @@ const feishuSchema = z.object({
   verification_token: z.string().default(''),
   encrypt_key: z.string().default(''),
   edit_throttle_ms: z.coerce.number().int().nonnegative().default(1200),
+  /**
+   * Web 发起的任务，结果要不要也推到飞书？
+   *
+   * 默认 false。理由（2026-10-21 实测）：24 小时 50 个任务里 32 个来自 Web，
+   * 但 44 条回复**全部**推到了飞书 —— 人在电脑前看着 Web 会话，
+   * 手机上又原样收一遍。这不是「通知」，是重复。
+   * 飞书里发起的任务（channel=feishu）不受影响，照常回。
+   */
+  mirror_web_to_feishu: z.boolean().default(false),
 });
 
 const surfacesSchema = z.object({
@@ -295,6 +304,7 @@ const surfacesSchema = z.object({
     verification_token: '',
     encrypt_key: '',
     edit_throttle_ms: 1200,
+    mirror_web_to_feishu: false,
   }),
   ui: uiSchema.default({ stream_deltas: true }),
   progress: progressSchema.default({ enabled: false, every_n_steps: 3, min_interval_ms: 90_000 }),
@@ -354,6 +364,7 @@ export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
       verificationToken: expandEnv(s.feishu.verification_token, { strict: false }),
       encryptKey: expandEnv(s.feishu.encrypt_key, { strict: false }),
       editThrottleMs: s.feishu.edit_throttle_ms,
+      mirrorWebToFeishu: s.feishu.mirror_web_to_feishu,
     },
     ui: { streamDeltas: s.ui.stream_deltas },
     progress: {
