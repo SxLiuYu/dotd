@@ -285,6 +285,44 @@ export async function webAct(args: Record<string, unknown>): Promise<WebResult> 
 // identity 语义完全照抄 src/runner/dot.ts 的 resolveBrowserIdentity：
 // 显式传就用显式的，anon 走无痕，缺省按域名给 site:<host> 做持久登录态。
 
+// ── 截图落盘：写进容器的 home 卷，保住 A3「截图随回复推送」 ──────────────
+//
+// 为什么不能随便存个临时路径：`src/surfaces/screenshot-push.ts` 只认
+// `/dot/home/screenshots/*.png`，并靠 `MemoryService.readHomeFile` → bridge
+// 从容器 home 卷读字节再推飞书。容器版 browser.screenshot 就是照这个约定做的；
+// 宿主版如果只顾着"存下来就行"，那条推送会静默失效（不报错，只是永远收不到图）。
+//
+// 桥只能读（FsOpsBridge 只有 read/list/stat/rename），但 `/dot/home` 是 docker
+// volume，挂到宿主就是普通目录 —— 于是让截图直接写到卷里，路径用
+// `docker inspect` 按容器名+挂载点动态解析，不写死 `/var/lib/docker`（root 可能
+// 被改、多 dot 时卷名也不同）。
+const SCREENSHOT_DIR_IN_HOME = '/dot/home/screenshots';
+
+/** 文件字节数；拿不到返回 null（只用于回包里的 bytes 字段，不阻断流程）。 */
+async function statSize(abs: string): Promise<number | null> {
+  const r = await new Promise<string>((resolve) => {
+    execFile('stat', ['-c', '%s', abs], { timeout: 10_000, windowsHide: true }, (err, stdout) =>
+      resolve(err === null ? String(stdout ?? '').trim() : ''),
+    );
+  });
+  const n = Number(r);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** 解析 dot 的 home 卷在宿主上的真实路径；拿不到返回 null（不影响截图本身）。 */
+async function hostHomeDir(dotId: string): Promise<string | null> {
+  const container = `dotd-dot-${dotId}`;
+  const out = await new Promise<string>((resolve) => {
+    execFile(
+      'docker',
+      ['inspect', container, '--format', '{{range .Mounts}}{{if eq .Destination "/dot/home"}}{{.Source}}{{end}}{{end}}'],
+      { timeout: 15_000, windowsHide: true },
+      (err, stdout) => resolve(err === null ? String(stdout ?? '').trim() : ''),
+    );
+  });
+  return out === '' ? null : out;
+}
+
 /** browser.act 的 action → agent-browser 子命令。submit 拆成 click 同义处理。 */
 const LEGACY_ACTIONS: Record<string, string> = {
   click: 'click',
@@ -331,11 +369,32 @@ export async function legacyBrowser(
   }
 
   if (tool === 'browser.screenshot') {
-    // 落盘到 agent-browser 的临时目录并回路径；容器版是 PNG 存 screenshots/，
-    // 宿主侧不假装一样——把真实路径交出去，比编一个不存在的路径好。
-    const r = await run(['screenshot'], session);
+    // 存进容器 home 卷，保住 A3「截图随回复推送」（screenshot-push 只认
+    // /dot/home/screenshots/*.png）。dotId 从任务名反推不出来，用 daemon 侧的
+    // 单 dot 约定：容器名 dotd-dot-<dotId>，通常就是配置里的第一个 dot。
+    const dotId = typeof args['dot_id'] === 'string' ? args['dot_id'] : 'dot1';
+    const home = await hostHomeDir(dotId);
+    if (home === null) {
+      // 拿不到卷路径不阻断截图：退回 agent-browser 自己的临时目录，
+      // 并在返回里说清"这张图不会被自动推送"，别让人以为推送坏了。
+      const r = await run(['screenshot'], session);
+      if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+      return {
+        ok: true,
+        output: `${r.stdout.trim()}\n（提示：没能定位容器 home 卷，此图不会随回复自动推送）`,
+      };
+    }
+    const name = `shot-${Date.now().toString(36)}.png`;
+    const abs = `${home}/screenshots/${name}`;
+    const r = await run(['screenshot', abs], session);
     if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
-    return { ok: true, output: r.stdout.trim() };
+    // 与容器版同形：{path: '/dot/home/screenshots/...'}，screenshot-push 靠这个字段取值
+    const homePath = `${SCREENSHOT_DIR_IN_HOME}/${name}`;
+    const size = await statSize(abs);
+    return {
+      ok: true,
+      output: JSON.stringify({ path: homePath, bytes: size === null ? undefined : size }),
+    };
   }
 
   if (tool === 'browser.close') {
