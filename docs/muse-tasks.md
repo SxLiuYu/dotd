@@ -528,3 +528,45 @@ Muse 的演示里 agent 是"替你操作浏览器"的：登录过的网站它接
 
 装法：`dotd vault add github.com token`（隐藏输入）→ 重启 daemon 生效。
 实测：`github.notifications` 走 daemon 调用 succeeded（709ms）；`api.github.com/user` 返回 200，身份 `SxLiuYu`。
+
+### 浏览器能力（2026-10-21 实机）
+
+分两代，各有各的用途：
+
+| 代 | 工具 | 跑在哪 | 取页面结构的方式 |
+|---|---|---|---|
+| 容器内 | `browser.open/snapshot/screenshot/close/act` | 容器，playwright-core 1.49.1 | CDP `Accessibility.getFullAXTree` → 缩进文本 |
+| 宿主侧 | `web.snapshot/read/act` | 宿主，agent-browser CLI | `snapshot -i` → 带 `@eN` 引用的元素清单 |
+
+宿主侧是新增的主力：容器内那套只能猜 CSS 选择器，模型看不到页面上哪些东西
+可点；agent-browser 的引用机制让"先看能点啥，再用 @eN 去点"成为可能，这也是
+目前 AI 浏览器自动化的主流形状（vercel-labs/agent-browser，GitHub 44.4k stars）。
+
+**W2 的解法**：容器里的 `net.get` 只是 HTTP 客户端，遇到 JS 渲染的页面只能
+拿到空壳（实测模型两次 `net_get` 都失败，只能答"没有拿到任何页面内容"）。
+`web.read` 走真实浏览器渲染后取文本，一行解决。
+
+**安装**（宿主侧一次性）：
+```bash
+npm i -g agent-browser
+agent-browser install --with-deps   # 首次约 190MB，并装 Chrome 依赖库
+```
+
+**实测**：`web.read` 1.1s 拿到 example.com 正文；`web.snapshot` 返回
+`- link "Learn more" [ref=e2]`；`web.act` 点 @eN 跳转成功并自动附新的元素清单。
+判据 `scripts/regress/web-tools-criteria.sh` 12/12，单测 10/10。
+
+### 审批策略调整（2026-10-21）
+
+主人明确"浏览器控制不需要审批，重大决定才需要我审批"。两个元凶都在
+`src/governance/gate.ts`：
+
+1. `needsReview` 里"params 含 http(s) 就 review"——而 `browser.open/act` 的
+   正常参数就是 URL，这条等于让每一次网页操作都弹卡；
+2. `loginSensitive` 在 `tier==read` 快速路径之前就 `return approve`——把
+   "带登录身份浏览"这个标记直接当成了"必须人工批"的结论。
+
+改法：`needsReview` 去掉 URL 信号（保留 password/token/cookie）；只读浏览
+动作显式点名白名单（open/snapshot/screenshot/close）跳过登录态审批。
+`browser.act` 会点/填/提交，可能下单改设置发消息，仍然人批。契约 G1 的
+`isLoginSensitive` 本身没动，identity 照旧进 decision 记录，审计不失真。
