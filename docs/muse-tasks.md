@@ -614,3 +614,24 @@ agent-browser install --with-deps   # 首次约 190MB，并装 Chrome 依赖库
 
 单测 `web-tools.test.ts` 24/24（新增 10 条兼容层 + 4 条会话继承）；
 判据 `web-tools-criteria.sh` 18/18；全量 1636 通过 / 0 失败。
+
+## 容器浏览器实现已删除（2026-10-21 最终收口）
+
+上一节是"宿主侧覆盖容器侧"，两套并存。现在容器那套真删了：
+
+- `agent-runtime/browser.ts`（460 行：`BrowserHolder` / LRU / 内存硬重置 / profile 回收）
+- `server.ts` 的 `browserCall` / `browserAct` / `adaptContext` / `axSnapshot` /
+  `requireBrowserFactory`，以及构造初始化、`closeAll`、取消时关 context
+- 对应测试 28 条
+
+**保留的**：`browser.*` 五个工具名（模型按老习惯调用，治理/进度/截图推送都认这些
+名字），以及 `agent-runtime/protocol.ts` 的能力定义。容器 dispatch 仍列出它们，
+但真走到那里会返回 `host_owned_tool` —— 那是装配问题，不该悄悄兜底。
+
+**删之前必须先做的一件事**：A3「截图随回复推送」只认 `/dot/home/screenshots/*.png`，
+靠 bridge 从容器 home 卷读字节。容器版一删，这条会**静默失效**（不报错，只是永远
+收不到图）。所以先把宿主侧截图改成写进 home 卷（`/dot/home` 是 docker volume，
+挂到宿主就是普通目录，路径用 `docker inspect` 动态解析），确认通再删。
+
+实测：容器内已无 `browser.ts`；旧名 `browser.open` 321ms、`browser.snapshot` 41ms
+返回 `ref=e4`；截图 67006 字节正常落在卷里。

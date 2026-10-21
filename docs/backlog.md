@@ -572,8 +572,13 @@ tk_mvgow7taoew2sg）无人认领，属已知行为：启动恢复只处理"在�
 
 ## browser.test 的 §6.3 水位线用例是并发敏感的（2026-10-21 实测）
 
+**2026-10-21 更正**：这条最初把 `§6.3` 记在 `agent-runtime-browser.test.ts` 名下，
+是错的——那个文件测的是 `BrowserHolder`（LRU/内存硬重置/profile 回收），
+`§6.3` 实际在 guard/scheduler 那几个文件里。而且该文件已随容器浏览器实现一起删除。
+下面保留原始记录，作为"偶发失败怎么排查"的例子。
+
 全量回归（`suite-chunked.sh`）跑块 1 时，`tests/agent-runtime-browser.test.ts` 的
-5~8 个 §6.3 内存水位线用例会偶发失败（`mem 高 → normal`、`calibrateOrUseFallback`、
+5~8 个内存水位线用例会偶发失败（`mem 高 → normal`、`calibrateOrUseFallback`、
 `解冻`、`container_pause` 几类）。**不是回归**，证据：
 
 - 单独跑：17/17 全过
