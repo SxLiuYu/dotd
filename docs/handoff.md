@@ -10,18 +10,25 @@
 
 ## 1. 一句话现状
 
-dotd 已经和 Meta Muse 对齐到可用状态：38 个工具、六步验收 + T1→T6 全过、
-全量回归 **1627 条 / 1626 通过 / 0 失败 / 1 跳过**（2026-10-21 19:xx 实测 EXIT=0）。
+dotd 已经和 Meta Muse 对齐到可用状态：**41 个工具**、六步验收 + T1→T6 全过、
+全量回归 **1630 条 / 1629 通过 / 0 失败 / 1 跳过**（2026-10-21 22:xx 实测 EXIT=0）、
+5 个功能判据 **157 条全绿**。
 
-最近收的尾：
-- 浏览器从容器搬到宿主 —— 已完成并上线
-- 容器基座换 300MB node slim —— **代码写完了，还没上线**
-- 飞书消息精简（长文折叠 + 无信息量回复静音 + Web 会话不镜像）—— 已上线
-- **审批卡片点击无反应 —— 已修，四个缺陷叠加**（详见 §9）
+最近连续收的尾（每一个都是「文档说做完了，实际没生效」）：
 
-**当前没有已知的坏功能。** 唯一遗留的数据问题是 126 条历史审批停在 `executing`
-（不影响运行，方案见 [approvals-stuck-executing.md](approvals-stuck-executing.md)，
-**未执行**，等主人点头）。
+| 项 | 状态 |
+|---|---|
+| 审批卡片点击无反应 | **已修** —— 四个缺陷叠加，见 §9bis |
+| 审批永不进终态（`resolveExecution` 没接线） | **已修** —— 126 条历史数据仍是脏的，见 §7.4 |
+| 截图从没随进度发出去过 | **已修** —— 三个叠加缺陷，见 §9ter |
+| 长文折叠反而变长（601→655 字） | **已修** —— 见 §9ter |
+| 判据把通过条数钉死 | **已修** —— 见 §4.3 |
+| 主动推送只有 1/5 在跑 | **已开 4/6** —— 见 §7.5 |
+
+**当前没有已知的坏功能。** 遗留的都是数据和配置选择，不是代码缺陷：
+- 126 条历史审批停在 `executing`（方案见 [approvals-stuck-executing.md](approvals-stuck-executing.md)，**未执行**）
+- 两条重复的「喝水提醒」crontab（见 §7.5）
+- 一条测试残留的「一次性验证」crontab（凌晨 3 点跑，建议删）
 
 ---
 
@@ -140,14 +147,67 @@ node --import tsx src/surfaces/cli.ts container
 
 ## 4. 测试怎么跑
 
-**别直接跑全量**（300 秒会超时），用分块脚本丢后台：
+### 4.1 全量（2026-10-21 起可以直跑了）
 
 ```bash
-nohup bash scripts/regress/suite-chunked.sh 15 >/tmp/fullN.log 2>&1 &
-grep -oE "pass=[0-9]+ fail=[0-9]+" /tmp/fullN.log | awk -F'[= ]' '{p+=$2; f+=$4} END {print "pass="p" fail="f}'
+cd /root/dotd
+node --import tsx --test --test-concurrency=4 --test-timeout=180000 \
+  $(ls tests/*.test.ts | grep -v exec-container-concurrency) > _allN.log 2>&1
+echo "EXIT=$?"; grep -aE '^. (tests|pass|fail|skipped) ' _allN.log
 ```
 
-跑一次约 1 分半。**基线：1606 通过 / 0 失败**（9 块）。数字变了要能解释。
+**实测 52 秒**（138 个测试文件，并发 4）。**基线：1630 tests / 1629 pass /
+0 fail / 1 skipped / EXIT=0**。数字变了要能解释。
+
+> 2026-10-21 更正：本文档此前写「别直接跑全量，300 秒会超时，要用
+> `suite-chunked.sh` 分 9 块，基线 1606」。现在全量一条命令 52 秒跑完，
+> 那条警告已经不成立。`suite-chunked.sh` 还在，需要分块时能用，但不是必须。
+
+**必须排除 `tests/exec-container-concurrency.test.ts`** —— 它**永远不退出**
+（容器并发场景下等一个不会来的事件），会把整轮拖到 timeout。
+
+### 4.2 功能判据（5 个，跑得很快）
+
+```bash
+cd /root/dotd
+for s in mail card proactive progress calendar; do
+  bash scripts/regress/${s}-criteria.sh > /tmp/c_$s.log 2>&1
+  echo "$s: rc=$? PASS=$(grep -ac PASS /tmp/c_$s.log) FAIL=$(grep -ac FAIL /tmp/c_$s.log)"
+done
+```
+
+**基线：mail 41 / card 21 / proactive 19 / progress 27 / calendar 49，共 157 条，0 失败。**
+
+> 注意：`docs/muse-parity.md` 里引用的就是这些数字，两边必须对得上。
+> 判据脚本在 `scripts/regress/` 下 —— **不是** `scripts/` 顶层，
+> `ls scripts/ | grep criteria` 会得到 0，别据此下「脚本不存在」的结论（我真这么错过）。
+
+### 4.3 判据脚本的两条写法规矩（2026-10-21 踩出来的）
+
+**① 不准把通过条数钉死。**
+
+曾经是：
+
+```bash
+t "卡片单元判据 48 条全过"  test "$CARD" = "合计 48 通过 / 0 失败"
+```
+
+于是「加了一条测试」= 「判据失败」。这类断言是负资产：久而久之没人敢动测试，
+而真正该守的「0 失败」反而被忽略。正确写法：
+
+```bash
+t "卡片单元判据全过"  bash -c '[[ "$1" =~ 0\ 失败$ ]]' _ "$CARD"
+```
+
+**② 只守不变量，不守部署选择。**
+
+`progress-criteria.sh` 曾经验「`config/dotd.yml` 的 `progress.enabled === false`」。
+但主人目标 ③ 明确要求开启，我们把它改成 `true`，判据就红了 —— 我们计划内的
+合理改动被判成回归。
+
+要守的是：节流值不变（3 步 / 90 秒）+ **代码默认值**必须是关
+（升级不能自己开始给主人发消息）。
+不该守的是：**部署配置的值**。那是主人的决定，不是不变量。
 
 ### 一个反复骗人的陷阱
 
@@ -206,19 +266,22 @@ node --import tsx --test $(cat <该块的文件列表>)
 
 | 项目 | 状态 |
 |---|---|
-| HEAD | 写这份时是 `fcb7343`（会变，以 `git log` 为准） |
+| HEAD | 写这份时是 `7a5e5b1`（会变，以 `git log` 为准） |
 | 工作区 | 干净 |
 | `npx tsc --noEmit` | 0 错误 |
-| 全量回归 | **1627 条 / 1626 通过 / 0 失败 / 1 跳过**（2026-10-21，EXIT=0） |
-| slim 改造 | **已提交**（`8937390`），镜像已验证但**未切到现网** |
+| 全量回归 | **1630 条 / 1629 通过 / 0 失败 / 1 跳过**（2026-10-21，EXIT=0） |
+| 功能判据 | **5 个全绿 157 条**（mail 41 / card 21 / proactive 19 / progress 27 / calendar 49） |
+| 工具数 | **41**（`config/tools.yml`，别再写 38） |
+| slim 改造 | **已提交**（`8937390`），镜像 `dotd/exec:slim-probe` 563MB 已建但**未切到现网** |
 | 现网跑的镜像 | **还是旧的** `dotd/exec:1.49.1-0.1.0`（3.55GB） |
-| 容器 | `dotd-dot-dot1`，id `dbd70605a4e6` |
+| 容器 | `dotd-dot-dot1`，Up 8 小时 |
 | daemon | 在跑，HTTP 200 |
-| 邮箱账号 | 1 个活跃（`yujinze000@163.com`），11 封缓存 |
-| crontab | 5 条 |
+| 邮箱账号 | **2 个**，11 封缓存 |
+| crontab | **6 条**（4 条启用且主动推送，1 条关着，1 条重复待处理） |
 | 暂停的任务 | `tk_mvf3rc3gxyradt`、`tk_mvgow7taoew2sg`、`tk_mvgp03asc3qtkv` |
-| 审批卡片点击 | **已修**（四个缺陷叠加，见 §9） |
-| 审批终态 | **已修**：`resolveExecution` 已接线；历史 126 条仍停 `executing`（未清理） |
+| 审批终态分布 | `executing` 126 / `expired` 9 / **`executed` 1** —— 只有 1 条走到了终态 |
+| 审批卡片点击 | **已修**（四个缺陷叠加，见 §9bis） |
+| 截图随进度推送 | **已修**并经真实链路实测（4 张不同 PNG，零重复，见 §9ter） |
 | 飞书消息精简 | 已上线，真实链路实测 5719 字 → 529 字 |
 
 ### 数据备份
@@ -271,7 +334,7 @@ docker exec dotd-dot-dot1 sh -c 'command -v pdftotext git python3'
 - [ ] 容器以 uid 1000 跑：`docker exec dotd-dot-dot1 id`
 - [ ] `shell.run` 能跑 `git --version`、`python3 -V`、`pdftotext -v`
 - [ ] `browser.screenshot` 还能落盘（走的是 home 卷，跟基座无关，但要确认）
-- [ ] 全量回归仍是 1606 / 0
+- [ ] 全量回归仍是 1630 / 1629 / 0
 
 **回滚**：旧镜像 `dotd/exec:1.49.1-0.1.0` 先别删（`scripts/rebuild-image.sh`
 开头会 `docker rmi` 它，注意别手快），D: 侧 `git revert` 那批改动即可。
@@ -305,6 +368,68 @@ docker exec dotd-dot-dot1 sh -c 'command -v pdftotext git python3'
 > `scripts/acceptance.sh:103`，而且那段上下有 20 行注释专门解释**为什么必须**
 > 先清空再跑（不清空的话上一轮证据会污染这一轮的判定，k1 全过却 exit=1）。
 > 不是 bug。真正待确认的是"跑一半断电会留半截文件"这个边角，优先级很低。
+
+---
+
+### 7.4 清理 126 条卡在 `executing` 的审批（等主人点头）
+
+现状（2026-10-21 实测）：
+
+```
+executing    126
+expired        9
+executed       1     << 只有 1 条走到了终态
+```
+
+`resolveExecution` 已接线（新审批能进终态），但这 126 条是历史脏数据。
+方案和回滚 SQL 在 [approvals-stuck-executing.md](approvals-stuck-executing.md)，
+建议把「执行结果已落库的」回填成 `executed`、其余标 `expired`。
+**未执行**，改数据前要备份。
+
+### 7.5 主动推送：已经开了 4/6，但有 3 个配置问题要你定
+
+2026-10-21 实测状态：
+
+```
+enabled proactive  cron           throttle   标题
+   1        1      30 8 * * *      6h        早间天气提醒
+   1        1      0 7 * * *       6h        早上喝水提醒
+   1        1      0 15 * * *      6h        组会提醒
+   0        0      0 3 * * *       6h        一次性验证      << 测试残留
+   1        1      0 9 * * *       20h       早间日程提醒
+   1        0      0 7 * * *       6h        早间喝水提醒    << 与上面重复
+```
+
+**端到端已经实测通了**，不是看代码：
+
+```
+tk_ev_24  组会提醒      task_reply ok=1  oc_e764f9021f3db527f36dff984ff061f4
+          "下午3点了，该去开组会了。"
+tk_ev_23  早间天气提醒   task_reply ok=1  oc_e764f9021f3db527f36dff984ff061f4
+          "北京今天（10 月 21 日）晴，当前约 9.6°C，全天 3.9～15.7°C…不用带伞"
+```
+
+天气那条真的调了 `net.get` 取了实时天气。**注意 `missed:1` 是补跑**：
+把 `next_fire` 改成 +60s 时，它把当天已经错过的时点补上了，
+所以「组会提醒」在晚上 21:47 说「下午3点了」是**正确的**，不是 bug。
+
+三个待你决定的配置问题：
+
+1. **两条喝水提醒重复**：`早上喝水提醒`（已开）和 `早间喝水提醒`（`proactive=0`）
+   内容几乎一样、都是 7:00。开第二条会一天提醒两次喝水。**建议删一条**。
+2. **`一次性验证` 是测试残留**：prompt 是「只回复 ONCE-OK」，`0 3 * * *`，
+   每天凌晨 3 点跑一次没意义。**建议删**。
+3. **`throttle_hours=6` 会挡掉 9:00 的日程提醒**：天气 8:30 推完，
+   6 小时内不再推 —— 日程 9:00 那条会被节流（同一条 crontab 的 `last_push_at`
+   是各自的，所以实际上不互相影响，但**同一条**在 6 小时内不会重复推）。
+   如果想让日程提醒必到，把它的 `throttle_hours` 调小。
+
+> 有个更重要的结论要说清楚：**「消息精简」不会误杀主动推送**。
+> 我用 47 条真实定时任务回复实测，`isLowValueReply` 判为无信息量的是 **0 条**；
+> 主动推送的线程是 `channel=event`，`shouldMirrorToFeishu` 恒为 `true`；
+> `shouldAnnounce` 精确按 `payload.proactive` 工作
+> （`proactive=false` 的测试任务全部 `announce=false`）。
+> 所以「开了 crontab 但消息被吞掉」这个担心不成立。
 
 ---
 
@@ -400,7 +525,7 @@ docker exec dotd-dot-dot1 sh -c 'command -v pdftotext git python3'
 | 3 | `action.value` **双重编码**，`parseCardAction` 只解一层 | 解出仍是字符串 → `null` → 判 `ignore` |
 | 4 | `resolveExecution()` 定义了但**全项目无人调用** | 126 条审批全停 `executing`，无一条终态 |
 
-第 4 条后果最重：`gate.ts:372` 对 `executing` 是 `deny('execution in flight')`，
+第 4 条后果最重：`src/governance/gate.ts:372` 对 `executing` 是 `deny('execution in flight')`，
 **同一张单子永久不可用**。
 
 ### 真实载荷（保存下来，别再猜）
@@ -437,6 +562,84 @@ FAIL done 分支真的调用 clipForFeishu -- 没找到调用点，长文会原�
 
 ---
 
+## 9ter. 截图从没随进度发出去过 + 折叠反而让消息变长（2026-10-21）
+
+两件事分开记，因为教训不同。
+
+### 9ter.1 截图：三个叠加缺陷，修了三轮才对
+
+**症状**：`progress` 推了文字，但一张图都没到过飞书。
+主人问「为什么只有字没有图」。
+
+**三个叠加缺陷**（任何一个单独存在都足以让图发不出去）：
+
+1. `screenshotPathOf()` 认错数据形状 —— 从 `steps.result_json` 取路径时
+   按 `{value:{path}}` 取，实际是 `{path}`。取出来永远是 `null`。
+2. `decideScreen()` 里 `if (needsAttention) return path;` ——
+   意图是「需要关注时必须带图」，副作用是**同一张图会被反复发**。
+3. `progress-push` 在 `await sender.send()` **之后**才写状态，
+   并发两次推送时都读到旧状态，同一张图发两遍。
+
+**三轮测量**（每轮都数 `surf_outbound_log` 里 `kind='progress_image'` 的行）：
+
+| 轮次 | 改了什么 | 台账行数 | 去重后 | 结论 |
+|---|---|---|---|---|
+| 1 | 未修 | 5 | 4 | 有重复 |
+| 2 | 只加跨模块去重 | 2 | 1 | **仍重复** —— 模块内竞态 |
+| 3 | 修竞态 + 改 `decideScreen` | 4 | 4 | **零重复** |
+
+**第 2 轮是关键教训**：跨模块去重做了，还是重复 —— 因为模块内
+`await` 前后有竞态。**光看代码看不出来，必须数台账。**
+
+**可观测性补了两个口子**：
+- `sendShot()` 现在把每条 `progress_image` 记进 `surf_outbound_log`
+  （`dedup_key = progress:{taskId}:{path}`）
+- `screenshot-push.ts` 发图前查这张表，发过就跳过
+- `progress-push` 的每个跳过分支都有日志（`[progress] xxx 跳过（原因）`）
+
+> 陷阱：`surf_outbound_log.text_preview` **恒定只存前 200 字**
+> （源码就是 `out.text.slice(0,200)`），所以它**不能**用来证明裁剪生效了。
+> 长文和短文在库里长得一模一样。这条也是踩过才知道的。
+
+### 9ter.2 折叠反而让消息变长：601 字 → 655 字
+
+`clipForFeishu` 先 `slice(0, 600)` 再追加 55 字提示语：
+
+```
+ 601 字 -> 655 字    << 比原文还长
+ 650 字 -> 656 字
+1000 字 -> 658 字
+```
+
+原文越接近 600，膨胀比例越大。「折叠」把消息变大了。
+
+**为什么原有测试没抓到** —— 这条最值得记：
+
+```js
+assert.ok(call.text.startsWith('A'.repeat(600)), '前 600 字原样保留');
+assert.ok(call.text.length < 700, '整体不回到千字级');
+```
+
+第一条在 bug 存在时**通过**（前 600 字确实原样保留了，只是后面又加了 55 字）。
+第二条上限 700 太宽松（655 < 700）。
+
+**断言写成了「某次实现的细节」，而不是「折叠的定义」。**
+改成 `call.text.length <= 600` 才是真正的不变量。
+
+**修法**：先按最长提示语预留空间 → 裁 → 循环收敛
+（提示里的数字位数会变 9 → 10 → 100，一轮不够）。
+现在 599~700 每个长度都 ≤ 600。
+
+**反向注入的曲折**（也值得记）：
+- 只去掉「预留」→ 测试**不报错**
+- 只去掉「收敛」→ 测试**不报错**
+- 两个都去掉 → **3 条 FAIL**，精确复现「601→655」
+
+因为两层是双保险，任一层单独失效另一层兜住。这是**正确的设计**，
+但也说明：**单点注入容易得出「测试无效」的错误结论**。我第一次就下错了。
+
+---
+
 ## 10. 验收相关
 
 ```bash
@@ -455,4 +658,26 @@ bash scripts/regress/calendar-criteria.sh
 
 这份文档会过期。**当它和代码冲突时，信代码**，然后把这里改对。
 
-现在最该更新的地方：第 6 节的状态表（尤其是 slim 上线之后）。
+现在最该更新的地方：
+- 第 6 节状态表（尤其是 slim 上线之后）
+- 第 7.5 节（那 3 个 crontab 配置问题定了之后）
+
+### 一条元教训（比任何单项都重要）
+
+这一轮里，**「文档说做完了」和「实际生效了」是两件事**，而且不一致是常态：
+
+| 文档声称 | 实际 |
+|---|---|
+| 审批卡片能点 | 点了没反应（四个缺陷） |
+| 审批有终态 | 126 条永远停在 `executing` |
+| 截图随进度发 | 一张都没发出去过（三个缺陷） |
+| 长文会自动折叠 | 601 字裁成 655 字，反而更长 |
+| 判据全绿 | 2 个脚本红着，因为数字被钉死 |
+| 主动推送能用 | 只有 1/5 在跑，而且关着的照样推（旧版本） |
+
+**所以：任何「已完成」的结论，必须能当场跑出证据。**
+最少三选一 —— 一条能复现的命令、一个 `file:line`、一次真实运行。
+只有文档/记忆/代码阅读的结论，一律当「未验证」。
+
+`docs/muse-parity.md` 里那些 41/0、21/0、19/0、27/0、49/0 现在是真的能跑出来的，
+但它们**曾经也是真的**——判据脚本一旦被改动就会失真。定期复跑比读数字可靠。
