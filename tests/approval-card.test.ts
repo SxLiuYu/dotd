@@ -85,7 +85,10 @@ const cardText = (c: Record<string, unknown>): string => JSON.stringify(c);
   const c = buildApprovalCard(v);
   const t = cardText(c);
   ok('spend 档用橙色', (c['header'] as Record<string, unknown>)['template'] === 'orange');
-  ok('显示金额', t.includes('50000') && t.includes('CNY'));
+  // 2026-10-21（9.2）：amountCents 语义是**分**，卡片现在印 500.00 CNY 而不是 50000 CNY。
+  // 旧断言 `t.includes('50000')` 是错的：那等于把 500 元显示成 50000 元。
+  ok('显示金额（分→元）', t.includes('500.00') && t.includes('CNY'), t.match(/[\d.]+ CNY/)?.[0] ?? '未找到');
+  ok('不再印裸的分值', !t.includes('50000 CNY'));
 }
 
 // 4. 按钮 value 可解析
