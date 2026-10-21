@@ -136,10 +136,11 @@ node --import tsx --test $(cat <该块的文件列表>)
 
 | 项目 | 状态 |
 |---|---|
-| HEAD | `97593bc` |
-| 未提交改动 | `agent-runtime/{server.ts,package.json}`、`exec-image/Dockerfile`、`src/exec/image.ts`、`tests/agent-runtime-server.test.ts`、删 `agent-runtime/xvhfd.ts` —— **就是 slim 那批** |
+| HEAD | `8937390` |
+| 工作区 | 干净 |
 | `npx tsc --noEmit` | 0 错误 |
-| 全量回归 | 1606 / 0 |
+| 全量回归 | 1606 / 0（9 块） |
+| slim 改造 | **已提交**（`8937390`），镜像已验证但**未切到现网** |
 | 现网跑的镜像 | **还是旧的** `dotd/exec:1.49.1-0.1.0`（3.55GB） |
 | 容器 | `dotd-dot-dot1`，id `dbd70605a4e6` |
 | daemon | 在跑，HTTP 200 |
