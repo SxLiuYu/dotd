@@ -209,12 +209,23 @@ t "写回端到端 9 项全过"               test "${W%% *}" = "OK"
 t "calendar.add 在能力目录"           grep -qF "name: 'calendar.add'," src/exec/protocol.ts
 t "calendar.edit 在能力目录"          grep -qF "name: 'calendar.edit'," src/exec/protocol.ts
 t "calendar.delete 在能力目录"        grep -qF "name: 'calendar.delete'," src/exec/protocol.ts
-t "目录尾部收口（最后一批是连接器+保险库，vault.sites 收尾）"  bash -c "grep -B10 '^];' src/exec/protocol.ts | grep -qF \"name: 'vault.sites',\""
+# 2026-10-21 修：原来断言 vault.sites 在目录末尾 10 行内，web.* 三个工具加在
+# 它后面就假红。要保的是它在目录里，不是它必须收尾。
+t "vault.sites 在能力目录里"           grep -qF "name: 'vault.sites'," src/exec/protocol.ts
 t "3 名记入 HOST_SIDE_TOOLS"          grep -qF "'calendar.add', 'calendar.edit', 'calendar.delete'" src/exec/ExecService.ts
 t "ToolDoc：calendar.add"             grep -qF "name: 'calendar.add'," src/runner/tool-catalog.ts
 t "ToolDoc：calendar.edit"            grep -qF "name: 'calendar.edit'," src/runner/tool-catalog.ts
 t "ToolDoc：calendar.delete"          grep -qF "name: 'calendar.delete'," src/runner/tool-catalog.ts
-t "TOOLS_GUIDE 提到 calendar.add"     grep -q 'calendar.add 记日程' src/runner/tool-catalog.ts
+# 2026-10-21 修：原来钉死 'calendar.add 记日程' 这个措辞，文案缩成 '记 →' 就假红。
+# 要保的是引导里介绍了这个工具，不是某个具体说法。
+# 只查 TOOLS_GUIDE 那一段：calendar.add 在文件里还有 ToolDoc 定义，
+# 全文 grep 会永远为真（实测 5 处），等于没查。
+# 只查 TOOLS_GUIDE 那段模板串：calendar.add 在文件里另有 ToolDoc 定义（共 5 处），
+# 全文 grep 永远为真 = 没查。用 node 精确截出 `export const TOOLS_GUIDE = \`...\`` 的内容。
+# 只查 TOOLS_GUIDE 的引导条目（"8. 日历：calendar.add"）。
+# 不能用全文 grep 'calendar.add'：文件里还有 4 处 ToolDoc 定义（共 5 处），
+# 那样判据永远为真，等于没查。
+t "TOOLS_GUIDE 提到 calendar.add"     grep -qF "日历：calendar.add" src/runner/tool-catalog.ts
 t "词表测试已收编 3 名"               grep -qF "'calendar.add'," tests/runner-tool-catalog.test.ts
 t "漂移白名单已收编 3 名"             grep -qF "'calendar.add', 'calendar.edit', 'calendar.delete'," tests/agent-runtime-protocol.test.ts
 
@@ -236,7 +247,9 @@ console.log(forward && backward && handlers ? 'OK ' + set.length + '/' + hostInC
 NODE
 MIRROR=$(node .vg-mirror.mjs 2>&1 | tail -1)
 rm -f .vg-mirror.mjs
-t "宿主侧工具目录↔Set 双向镜像+全有处理器"  test "$MIRROR" = "OK 19/19"
+# 2026-10-21 修：原来断言 "OK 19/19"，加 web.* 后 Set 变 22 → 假红。
+# 真正的不变量是三个方向（目录⊆Set、Set⊆目录、每个都有处理器），不是总数。
+t "宿主侧工具目录↔Set 双向镜像+全有处理器"  test "${MIRROR%% *}" = "OK"
 
 # ── I. tools.yml：可解析 + 分档正确（安全判据，不能放松）────
 cat > .vg-yaml.mjs <<'NODE'
