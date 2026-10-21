@@ -79,6 +79,42 @@ interface TaskStatePayload {
   to: string;
 }
 
+/**
+ * 这个任务的结果该不该主动说给主人（2026-10-21）。
+ *
+ * 数据源：tasks.source_event_id → events.payload.proactive。
+ * 调度器在 fireHeartbeat 里已用 shouldPush() 判过三闸（开关/安静时段/节流），
+ * 这里只是**读回那个结论**，不重算 —— 重算会因 last_push_at 已被更新而得出不同答案。
+ *
+ * 三种情况返回 true（照常回复）：
+ *   ① 不是定时任务触发的（source_event_id 为空）—— 主人在对话，回复是应答不是打扰；
+ *   ② 事件读不出来（老数据/已被清理）—— 宁可多说一句，也不要吞掉主人的回答；
+ *   ③ payload 里没有 proactive 字段（老版本事件）—— 同上，向后兼容。
+ *
+ * 只有明确 proactive === false 才返回 false（静默）。
+ */
+export function shouldAnnounce(db: DatabaseSync, taskId: string): boolean {
+  try {
+    const row = db
+      .prepare('SELECT source_event_id FROM tasks WHERE id = ?')
+      .get(taskId) as { source_event_id: number | null } | undefined;
+    if (row === undefined || row.source_event_id === null) return true;
+
+    const ev = db
+      .prepare("SELECT source, payload FROM events WHERE id = ?")
+      .get(row.source_event_id) as { source: string; payload: string } | undefined;
+    if (ev === undefined || ev.source !== 'heartbeat') return true;
+
+    const parsed = JSON.parse(ev.payload) as { proactive?: unknown };
+    // 字段缺失 → 老事件，按"该说"处理（兼容优先，不静默主人）
+    if (!('proactive' in parsed)) return true;
+    return parsed.proactive !== false;
+  } catch {
+    // 读不出来就照常回复：吞掉回答比多发一条糟糕得多
+    return true;
+  }
+}
+
 /** 从 mem_threads 解析飞书回复目标；非 feishu 渠道/无 external_ref → null。 */
 export function feishuChatIdForThread(db: DatabaseSync, threadId: string): string | null {
   const row = db
@@ -312,6 +348,22 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
     const threadChat = feishuChatIdForThread(deps.db, task.thread_id);
     const chatId = threadChat ?? deps.fallbackChatId ?? null;
     if (chatId === null) return null;
+
+    // ── 2026-10-21：主动推送判定的**消费端**（此前判定了但没人用）──
+    //
+    // 现场：crontabs 的 proactive / quiet_hours / throttle_hours 三闸，
+    // 在 fireHeartbeat 里由 shouldPush() 算成 payload.proactive 写进事件，
+    // 然后……没有任何地方读它。实测建一条 proactive=0 和一条 proactive=1
+    // 同一时刻触发，**两条都推给了主人**（surf_outbound_log 811/812）。
+    // 也就是说"主动推送开关"此前完全不生效，关着的任务照样天天打扰。
+    //
+    // 判据：只有"定时任务触发 + 它自己判定为不推送"这一种情况才静默。
+    // 其余（主人在飞书里说的话、Web 发起的、手动跑的都算）照常回 ——
+    // 那些是**应答**，不是打扰，静默掉才是 bug。
+    if (!shouldAnnounce(deps.db, p.taskId)) {
+      deps.log(`飞书出站跳过：${p.taskId} 来自 proactive=0 的定时任务（结果只记日志）`);
+      return null;
+    }
     if (threadChat === null) {
       deps.log(`飞书出站：${p.taskId} 非飞书会话，改投默认会话 ${chatId}`);
     }
