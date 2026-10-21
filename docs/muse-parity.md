@@ -564,6 +564,86 @@ rules.yml 条目 {"tool":"shop.buy","amountAtLeast":50000} 试图把 approve 放
 
 ---
 
+### 4.8 截图从来没随进度发出去过（2026-10-21，已修并实测）
+
+**发现过程**：主人问「meta muse 功能都满足了吗」。我没有读文档，逐项实跑核对，
+结果在一片"已完成"里发现了这个。
+
+#### 表面症状
+
+§4.1 原来把「进度推送接真截图」标为**已完成**。但实测一个普通任务：
+
+```
+[progress] tk_mvi2ruzz4pd33b 推了进度（start，1 步）   ← 唯一的推送
+```
+
+`browser.screenshot` 成功了 **2 次**，可那次推送发生在第 1 步 ——
+**截图还没产生**。按日常配置（每 3 步 / 至少隔 90 秒），
+一个 20 秒的任务永远轮不到"带图的那一次"。
+
+结论：**功能是好的，但主人从没在手机上看过一张截图。**
+§4.1 标"已验证"用的是临时把阈值调到 1 步 / 0 秒，**不代表日常配置下能用**。
+这是拿"能跑通"当"已满足"的典型误判。
+
+#### 三个叠加的缺陷
+
+| # | 缺陷 | 后果 |
+|---|------|------|
+| 1 | 新截图不越过 `every_n_steps` / `min_interval` 节流 | 短任务永远推不到带图那次 |
+| 2 | `decideScreen` 在 `needsAttention` 时**无条件**返回同一张图 | 同一张图几秒内发两遍 |
+| 3 | `st.lastPushAt` / `lastImagePath` 在 `await send()` **之后**才更新 | 并发的两个总线事件都读到旧值 → 连推两条文字 + 连发两张图 |
+
+#### 修法（主人选方案 1：截图成功时立刻推）
+
+1. `ProgressInput` 加 `freshShot`；`decideProgress` 在 `too_few_steps` **之前**
+   判定它，新截图越过步数与时间节流，`reason` 标 `shot`
+2. `decideScreen` 去掉 attention 的无条件放行 —— **attention 要保证的是
+   "文字一定到达"，不是"图一定重发"**；同一张 PNG 看第二遍没有新信息
+3. 状态**先占位再 await**，失败回滚（不能"发失败也算推过"，否则最该看的那条永久丢）
+
+#### 顺带修的两个可观测性缺口
+
+- `progress-push` 原来**完全不写持久台账**（只写日志，日志每次重启被截断）。
+  我因此误判过一次："`surf_outbound_log` 里只有 `approval_card`/`task_reply`，
+  就以为从没发过图"。现在 `sendShot` 写 `kind='progress_image'`。
+- 静默分支（`too_few_steps` / `too_soon`）原来不打日志，排查时看不出
+  "是被节流还是根本没走到"。现在每个分支都落一行。
+
+#### 还发现跨模块重复
+
+`progress-push`（过程中）和 `screenshot-push`（任务结束时重发最近 3 张）
+是两条独立路径，同一张图会发两遍。用 `surf_outbound_log` 当共享台账去重：
+
+```
+[screenshot-push] 跳过（进度推送已经发过）/dot/home/screenshots/shot-mvi3lqh7.png
+[screenshot-push] 跳过（进度推送已经发过）/dot/home/screenshots/shot-mvi3ln58.png
+```
+
+判据是 `kind='progress_image' AND ok=1` —— **发失败的不算发过**，仍要重试。
+
+#### 实测证据（三轮，每轮都暴露一个新问题）
+
+| 轮次 | 台账记录 | 去重后 | 结论 |
+|---|---|---|---|
+| 修复前 | 5 条 | 4 张 | 重复 1 张 |
+| 只补跨模块去重 | 2 条 | 1 张 | 仍有重复（竞态） |
+| **修竞态 + `decideScreen`** | **4 条** | **4 张** | **零重复** |
+
+日志（`tk_mvi3qf2yiblohu`）—— 注意 `跳过(too_few_steps)` 与 `推了进度(shot)` 并存，
+证明节流仍生效、只是被新截图越过：
+
+```
+[progress] 跳过（too_few_steps，第 3 步）
+[progress] 推了进度（shot，5 步）        ← 越过节流，带图
+[progress] 推了进度（shot，7 步）        ← 新图，再带
+[progress] 跳过（too_few_steps，第 9 步）
+[progress] 推了进度（shot，11 步）
+```
+
+**这次是真的跑通了**：4 张不同的 PNG，`progress_image ok=1` × 4，零重复。
+
+---
+
 ## 10. 事实边界
 
 **实测**（2026-10-21 更新）：41 工具、9 delta/2 final、`sendImage` 存在、
