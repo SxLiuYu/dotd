@@ -520,7 +520,15 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
         deps.log(`飞书出站跳过：${p.taskId} 回复无信息量（只落库，可用 dotd task ${p.taskId} --verbose 看）`);
         return null;
       }
-      return { chatId, text: clipForFeishu(body) };
+      // 2026-10-21：把"发了多少字"落一行。
+      // 为什么需要：surf_outbound_log.text_preview 恒定只存前 200 字（设计如此），
+      // 光看它无法判断裁剪到底生效了没有 —— 长文和短文在库里长得一模一样。
+      const clipped = clipForFeishu(body);
+      deps.log(
+        `飞书出站裁剪：${p.taskId} 正文 ${body.length} 字 → 发出 ${clipped.length} 字` +
+          (clipped.length < body.length ? '（已折叠，末尾带完整内容指引）' : '（未触发上限）'),
+      );
+      return { chatId, text: clipped };
     }
     return { chatId, text: `任务未完成（${task.title.slice(0, 40)}）` };
   }

@@ -18,6 +18,7 @@
  *   2. isLowValueReply —— 「我没有 xx 工具」这类自我否定静音（只落库）
  *   3. mirrorWebToFeishu = false —— Web 发起的任务不再镜像到飞书
  */
+import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import {
   clipForFeishu,
@@ -103,5 +104,21 @@ ok('上限是 600（不是原来的 3800）', FEISHU_REPLY_MAX_CHARS === 600, St
 ok('上限能容下结论+两条理由', FEISHU_REPLY_MAX_CHARS >= 400);
 
 console.log('');
+console.log('');
+console.log('  六、调用点：函数再对，没人调也白搭（2026-10-21 实测踩到）');
+
+{
+  // 现场：clipForFeishu 单测全绿，但把调用点从 clipForFeishu(body) 改成 body
+  // （等于不裁剪），这个测试文件 **一条都不会失败** —— 它只测函数，不测接线。
+  //
+  // 而线上根本看不出来：surf_outbound_log.text_preview 恒定只存前 200 字，
+  // 5719 字的长文和 200 字的短信在库里长得一模一样。
+  const src = readFileSync(new URL('../src/surfaces/feishu-outbound.ts', import.meta.url), 'utf8');
+  ok('done 分支真的调用 clipForFeishu', src.includes('clipForFeishu(body)'),
+     '没找到调用点，长文会原样全发');
+  ok('裁剪长度有日志可观测', src.includes('飞书出站裁剪'),
+     '没有长度日志就无法判断线上到底裁了没有');
+}
+
 console.log('  合计 ' + pass + ' 通过 / ' + fail + ' 失败');
 process.exit(fail === 0 ? 0 : 1);

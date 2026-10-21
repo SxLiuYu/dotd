@@ -11,9 +11,17 @@
 ## 1. 一句话现状
 
 dotd 已经和 Meta Muse 对齐到可用状态：38 个工具、六步验收 + T1→T6 全过、
-全量回归 **1606 通过 / 0 失败**。最近在收两件事的尾：把浏览器从容器搬到宿主
-（已完成并上线）、把容器基座从 3.5GB 的 playwright 镜像换成 300MB 的 node slim
-（**代码写完了，还没上线**）。
+全量回归 **1627 条 / 1626 通过 / 0 失败 / 1 跳过**（2026-10-21 19:xx 实测 EXIT=0）。
+
+最近收的尾：
+- 浏览器从容器搬到宿主 —— 已完成并上线
+- 容器基座换 300MB node slim —— **代码写完了，还没上线**
+- 飞书消息精简（长文折叠 + 无信息量回复静音 + Web 会话不镜像）—— 已上线
+- **审批卡片点击无反应 —— 已修，四个缺陷叠加**（详见 §9）
+
+**当前没有已知的坏功能。** 唯一遗留的数据问题是 126 条历史审批停在 `executing`
+（不影响运行，方案见 [approvals-stuck-executing.md](approvals-stuck-executing.md)，
+**未执行**，等主人点头）。
 
 ---
 
@@ -201,7 +209,7 @@ node --import tsx --test $(cat <该块的文件列表>)
 | HEAD | 写这份时是 `fcb7343`（会变，以 `git log` 为准） |
 | 工作区 | 干净 |
 | `npx tsc --noEmit` | 0 错误 |
-| 全量回归 | 1606 / 0（9 块） |
+| 全量回归 | **1627 条 / 1626 通过 / 0 失败 / 1 跳过**（2026-10-21，EXIT=0） |
 | slim 改造 | **已提交**（`8937390`），镜像已验证但**未切到现网** |
 | 现网跑的镜像 | **还是旧的** `dotd/exec:1.49.1-0.1.0`（3.55GB） |
 | 容器 | `dotd-dot-dot1`，id `dbd70605a4e6` |
@@ -209,6 +217,9 @@ node --import tsx --test $(cat <该块的文件列表>)
 | 邮箱账号 | 1 个活跃（`yujinze000@163.com`），11 封缓存 |
 | crontab | 5 条 |
 | 暂停的任务 | `tk_mvf3rc3gxyradt`、`tk_mvgow7taoew2sg`、`tk_mvgp03asc3qtkv` |
+| 审批卡片点击 | **已修**（四个缺陷叠加，见 §9） |
+| 审批终态 | **已修**：`resolveExecution` 已接线；历史 126 条仍停 `executing`（未清理） |
+| 飞书消息精简 | 已上线，真实链路实测 5719 字 → 529 字 |
 
 ### 数据备份
 
@@ -365,6 +376,64 @@ docker exec dotd-dot-dot1 sh -c 'command -v pdftotext git python3'
 - `/dot/home` 是 docker volume（挂到宿主是普通目录，可读写）
   —— 截图落盘就是靠这个
 - 镜像 `dist` 是**烤进镜像**的，改 `agent-runtime/` 必须重建镜像
+
+---
+
+## 9bis. 审批卡片点击无反应：四个缺陷（2026-10-21）
+
+主人三次反馈「点了没反应」。这是本仓库里**最典型的"函数对但没人调用"连环坑**，
+值得完整记下来。
+
+### 症状与假象
+
+- 日志里有 `飞书长连接收到事件 card.action.trigger：chat=- sender=-:- type=- len=0`
+- 这行 **`chat=-` 是假线索**：它读的是 `event.message.chat_id`/`event.sender`，
+  而卡片回调用的是 `context.open_chat_id`/`operator.open_id` —— 打在了错的地方。
+  我一度据此判断"字段缺失"，方向错了。
+
+### 四个缺陷
+
+| # | 缺陷 | 表现 |
+|---|------|------|
+| 1 | `daemon.ts` 启动 `startFeishuWs()` 没传 `approval` | 每次点击返回 `{"ignored":true,"reason":"approval_not_wired"}` |
+| 2 | `feishu-ws.ts` 手工挑字段构造入参时漏了 `approval` | 补完 #1 仍复现（自己引入的） |
+| 3 | `action.value` **双重编码**，`parseCardAction` 只解一层 | 解出仍是字符串 → `null` → 判 `ignore` |
+| 4 | `resolveExecution()` 定义了但**全项目无人调用** | 126 条审批全停 `executing`，无一条终态 |
+
+第 4 条后果最重：`gate.ts:372` 对 `executing` 是 `deny('execution in flight')`，
+**同一张单子永久不可用**。
+
+### 真实载荷（保存下来，别再猜）
+
+```json
+{
+  "schema": "2.0", "event_type": "card.action.trigger",
+  "operator": { "open_id": "ou_028f4e..." },
+  "action": { "value": "\"{\\\"kind\\\":\\\"approval\\\",\\\"approvalId\\\":134,\\\"verdict\\\":\\\"approve\\\"}\"", "tag": "button" },
+  "context": { "open_message_id": "om_x100b62...", "open_chat_id": "oc_e764f9..." },
+  "host": "im_message"
+}
+```
+
+注意两点：**扁平**（没有 `event` 包装）、**`action.value` 编码两层**。
+
+### 教训：先让失败可见，再改代码
+
+前三轮我是「先改代码，再看效果」，每轮只能确认「又没成」。根因是
+`route()` 只对 `error`/`taskId` 打日志，`ignored`/`decided` **全静默** ——
+根本看不见卡在哪。加了「任何结果都落一行」之后，下一次点击就直接指出
+`approval_not_wired`。
+
+**这条值得写进习惯**：排查时可以改代码，但**第一步必须是加可观测性**。
+
+### 同类盲区（顺带修的）
+
+`clipForFeishu` 单测全绿，但把调用点改成不裁剪，**一条都不会失败**。
+"函数对"和"被调用"是两件事。已补源码级断言：
+
+```
+FAIL done 分支真的调用 clipForFeishu -- 没找到调用点，长文会原样全发
+```
 
 ---
 
