@@ -16,15 +16,22 @@
 |---|---|---|---|
 | 9.4 | 心跳事件被模型误判 | **P0 故障** | 已修复 + 实测 |
 | A1 | 主动推送开关不生效 | **P0 故障** | 已修复 + 实测 |
+| 9.7 | 截图一张都没发出去过 | **P0 故障** | 已修复 + 实测（第二轮发现） |
+| 9.6 | 进度推送「配了不生效」 | **配置缺陷** | 已修复 + 已开启 |
 | 9.3 | 活动/回执总览 | 缺失能力 | 已实现（CLI + Web） |
 | 9.2 | 审批金额显示 | 显示缺陷 | 已实现 |
 | 9.1 | 进度推送接截图 | 缺接线 | 已实现 |
+| 9.5 | 金额阈值规则 | 受限实现 | 已实现（见 §4.5 说明） |
+| B2 | 真流式输出 | 早已实现 | 本轮实测确认 |
 
-全套测试 **1623 个：1622 通过 / 0 失败 / 1 跳过**。
+全套测试 **1625 个：1624 通过 / 0 失败 / 1 跳过**。
+
+> 第二轮追加：原以为只剩「两个 P0」，实际又挖出两个。
+> 一共**四个**缺陷，其中两个属于「功能写着、但从没生效过」。
 
 ---
 
-## 二、两个 P0 故障（这两个最要紧）
+## 二、四个缺陷（这两个 P0 最要紧）
 
 ### 2.1 定时任务从来建不出来（9.4）
 
@@ -99,9 +106,46 @@ ct_g2_off (proactive=0) → tk_ev_17 done + 无出站记录
 反向注入：删掉 `shouldAnnounce` 调用 → `ct_g3_off` 的 `G3-OFF` 又被推送（id 815），
 原 bug 重现；恢复后重新对照，只有一条出站。
 
+### 2.3 截图一张都没发出去过（第二轮发现）
+
+**这个最难发现**，因为代码看着完全正确：读图、发图、去重三件齐备，47 条测试全过。
+
+真跑一遍才发现：截图在容器里造得出来（67006 字节 PNG），**一张都没送到你手上**。
+进度推了 7 次，日志里 7 行「推了进度」，**零行「随进度发了截图」** ——
+也没有任何「读图失败」，因为发图函数压根没被调用。
+
+根因：`steps.result_json` 里存的不是 `{path: ...}`，而是
+
+```json
+{"output":"{\"path\":\"/dot/home/screenshots/x.png\"}"}
+```
+
+工具输出先被字符串化、又包了一层。而解析函数只认前一种形状，于是永远返回 null，
+附图分支静默跳过。
+
+**为什么测试没抓到**：那 47 条测的是去重逻辑（`decideScreen`），输入是我手写的
+路径字符串。真实的数据形状从没进过测试视野。这是「纯函数测对了，接线处形状错了」。
+
+修好后日志变成 `随进度发了截图（67006B）`，出现 3 次。
+
+**一个你可能关心的副作用**：正式节流是「每 3 步 + 至少隔 90 秒」。
+一个 20 秒跑完的任务只会在第 1 步推一次，那时还没截图 ——
+所以**短任务基本看不到过程图**，长任务才有。这是节流按设计工作，不是 bug。
+
+### 2.4 进度推送「配了但从不生效」（第二轮发现）
+
+打开 `progress.enabled` 的过程本身挖出一个缺陷。
+
+`_config_src.yml` 里 `progress:` 的缩进是 6/8 空格（应为 2/4），被 YAML
+解析成 `ui.stream_deltas` 的**子节点**。于是 `surfaces.progress` 恒为 `undefined`，
+由 zod 的默认值兜底 —— 看起来配了，实际从没生效。而启动脚本每次都用这个文件
+覆盖 `~/.dotd/config.yml`，谁改都会被冲掉。
+
+修好后启动日志：`过程可视化已启用（每 3 步 / 至少隔 90 秒）`。
+
 ---
 
-## 三、三个能力补齐
+## 三、五个能力补齐
 
 ### 3.1 活动/回执总览（9.3）
 
@@ -162,6 +206,48 @@ Web 侧新增 `ActivityView.tsx`，登记为第七个视图。刻意**不订阅 
 
 顺序**固定为先文字后图片**：文字失败就不发图，避免你收到一张没有说明的截图。
 
+### 3.4 金额阈值规则（9.5）—— 受限实现，原因要说清
+
+清单原话是「加数值阈值规则（"超过 ¥500 才问"）」，**字面读 = 低于阈值不问**。
+
+这条读法与项目自己的硬约束直接冲突：
+
+- `docs/design/modules/governance.md:105`：`spend | approve | 一律人工审批`；
+- `rules.yml` 只能收紧（降档在加载时拒绝并告警）。
+
+`rules.yml` 的 `decision` 只有 `allow/review/approve/deny`，命中后只能升级不能降级。
+所以「加个谓词就能免审批花钱」在本架构里**结构上做不到** —— 不是没实现，是设计上拒绝。
+
+**我实现的是阈值的可用形式**：新增谓词 `match.amountAtLeast`（单位分）。
+
+```yaml
+rules:
+  - match:
+      tool: shop.checkout
+      amountAtLeast: 50000        # ≥ ¥500
+    decision: approve
+    reason: "单笔 500 元以上必须人工确认"
+```
+
+因为命中后只能转 `approve`/`deny`，这个谓词**不可能**产生「低于阈值放行」。
+写 `decision: allow` 配它会在加载时被拒：
+
+```
+试图把 approve 放宽为 allow，已拒绝
+```
+
+**当前限制**：阶段一 `config/tools.yml` **没有登记任何 spend 档工具**
+（`shop.checkout` 是注释掉的结构示例）。所以这个谓词现在可用于 `fs.write` 等
+收紧场景，真正用在花钱上要等阶段二接入支付类工具 —— **那时不用改代码，只加配置**。
+
+### 3.5 真流式输出（B2）—— 早已实现，本轮只做确认
+
+checklist 说「前端订阅了 `chat.delta` 但全仓库无生产者」。实测推翻：
+
+`src/runner/dot.ts:1628` 的 `publishChatDelta()` 就是生产者。订阅 SSE 后发一条消息，
+收到 **16 条 `chat.delta`**，内容是逐字增量（首条 delta 只有一个「你」字）。
+真流式一直在工作。
+
 ---
 
 ## 四、哪些我做不到（需要你处理）
@@ -201,7 +287,11 @@ Web 侧新增 `ActivityView.tsx`，登记为第七个视图。刻意**不订阅 
 
 - **真人收到推送的观感**。我验的是「发出去了」（`ok=1`），没验「看起来对不对」。
 - **「早间日程提醒」明天 9:00 真会推**。我把它 `proactive` 打开了（节流 20 小时），
-  链路已实测通，但**没等到它自然触发**。明天早上是第一次真实检验。
+  三道闸已逐条实测（见 `muse-parity.md` §3.2），但**没等到它自然触发**。
+  明天早上是第一次真实检验。**这是本轮唯一真正待验的事。**
+- **长任务的过程截图观感**。链路已实测（67006B 真的发出去了），但正式节流是
+  「每 3 步 + 90 秒」，我只在把阈值临时调到 1/0 时验过连续推送。
+  真实长任务下你多久能看到一张图，没验。
 - **跨网络稳定性**。飞书长连接在断网重连时的行为，没压测。
 - **Muse 的记忆/并行/重试机制**。见 `docs/meta-muse.md` §8，那里标的是未验。
 
@@ -238,9 +328,36 @@ Web 控制台新增「活动」页，和「队列」页的分工是：
 
 ---
 
+## 七、两棵树的一致性
+
+19 个改动文件逐一比对 sha256（归一化换行后），全部一致：
+
+```
+src/governance/catalog.ts            OK      tests/amount-threshold-rule.test.ts   OK
+src/governance/gate.ts               OK      tests/screenshot-path.test.ts         OK
+src/surfaces/screenshot-push.ts      OK      tests/proactive-announce.test.ts      OK
+src/surfaces/feishu-outbound.ts      OK      tests/heartbeat-decision.test.ts      OK
+src/surfaces/progress.ts             OK      tests/activity-endpoint.test.ts       OK
+src/surfaces/progress-push.ts        OK      tests/web-ui-activity-view.test.ts    OK
+src/control-plane/match.ts           OK      config/dotd.yml                       OK
+src/surfaces/http.ts                 OK      docs/muse-parity.md                   OK
+src/surfaces/cli.ts                  OK      docs/muse-parity-report.md            OK
+src/daemon.ts                        OK
+```
+
+注意：`_config_src.yml` 只存在于 WSL 侧（运行时装配用），不在仓库里，
+所以不在比对范围内 —— 但它是本轮修缩进缺陷的地方，改动已在 WSL 侧生效并验证。
+
+---
+
 ## 附：本轮提交
 
 ```
+993ee80 docs(parity): 三道闸实测记录 + 主动推送现状更新
+7f79794 fix(progress): 截图一张都没发出去过 —— screenshotPathOf 认错数据形状
+49d4182 docs(parity): 记录 9.5 金额阈值与 9.6 开启进度推送
+10001f0 feat(governance): 金额阈值规则谓词 + 开启进度推送
+caba49a docs: 交付说明 muse-parity-report.md
 e4f9d88 chore: 忽略 _quarantine-*/（脚本误写的隔离文件）
 dfe3eac fix: proactive 判定没有消费端 —— 关着的定时任务照样天天打扰
 aaabe59 feat(web): 活动视图（9.3 的 Web 侧）
