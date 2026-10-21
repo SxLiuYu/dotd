@@ -569,3 +569,21 @@ tk_mvgow7taoew2sg）无人认领，属已知行为：启动恢复只处理"在�
 - [已知慢测] `tests/exec-container-concurrency.test.ts` 第 10 个用例（生产路径容器闸）在容器/daemon
   同时运行时耗时可达 ~280s（内部 400×5ms 轮询 + pollIntervalMs:2 空转），会把全量套件从 ~4min
   拉到 20min+。功能正确（9 pass 0 fail），但判据脚本需要给单文件超时上限或隔离该用例（2026-10-21 实测）。
+
+## browser.test 的 §6.3 水位线用例是并发敏感的（2026-10-21 实测）
+
+全量回归（`suite-chunked.sh`）跑块 1 时，`tests/agent-runtime-browser.test.ts` 的
+5~8 个 §6.3 内存水位线用例会偶发失败（`mem 高 → normal`、`calibrateOrUseFallback`、
+`解冻`、`container_pause` 几类）。**不是回归**，证据：
+
+- 单独跑：17/17 全过
+- 与 `agent-runtime-axsnapshot.test.ts` 同批：23/23 全过
+- 整块 15 个文件复跑：247/247 全过
+- 连续三次单跑：17/17、17/17、17/17
+
+这些用例真的去读 `/proc/meminfo` 并按水位线做判断，同时在跑别的重活（daemon
+重启后的容器、浏览器端到端）时会抖动。**不要在压力下把它们当硬失败**；真要
+判回归，单独跑这个文件。
+
+顺带记一条方法论：`suite-chunked.sh` 汇总里出现块级 `rc=1` 时，先按块的文件
+列表原样复跑一遍（`node --import tsx --test $(cat 文件列表)`），能复现才是回归。
