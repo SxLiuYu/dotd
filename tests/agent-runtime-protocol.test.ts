@@ -116,6 +116,9 @@ test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sid
     // mail 8 件套（2026-10-20）：同样只在 daemon 里跑，不进容器
     'mail.account.add', 'mail.account.list', 'mail.account.remove',
     'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send',
+    // 日历写 3 件套（2026-10-21，task-1）：同样只在 daemon 里跑，不进容器
+    'calendar.add', 'calendar.edit', 'calendar.delete',
+    'github.notifications', 'github.issues', 'github.pulls', 'rss.read',
   ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),
@@ -448,6 +451,7 @@ test('能力目录: sideEffect 档位（契约 J2：未声明按 unknown）', ()
     'browser.open': 'unknown',
     'browser.act': 'unknown',
     'browser.snapshot': 'safe',
+    'browser.screenshot': 'safe',
     'browser.close': 'safe',
     'net.get': 'safe',
     'net.post': 'unknown',

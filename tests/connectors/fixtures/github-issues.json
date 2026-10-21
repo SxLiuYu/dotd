@@ -1,0 +1,31 @@
+[
+  {
+    "number": 12,
+    "title": "old issue",
+    "state": "open",
+    "html_url": "https://github.com/octo/hello/issues/12",
+    "user": { "login": "alice" },
+    "updated_at": "2026-02-01T10:00:00Z",
+    "comments": 2,
+    "labels": [{ "name": "bug" }]
+  },
+  {
+    "number": 15,
+    "title": "PR disguised as issue",
+    "state": "open",
+    "html_url": "https://github.com/octo/hello/issues/15",
+    "user": { "login": "bob" },
+    "updated_at": "2026-02-12T09:00:00Z",
+    "pull_request": { "url": "https://api.github.com/repos/octo/hello/pulls/9" }
+  },
+  {
+    "number": 18,
+    "title": "newest issue",
+    "state": "open",
+    "html_url": "https://github.com/octo/hello/issues/18",
+    "user": { "login": "carol" },
+    "updated_at": "2026-02-11T10:00:00Z",
+    "comments": 0,
+    "labels": ["triage"]
+  }
+]

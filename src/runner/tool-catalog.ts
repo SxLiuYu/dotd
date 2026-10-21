@@ -187,6 +187,7 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '跑完记得 browser.close：每个身份最多 2 个浏览器上下文、3 个页面，不关会被回收或撞上限。',
     params: {
       url: 'http(s) 开头的完整网址。只接受 http/https，不能是 file:// 或 data:。',
+      identity: '浏览器身份；不填=按域名自动持久登录态，anon=无痕',
     },
     returns: '返回值是 JSON：url（跳转后的最终地址）、title（页面标题）。页面正文要用 browser.snapshot 拿。',
     failures:
@@ -227,6 +228,16 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     },
     returns: '返回值是 JSON：text（可读快照文本），部分实现另带 html（简化后的 DOM）。',
     failures: 'browser_crashed（retryable）。没有打开页面时也返回 ok，但 text 为空——先 browser.open。',
+  },
+  {
+    name: 'browser.screenshot',
+    description:
+      '把当前页面截成 PNG 图片存到 home 的 screenshots 目录，随回复自动推送给主人看。' +
+      '适合"让主人看见网页长什么样"的场景：填好的表单、查到的账单页面、比价结果页。' +
+      '截图是文件不是文本，要读页面内容仍用 browser.snapshot。',
+    params: {},
+    returns: '返回值是 JSON：path（PNG 在 home 里的路径）、bytes（字节数）、sha256。图片本体不进对话。',
+    failures: 'browser_crashed（retryable）。没有打开页面时报错。测试桩页面不支持时返回 bad_args。',
   },
   {
     name: 'browser.close',
@@ -471,6 +482,130 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
         failures:
           '草稿不存在或已发送；SMTP 认证失败（授权码不对/端口错）——如实转述 error，别假装发出去了。',
       },
+      {
+        name: 'calendar.add',
+        description:
+          '往主人的**本地日历**加一条日程（订阅来的 .ics 日历只读，加不进去）。' +
+          '主人说"帮我记一下周三下午 3 点和产品评审/加个日程"时用它。' +
+          '时间三种写法：带时区的 ISO（2026-10-25T09:00:00+08:00，最稳）、本地时刻（2026-10-25 09:00）、全天（2026-10-25）；' +
+          '结束时给 end 或 durationMin（分钟），都不给按 1 小时算。' +
+          '同 标题+开始+结束 的事件已存在时直接返回已有那条，不重复加 —— 放心重试。',
+        params: {
+          summary: '日程标题，一句话，如 "周会"、"看牙"。别空着。',
+          start: '开始时间，三选一：2026-10-25T09:00:00+08:00（带时区）/ 2026-10-25 09:00（本机时区）/ 2026-10-25（全天）。',
+          end: '可选。结束时间，写法同 start；与 durationMin 二选一。',
+          durationMin: '可选。时长按分钟给，如 90。缺省 60。',
+          location: '可选。地点，如 "会议室 A"。',
+          notes: '可选。备注，存进事件描述；放会议链接、议程这类信息。',
+        },
+        returns:
+          '返回 JSON：event（uid/summary/startMs/endMs/allDay/location/source=local）、duplicate（true=已存在未重复加）、text（含冲突提示）。' +
+          'uid 留好 —— calendar.edit / calendar.delete 都要用它。',
+        failures:
+          'BAD_ARG：时间写法认不出（按三种写法重写再试）、durationMin 不是正整数、结束早于开始、summary 为空。' +
+          '写文件失败会返回系统错误原文 —— 如实转告主人，别假装加上了。',
+      },
+      {
+        name: 'calendar.edit',
+        description:
+          '改一条**本地日历**事件的标题/时间/地点/备注。只改得动 source=local 的事件：' +
+          '订阅来的 .ics 是别人系统的投影，本工具改不了它，别拿订阅事件的 uid 来试。' +
+          '主人说"把周会改到 4 点/那条日程地点换成 xx"时用。给哪个字段改哪个，没给的不动；' +
+          '只改 start 而不给 end/durationMin 时，事件按原时长整体平移。',
+        params: {
+          id: '事件 id，从 calendar.add 的返回或 calendar.list 结果里拿。',
+          summary: '可选。新标题，一句话讲清楚改完叫什么，如 "周会（改）"。',
+          start: '可选。新开始时间，写法同 calendar.add。',
+          end: '可选。新结束时间，写法同 start；不给则只平移开始、时长不变。',
+          durationMin: '可选。新时长，按分钟给正整数，如 90；给了会覆盖 end。',
+          location: '可选。新地点，如 "会议室 A"；传空串表示清空地点。',
+          notes: '可选。新备注，存进事件描述，会整体替换原备注。',
+        },
+        returns: '返回 JSON：event（改后的完整事件，source=local）。',
+        failures:
+          'BAD_ARG（缺 id / 时间写法不对）；id 不存在（多半是拿成了订阅事件的 uid —— 用 calendar.list 确认来源再改）。',
+      },
+      {
+        name: 'calendar.delete',
+        description:
+          '删一条**本地日历**事件。同样只删得动 source=local 的事件，订阅 .ics 只读。' +
+          '主人说"把那条日程删了/周会取消了"时用。按 uid 精确匹配，不会误删别的日程。',
+        params: {
+          id: '要删的本地事件 id（calendar.add 的返回或 calendar.list 结果里拿）。',
+        },
+        returns: '返回 JSON：removed。true=已删；false=本地日历里没有这个 id（把原话转告主人，别反复重试）。',
+        failures: 'BAD_ARG（缺 id）；写文件失败时返回系统错误原文。',
+      },
+  {
+    name: 'github.notifications',
+    description:
+      '列出当前配置的 GitHub 账号的未读/最新通知：谁在哪个仓库 mention 了你、请你 review、' +
+      'issue 有新评论。配了 DOTD_GITHUB_TOKEN 才可用（未配时连接器状态是 public-only）。' +
+      '要查某个仓库的 issue / PR 清单用 github.issues / github.pulls，别用通知凑。',
+    params: {},
+    returns:
+      'JSON 数组，每条含 id、reason（mention / review_requested / comment 等原词）、title、' +
+      'type（Issue / PullRequest / Release）、url、repo（owner/name）、updatedAt、unread；' +
+      '另带 rateLeft（剩余 API 配额）。',
+    failures:
+      'no_token：没配 DOTD_GITHUB_TOKEN —— 提示主人去配，不要重试；' +
+      'timeout / network：15s 超时或网络不通 —— 稍后重试；' +
+      'http_401 / http_403：token 无效或配额耗尽（对照 rateLeft）—— 别原样重发。',
+  },
+  {
+    name: 'github.issues',   // github.pulls 同形，把 issue 换成 PR
+    description:
+      '列一个仓库当前 open 的 issues，按最后更新时间倒序（GitHub 的 PR 会混进 issues 接口，已剥离）。' +
+      '查公开仓库不需要 token；私有仓库需要。要知道每页还有没有下一页看 nextPage。',
+    params: {
+      owner: '仓库属主，如 octo/hello 里的 octo',
+      repo: '仓库名，如 octo/hello 里的 hello',
+      page: '页码，从 1 起；缺省 1，翻页看返回里的 nextPage',
+      limit: '每页条数，1-50，缺省 20（工具层口径统一用 limit；内部映射 GitHub 的 per_page）',
+    },
+    returns:
+      'JSON 数组，每条含 number、title、url（html url）、user（作者 login）、updatedAt、' +
+      'labels（标签名字符串数组）；github.pulls 每条另有 draft 布尔。另带 rateLeft。',
+    failures:
+      'http_404：仓库不存在或（私有仓库）没配 token —— 先核对 owner/repo 拼写；' +
+      'http_403：未认证限速 60 请求/小时耗尽 —— 配 token 或稍后再试；' +
+      'timeout / network / bad_json：网络层问题 —— 稍后重试。',
+  },
+  {
+    name: 'github.pulls',
+    description:
+      '列一个仓库当前 open 的 pull requests，按最后更新时间倒序。查公开仓库不需要 token；' +
+      '私有仓库需要。要看每页是否还有更多看返回里的 nextPage。',
+    params: {
+      owner: '仓库属主，如 octo/hello 里的 octo',
+      repo: '仓库名，如 octo/hello 里的 hello',
+      page: '页码，从 1 起；缺省 1，翻页看返回里的 nextPage',
+      limit: '每页条数，1-50，缺省 20（工具层口径统一用 limit；内部映射 GitHub 的 per_page）',
+    },
+    returns:
+      'JSON 数组，每条含 number、title、url、user（作者 login）、updatedAt、labels、draft 布尔；' +
+      '另带 rateLeft（剩余 API 配额）。',
+    failures:
+      'http_404：仓库不存在或（私有仓库）没配 token —— 先核对 owner/repo 拼写；' +
+      'http_403：未认证限速耗尽 —— 配 token 或稍后再试；' +
+      'timeout / network / bad_json：网络层问题 —— 稍后重试。',
+  },
+  {
+    name: 'rss.read',
+    description:
+      '抓一个 RSS 2.0 或 Atom 源并解析成条目列表。url 必须是 feed 地址（不是文章页）。' +
+      '返回按 link 去重，同一链接只出一次。',
+    params: {
+      url: '订阅源 URL，http(s)，如 https://example.com/feed.xml',
+    },
+    returns:
+      '{ title, items }：items 每条含 title、link、published（源里的原始时间串，RSS 是 RFC822，' +
+      'Atom 是 ISO 8601）、text（摘要纯文本，已去 HTML 标签、解实体）。',
+    failures:
+      'bad_xml：地址不是订阅源（多半是普通网页）—— 换真正的 feed 地址；' +
+      'http_404 / http_403：源挂了或反爬 —— 换源或稍后再试；' +
+      'timeout / network：15s 超时或网络不通 —— 稍后重试。',
+  },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
@@ -609,11 +744,13 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
    · PDF：\`pdftotext 文件.pdf -\` 直接打出文本；\`pdfinfo 文件.pdf\` 看页数/元信息
    · Word(.docx) / Excel(.xlsx)：本质是 zip+xml，用 python3 解（zipfile 读内部 xml，正则或 ElementTree 取文本）
    · 纯文本/代码/日志：fs.read 就够
-4. 网页：browser.open → browser.snapshot（看结构）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
+4. 网页：browser.open → browser.snapshot（看结构）→ browser.screenshot（要给主人看画面：PNG 存 screenshots/，随回复自动推）→ browser.act（点/填/等）→ browser.snapshot（确认）→ browser.close。
 5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 对外有副作用，谨慎。**出网默认关闭**。
 6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
    7. 邮件：mail.account.list 看接了哪些 → mail.list / mail.search / mail.read 收、搜、读 → mail.draft 起稿 → mail.send 真发（dangerous，必过主人审批）；接入 mail.account.add，移除 mail.account.remove。
-   8. 造工具：tool.create / tool.list / tool.invoke。
+   8. 日历：calendar.add 记日程 → calendar.edit 改 → calendar.delete 删（写的是本地日历；订阅 .ics 只读）。约时间前先 calendar.conflicts 查冲突。
+   9. 连接器：github.notifications（GitHub 通知）/ github.issues / github.pulls（仓库 issue/PR 清单）/ rss.read（抓 RSS/Atom 源）。都是只读；没配 DOTD_GITHUB_TOKEN 时 GitHub 只能查公开仓。
+   10. 造工具：tool.create / tool.list / tool.invoke。
       **写脚本前先看有没有「你已有的自造工具」**：对口就 tool.invoke，别重写。
       没对口但以后会重复 → tool.create 造一个。
 通用约定：

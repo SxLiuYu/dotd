@@ -742,6 +742,7 @@ export type ToolName =
   | 'browser.open'
   | 'browser.act'
   | 'browser.snapshot'
+  | 'browser.screenshot'
   | 'browser.close'
   | 'net.get'
   | 'net.post'

@@ -30,6 +30,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ApprovalView } from '../shared/contracts.ts';
 import type { EventBus } from '../shared/bus.ts';
 import { renderQuarantineNotice } from '../governance/review.ts';
+import { pushTaskScreenshots, type ScreenshotPushDeps } from './screenshot-push.ts';
 
 /** 只需要 sendText 的能力面（真 FeishuGateway 满足；测试注 fake）。 */
 export interface FeishuSendPort {
@@ -59,6 +60,11 @@ export interface FeishuOutboundDeps {
    * 取 surfaces.feishu.owner_chat_id 的第一个；未配置则跳过这类通知。
    */
   fallbackChatId?: string | null;
+  /**
+   * A3（2026-10-21）：任务回复发出后，把该任务的 browser.screenshot 截图推给主人。
+   * 不注入 = 不推（CLI/测试场景）。注入体见 screenshot-push.ts（daemon 装配）。
+   */
+  screenshotPush?: ScreenshotPushDeps;
 }
 
 /** 飞书纯文本消息实际上限很宽，但长报告截到这里，避免整篇刷屏。 */
@@ -179,6 +185,7 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
      * 卡片失败才走 build() 的纯文本路径（退路必须留着）。
      */
     cardView?: ApprovalView,
+    onSent?: (chatId: string) => void,
   ): Promise<void> {
     if (sent.has(key) || inflight.has(key)) return;
     inflight.add(key);
@@ -226,6 +233,7 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
         claimed = true;
         prune();
         deps.log(`飞书出站：已发送 ${key} → ${out.chatId}`);
+          onSent?.(out.chatId);
       } else {
         deps.log(`飞书出站失败：${key} ${res.error ?? '?'}`);
       }
@@ -239,7 +247,19 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
   const unsubscribeTask = deps.bus.on<TaskStatePayload>('task.state', (ev) => {
     const p = ev.payload;
     if (p.to !== 'done' && p.to !== 'failed') return;
-    void claimAndSend(p.taskId, () => taskStateText(p));
+    void claimAndSend(
+        p.taskId,
+        () => taskStateText(p),
+        undefined,
+        // A3：文本回复发出成功后，随单推该任务的截图（无注入则不推）。
+        deps.screenshotPush === undefined
+          ? undefined
+          : (chatId) => {
+              void pushTaskScreenshots(p.taskId, chatId, deps.screenshotPush!).catch((cause) =>
+                deps.log(`[screenshot-push] 异常：${String(cause)}`),
+              );
+            },
+      );
   });
 
   const unsubscribeApproval = deps.bus.on<ApprovalView>('approval:created', (ev) => {

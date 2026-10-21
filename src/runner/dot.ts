@@ -2067,6 +2067,7 @@ export class DotRunner {
     this.repeatSkipsByTask.delete(taskId);
     this.toolCallCounts.delete(taskId);
     this.rewritesByPath.delete(taskId);
+    browserIdentityByTask.delete(taskId); // A1：浏览器身份表同样随任务终态释放
   }
 
 
@@ -2185,7 +2186,12 @@ export class DotRunner {
     // 接缝 G5：goalDigest 由 Runner 在 evaluate 前截取（≤800B）注入治理审查档
     const verdict = await this.governance.evaluate(
       { dotId: task.dotId, taskRef: { taskId: task.id, journalStepId: callId }, emergency: this.router.emergencyActive },
-      { callId, tool: execTool, params: execArgs, identity: identityOf(execArgs) },
+      {
+        callId,
+        tool: execTool,
+        params: execArgs,
+        identity: resolveBrowserIdentity(execTool, execArgs, browserIdentityByTask.get(task.id)),
+      },
       { goalDigest: goalDigestOf(ctx.goal) },
     );
 
@@ -2995,6 +3001,25 @@ function toolCall(
   };
   const id = identityOf(args);
   if (id !== undefined) call.identity = id;
+  // A1（2026-10-21）浏览器登录态持久化：容器端 launchPersistentContext +
+  // /dot/profiles 卷早已就绪，但宿主从不填 identity → 一切调用挤共享
+  // ephemeral，容器一重启登录态全丢（Muse 的"登进去"因此不可能）。
+  // 规则：显式 args.identity 优先（含 'anon'=无痕）；缺省时 browser.open
+  // 按网址域名派发 site:<host>，同任务的 act/snapshot/close 继承最后一次
+  // open 的身份；browser.close 清除。派发与治理审查用同一判定。
+  const resolved = resolveBrowserIdentity(tool, args, browserIdentityByTask.get(task.id));
+  if (resolved !== undefined) {
+    call.identity = resolved;
+    if (tool === 'browser.open') browserIdentityByTask.set(task.id, resolved);
+  }
+  if (tool === 'browser.close') browserIdentityByTask.delete(task.id);
+  // A1：身份由顶层 call.identity 承载（契约 G1）；容器侧 args schema 是
+  // additionalProperties:false，args.identity 留在 args 里会被容器 400 拒。
+  if (tool.startsWith('browser.') && call.args.identity !== undefined) {
+    const rest: Record<string, unknown> = { ...call.args };
+    delete rest.identity;
+    call.args = rest;
+  }
   return call;
 }
 
@@ -3004,6 +3029,40 @@ function toolCall(
  * 这里只透传 args 中显式出现的 identity 字段；缺失时不设（undefined），
  * 让治理按 fail-closed 处理。
  */
+/** A1：任务级浏览器身份表（taskId → 最近一次 browser.open 的 identity）。模块级
+ * 与 identityOf 同域（toolCall 是模块函数）；resetRepeatGuard 负责随任务终态清理。 */
+const browserIdentityByTask = new Map<string, string>();
+
+/** A1：从网址派生持久站点身份（site:<host>）；解析不了就不派发（fail-closed 由治理兜）。 */
+export function siteIdentityOf(url: unknown): string | undefined {
+  if (typeof url !== 'string' || url.length === 0) return undefined;
+  try {
+    const host = new URL(url).hostname;
+    if (host.length === 0) return undefined;
+    return `site:${host}`.slice(0, 80);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A1：浏览器系工具的身份解析（纯函数，toolCall 与治理审查共用同一判定）。
+ * 显式 args.identity 永远优先（'anon'=无痕，模型可显式要求不持久）；browser.open
+ * 缺省派发 site:<host>；其余 browser.* 继承该任务最近一次 open 的身份。
+ * 非 browser.* 一律 undefined（不挂 identity 字段）。
+ */
+export function resolveBrowserIdentity(
+  tool: string,
+  args: Record<string, unknown>,
+  prev: string | undefined,
+): string | undefined {
+  if (!tool.startsWith('browser.')) return undefined;
+  const explicit = args.identity;
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit;
+  if (tool === 'browser.open') return siteIdentityOf(args.url);
+  return prev;
+}
+
 function identityOf(args: Record<string, unknown>): string | undefined {
   const v = args.identity;
   if (typeof v === 'string' && v.length > 0) return v;

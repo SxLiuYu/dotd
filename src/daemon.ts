@@ -42,7 +42,16 @@ import { openDb, resolveDbPath } from '../db/conn.ts';
 import { MailService } from './mail/MailService.ts';
 import { CardRegistry, pushApprovalCard, resolveApprovalCard } from './surfaces/feishu-approval.ts';
 import { startProgressPush } from './surfaces/progress-push.ts';
-import { listEvents, listConflicts, renderList, renderConflicts } from './calendar/CalendarService.ts';
+import {
+  addLocalEvent,
+  deleteLocalEvent,
+  editLocalEvent,
+  listConflicts,
+  listEvents,
+  renderConflicts,
+  renderList,
+  type LocalEventInput,
+} from './calendar/CalendarService.ts';
 import { buildApprovalCard } from './surfaces/feishu-card.ts';
 import { migrate } from '../db/migrate.ts';
 
@@ -108,6 +117,8 @@ import {
 } from './surfaces/channels.ts';
 import { startFeishuWs } from './surfaces/feishu-ws.ts';
 import { startFeishuOutbound } from './surfaces/feishu-outbound.ts';
+import { githubNotifications, githubIssues, githubPulls } from './connectors/github.ts';
+import { fetchFeed } from './connectors/rss.ts';
 import { DotRunner } from './runner/dot.ts';
 import { loadEventRules } from './event-rules.ts';
 
@@ -1220,11 +1231,13 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     log('[mail] 未配置 DOTD_MAIL_KEY，邮件工具不注册（这是预期行为，配了密钥才启用）');
   }
 
-  // ── 日历只读工具（T6，2026-10-20）──────────────────────────────────────────────
+  // ── 日历工具（T6 只读订阅，2026-10-20；T7 本地写回，2026-10-21）─────────────────
   //
-  // 两个都是 read 档，因为这一版日历**没有任何写入方法**。
-  // 想加"创建日程"必须新开一个写档工具并走审批 ——
-  // 让读写共用同一个工具名等于把审批绕过去了。
+  // 读两个（calendar.list / conflicts）是 read 档；写三个（add/edit/delete，
+  // T7）是 write_file 档，**只动本地日历文件**（<dataDir>/calendar/local.ics），
+  // 订阅 .ics 是别人系统的投影，在写路径上永远只读。
+  // 读写分工具名而不是共用一个带开关的工具 —— 让"读"和"写"共用同一个工具名
+  // 等于把审批绕过去了。
   //
   // 为什么不需要密钥：读的是本地 .ics 文件。不连 Google/Outlook，
   // 所以没有 OAuth、没有 token 过期、没有申请审核。
@@ -1254,7 +1267,106 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     return { ok: true, value: { ...r, text: renderConflicts(r) } };
   });
 
-  log(`[calendar] 日历工具已注册（2 个，只读），日历目录：${calendarDir}`);
+  exec.registerHostTool('calendar.add', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const input: LocalEventInput = {
+      summary: typeof a.summary === 'string' ? a.summary : '',
+      start: typeof a.start === 'string' ? a.start : '',
+    };
+    if (typeof a.end === 'string') input.end = a.end;
+    if (typeof a.durationMin === 'number') input.durationMin = a.durationMin;
+    if (typeof a.location === 'string') input.location = a.location;
+    if (typeof a.notes === 'string') input.notes = a.notes;
+    const r = addLocalEvent({ dir: calendarDir }, Date.now(), input);
+    if (!r.ok) return { ok: false, code: 'BAD_ARG', message: r.error, retryable: false };
+    // 加完顺手查 14 天冲突（本地+订阅合并后查），把"撞车"直接递到模型眼前
+    const c = listConflicts({ dir: calendarDir }, Date.now(), 14);
+    const mine = c.conflicts.filter((x) => x.a.uid === r.event.uid || x.b.uid === r.event.uid);
+    const dupNote = r.duplicate === true ? '（同一条此前已加过，未重复添加）' : '';
+    const conflictNote = mine.length > 0 ? `；注意：与已有日程冲突 ${mine.length} 处` : '';
+    return {
+      ok: true,
+      value: {
+        event: r.event,
+        ...(r.duplicate === true ? { duplicate: true } : {}),
+        conflicts: mine,
+        text: `已加日程：${r.event.summary}${dupNote}${conflictNote}。`,
+      },
+    };
+  });
+
+  exec.registerHostTool('calendar.edit', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const patch: Partial<LocalEventInput> = {};
+    if (typeof a.summary === 'string') patch.summary = a.summary;
+    if (typeof a.start === 'string') patch.start = a.start;
+    if (typeof a.end === 'string') patch.end = a.end;
+    if (typeof a.durationMin === 'number') patch.durationMin = a.durationMin;
+    if (typeof a.location === 'string') patch.location = a.location;
+    if (typeof a.notes === 'string') patch.notes = a.notes;
+    const r = editLocalEvent(
+      { dir: calendarDir },
+      Date.now(),
+      typeof a.id === 'string' ? a.id : '',
+      patch,
+    );
+    if (!r.ok) return { ok: false, code: 'BAD_ARG', message: r.error, retryable: false };
+    return { ok: true, value: { event: r.event, text: `已改日程：${r.event.summary}。` } };
+  });
+
+  exec.registerHostTool('calendar.delete', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const r = deleteLocalEvent({ dir: calendarDir }, Date.now(), typeof a.id === 'string' ? a.id : '');
+    if (!r.ok) return { ok: false, code: 'BAD_ARG', message: r.error, retryable: false };
+    return {
+      ok: true,
+      value: { removed: r.removed, text: r.removed ? '已删除该日程。' : '本地日历里没有这个 id，没有日程被删。' },
+    };
+  });
+
+  log(`[calendar] 日历工具已注册（5 个：读 2 + 写 3，写只动本地日历），日历目录：${calendarDir}`);
+
+  // === 连接器第一批（2026-10-21，task-2 接线）：github x3 + rss.read ===
+  // 连接器实现永不抛、失败返回 {ok:false, error:"前缀: 详情"}；这里只做
+  // 形状适配（宿主工具约定 {ok,value} / {ok:false,code,message}）与 limit->per_page。
+  const connectorWrap = (r: { ok: boolean; error?: string }) =>
+    r.ok
+      ? { ok: true as const, value: r }
+      : {
+          ok: false as const,
+          code: String(r.error ?? 'connector_error').split(/[：:]/, 1)[0] || 'connector_error',
+          message: r.error ?? '连接器失败',
+          retryable: false,
+        };
+  exec.registerHostTool('github.notifications', async () => connectorWrap(await githubNotifications()));
+  const pageOf = (a: Record<string, unknown>) =>
+    typeof a['page'] === 'number' ? Math.max(1, Math.floor(a['page'])) : 1;
+  const limitOf = (a: Record<string, unknown>) =>
+    typeof a['limit'] === 'number' ? Math.max(1, Math.min(50, Math.floor(a['limit']))) : 20;
+  exec.registerHostTool('github.issues', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    return connectorWrap(
+      await githubIssues(
+        typeof a['owner'] === 'string' ? a['owner'] : '',
+        typeof a['repo'] === 'string' ? a['repo'] : '',
+        { page: pageOf(a), perPage: limitOf(a) },
+      ),
+    );
+  });
+  exec.registerHostTool('github.pulls', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    return connectorWrap(
+      await githubPulls(
+        typeof a['owner'] === 'string' ? a['owner'] : '',
+        typeof a['repo'] === 'string' ? a['repo'] : '',
+        { page: pageOf(a), perPage: limitOf(a) },
+      ),
+    );
+  });
+  exec.registerHostTool('rss.read', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    return connectorWrap(await fetchFeed(typeof a['url'] === 'string' ? a['url'] : ''));
+  });
 
   const bootReport = await exec.boot(cfg.dotIds);
   for (const w of bootReport.warnings) log(`[exec] boot 告警：${w}`);
@@ -1400,6 +1512,28 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           // 系统级通知（如 dot 被隔离）发到主人默认会话的第一个 chat
           fallbackChatId:
             surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0] ?? null,
+          // A3：截图随单推送 —— 文本回复发出成功后触发（见 screenshot-push.ts）。
+          // 读图走容器 fs.read(base64)；发图走 FeishuGateway.sendImage。
+          screenshotPush: {
+            db,
+            log,
+            readHomeFile: async (dotId, path) => {
+              const call: ExecToolCall = {
+                call_id: `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                task_id: 'screenshot-push',
+                dot_id: dotId,
+                tool: 'fs.read',
+                args: { path, encoding: 'base64' },
+                deadline_ms: 30_000,
+                issued_at: new Date().toISOString(),
+              };
+              const r = await exec.runTool(call);
+              if (r.status !== 'ok') return null;
+              const b64 = (r.result as { content_base64?: string } | undefined)?.content_base64;
+              return typeof b64 === 'string' && b64.length > 0 ? Buffer.from(b64, 'base64') : null;
+            },
+            sendImage: (chatId, png) => feishuGw.sendImage(chatId, png),
+          },
         })
       : null;
 

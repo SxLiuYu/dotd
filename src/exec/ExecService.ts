@@ -258,7 +258,7 @@ export interface ExecServiceDeps {
  * 所以容器返回的能力目录里天然没有它们 —— getCapabilities 必须把它们合并进去，
  * 否则模型根本看不见（2026-10-18 实测：主人让设提醒，模型答"schedule.create 不在列表里"）。
  */
-const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send']);
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read']);
 
 export class ExecServiceImpl implements ExecService {
   readonly cfg: ExecConfig;
@@ -521,6 +521,20 @@ export class ExecServiceImpl implements ExecService {
     if (invalid !== null && invalid !== undefined) {
       this.fleet.failCall(call.call_id, invalid.code, call);
       return { call_id: call.call_id, status: 'error', error: invalid, finished_at: at };
+    }
+
+    // A1（2026-10-21）：持久身份入 exec_identities 台账（S5 审计）。
+    // 'anon'/undefined 不入账（契约 G1 末段：非持久 profile 不落台账）。
+    if (
+      call.tool.startsWith('browser.') &&
+      typeof call.identity === 'string' &&
+      call.identity !== 'anon'
+    ) {
+      try {
+        this.fleet.setIdentity(call.dot_id, call.identity);
+      } catch {
+        // 台账失败不挡执行
+      }
     }
 
     const mode = this.modeOf(call.tool);

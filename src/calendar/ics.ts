@@ -1,17 +1,19 @@
 /**
- * src/calendar/ics.ts —— iCalendar 只读解析（T6，2026-10-20）
+ * src/calendar/ics.ts —— iCalendar 解析（T6，2026-10-20）与本地日历生成（T7，2026-10-21）
  *
- * 为什么是只读
- *   读日历（"下周三有什么会"）是高频、低风险的需求。
- *   写日历是另一回事：写错了别人的日程会被打扰，
- *   而且冲突检测、时区、参与人、重复规则每一样都能出错。
- *   Muse 的报道里记者让它"看我明天的安排"，没说让它改。
- *   所以这一版只读 —— 能力边界诚实，比"号称能写但会搞坏你的日历"好。
+ * 只读边界及其演化（T6 → T7）
+ *   T6 整体只读：写错了别人的日程会被打扰，冲突检测、时区、参与人、
+ *   重复规则每一样都能出错 —— 能力边界诚实，比"号称能写但会搞坏你的日历"好。
+ *   T7 把边界改成"**订阅只读，本地可写**"：订阅 .ics 是别人系统的投影，
+ *   永远只读；本地日历（local.ics）是我们自己的数据，本文件因此新增
+ *   **生成侧**（escapeIcsText / foldIcsLine / serializeIcs）。写文件仍归
+ *   CalendarService，本文件保持纯文本进出、不碰文件系统。
  *
  * 为什么手写而不装库
  *   dotd 零运行时依赖（只有 node: 内置模块）。ICS 是行式
  *   `KEY;PARAM=VALUE:CONTENT`，折行用行首空格续接。
- *   一个库换来的是我已经理解的解析器，不值。
+ *   一个库换来的是我已经理解的解析器，不值。生成侧同理：手写才能保证
+ *   写出去的文件一定被自己的解析器认得（往返自洽是硬要求）。
  *
  * RFC 5545 里真正会咬人的四条（都实现了）
  *   ① 折行：超过 75 字节的长行用「CRLF + 一个空格」续接。
@@ -305,4 +307,119 @@ export function eventsInWindow(events: CalendarEvent[], nowMs: number, windowDay
   return events
     .filter((e) => e.startMs !== null && e.startMs >= from && e.startMs < to)
     .sort((x, y) => (x.startMs ?? 0) - (y.startMs ?? 0));
+}
+
+// ═════════════════════════════════════════════════════════════════
+// 生成侧（T7，2026-10-21）：本地日历的 ICS 写出
+// ═════════════════════════════════════════════════════════════════
+//
+// 与解析侧同住一个文件是刻意的：折行/转义/时刻格式这三件事，读和写
+// 必须用同一套认知，分开放迟早漂移（写出去的文件自己都读不回来）。
+
+/** 转义 ICS TEXT 值（RFC 5545 §3.3.11，解析侧 unescapeText 的镜像）。 */
+export function escapeIcsText(s: string): string {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i] ?? '';
+    if (ch === '\r') continue; // \r\n 或 \r 都算一个换行，统一输出 \n
+    if (ch === '\n') out += '\\n';
+    else if (ch === '\\' || ch === ';' || ch === ',') out += '\\' + ch;
+    else out += ch;
+  }
+  return out;
+}
+
+/**
+ * 生成侧折行（RFC 5545 §3.1，解析侧 unfoldLines 的镜像）：
+ * 单行（不含 CRLF）不得超过 75 **字节**，超长用「CRLF + 一个空格」续接。
+ * 按字节切而不是按字符切 —— 中文一行 25 个字就到 75 字节；
+ * 且按完整码点推进，绝不把一个多字节字符切成两半。
+ */
+export function foldIcsLine(line: string): string {
+  const LIMIT = 75;
+  const segs: string[] = [];
+  let cur = '';
+  let octets = 0;
+  for (let i = 0; i < line.length; ) {
+    const code = line.codePointAt(i) ?? 0;
+    const width = code > 0xffff ? 2 : 1;
+    const ch = line.slice(i, i + width);
+    const oct = Buffer.byteLength(ch, 'utf8');
+    if (octets + oct > LIMIT) {
+      segs.push(cur);
+      cur = ' '; // 续行以空格开头，这个空格占续行的 1 字节配额
+      octets = 1;
+    }
+    cur += ch;
+    octets += oct;
+    i += width;
+  }
+  segs.push(cur);
+  return segs.join('\r\n');
+}
+
+/** epoch ms → `YYYYMMDDTHHMMSSZ`（UTC）。 */
+export function toIcsUtc(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return (
+    String(d.getUTCFullYear()) + p(d.getUTCMonth() + 1) + p(d.getUTCDate()) +
+    'T' + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()) + 'Z'
+  );
+}
+
+/** epoch ms → `YYYYMMDD`（按**本地**日历日，全天事件用；按 UTC 会错一天）。 */
+export function toIcsDateOnly(ms: number): string {
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return String(d.getFullYear()) + p(d.getMonth() + 1) + p(d.getDate());
+}
+
+/** 生成侧的事件草稿（字段与 VEVENT 一一对应）。 */
+export interface IcsEventDraft {
+  uid: string;
+  /** 开始（epoch ms）。 */
+  startMs: number;
+  /** 结束（epoch ms）。全天事件忽略此值（只写 DTSTART;VALUE=DATE，解析侧默认 +24h）。 */
+  endMs: number;
+  allDay: boolean;
+  summary: string;
+  location: string;
+  description: string;
+  /** DTSTAMP。解析侧不保留它，所以每次重写文件都取当下 —— 语义=「本文件何时写成」。 */
+  dtstampMs: number;
+}
+
+/**
+ * 把事件列表序列化成一个完整 VCALENDAR 文本（CRLF 行尾，RFC 5545 口径）。
+ *
+ * 刻意**全量重写**而不是往文件追加/原地改：.ics 是「行式 + 折行」格式，
+ * 原地改字节是坏文件之源；文件只有几 KB，全量重写幂等且可重建
+ * （同一批事件 → 同一字节输出；删掉文件重新加也就几毫秒）。
+ *
+ * 本地事件的时间一律写 **UTC（Z 形态）**：TZID 要配 VTIMEZONE 才完整，
+ * 而解析侧不展开时区定义 —— 写 TZID 会在非本地时区的机器上漂移；
+ * Z 形态往返自洽，且满足"DTSTART 带时区"。
+ */
+export function serializeIcs(events: IcsEventDraft[]): string {
+  const lines: string[] = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//dotd//local calendar//CN'];
+  for (const e of events) {
+    lines.push('BEGIN:VEVENT');
+    lines.push('UID:' + e.uid);
+    lines.push('DTSTAMP:' + toIcsUtc(e.dtstampMs));
+    if (e.allDay) {
+      lines.push('DTSTART;VALUE=DATE:' + toIcsDateOnly(e.startMs));
+      // 全天不写 DTEND：DATE 形的 DTEND 是"非包含"语义，自己补容易差一天，
+      // 让解析侧按惯例默认 +24h。
+    } else {
+      lines.push('DTSTART:' + toIcsUtc(e.startMs));
+      lines.push('DTEND:' + toIcsUtc(e.endMs));
+    }
+    lines.push('SUMMARY:' + escapeIcsText(e.summary));
+    if (e.location !== '') lines.push('LOCATION:' + escapeIcsText(e.location));
+    if (e.description !== '') lines.push('DESCRIPTION:' + escapeIcsText(e.description));
+    lines.push('END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+  return lines.map((l) => foldIcsLine(l)).join('\r\n') + '\r\n';
 }

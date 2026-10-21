@@ -1,0 +1,26 @@
+[
+  {
+    "id": "1001",
+    "reason": "mention",
+    "subject": {
+      "title": "fix: connector rate limit",
+      "type": "Issue",
+      "url": "https://api.github.com/repos/octo/hello/issues/12"
+    },
+    "repository": { "full_name": "octo/hello" },
+    "updated_at": "2026-02-11T08:30:00Z",
+    "unread": true
+  },
+  {
+    "id": "1002",
+    "reason": "review_requested",
+    "subject": {
+      "title": "Add RSS connector",
+      "type": "PullRequest",
+      "url": "https://api.github.com/repos/octo/hello/pulls/9"
+    },
+    "repository": { "full_name": "octo/hello" },
+    "updated_at": "2026-02-10T19:00:00Z",
+    "unread": false
+  }
+]

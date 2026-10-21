@@ -410,3 +410,80 @@ Muse 的报道里记者让它"看我明天的安排"，没说让它改。所以�
 | 找不到 mail 注册标记 | `AssertionError` | 那是反引号模板串不是普通字符串，marker 里少了 `` ` `` |
 
 ---
+
+---
+
+## A1 浏览器登录态持久化 + A3 截图（2026-10-21，lead）
+
+### 要解决的真问题
+
+Muse 的演示里 agent 是"替你操作浏览器"的：登录过的网站它接着用，网页长什么样主人看得见。dotd 此前两个都缺：
+
+- 每次开浏览器都是全新 profile，**163/GitHub 的登录态活不过一次调用**；
+- 模型只能"读"页面（snapshot 文本），主人永远**看不见**网页画面——填好的表单、查到的账单，全靠模型用文字转述。
+
+### A1 的设计：身份是宿主推导的，模型不用管 profile
+
+- `browser.open` 的 `args.identity` 可选：不填 = 按 URL 域名自动推导 `site:<host>`（截 80 字符），每个身份一个持久 profile 目录 `/dot/profiles/<sha256(身份)前16位>`；显式 `anon` = 无痕。`browser.act/snapshot/close` 不传就**继承本任务当前身份**。
+- 治理判定与真实派发共用同一个 `resolveBrowserIdentity()`——否则"审的是 A、跑的是 B"。
+- 派发前把 `args.identity` 从 args 里剥掉：容器 schema 是 `additionalProperties:false`，不剥会被容器 400 拒。
+- profile 卷挂载持久（docker volume），cookie 由 Chromium 自己管理；**硬重启会丢未冲刷的 cookie**—— Chromium 是批量落盘的，所以一切"要保登录态"的流程最后都要 `browser.close`（这同时释放 2 上下文/3 页面配额）。
+
+### A3 的设计：base64 绝不进模型上下文
+
+- 容器端 `browser.screenshot`：PNG 落 `/dot/home/screenshots/<task>-<call>.png`（持久卷），结果只带 `{path, bytes, sha256}`。base64 一旦进工具结果，就会进模型上下文（几百 KB）+ journal（永久）——两头都是灾难。
+- 出站推送三段：① journal `steps` 表按 task 查 succeeded 的截图步骤（≤3 张，新的在前）→ ② 宿主经容器 `fs.read(base64)` 取回字节 → ③ `FeishuGateway.sendImage`（im/v1/images 上传拿 image_key → im/v1/messages 发 image 消息）。
+- 触发点在出站层"文本回复发送成功之后"——截图是**随单附件**，不是独立消息；任何一步失败只落日志，绝不影响已发出的回复。
+
+### 实机证据
+
+- A1：`scripts/regress/browser-identity-e2e.sh` **6/6 PASS**（exit 0）——同一身份跨 `docker restart` cookie 存活（`CK sid=e2e123`）、`anon` 隔离干净（`CK none`）、profile 目录 `ae62613a33075f6d` 真实落盘。
+- A3：`scripts/regress/browser-screenshot-e2e.sh`（daemon 重启后跑）——断言 path 形状、bytes>100、**PNG 魔数 89504E47 落盘**、容器内 sha256sum 与工具返回一致。
+- 单测：runner-browser-identity 12 断言、screenshot-push/网关发图 52 绿。
+
+### 踩到的坑
+
+| 坑 | 现象 | 根因 |
+|---|---|---|
+| 批量补丁两次截断文件 | protocol.ts 769→210 行、tool-catalog.ts 同型截断，都断在插入点后一行的中间 | Python 写文件没关句柄（`io.open(...).write(s)` 一行式），缓冲没冲完进程就退了。**全部改为 with 块 + flush + 写后全文回读比对** |
+| WSL 树不是 git 仓库 | 截断后在 WSL 里 `git checkout` 报 not a git repository | 权威库在 `D:\toagi\dotd`，WSL `/root/dotd` 是运行副本——恢复必须回 D 侧做 |
+| 防漂移测试逮住容器侧新增 | tsc 报 contracts 类型 Exact 不满足 | 容器 `ToolName` 与契约 `ToolName` 是编译期 Exact 等价——两侧必须同步加名，这正是防漂移存在的意义 |
+| 缩进连环判断错误 | 锚点命中 0 次 | 终端输出的缩进前缀是显示用的；**一律先 repr()/cat -A 看真实字节再定锚**，或用"按名字定位 + 缩进自适应" |
+
+### 刻意不做的
+
+- **不给模型看截图内容**（本批）：多模态回喂已有 inbound 先例（loadGoalImages），但截图回喂会让上下文爆炸，先只做"给主人看"。
+- **不做截图基64直返**：见上，架构上就不允许。
+- **不推送失败重试**：截图是附件不是主件，丢了可重截，不值得一套重试状态机。
+
+
+## C 连接器第一批（2026-10-21，lead 集成 task-2 交付）
+
+**范围拍板**：第一批 4 工具上目录——`github.notifications` / `github.issues` / `github.pulls` / `rss.read`（`rss.feeds` 无订阅清单数据源，随 subscribe/remove 一起推迟到第二批；详见 SPEC_BLOCK 开放点 ②③）。
+
+**接线五层**（与 mail/calendar 同路径）：
+1. `src/exec/protocol.ts` catalog 尾部 +4（全 sync / 60s / safe，注释标宿主侧）；
+2. `src/exec/ExecService.ts` HOST_SIDE_TOOLS 14→18；
+3. `src/daemon.ts` registerHostTool ×4 + `connectorWrap` 适配器（连接器永不抛、失败 `{ok:false,error:"前缀: 详情"}` → 宿主约定 `{ok:false,code,message,retryable:false}`，code 取前缀 no_token/timeout/network/http_403/bad_json）；
+4. `src/runner/tool-catalog.ts` ToolDoc ×4 + 引导段第 9 条（造工具顺延为 10）；`SYSTEM_PROMPT_BUDGET` 4400→4600（runner-tool-catalog 预算断言同步 4600）；
+5. `config/tools.yml` +4 块 tier: read（全只读 GET）。
+
+**两个设计决定**：
+- **limit 而非 per_page**：模型侧参数口径统一为 `limit`（与 mail.list 一致），处理器内映射 `perPage: min(max(limit,1),50)`。GitHub 原生 per_page ≤100，我们收口到 50 防炸上下文。
+- **failure code 前缀透传**：连接器 error 串形如 `no_token：...`，wrap 层按 `：/:` 切前缀当 code，模型能据此决定"提示主人配 token"还是"稍后重试"。
+
+**守卫同步**：`tests/agent-runtime-protocol.test.ts` HOST_SIDE_ONLY +4（容器↔宿主防漂移）；`tests/exec-protocol.test.ts` 计数 30→34 ×2 + expect 4 行；`tests/runner-tool-catalog.test.ts` 顺序数组 +4；`scripts/regress/calendar-criteria.sh` 双向镜像守卫改为前缀匹配 `/^(schedule|mail|calendar|github|rss)\./`（不再是写死 14），tools.yml 下界 ≥35，目录尾部收口判据改为 rss.read 收尾。
+
+**未配 token 的降级路径**（connector 实现）：`github.notifications` → 结构化 `no_token` 错误（提示主人去配，不重试）；`github.issues/pulls` 公开仓照常可用（60 请求/时限速）。`DOTD_GITHUB_TOKEN` 未装钥匙，属 backlog。
+
+
+### A3/C 实机验收记录（2026-10-21，lead）
+
+**结果**：`browser-identity-e2e.sh` PASS、`browser-screenshot-e2e.sh` PASS 3/3（path 白名单 / bytes>100 / sha256 对上容器内文件魔数 89504e47）；ask 冒烟任务 tk_mvhcse7dq0lnyl 全链 done：browser.open → browser.screenshot（PNG 落 `/dot/home/screenshots/`，5388B）→ `FeishuGateway.sendImage` 返回 `{"ok":true}`，截图真实送达主人飞书。
+
+**实机抓到的三个坑（单测全绿也拦不住，都是 e2e 的功劳）**：
+1. **外层 dispatch switch 漏 case**：A3 把 `case 'browser.screenshot'` 加进了 `browserCall()` 的内层 switch，但外层工具分发 switch（server.ts 664-667）没加 → 运行时永远 `unknown_tool`。单测直接调 browserCall 所以绿。教训：加工具必须五层全查（catalog/union/name 列表/CAPABILITIES/外层 dispatch case）。
+2. **runtime 词表是容器内 dist**：改了 /root/dotd 源码不等于容器生效——必须 `scripts/rebuild-image.sh`（删镜像→删容器→daemon 重建镜像拉新容器，卷都外挂不丢）。诊断信号：宿主侧 `/capabilities` 是新的、容器 runtime 报 unknown_tool。
+3. **undici FormData 被飞书拒**：`FormData+Blob` 上传 `/im/v1/images` 报 230001 invalid parameter，同一 PNG 用 `curl -F` 成功 → channels.ts 改为手工拼 RFC2046 边界体（与 curl 逐字节对齐），live 通过。
+
+**顺带发现（backlog 候选）**：browser.snapshot 在容器 playwright 上 `page.snapshot is not a function`（新版 API 是 ariaSnapshot）；gov 对每个 browser.* 步骤都发审批卡（一台本地测试页也要批一次）——后续考虑给 safe 档 browser.* 记忆式放行。

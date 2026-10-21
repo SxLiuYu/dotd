@@ -25,6 +25,8 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFileSync, existsSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { hostname, uptime } from 'node:os';
 import type { ToolCall, ToolResult, Capability, HealthReport, JobView, JobEvent } from './protocol.ts';
 import {
@@ -662,6 +664,7 @@ export class AgentRuntime {
       case 'browser.open':
       case 'browser.act':
       case 'browser.snapshot':
+      case 'browser.screenshot':
       case 'browser.close':
         return this.browserCall(call, key, jobId);
       case 'net.get':
@@ -737,6 +740,30 @@ export class AgentRuntime {
           return this.browserAct(call, page);
         case 'browser.snapshot':
           return okResult(call.call_id, await page.snapshot());
+        case 'browser.screenshot': {
+          // A3（2026-10-21）：截图落 home 卷（/dot/home/screenshots，持久），
+          // 结果只带元数据 —— base64 不进结果 → 模型上下文零污染、journal 不膨胀。
+          // 出站推送时宿主再经 fs.read base64 取回（feishu-outbound）。
+          if (typeof page.screenshot !== 'function') {
+            return errorResult(
+              call.call_id,
+              ERROR_CODES.bad_args,
+              '该页面不支持截图（测试桩未实现 screenshot）',
+              false,
+            );
+          }
+          const png = await page.screenshot();
+          const safeCall = call.call_id.replace(/[^A-Za-z0-9._-]/g, '_');
+          const dir = `${this.cfg.homeRoot ?? '/dot/home'}/screenshots`;
+          await mkdir(dir, { recursive: true });
+          const file = `${dir}/${call.task_id.replace(/[^A-Za-z0-9._-]/g, '_')}-${safeCall}.png`;
+          await writeFile(file, png);
+          return okResult(call.call_id, {
+            path: file,
+            bytes: png.byteLength,
+            sha256: createHash('sha256').update(png).digest('hex'),
+          });
+        }
         default:
           return errorResult(call.call_id, ERROR_CODES.unknown_tool, 'unreachable', false);
       }

@@ -148,16 +148,17 @@ test('计数工具自证：故意不删的目录必须被数出来（否则判�
 });
 
 test('净增长为 0：本文件建的临时目录全部删干净', () => {
-  const base = countTempDirs();
+  // 判据拆分（2026-10-21）：本文件内能确定性保证的是「自己建的目录自己删干净」
+  // ——按名字逐一 existsSync 断言，无并发噪声。全局净增长（抓别的文件忘了
+  // cleanup）挪到 scripts/regress/temp-leak-criteria.sh：套件级前后计数，天然
+  // 串行、确定性。在并行 node --test 里数全局目录会被别的文件的存活目录
+  // 误伤（单跑恒绿、全量偶红，连接器集成期间实测复现）。
   const dirs = [makeTempDataDir(), makeTempDataDir(), makeTempDataDir()];
-  assert.ok(countTempDirs() > base, '计数工具自检：建目录后必须数得出来');
+  assert.ok(countTempDirs() > 0, '计数工具自检：TEMP 里至少数得出本文件的目录');
   for (const d of dirs) d.cleanup();
-  const end = countTempDirs();
-  assert.ok(
-    end <= base,
-    `本文件跑完后 dotd-test-* 从 ${base} 涨到 ${end}：` +
-      '说明有目录没被删掉。注意本判据只看本文件，跨文件泄漏靠 npm test 后的手工复核',
-  );
+  for (const d of dirs) {
+    assert.ok(!existsSync(d.root), `自建目录没删干净：${d.root}`);
+  }
 });
 
 /** TEMP 里 dotd-test-* 目录个数（读不到时 0）。 */

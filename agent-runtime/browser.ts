@@ -63,6 +63,9 @@ export interface BrowserPage {
   url(): string;
   /** 可读快照（a11y 树/简化 DOM）。 */
   snapshot(): Promise<{ text: string; html?: string }>;
+  /** PNG 截图（A3，2026-10-21）。可选：测试桩可不实现，handler 会优雅报错。
+   * 真实实现就是 playwright Page.screenshot({type:'png'})，天然满足。 */
+  screenshot?(): Promise<Uint8Array>;
   close(): Promise<void>;
 }
 

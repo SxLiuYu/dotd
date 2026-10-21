@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title><![CDATA[科技周报 & More]]></title>
+    <atom:link href="https://weekly.example.com/rss" rel="self" type="application/rss+xml"/>
+    <item>
+      <title>一号 &amp; 二号齐发</title>
+      <link>https://weekly.example.com/posts/1?utm=rss&amp;src=feed</link>
+      <pubDate>Wed, 11 Feb 2026 08:00:00 GMT</pubDate>
+      <dc:creator>小明</dc:creator>
+      <content:encoded><![CDATA[<p>正文 <b>加粗</b> 与 &quot;引号&quot;</p>]]></content:encoded>
+      <description>短摘要版本（不应被采用，content:encoded 优先）</description>
+    </item>
+    <item>
+      <title>重复条目（同 link 应去重）</title>
+      <link>https://weekly.example.com/posts/1?utm=rss&amp;src=feed</link>
+      <pubDate>Wed, 11 Feb 2026 09:00:00 GMT</pubDate>
+      <description>dup</description>
+    </item>
+    <item>
+      <title><![CDATA[第三条：无 pubDate 只有 dc:date]]></title>
+      <link>https://weekly.example.com/posts/3</link>
+      <dc:date>2026-02-10T12:00:00+08:00</dc:date>
+      <description>数字实体 &#39;single&#39; 与 &lt;em&gt;标签&lt;/em&gt;</description>
+    </item>
+  </channel>
+</rss>

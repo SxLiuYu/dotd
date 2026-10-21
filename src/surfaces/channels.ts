@@ -364,6 +364,76 @@ export class FeishuGateway {
   }
 
   /** 发送文本消息（§5.7 同款 3 次快重试由调用方编排，这里只发一次）。 */
+  /**
+   * A3（2026-10-21）：发一张 PNG 截图。两步：im/v1/images 上传拿 image_key，
+   * 再 im/v1/messages 发 image 消息。上传走 multipart（fetch 原生 FormData/Blob）。
+   */
+  async sendImage(chatId: string, png: Buffer): Promise<DeliverResult> {
+    try {
+      const token = await this.accessToken();
+      // 手工拼 multipart（2026-10-21）：undici 的 FormData/Blob 会被飞书拒
+      // （code=230001 invalid parameter，同一文件用 curl -F 就成功），不再赌它的
+      // 序列化细节，直接按 RFC 2046 拼边界体，与 curl -F 行为逐字节对齐。
+      const boundary = `----dotd-shot-${Date.now()}`;
+      const head = Buffer.from(
+        `--${boundary}\r\n` +
+          'Content-Disposition: form-data; name="image_type"\r\n\r\n' +
+          `message\r\n--${boundary}\r\n` +
+          'Content-Disposition: form-data; name="image"; filename="shot.png"\r\n' +
+          'Content-Type: image/png\r\n\r\n',
+      );
+      const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+      const up = await fetch(
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/images`,
+        {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${token}`,
+            'content-type': `multipart/form-data; boundary=${boundary}`,
+          },
+          body: Buffer.concat([head, png, tail]),
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      const uj = (await up.json()) as { code?: number; msg?: string; data?: { image_key?: string } };
+      if (uj.code !== 0 || uj.data?.image_key === undefined) {
+        return { ok: false, error: `图片上传失败：code=${uj.code} msg=${uj.msg ?? '?'}` };
+      }
+      return await this.sendImageByKey(chatId, uj.data.image_key);
+    } catch (cause) {
+      return { ok: false, error: String(cause) };
+    }
+  }
+
+  /** 用已有 image_key 发图片消息（同一张图重复用有上限，不在本层管）。 */
+  async sendImageByKey(chatId: string, imageKey: string): Promise<DeliverResult> {
+    try {
+      const token = await this.accessToken();
+      const res = await fetch(
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/messages?receive_id_type=chat_id`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            receive_id: chatId,
+            msg_type: 'image',
+            content: JSON.stringify({ image_key: imageKey }),
+          }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const json = (await res.json()) as { code?: number; msg?: string };
+      if (json.code !== 0) return { ok: false, error: `飞书 code=${json.code} msg=${json.msg ?? '?'}` };
+      this.lastOkAtMs = Date.now();
+      return { ok: true };
+    } catch (cause) {
+      return { ok: false, error: String(cause) };
+    }
+  }
+
   async sendText(chatId: string, text: string): Promise<DeliverResult> {
     try {
       const token = await this.accessToken();

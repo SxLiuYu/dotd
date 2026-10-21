@@ -168,7 +168,7 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     name: 'browser.open',
     mode: 'async',
     max_deadline_ms: 30 * 60_000,
-    args_schema: obj({ url: str('http(s) URL') }, ['url']),
+    args_schema: obj({ url: str('http(s) URL'), identity: str('浏览器身份；不填=按域名自动持久登录态，anon=无痕') }, ['url']),
     sideEffect: 'unknown',
   },
   {
@@ -190,6 +190,13 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     mode: 'async',
     max_deadline_ms: 30 * 60_000,
     args_schema: obj({ selector: str('可选：只截取某区域') }),
+    sideEffect: 'safe',
+  },
+  {
+    name: 'browser.screenshot',
+    mode: 'async',
+    max_deadline_ms: 30 * 60_000,
+    args_schema: obj({}),
     sideEffect: 'safe',
   },
   {
@@ -440,6 +447,107 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     ),
     // 一封真实外发邮件，绝不能自动重放
     sideEffect: 'unknown',
+  },
+  {
+    /** 宿主侧工具：往本地日历加一条事件（写 <dataDir>/calendar/local.ics；订阅 .ics 只读）。 */
+    name: 'calendar.add',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        summary: str('日程标题，如 "周会"'),
+        start: str('开始时间：2026-10-25T09:00:00+08:00（带时区）/ 2026-10-25 09:00（本地）/ 2026-10-25（全天）'),
+        end: str('可选。结束时间，与 durationMin 二选一；都不给按 1 小时'),
+        durationMin: { type: 'integer', minimum: 1, description: '可选。时长（分钟）' },
+        location: str('可选。地点'),
+        notes: str('可选。备注（写进 DESCRIPTION）'),
+      },
+      ['summary', 'start'],
+    ),
+    // 内容幂等：同 标题+开始+结束 已存在时返回已有事件 —— 声明 safe 的前提是
+    // 重放不会造出第二份 VEVENT（实现见 CalendarService.addLocalEvent）。
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧工具：改一条**本地**日历事件（订阅 .ics 是别人系统的投影，改不了）。 */
+    name: 'calendar.edit',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        id: str('事件 id，从 calendar.add 的返回或 calendar.list 结果里拿'),
+        summary: str('可选。新标题'),
+        start: str('可选。新开始时间，写法同 calendar.add；只平移开始时保持原时长'),
+        end: str('可选。新结束时间'),
+        durationMin: { type: 'integer', minimum: 1, description: '可选。新时长（分钟）' },
+        location: str('可选。新地点'),
+        notes: str('可选。新备注'),
+      },
+      ['id'],
+    ),
+    sideEffect: 'replayable',
+  },
+  {
+    /** 宿主侧工具：删一条**本地**日历事件（订阅 .ics 只读，删不了）。 */
+    name: 'calendar.delete',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      { id: str('要删除的本地事件 id，从 calendar.add 的返回或 calendar.list 结果里拿') },
+      ['id'],
+    ),
+    sideEffect: 'replayable',
+  },
+  {
+    /** 宿主侧：列当前 GitHub 通知（mention / review_requested 等，需配 token）。 */
+    name: 'github.notifications',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj({}, []),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧：列一个仓库的 open issues（updated 倒序，已剥离 PR 混入）。 */
+    name: 'github.issues',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        owner: str('仓库属主，如 "octo"'),
+        repo: str('仓库名，如 "hello"'),
+        page: { type: 'integer', minimum: 1, description: '页码，缺省 1（翻页看返回里的 nextPage）' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '每页条数，缺省 20（内部映射 GitHub 的 per_page）' },
+      },
+      ['owner', 'repo'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧：列一个仓库的 open pull requests（updated 倒序）。 */
+    name: 'github.pulls',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        owner: str('仓库属主'),
+        repo: str('仓库名'),
+        page: { type: 'integer', minimum: 1, description: '页码，缺省 1' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '每页条数，缺省 20（内部映射 GitHub 的 per_page）' },
+      },
+      ['owner', 'repo'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧：拉取并解析一个 RSS 2.0 / Atom 源，返回去重后的条目。 */
+    name: 'rss.read',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      { url: str('订阅源 URL，http(s)，如 "https://example.com/feed.xml"') },
+      ['url'],
+    ),
+    sideEffect: 'safe',
   },
 ];
 

@@ -60,6 +60,8 @@ tools:
     #                          && call.identity != null && call.identity !== 'anon'
   - name: browser.snapshot
     tier: read                              # 读取当前页面结构，无副作用
+  - name: browser.screenshot            # 只读动作：PNG 落盘，不与页面交互
+    tier: read
   - name: browser.close
     tier: read                              # 关 context，profile 留卷上（EX §5.5）
   - name: net.get
@@ -170,4 +172,27 @@ tools:
   - name: calendar.list
     tier: read
   - name: calendar.conflicts
+    tier: read
+
+  # ── 日历写回（T7，2026-10-21）─────────────────────────────────
+  #
+  # 写档与 mail 的分级同理（写本地文件/动别人日程是两回事）：
+  #   - calendar.add / edit / delete：只动本地日历文件（<dataDir>/calendar/local.ics），
+  #     订阅 .ics 永远只读 ⇒ write_file（和 fs.write 同档，可审计可重放，不用弹卡）。
+  #     add 是内容幂等的（同 标题+开始+结束 返回已有事件），重放无副作用。
+  - name: calendar.add
+    tier: write_file
+  - name: calendar.edit
+    tier: write_file
+  - name: calendar.delete
+    tier: write_file
+  # 连接器第一批（2026-10-21，task-2 接线）：全是只读 GET，tier: read。
+  # GitHub 未配 token 时 issues/pulls 仍可用（公开仓，60 请求/时限速）；notifications 需要 token。
+  - name: github.notifications
+    tier: read
+  - name: github.issues
+    tier: read
+  - name: github.pulls
+    tier: read
+  - name: rss.read
     tier: read

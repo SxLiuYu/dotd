@@ -39,6 +39,11 @@ function cleanupBody(): string {
 
 test('按 taskId 累积的三组缓存都随任务终态释放', () => {
   const body = cleanupBody();
+  // A1：模块级浏览器身份表同样随任务终态释放（不在 this. 上，单独判）
+  assert.ok(
+    /browserIdentityByTask\.delete\(taskId\)/.test(body),
+    'browserIdentityByTask 应在 resetRepeatGuard 里被 delete',
+  );
   for (const field of ['repeatGuard', 'repeatSkipsByTask', 'toolCallCounts']) {
     assert.ok(
       new RegExp(`this\\.${field}\\.delete\\(taskId\\)`).test(body),

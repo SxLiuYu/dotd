@@ -33,6 +33,7 @@ export type ToolName =
   | 'browser.open'
   | 'browser.act'
   | 'browser.snapshot'
+  | 'browser.screenshot'
   | 'browser.close'
   | 'net.get'
   | 'net.post'
@@ -50,6 +51,7 @@ export const TOOL_NAMES: readonly ToolName[] = [
   'browser.open',
   'browser.act',
   'browser.snapshot',
+  'browser.screenshot',
   'browser.close',
   'net.get',
   'net.post',
@@ -273,6 +275,15 @@ export const CAPABILITIES: readonly Capability[] = [
   },
   {
     name: 'browser.snapshot',
+    mode: 'async',
+    max_deadline_ms: 30 * 60_000,
+    args_schema: { type: 'object', properties: {}, additionalProperties: false },
+    sideEffect: 'safe',
+  },
+  {
+    // A3（2026-10-21）：截图落 /dot/home/screenshots 卷，结果只带元数据。
+    // mode/时效/分类与 snapshot 完全一致（同族同形，防漂移测试同口径）。
+    name: 'browser.screenshot',
     mode: 'async',
     max_deadline_ms: 30 * 60_000,
     args_schema: { type: 'object', properties: {}, additionalProperties: false },

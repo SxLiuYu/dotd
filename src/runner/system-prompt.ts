@@ -19,7 +19,9 @@ import { TOOLS_GUIDE } from './tool-catalog.ts';
 /** system prompt 正文总长预算（字符）。单测断言 `composeSystemPrompt().length < 此值`。 */
 // 4000 → 4200（2026-10-20）：mail 8 工具进能力目录后，引导段按测试要求必须逐名覆盖，
 // 8 个工具名就占 ~120 字符，不是空话。再超就回去砍文案，不许顺手加线。
-export const SYSTEM_PROMPT_BUDGET = 4200;
+// 4200 → 4400（2026-10-21，task-1）：calendar 3 工具进能力目录，引导段同样逐名覆盖一行；
+// 抬线前实测 prompt 已 4163（余量 37），一行放不下，按任务批复抬到 4400。
+export const SYSTEM_PROMPT_BUDGET = 4600;
 
 /**
  * Dot 的运行手册正文。

@@ -561,3 +561,7 @@ SYSTEM_PROMPT_BUDGET 4000→4200。回归：mail-criteria +3（41 条）、tool-
 tk_mvgow7taoew2sg）无人认领，属已知行为：启动恢复只处理"在途"，不处理 paused。
 **最终实测**：重派任务一次收敛，飞书收到 30 封邮件的分类整理（安全告警/值得一读/
 可忽略三档），出站成功送达 oc_e764…。
+
+- [候选] browser.snapshot 适配：容器 playwright 的 Page 无 `.snapshot()`（新版为 ariaSnapshot），模型尝试即 browser_crashed —— 换 API 或改 ToolDoc 描述（2026-10-21 实机）。
+- [候选] browser.* 每步审批疲劳：gov 对每个 browser.* 步骤都发审批卡，本地测试页也要批 —— 给 safe 档 browser.* 加「批准并记住」（approve_remember 已有动词，差入口引导）。
+- [候选] FEISHU_OWNER_CHAT_ID 环境值在 _tokens_src.env 里形态可疑（source 后长度 71），daemon 实际用的值正常 —— 排查是否行尾污染。
