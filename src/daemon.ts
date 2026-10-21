@@ -123,7 +123,7 @@ import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
 const vaultDir = (): string => process.env.DOTD_VAULT_DIR ?? '/root/.dotd';
 import { githubNotifications, githubIssues, githubPulls } from './connectors/github.ts';
 import { fetchFeed } from './connectors/rss.ts';
-import { webAct, webRead, webSnapshot } from './exec/webtools.ts';
+import { legacyBrowser, webAct, webRead, webSnapshot } from './exec/webtools.ts';
 import { DotRunner } from './runner/dot.ts';
 import { loadEventRules } from './event-rules.ts';
 
@@ -1410,6 +1410,29 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     hostWrap(await webAct((args ?? {}) as Record<string, unknown>)),
   );
   log('[web] 浏览器工具已注册（3 个：snapshot/read/act，走 agent-browser CLI）');
+
+  // 2026-10-21：browser.* 统一到 agent-browser。
+  //
+  // ExecService.runTool 先查 hostTools 再发容器，所以在这里注册同名工具就是
+  // **覆盖**掉容器里那套 playwright 实现——既统一成一条路径，又不用删容器代码
+  // （想回滚只需删掉这几行）。参数形状完全不动：老的 browser.act 传
+  // {action, selector, value} 照样能用，selector 里写 @e1 也行、写 CSS 也行。
+  //
+  // identity 语义照抄 resolveBrowserIdentity：显式优先 / anon 无痕 / 缺省按域名
+  // 派生 site:<host> 做持久登录态。落地成 agent-browser 的 --session（实测跨进程
+  // 保留 cookie，等价于容器版 launchPersistentContext + /dot/profiles 卷）。
+  for (const name of [
+    'browser.open',
+    'browser.snapshot',
+    'browser.act',
+    'browser.screenshot',
+    'browser.close',
+  ] as const) {
+    exec.registerHostTool(name, async (args, taskId) =>
+      hostWrap(await legacyBrowser(name, (args ?? {}) as Record<string, unknown>, taskId)),
+    );
+  }
+  log('[web] browser.* 已覆盖为 agent-browser（容器内 playwright 实现保留作回滚）');
 
   // A2-C 收尾（2026-10-21）：GitHub token 从保险库注入（site='github.com', user='token'）。
   // 没配就维持 public-only 降级模式，不报错不挡启动。

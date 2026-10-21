@@ -436,7 +436,10 @@ export class ExecServiceImpl implements ExecService {
    */
   private readonly hostTools = new Map<
     string,
-    (args: Record<string, unknown>) => Promise<{ ok: true; value: unknown } | { ok: false; code: string; message: string; retryable?: boolean }>
+    (
+      args: Record<string, unknown>,
+      taskId?: string,
+    ) => Promise<{ ok: true; value: unknown } | { ok: false; code: string; message: string; retryable?: boolean }>
   >();
 
   /** 注册一个宿主侧工具（name 必须与能力目录一致）。 */
@@ -444,6 +447,13 @@ export class ExecServiceImpl implements ExecService {
     name: string,
     handler: (
       args: Record<string, unknown>,
+      /**
+       * 2026-10-21：调用所属任务 id。浏览器工具需要它来记住"这个任务当前在哪个
+       * 站点"，好让没有 url 的 browser.snapshot/act 继承 open 建立的会话
+       * （agent-browser 的 session 跨进程，不继承就只能看到空白页）。其余宿主
+       * 工具用不到，留着不填即可。
+       */
+      taskId?: string,
     ) => Promise<{ ok: true; value: unknown } | { ok: false; code: string; message: string; retryable?: boolean }>,
   ): void {
     this.hostTools.set(name, handler);
@@ -519,7 +529,7 @@ export class ExecServiceImpl implements ExecService {
     const host = this.hostTools.get(call.tool);
     if (host !== undefined) {
       try {
-        const r = await host(call.args as Record<string, unknown>);
+        const r = await host(call.args as Record<string, unknown>, call.task_id);
         if (r.ok) {
           return { call_id: call.call_id, status: 'ok', result: r.value, finished_at: at };
         }

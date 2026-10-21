@@ -39,11 +39,19 @@ export interface WebResult {
 }
 
 /** 跑一条 agent-browser 子命令。数组传参，绝不过 shell。 */
-function run(argv: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+function run(
+  argv: string[],
+  session?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  // 2026-10-21：identity → --session。容器侧 browser.* 靠 launchPersistentContext +
+  // /dot/profiles 卷做持久登录态；agent-browser 的等价物是具名 session —— 实测跨进程
+  // 保留 cookie（开一次百度，另一个进程 --session 读得到 BAIDUID）。
+  const full: string[] =
+    session === undefined ? argv : [String(argv[0]), '--session', session, ...argv.slice(1)];
   return new Promise((resolve) => {
     execFile(
       BIN,
-      argv,
+      full,
       { timeout: TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, windowsHide: true },
       (err, stdout, stderr) => {
         // 2026-10-21：spawn 失败（二进制不存在/无执行权限）时 stderr 是空的，
@@ -82,6 +90,72 @@ function safeUrl(u: string): string | null {
   }
 }
 
+/**
+ * identity → agent-browser 的 `--session` 名。
+ *
+ * 为什么要这个映射：容器侧 browser.* 的 identity 是 `site:<host>` 这种字符串
+ * （见 src/runner/dot.ts 的 siteIdentityOf），里面带冒号；而 `--session` 会变成
+ * 磁盘上的目录名，直接塞进去会出问题。这里做一次确定性哈希：同一个 identity
+ * 永远映射到同一个 session，登录态才能跨调用保持；不同 identity 不会撞车
+ * （撞车 = 两个站共用 cookie，那比不持久更糟）。
+ *
+ * `anon`/空 → 不传 session，走 agent-browser 的默认匿名会话（无痕语义）。
+ */
+function sessionOf(identity: unknown): string | undefined {
+  if (typeof identity !== 'string' || identity.length === 0) return undefined;
+  if (identity === 'anon') return undefined;
+  // FNV-1a 32 位：够短、够稳、无需引入 crypto 依赖。
+  let h = 0x811c9dc5;
+  for (let i = 0; i < identity.length; i += 1) {
+    h ^= identity.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `id-${h.toString(16).padStart(8, '0')}`;
+}
+
+/**
+ * 从工具参数推 identity（复刻 src/runner/dot.ts 的 resolveBrowserIdentity 规则）。
+ *
+ * 为什么要在这里再算一遍：宿主工具只收到 `call.args`，runner 派生的
+ * `call.identity` 不会进 args（见 ExecService.runToolInner: host(call.args)）。
+ * 规则必须和 runner 一致，否则"治理审查认为这是登录态、实际执行却用匿名 session"
+ * 这种错位迟早出事：
+ *   - 显式 args.identity 优先（含 'anon' = 无痕）
+ *   - 缺省时按 url 域名派生 site:<host>
+ *   - 都没有就用同任务上一次 open 的（snapshot/act 靠这条接上会话）
+ *
+ * 最后那条是必须的：agent-browser 的 session 决定"看的是哪个浏览器实例"。
+ * browser.open 带 url 能派生 session，但紧接着的 browser.snapshot / browser.act
+ * **没有 url**，派生不出 identity —— 早先让它们退化成匿名 session，结果 open
+ * 打开的页面根本不在那个 session 里，snapshot 只能看见空白页（实测返回
+ * "(no interactive elements)"）。所以记一份"这个任务当前在哪个站"给后续继承。
+ */
+const lastIdentityByTask = new Map<string, string>();
+
+function identityOf(args: Record<string, unknown>, taskKey?: string): unknown {
+  const explicit = args['identity'];
+  if (typeof explicit === 'string' && explicit.length > 0) {
+    // 'anon' 是显式要求无痕，不记进继承表（否则后续 snapshot 反而带上登录态）
+    if (taskKey !== undefined && explicit !== 'anon') lastIdentityByTask.set(taskKey, explicit);
+    return explicit;
+  }
+  const url = args['url'];
+  if (typeof url === 'string' && url.length > 0) {
+    try {
+      const host = new URL(url).hostname;
+      if (host.length > 0) {
+        const id = `site:${host}`.slice(0, 80);
+        if (taskKey !== undefined) lastIdentityByTask.set(taskKey, id);
+        return id;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  // 没有 url（snapshot/act/screenshot/close）：继承同任务上一次 open 的站点
+  return taskKey === undefined ? undefined : lastIdentityByTask.get(taskKey);
+}
+
 /** agent-browser 没装好时给一条能自己修的话，而不是干巴巴的 ENOENT。 */
 function friendlyFailure(stderr: string, code: number): string {
   if (/ENOENT|not found/i.test(stderr)) {
@@ -104,17 +178,18 @@ function friendlyFailure(stderr: string, code: number): string {
 export async function webSnapshot(args: Record<string, unknown>): Promise<WebResult> {
   const rawUrl = typeof args['url'] === 'string' ? args['url'] : '';
   const interactive = args['interactive_only'] !== false;
+  const session = sessionOf(args['identity']);
 
   if (rawUrl !== '') {
     const url = safeUrl(rawUrl);
     if (url === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
-    const opened = await run(['open', url]);
+    const opened = await run(['open', url], session);
     if (opened.code !== 0) {
       return { ok: false, error: friendlyFailure(opened.stderr, opened.code) };
     }
   }
 
-  const snap = await run(interactive ? ['snapshot', '-i'] : ['snapshot']);
+  const snap = await run(interactive ? ['snapshot', '-i'] : ['snapshot'], session);
   if (snap.code !== 0) {
     return { ok: false, error: friendlyFailure(snap.stderr, snap.code) };
   }
@@ -143,7 +218,7 @@ export async function webRead(args: Record<string, unknown>): Promise<WebResult>
   const url = safeUrl(rawUrl);
   if (url === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
 
-  const r = await run(['read', url]);
+  const r = await run(['read', url], sessionOf(args['identity']));
   if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
   const out = clip(r.stdout.trim());
   if (out === '') return { ok: true, output: `（${url} 没有可读正文——可能是空页面或需要登录）` };
@@ -179,13 +254,120 @@ export async function webAct(args: Record<string, unknown>): Promise<WebResult> 
     else argv.push(ref);
   }
 
-  const r = await run(argv);
+  const session = sessionOf(args['identity']);
+  const r = await run(argv, session);
   if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
 
   // 操作后页面可能变了：顺手回一份新快照，省掉模型再调一次。
   // 失败不影响动作本身的结果（有些动作本来就会跳转走）。
-  const after = await run(['snapshot', '-i']);
+  const after = await run(['snapshot', '-i'], session);
   const tail = after.code === 0 ? clip(after.stdout.trim()) : '';
   const head = r.stdout.trim() === '' ? `已执行 ${action}` : clip(r.stdout.trim());
   return { ok: true, output: tail === '' ? head : `${head}\n\n— 操作后的可交互元素 —\n${tail}` };
+}
+
+// ══════════════════════════════════════════════════════════════════
+// browser.* 兼容层（2026-10-21，统一到 agent-browser）
+// ══════════════════════════════════════════════════════════════════
+//
+// ## 为什么保留这层
+// 容器里那五个 browser.* 还在（playwright 驱动），但它们只能猜 CSS 选择器。
+// 宿主侧的 hostTools 优先于容器分发（ExecService.runTool 先查 this.hostTools），
+// 所以在这里注册同名工具就等于**覆盖**容器实现，既统一到一条路径，又不必删
+// 容器里的代码（回滚容易）。
+//
+// ## 参数为什么这么怪
+// browser.act 的老形状是 `{action, selector, value}`，模型已经按这个习惯调用
+// （历史对话里都是）。语义上 selector 和 @eN 引用是一回事——agent-browser 的
+// click/fill 本来就接受任意选择器，`@e1` 只是它自己的简写。所以直接透传，
+// 模型写 @e1 也行，写 `button.submit` 也行，不用改习惯也不用改 schema。
+//
+// identity 语义完全照抄 src/runner/dot.ts 的 resolveBrowserIdentity：
+// 显式传就用显式的，anon 走无痕，缺省按域名给 site:<host> 做持久登录态。
+
+/** browser.act 的 action → agent-browser 子命令。submit 拆成 click 同义处理。 */
+const LEGACY_ACTIONS: Record<string, string> = {
+  click: 'click',
+  type: 'type',
+  fill: 'fill',
+  submit: 'click',
+  select: 'select',
+  scroll: 'scroll',
+  wait: 'wait',
+};
+
+/**
+ * browser.* 统一入口：把老参数形状翻译成 web.* 的实现。
+ *
+ * 这一个函数覆盖 open/snapshot/act/screenshot/close 五个名字，
+ * 因为它们的差异只在"翻译成哪条命令"。
+ */
+export async function legacyBrowser(
+  tool: 'browser.open' | 'browser.snapshot' | 'browser.act' | 'browser.screenshot' | 'browser.close',
+  args: Record<string, unknown>,
+  taskKey?: string,
+): Promise<WebResult> {
+  const session = sessionOf(identityOf(args, taskKey));
+
+  if (tool === 'browser.open') {
+    const rawUrl = typeof args['url'] === 'string' ? args['url'] : '';
+    if (rawUrl === '') return { ok: false, error: 'browser.open 需要 url' };
+    const url = safeUrl(rawUrl);
+    if (url === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
+    const r = await run(['open', url], session);
+    if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+    // 老的 browser.open 返回 {url,title}；这里给同样的信息，历史调用方不用改。
+    const title = r.stdout.trim().split('\n')[0]?.replace(/^[\s✓]+/, '') ?? '';
+    return {
+      ok: true,
+      output: JSON.stringify({ url, title: title === '' ? url : title }),
+    };
+  }
+
+  if (tool === 'browser.snapshot') {
+    // 老接口没 url（沿用当前页），selector 参数用于局部截图——agent-browser 的
+    // snapshot 不支持局部，忽略它比报错好（模型常在参数里多带一个 selector）。
+    return webSnapshot({ identity: identityOf(args, taskKey) });
+  }
+
+  if (tool === 'browser.screenshot') {
+    // 落盘到 agent-browser 的临时目录并回路径；容器版是 PNG 存 screenshots/，
+    // 宿主侧不假装一样——把真实路径交出去，比编一个不存在的路径好。
+    const r = await run(['screenshot'], session);
+    if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+    return { ok: true, output: r.stdout.trim() };
+  }
+
+  if (tool === 'browser.close') {
+    const r = await run(['close'], session);
+    // 页面关了，继承就没意义了；不清会让下一次 snapshot 指向一个已销毁的 session
+    if (taskKey !== undefined) lastIdentityByTask.delete(taskKey);
+    if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+    return { ok: true, output: '已关闭' };
+  }
+
+  // browser.act
+  const action = typeof args['action'] === 'string' ? args['action'] : '';
+  const cmd = LEGACY_ACTIONS[action];
+  if (cmd === undefined) {
+    return { ok: false, error: `browser.act 不支持 action=${action}（可用：${Object.keys(LEGACY_ACTIONS).join('/')}）` };
+  }
+  const selector = typeof args['selector'] === 'string' ? args['selector'] : '';
+  const value = typeof args['value'] === 'string' ? args['value'] : '';
+
+  const argv: string[] = [cmd];
+  if (cmd === 'wait') {
+    // 老的 wait 可以等时间或等元素；agent-browser 的 wait 两者都收。
+    argv.push(selector === '' ? '500' : selector);
+  } else if (cmd === 'scroll') {
+    argv.push(value === '' ? 'down' : value);
+  } else {
+    if (selector === '') return { ok: false, error: `browser.act 的 ${action} 需要 selector` };
+    if (value !== '') argv.push(selector, value);
+    else argv.push(selector);
+  }
+
+  const r = await run(argv, session);
+  if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+  return { ok: true, output: r.stdout.trim() === '' ? `已执行 ${action}` : clip(r.stdout.trim()) };
 }

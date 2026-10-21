@@ -135,3 +135,176 @@ test('CLI 不存在时给可执行的修复提示，而不是裸 ENOENT', async 
     else process.env['DOTD_AGENT_BROWSER_BIN'] = prev;
   }
 });
+
+// ══════════════════════════════════════════════════════════════════
+// browser.* 兼容层（2026-10-21，统一到 agent-browser）
+// ══════════════════════════════════════════════════════════════════
+//
+// 宿主侧注册同名 browser.* 覆盖容器里那套 playwright 实现。这里验的是
+// **翻译层**：老参数形状要能正确变成 agent-browser 的子命令，且 identity
+// 派生规则必须和 runner 的 resolveBrowserIdentity 一致（否则治理与执行会错位）。
+
+test('browser.open 把 url 变成 open 子命令，并回 {url,title}', async () => {
+  await withBin('echo "✓ My Title"', async (m) => {
+    const r = await m.legacyBrowser('browser.open', { url: 'https://example.com/x' });
+    assert.equal(r.ok, true);
+    const info = JSON.parse(r.output ?? '{}') as { url?: string; title?: string };
+    assert.equal(info.url, 'https://example.com/x');
+    assert.equal(info.title, 'My Title');
+  });
+});
+
+test('browser.open 拒绝非 http(s)', async () => {
+  await withBin('echo SHOULD_NOT_RUN', async (m) => {
+    const r = await m.legacyBrowser('browser.open', { url: 'file:///etc/passwd' });
+    assert.equal(r.ok, false);
+  });
+});
+
+test('browser.act 翻译 click/type/submit/scroll/wait', async () => {
+  await withBin('echo "ARGS:$*"', async (m) => {
+    const click = await m.legacyBrowser('browser.act', { action: 'click', selector: '@e1' });
+    assert.equal(click.ok, true);
+    assert.match(click.output ?? '', /ARGS:click @e1/);
+
+    const type = await m.legacyBrowser('browser.act', { action: 'type', selector: '#q', value: 'hi' });
+    assert.equal(type.ok, true);
+    assert.match(type.output ?? '', /ARGS:type #q hi/);
+
+    // submit 是 click 的同义词（老接口有它，agent-browser 没有单独命令）
+    const submit = await m.legacyBrowser('browser.act', { action: 'submit', selector: 'form' });
+    assert.equal(submit.ok, true);
+    assert.match(submit.output ?? '', /ARGS:click form/);
+
+    // wait 不传 selector 时给一个默认时长，而不是空命令
+    const wait = await m.legacyBrowser('browser.act', { action: 'wait' });
+    assert.equal(wait.ok, true);
+    assert.match(wait.output ?? '', /ARGS:wait 500/);
+
+    const scroll = await m.legacyBrowser('browser.act', { action: 'scroll', value: 'up' });
+    assert.equal(scroll.ok, true);
+    assert.match(scroll.output ?? '', /ARGS:scroll up/);
+  });
+});
+
+test('browser.act 未知 action 给可用清单，不静默失败', async () => {
+  await withBin('echo SHOULD_NOT_RUN', async (m) => {
+    const r = await m.legacyBrowser('browser.act', { action: 'teleport', selector: 'x' });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? '', /不支持 action=teleport/);
+  });
+});
+
+test('browser.act 缺 selector 时说清哪个动作需要它', async () => {
+  await withBin('echo SHOULD_NOT_RUN', async (m) => {
+    const r = await m.legacyBrowser('browser.act', { action: 'click' });
+    assert.equal(r.ok, false);
+    assert.match(r.error ?? '', /click 需要 selector/);
+  });
+});
+
+test('browser.snapshot 不带 url（沿用当前页）', async () => {
+  await withBin('echo "- link \\"x\\" [ref=e1]"', async (m) => {
+    const r = await m.legacyBrowser('browser.snapshot', {});
+    assert.equal(r.ok, true);
+    assert.match(r.output ?? '', /ref=e1/);
+  });
+});
+
+test('browser.close 翻译成 close', async () => {
+  await withBin('echo closed', async (m) => {
+    const r = await m.legacyBrowser('browser.close', {});
+    assert.equal(r.ok, true);
+    assert.match(r.output ?? '', /已关闭/);
+  });
+});
+
+test('identity 派生：显式优先，anon 无痕，缺省按域名 site:<host>', async () => {
+  // 假 CLI 把 --session 打出来，间接验证 sessionOf(identityOf(args)) 的结果
+  await withBin('echo "ARGS:$*"', async (m) => {
+    // 显式 identity → 有 --session
+    const explicit = await m.legacyBrowser('browser.open', {
+      url: 'https://a.example.com',
+      identity: 'work',
+    });
+    assert.equal(explicit.ok, true);
+    assert.match(explicit.output ?? '', /--session/);
+
+    // anon → 无痕，不该出现 --session
+    const anon = await m.legacyBrowser('browser.open', {
+      url: 'https://a.example.com',
+      identity: 'anon',
+    });
+    assert.equal(anon.ok, true);
+    assert.doesNotMatch(anon.output ?? '', /--session/);
+
+    // 缺省 + 有 url → 按域名派生，仍会有 --session
+    const derived = await m.legacyBrowser('browser.open', { url: 'https://b.example.com/z' });
+    assert.equal(derived.ok, true);
+    assert.match(derived.output ?? '', /--session/);
+  });
+});
+
+test('identity 派生稳定：同一域名两次调用落到同一 session', async () => {
+  await withBin('echo "ARGS:$*"', async (m) => {
+    const a = await m.legacyBrowser('browser.open', { url: 'https://same.example.com/1' });
+    const b = await m.legacyBrowser('browser.open', { url: 'https://same.example.com/2' });
+    const sessA = /--session (\S+)/.exec(a.output ?? '')?.[1];
+    const sessB = /--session (\S+)/.exec(b.output ?? '')?.[1];
+    assert.ok(sessA !== undefined && sessA === sessB, `同一域名应同 session：${sessA} vs ${sessB}`);
+  });
+});
+
+test('identity 派生不撞车：不同域名用不同 session', async () => {
+  await withBin('echo "ARGS:$*"', async (m) => {
+    const a = await m.legacyBrowser('browser.open', { url: 'https://one.example.com' });
+    const b = await m.legacyBrowser('browser.open', { url: 'https://two.example.com' });
+    const sessA = /--session (\S+)/.exec(a.output ?? '')?.[1];
+    const sessB = /--session (\S+)/.exec(b.output ?? '')?.[1];
+    assert.ok(sessA !== sessB, `不同域名必须分开：${sessA} vs ${sessB}`);
+  });
+});
+
+test('会话继承：open 之后的 snapshot 用同一个 session（否则看到空白页）', async () => {
+  // 这是实机踩到的缺陷：browser.open 带 url 能派生 session，但随后的
+  // browser.snapshot 没有 url → 早先退化成匿名 session，看到的是另一个空白页，
+  // 返回 "(no interactive elements)"。修法是按 taskKey 记住当前站点。
+  await withBin('echo "ARGS:$*"', async (m) => {
+    const opened = await m.legacyBrowser('browser.open', { url: 'https://ext.example.com/p' }, 'task-1');
+    const sessOpen = /--session (\S+)/.exec(opened.output ?? '')?.[1];
+    assert.ok(sessOpen !== undefined, 'open 应带 --session');
+
+    const snap = await m.legacyBrowser('browser.snapshot', {}, 'task-1');
+    const sessSnap = /--session (\S+)/.exec(snap.output ?? '')?.[1];
+    assert.equal(sessSnap, sessOpen, 'snapshot 必须继承 open 的 session');
+  });
+});
+
+test('会话继承：不同任务互不串（各有各的浏览器）', async () => {
+  await withBin('echo "ARGS:$*"', async (m) => {
+    await m.legacyBrowser('browser.open', { url: 'https://a.example.com' }, 'task-A');
+    const snapA = await m.legacyBrowser('browser.snapshot', {}, 'task-A');
+    assert.match(snapA.output ?? '', /--session/);
+
+    // task-B 还没 open 过：不该凭空继承 task-A 的
+    const snapB = await m.legacyBrowser('browser.snapshot', {}, 'task-B');
+    assert.doesNotMatch(snapB.output ?? '', /--session/);
+  });
+});
+
+test('会话继承：browser.close 之后清掉，不再凭空继承', async () => {
+  await withBin('echo "ARGS:$*"', async (m) => {
+    await m.legacyBrowser('browser.open', { url: 'https://c.example.com' }, 'task-C');
+    await m.legacyBrowser('browser.close', {}, 'task-C');
+    const after = await m.legacyBrowser('browser.snapshot', {}, 'task-C');
+    assert.doesNotMatch(after.output ?? '', /--session/, 'close 后不该再继承');
+  });
+});
+
+test('会话继承：anon 显式无痕不被记进继承表', async () => {
+  await withBin('echo "ARGS:$*"', async (m) => {
+    await m.legacyBrowser('browser.open', { url: 'https://d.example.com', identity: 'anon' }, 'task-D');
+    const snap = await m.legacyBrowser('browser.snapshot', {}, 'task-D');
+    assert.doesNotMatch(snap.output ?? '', /--session/, 'anon 之后不该继承出登录态 session');
+  });
+});
