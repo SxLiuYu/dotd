@@ -121,6 +121,14 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
     'im.message.recalled_v1': route('im.message.recalled_v1'),
     'im.chat.member.bot.added_v1': route('im.chat.member.bot.added_v1'),
     'im.chat.member.user.added_v1': route('im.chat.member.user.added_v1'),
+    // T3（2026-10-21 修）：审批卡片的按钮回调。
+    //
+    // 漏了这一行的现场：卡片发得出去（fs-outbound 记"已发卡片"），
+    // 但主人点「同意/拒绝」后飞书 SDK 打
+    //   [warn]: no card.action.trigger handle
+    // 事件直接丢弃 —— 审批永远停在 pending，任务卡在 awaiting_approval。
+    // 卡片这半条链路是通的，另外半条（回调）从来没接上。
+    'card.action.trigger': route('card.action.trigger'),
   } as Record<string, (data: never) => Promise<void>>);
 
   const client = new Lark.WSClient({
