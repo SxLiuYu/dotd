@@ -69,3 +69,6 @@ docs/acceptance/results.*.jsonl
 # 判据随之虚报"已经跑了 407 分钟"，而实际只跑了 15 分钟 ——
 # 足以让 7 天窗口提前 6.5 小时判定"达标"。这是能让 S6 作弊的缝。
 docs/acceptance/soak-day0.txt
+
+# quarantine for stray files written by mis-encoded script paths
+_quarantine-*/
