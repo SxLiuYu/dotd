@@ -557,6 +557,55 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     args_schema: obj({}, []),
     sideEffect: 'safe',
   },
+  // ── W2（2026-10-21）：浏览器能力升级为宿主侧 CLI（agent-browser）──
+  //
+  // ## 为什么另起 web.* 而不是改 browser.*
+  // browser.* 那五个跑在容器里，由 playwright-core 驱动。容器 rootfs 只读、
+  // Chrome 又是 200MB+，塞不进镜像；更要紧的是它只能"猜 CSS 选择器"——
+  // 模型看不到页面上到底哪些东西可以点。
+  //
+  // agent-browser（GitHub 44.4k stars，vercel-labs）走的是另一条路：
+  // snapshot 返回**带引用**的可交互元素（`- link "登录" [ref=e1]`），后续
+  // click/fill 直接写 `@e1`。模型不用猜选择器，也不必每次重读整页 HTML。
+  // 这是当前 AI 浏览器自动化的主流形状，照抄它比自己发明稳。
+  //
+  // 同时补上 W2 缺的正文抓取：web.read 走真实浏览器取文本，JS 渲染的页面
+  // 也能读——容器里的 net.get 对此无能为力（实测模型两次 net_get 都拿不到
+  // 内容，只能答"没有拿到任何页面内容"）。
+  {
+    /** 打开 URL 并返回带 ref 引用的可交互元素清单（模型据此决定下一步）。 */
+    name: 'web.snapshot',
+    mode: 'async',
+    max_deadline_ms: 120_000,
+    args_schema: obj({
+      url: str('要打开的页面 URL（省略则沿用当前页），http(s)'),
+      interactive_only: bool('只列可交互元素（按钮/链接/输入框），默认 true'),
+    }),
+    sideEffect: 'safe',
+  },
+  {
+    /** 抓取页面正文（真实浏览器渲染后取文本，JS 页面也能读）。 */
+    name: 'web.read',
+    mode: 'async',
+    max_deadline_ms: 120_000,
+    args_schema: obj({ url: str('要读取的页面 URL，http(s)') }, ['url']),
+    sideEffect: 'safe',
+  },
+  {
+    /** 用 snapshot 给出的 @eN 引用操作页面（点击/输入/按键）。 */
+    name: 'web.act',
+    mode: 'async',
+    max_deadline_ms: 120_000,
+    args_schema: obj(
+      {
+        action: str('动作：click | fill | type | press | scroll'),
+        ref: str('snapshot 返回的引用，如 "@e1"；press/scroll 可省略'),
+        text: str('fill/type 写入的文本，或 press 的键名（如 Enter）'),
+      },
+      ['action'],
+    ),
+    sideEffect: 'unknown',
+  },
 ];
 
 /**

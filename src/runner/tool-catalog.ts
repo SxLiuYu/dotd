@@ -618,6 +618,51 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       '用 $vault: 占位符但保险库里没有该条目 → 工具调用直接 vault_missing，' +
       '请让主人在 CLI 用 dotd vault add 添加。',
   },
+  {
+    name: 'web.snapshot',
+    description:
+      '打开网页并列出**可交互元素**，每个带一个引用编号（@e1、@e2…）。' +
+      '这是上网的首选入口：先看能点什么，再用 web.act 用引用去点。' +
+      '比读整页 HTML 省得多，也不用猜 CSS 选择器。',
+    params: {
+      url: '要打开的地址，http(s)；省略则沿用当前页',
+      interactive_only: '默认 true 只列可交互元素；false 则给完整页面结构（用于理解页面）',
+    },
+    returns:
+      '{ output }：每行形如 `- link "登录" [ref=e1]` / `- button "加入购物车" [ref=e2]`，' +
+      '方括号里就是 web.act 要用的 ref。',
+    failures:
+      'web_tool_error：浏览器起不来（agent-browser 未安装或 Chrome 缺失）—— ' +
+      '让主人跑 agent-browser install --with-deps；' +
+      '页面超时：站点慢或被墙 —— 换站点或稍后重试。',
+  },
+  {
+    name: 'web.read',
+    description:
+      '抓取网页正文（真实浏览器渲染后取文本）。' +
+      '**读文章/公告/文档优先用它**，特别是 JS 渲染的页面——net.get 这类纯 HTTP ' +
+      '抓取对它们只能拿到空壳。',
+    params: { url: '要读取的地址，http(s)' },
+    returns: '{ output }：页面正文纯文本，超长会截断并标注。',
+    failures:
+      '输出为空：页面需要登录或是纯前端空壳 —— 改用 web.snapshot 看结构；' +
+      'web_tool_error：浏览器不可用 —— 让主人检查安装。',
+  },
+  {
+    name: 'web.act',
+    description:
+      '在上一步 web.snapshot 给出的元素上操作。' +
+      'ref 用那个 @eN；页面变化后旧 ref 可能失效，重新 snapshot 拿新的。',
+    params: {
+      action: 'click | fill | type | press | scroll | dblclick | select | check',
+      ref: 'snapshot 里的引用，如 "@e1"（press/scroll 可省略）',
+      text: 'fill/type 写的内容；press 时是键名（如 Enter）；scroll 时是方向',
+    },
+    returns: '{ output }：动作结果，并附一份操作后的新可交互元素清单（省一次 snapshot）。',
+    failures:
+      'web_tool_error：ref 失效或元素不可见 —— 重新 web.snapshot 再试；' +
+      'action 不合法：只支持上面列的那几个。',
+  },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */

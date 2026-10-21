@@ -119,7 +119,9 @@ test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sid
     // 日历写 3 件套（2026-10-21，task-1）：同样只在 daemon 里跑，不进容器
     'calendar.add', 'calendar.edit', 'calendar.delete',
     'github.notifications', 'github.issues', 'github.pulls', 'rss.read',
-  'vault.sites',
+    'vault.sites',
+    // W2（2026-10-21）：浏览器三件套在宿主上跑 agent-browser CLI，不进容器
+    'web.snapshot', 'web.read', 'web.act',
   ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),

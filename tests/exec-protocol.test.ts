@@ -102,8 +102,8 @@ test('端点表：八个 RUNTIME_PATHS 与契约逐字对应', () => {
   assert.equal(endpointUrl('172.18.0.3', 9223), 'http://172.18.0.3:9223');
 });
 
-test('能力目录：35 名工具（19 容器 + 8 宿主 mail + 3 日历写 + 4 连接器 + 1 保险库）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
-  assert.equal(CAPABILITY_CATALOG.length, 35);
+test('能力目录：38 名工具（19 容器 + 8 宿主 mail + 3 日历写 + 4 连接器 + 1 保险库 + 3 浏览器 web.*）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
+  assert.equal(CAPABILITY_CATALOG.length, 38);
   const by = new Map(CAPABILITY_CATALOG.map((c) => [c.name, c]));
   const expect: Record<string, [string, number, string]> = {
     'fs.read': ['sync', 60_000, 'safe'],
@@ -524,8 +524,9 @@ test('getCapabilities：容器 /capabilities 优先，回退宿主 catalog；形
     const svc = new ExecServiceImpl({ db: t.db, bus: t.bus, cfg: { tokenDir: t.root } });
     await svc.boot(['dot-a']);
     const caps = await svc.getCapabilities('dot-a');
-    // 30 = 19 容器工具 + 8 宿主 mail + 3 日历写（回退路径整目录可见）
-    assert.equal(caps.length, 35);
+    // 38 = 19 容器工具 + 8 宿主 mail + 3 日历写 + 4 连接器 + 1 保险库 + 3 浏览器 web.*
+    // （回退路径整目录可见）
+    assert.equal(caps.length, 38);
     for (const c of caps) {
       assert.ok(['safe', 'replayable', 'unknown'].includes(c.sideEffect));
       assert.ok(['sync', 'async'].includes(c.mode));

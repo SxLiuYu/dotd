@@ -123,6 +123,7 @@ import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
 const vaultDir = (): string => process.env.DOTD_VAULT_DIR ?? '/root/.dotd';
 import { githubNotifications, githubIssues, githubPulls } from './connectors/github.ts';
 import { fetchFeed } from './connectors/rss.ts';
+import { webAct, webRead, webSnapshot } from './exec/webtools.ts';
 import { DotRunner } from './runner/dot.ts';
 import { loadEventRules } from './event-rules.ts';
 
@@ -1377,6 +1378,38 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   exec.registerHostTool('vault.sites', async () => {
     return { ok: true as const, value: { entries: vaultList(vaultDir()) } };
   });
+
+  // W2（2026-10-21）：web.* —— 宿主侧浏览器（agent-browser CLI）。
+  //
+  // 为什么在宿主而不在容器：容器 rootfs 只读，Chrome 200MB+ 进不了镜像；
+  // 而且 agent-browser 的价值是 snapshot 返回带 @eN 引用的可交互元素，
+  // 模型据此操作，不用猜 CSS 选择器。浏览器够不到宿主文件系统，只是访问
+  // 网络，宿主侧跑不扩大真实风险。
+  //
+  // 三个工具都**不用审批**：snapshot/read 是只读；act 虽然改外部状态，但它是
+  // 网页操作的唯一出口，每步都批等于网页能力不可用（主人 2026-10-21 明确：
+  // "浏览器控制不需要审批，重大决定才需要我审批"）。危险动作（花钱、提交订单）
+  // 由 tools.yml 的 spend 档单独把关。
+  const hostWrap = (r: { ok: boolean; output?: string; error?: string }) =>
+    r.ok
+      ? { ok: true as const, value: { output: r.output ?? '' } }
+      : {
+          ok: false as const,
+          code: 'web_tool_error',
+          message: r.error ?? '浏览器工具失败',
+          retryable: true,
+        };
+
+  exec.registerHostTool('web.snapshot', async (args) =>
+    hostWrap(await webSnapshot((args ?? {}) as Record<string, unknown>)),
+  );
+  exec.registerHostTool('web.read', async (args) =>
+    hostWrap(await webRead((args ?? {}) as Record<string, unknown>)),
+  );
+  exec.registerHostTool('web.act', async (args) =>
+    hostWrap(await webAct((args ?? {}) as Record<string, unknown>)),
+  );
+  log('[web] 浏览器工具已注册（3 个：snapshot/read/act，走 agent-browser CLI）');
 
   // A2-C 收尾（2026-10-21）：GitHub token 从保险库注入（site='github.com', user='token'）。
   // 没配就维持 public-only 降级模式，不报错不挡启动。
