@@ -778,6 +778,15 @@ function matchRules(catalog: Catalog, call: ToolCall): RuleHit | null {
       const p = paramStr(call.params, ['path', 'filePath', 'file', 'target', 'dest', 'outputPath']);
       if (p === null || !p.startsWith(m.pathPrefix)) continue;
     }
+    if (m.amountAtLeast !== undefined) {
+      // Muse B3 (2026-10-21): amount threshold predicate, in CENTS.
+      // Uses the same key set as the spend contract (governance.md 2.5) so a rule
+      // cannot accidentally read a different field than the ledger writes.
+      const amt = paramNum(call.params, ['amountCents', 'amount_cents']);
+      // Fail closed: no numeric amount means the rule does NOT match. If the caller
+      // wanted "any spend call", they should omit the predicate instead.
+      if (amt === null || amt < m.amountAtLeast) continue;
+    }
     return { decision: rule.decision as Decision0, reason: rule.reason };
   }
   return null;
@@ -787,6 +796,22 @@ function paramStr(params: Record<string, unknown>, keys: string[]): string | nul
   for (const k of keys) {
     const v = params[k];
     if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return null;
+}
+
+/**
+ * ????????Muse B3?2026-10-21???????????
+ *
+ * ????? number???? "50000" ????? ?? ???"?/?"?????
+ * 100 ????feishu-card.ts formatMoney ??????????????
+ * ????????? NaN ??????????????????????
+ * ????"??????????"???????????
+ */
+function paramNum(params: Record<string, unknown>, keys: string[]): number | null {
+  for (const k of keys) {
+    const v = params[k];
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
   }
   return null;
 }

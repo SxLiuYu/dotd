@@ -112,7 +112,9 @@ surfaces:
   # enabled 默认 false —— 升级后不会突然开始给主人发进度。
   # 打开是显式动作，因为"多久说一次"很主观，只有主人自己知道能忍多少条。
   progress:
-    enabled: false
+    # 2026-10-21：由 false 改为 true —— 目标 ③ 要求开启。三要素已齐备
+    # （enabled + sender + chatId），且 9.1 已把真截图接进这条链路。
+    enabled: true
     # 至少隔几步才说一次。3 意味着前 2 步都安静。
     every_n_steps: 3
     # 至少隔多少毫秒才说一次。90000 = 一分半。

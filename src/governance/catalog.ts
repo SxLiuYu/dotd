@@ -50,6 +50,19 @@ export const RuleDef = z.object({
       tool: z.string().optional(),
       urlHost: z.string().optional(),
       pathPrefix: z.string().optional(),
+      /*
+       * Minimum amount in CENTS; Muse B3 parity (2026-10-21).
+       *
+       * One direction only: a call whose amountCents >= this value matches the rule.
+       * rules.yml may only TIGHTEN (GOV section 2.6), so a hit can only become
+       * approve or deny -- never "skip approval below a threshold". That is why
+       * "ask only above 500" is expressed by tightening the small amounts too,
+       * and pairing this predicate with decision: allow is rejected at load time.
+       *
+       * Cents, same unit as amountCents / spend_ledger.amount_cents.
+       * Non-positive or non-integer values never match (fail closed).
+       */
+      amountAtLeast: z.number().int().positive().optional(),
     })
     .default({}),
   decision: z.enum(['allow', 'review', 'approve', 'deny']),
