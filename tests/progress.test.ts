@@ -241,14 +241,79 @@ ok(
 );
 
 // 需要人介入 → 即使重复也带（这是最该被看见的时刻，去重让位于可见性）
+// 2026-10-21 改写：原来这条断言「attention 时重复也要发」。
+// 实测推翻（任务 tk_mvi3nk51yqbp4d）：shot 推一次带图，紧接着 attention
+// 又带同一张，相隔几秒，主人手机上是同一张图看两遍。
+// 关键区分：attention 要保证的是**文字一定到达**（那在 decideProgress 层，
+// 越过步数/时间节流），不是**图一定重发** —— 同一张 PNG 看第二遍没有新信息。
 ok(
-  'attention 时重复也要发',
-  decideScreen('/dot/home/screenshots/a.png', '/dot/home/screenshots/a.png', true) ===
-    '/dot/home/screenshots/a.png',
+  'attention 时同一张图不重发',
+  decideScreen('/dot/home/screenshots/a.png', '/dot/home/screenshots/a.png', true) === null,
+);
+// 但 attention 遇到**新图**仍要带（不能因为上一条是 attention 就把新图也吞了）
+ok(
+  'attention 时换了新图仍要带',
+  decideScreen('/dot/home/screenshots/b.png', '/dot/home/screenshots/a.png', true) ===
+    '/dot/home/screenshots/b.png',
+);
+// attention 且从没发过图 → 带
+ok(
+  'attention 时首次有图要带',
+  decideScreen('/dot/home/screenshots/a.png', null, true) === '/dot/home/screenshots/a.png',
 );
 
 // attention 且无图 → 仍然不带（没有就是没有，不能拿别的东西冒充）
 ok('attention 但无图 → 不带', decideScreen(null, '/dot/home/screenshots/a.png', true) === null);
+
+console.log('\n  七、新截图越过节流（2026-10-21 主人选方案 1）\n');
+
+{
+  // 现场（实测 tk_mvi2ruzz4pd33b）：browser.screenshot 成功 2 次，
+  // 但进度只在第 1 步 start 推过一次 —— 那时截图还没产生。
+  // 按日常配置（3 步 / 90 秒），20 秒的任务永远轮不到"带图那一次"，
+  // 截图功能等于白做。
+  //
+  // 所以：新截图越过步数与时间两道节流（但不越过 enabled 与去重）。
+  const justPushed = {
+    lastPushAt: 1_000_000,
+    lastPushStep: 5,
+    stepCount: 5, // 步数完全没涨
+    now: 1_000_500, // 才过 0.5 秒
+    needsAttention: false,
+  };
+
+  // 基线：没有新截图时，这个场景必须被节流掉（否则下面的对比无意义）
+  const throttled = decideProgress(mk(justPushed), ON);
+  ok('无新截图 → 步数不够，不推', throttled.push === false && throttled.reason === 'too_few_steps',
+     JSON.stringify(throttled));
+
+  // 有新截图 → 同一个场景必须推
+  const withShot = decideProgress(mk({ ...justPushed, freshShot: true }), ON);
+  ok('有新截图 → 越过步数节流直接推', withShot.push === true, JSON.stringify(withShot).slice(0, 80));
+  ok('reason 标为 shot', withShot.push === true && withShot.reason === 'shot',
+     withShot.push ? withShot.reason : 'not pushed');
+
+  // 时间不够也一样要越过
+  const timeThrottled = {
+    lastPushAt: 2_000_000,
+    lastPushStep: 1,
+    stepCount: 99, // 步数早就够了
+    now: 2_000_100, // 但只过了 0.1 秒
+    needsAttention: false,
+  };
+  const base2 = decideProgress(mk(timeThrottled), ON);
+  ok('无新截图 → 时间不够，不推', base2.push === false && base2.reason === 'too_soon', JSON.stringify(base2));
+  const shot2 = decideProgress(mk({ ...timeThrottled, freshShot: true }), ON);
+  ok('有新截图 → 越过时间节流直接推', shot2.push === true);
+
+  // 但 enabled=false 仍然优先：开关关着就是不发，截图也不例外
+  const off = decideProgress(mk({ ...justPushed, freshShot: true }), { ...DEFAULT_PROGRESS, enabled: false });
+  ok('开关关着 → 新截图也不推', off.push === false && off.reason === 'disabled', JSON.stringify(off));
+
+  // freshShot 缺省不能改变旧行为
+  const noFlag = decideProgress(mk(justPushed), ON);
+  ok('freshShot 缺省 = 旧行为不变', noFlag.push === false);
+}
 
 console.log('\n  合计 ' + pass + ' 通过 / ' + fail + ' 失败\n');
 process.exit(fail === 0 ? 0 : 1);

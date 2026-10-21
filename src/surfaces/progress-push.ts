@@ -177,8 +177,34 @@ async function sendShot(
     deps.log(`[progress] 跳过过大截图（${png.byteLength}B）${path}`);
     return;
   }
+  // 2026-10-21：发图也落一条出站台账。
+  // 为什么必须落：此前 sendShot 只写日志，而日志每次重启被截断，
+  // 于是"截图到底发出去过没有"完全无法事后查证 —— 我因此误判过一次
+  // （surf_outbound_log 里只有 approval_card/task_reply，就以为从没发过）。
+  const recordShot = (ok: boolean, error: string | null): void => {
+    try {
+      deps.db
+        .prepare(
+          `INSERT INTO surf_outbound_log (kind, dedup_key, chat_id, ok, error, text_preview, at)
+           VALUES ('progress_image', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `progress:${taskId}:${path}`,
+          deps.chatId!,
+          ok ? 1 : 0,
+          error,
+          `截图 ${path}`.slice(0, 200),
+          new Date().toISOString(),
+        );
+    } catch (cause) {
+      // 台账写失败不能影响发图本身：图比记录重要。
+      deps.log(`[progress] 写图片台账失败 ${path}：${String(cause)}`);
+    }
+  };
+
   try {
     const res = await img.sendImage(deps.chatId!, png);
+    recordShot(res.ok, res.ok ? null : (res.error ?? null));
     if (res.ok) {
       st.lastImagePath = path;
       deps.log(`[progress] ${taskId} 随进度发了截图（${png.byteLength}B）`);
@@ -286,6 +312,11 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     const needsAttention =
       p.status === 'error' || recent.some((r) => r.status === 'failed' || r.status === 'interrupted');
 
+    // 2026-10-21（主人选方案 1）：这一步是不是刚出了**新手**截图？
+    // 实测 tk_mvi2ruzz4pd33b：截图成功 2 次，进度只在第 1 步推过一次，
+    // 按 3 步 / 90 秒的日常配置永远轮不到"带图那一次"，截图功能等于白做。
+    const freshShot = imagePath !== null && imagePath !== st.lastImagePath;
+
     const decision = decideProgress(
       {
         taskId,
@@ -297,11 +328,19 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
         lastPushStep: st.lastPushStep,
         needsAttention,
         screen,
+        freshShot,
       },
       cfg,
     );
 
     if (!decision.push) {
+      // 静默分支也记一笔（仅日志）：排查"为什么没推"时，
+      // 只有"推了"的日志等于没有日志 —— 看不出是被节流还是根本没走到。
+      deps.log(
+        `[progress] ${taskId} 跳过（${decision.reason}，第 ${stepCount} 步` +
+          (freshShot ? '，有新截图待发' : '') +
+          '）',
+      );
       state.set(taskId, st);
       return;
     }
@@ -309,13 +348,32 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     // 9.1：先定要不要带图（纯判断，可测），再发。
     const wantImage = decideScreen(imagePath, st.lastImagePath, needsAttention);
 
+    // 2026-10-21：**先占位再 await**，防同一任务的两个事件并发进来重复发。
+    //
+    // 现场（任务 tk_mvi3lgerj2lxwr）：progress_image 台账里 835/836 是同一张
+    // shot-mvi3lkfy.png，相隔不到 1 秒。原因不是跨模块重复（那个已经用台账拦住了），
+    // 而是本文件的读写竞态：`await send()` 期间事件循环是空的，
+    // 紧跟着的 seq=7 事件读到 st.lastPushAt 还是旧值 → 也判"该推"。
+    // 文字会连推两条，图会连发两张。
+    //
+    // 占位必须发生在 await **之前**。失败再回滚，不能"发失败也算推过"
+    // —— 那条最该看的就永久丢了。
+    const prevPushAt = st.lastPushAt;
+    const prevPushStep = st.lastPushStep;
+    const prevImagePath = st.lastImagePath;
+    st.lastPushAt = now();
+    st.lastPushStep = stepCount;
+    if (wantImage !== null) st.lastImagePath = wantImage;
+    state.set(taskId, st);
+
     const r = await deps.sender!.send(deps.chatId!, decision.text);
     if (r.ok) {
-      st.lastPushAt = now();
-      st.lastPushStep = stepCount;
       deps.log(`[progress] ${taskId} 推了进度（${decision.reason}，${stepCount} 步）`);
     } else {
-      // 发失败不落账 —— 下一次还有机会补。落账会让"正好那条最该看的"永久丢失。
+      // 发失败要回滚占位 —— 下一次还有机会补。
+      st.lastPushAt = prevPushAt;
+      st.lastPushStep = prevPushStep;
+      st.lastImagePath = prevImagePath;
       deps.log(`[progress] ${taskId} 进度推送失败：${r.error ?? '?'}`);
     }
 

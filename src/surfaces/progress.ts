@@ -64,6 +64,20 @@ export interface ProgressInput {
    * 这里给的是"它在看的那个页面现在有什么"，能回答"看到啥了"这个实际问题。
    */
   screen?: string | null;
+  /**
+   * 这一步**刚产出了一张以前没发过的截图**（2026-10-21 主人选方案 1）。
+   *
+   * 为什么要单独一个信号：实测（任务 tk_mvi2ruzz4pd33b）
+   * browser.screenshot 成功了 2 次，但进度只在第 1 步 start 推过一次 ——
+   * 那时截图还没产生。按 every_n_steps=3 / min_interval=90s 的日常配置，
+   * 一个 20 秒的任务永远轮不到"带着截图的那一次推送"。
+   * 结果就是：截图功能是好的，但**主人从没在手机上看过一张**。
+   *
+   * 语义：截图的时效性最强 —— 它描述"它现在看到的画面"，
+   * 晚 90 秒再发就变成历史照片了。所以新截图**越过步数与时间两道节流**。
+   * 但**不越过**：enabled 开关、去重（同一路径不重发，见 decideScreen）。
+   */
+  freshShot?: boolean;
 }
 
 export type ProgressDecision =
@@ -71,7 +85,7 @@ export type ProgressDecision =
   | {
       push: true;
       text: string;
-      reason: 'start' | 'attention' | 'interval';
+      reason: 'start' | 'attention' | 'interval' | 'shot';
       /**
        * 要附带的截图路径（容器内绝对路径）。null = 这次只发文字。
        *
@@ -107,7 +121,21 @@ export function decideScreen(
   needsAttention: boolean,
 ): string | null {
   if (path === null || path === '') return null;
-  if (needsAttention) return path;
+
+  // 2026-10-21：attention 不再无条件带图。
+  //
+  // 原设计是「attention 时即使重复也带，这是最该被看见的时刻」。
+  // 意图没错，但实现错了 —— 实测（任务 tk_mvi3nk51yqbp4d）：
+  //   [progress] 推了进度（shot，5 步）      ← 带 shot-mvi3noaj.png
+  //   [progress] 随进度发了截图（67006B）
+  //   [progress] 推了进度（attention，7 步） ← 又带同一张
+  //   [progress] 随进度发了截图（67006B）
+  // 相隔几秒，主人手机上是同一张图出现两遍。
+  //
+  // 关键区分：**attention 要保证的是"文字消息一定到达"，不是"图一定重发"。**
+  // 图重发不增加任何信息 —— 同一张 PNG 看第二遍和看第一遍一样。
+  // 所以去重规则对 attention 一样适用；attention 的特权在 decideProgress
+  // 那一层（越过步数/时间节流），不该延伸到图片去重。
   if (lastSentPath !== null && path === lastSentPath) return null;
   return path;
 }
@@ -134,6 +162,13 @@ export function decideProgress(
   if (input.lastPushAt === null) {
     if (input.stepCount === 0) return { push: false, reason: 'nothing_to_say' };
     return { push: true, text: renderProgress(input, false), reason: 'start' };
+  }
+
+  // 刚出了新截图 → 必推，越过步数与时间节流。
+  // 位置在 start 之后：首次推送本来就发，不必再判。
+  // 位置在 too_few_steps 之前：否则日常配置（3 步/90 秒）下永远轮不到。
+  if (input.freshShot === true) {
+    return { push: true, text: renderProgress(input, false), reason: 'shot' };
   }
 
   // 步数不够：连"上次推完到现在又走了几步"都不够，就别说话。

@@ -21,6 +21,10 @@ function makeDb(): DatabaseSync {
   db.exec(`CREATE TABLE steps (
     task_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
     call_id TEXT NOT NULL, tool_name TEXT NOT NULL, args_json TEXT, result_json TEXT, finished_at TEXT)`);
+  // 2026-10-21：随单推送要查这张共享台账做跨模块去重（见 §跨模块去重）
+  db.exec(`CREATE TABLE surf_outbound_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, dedup_key TEXT NOT NULL,
+    chat_id TEXT NOT NULL, ok INTEGER NOT NULL, error TEXT, text_preview TEXT NOT NULL, at TEXT NOT NULL)`);
   return db;
 }
 
@@ -176,4 +180,84 @@ test('FeishuGateway.sendImage：上传失败 → ok:false 带原因，不发消�
   } finally {
     restore();
   }
+});
+
+test('跨模块去重：进度推送已发过的图，随单推送不再重发（2026-10-21 实测重复）', async () => {
+  // 现场：任务 tk_mvi2zm3nah32ks 的 progress_image 台账里，
+  // shot-mvi2zy1f.png 被发了两次 —— 一次进度推送、一次任务结束随单推送。
+  // 主人手机上看同一张图出现两遍。
+  const db = makeDb();
+  db.prepare('INSERT INTO tasks (id, dot_id) VALUES (?, ?)').run('tk_1', 'dot1');
+
+  const p1 = '/dot/home/screenshots/a.png';
+  const p2 = '/dot/home/screenshots/b.png';
+  insertShot(db, 'tk_1', 4, JSON.stringify({ output: JSON.stringify({ path: p1 }) }));
+  insertShot(db, 'tk_1', 8, JSON.stringify({ output: JSON.stringify({ path: p2 }) }));
+
+  // 模拟进度推送已经把 p1 发出去了
+  db.prepare(
+    `INSERT INTO surf_outbound_log (kind, dedup_key, chat_id, ok, error, text_preview, at)
+     VALUES ('progress_image', ?, 'oc_1', 1, NULL, 'x', '2026-10-21T00:00:00Z')`,
+  ).run(`progress:tk_1:${p1}`);
+
+  const sends: string[] = [];
+  const deps = makeDeps(db, {
+    files: new Map([
+      [p1, Buffer.from('aaa')],
+      [p2, Buffer.from('bbb')],
+    ]),
+  });
+  // 记录真实发出的路径
+  const origRead = deps.readHomeFile;
+  deps.readHomeFile = async (dotId: string, path: string) => {
+    sends.push(path);
+    return origRead(dotId, path);
+  };
+
+  const n = await pushTaskScreenshots('tk_1', 'oc_1', deps);
+  // 两张都在 steps 里，但 p1 已经发过 → 只应发 p2
+  assert.equal(sends.length, 1, '已发过的图不应再读（读了就是准备再发）');
+  assert.equal(sends[0], p2);
+  assert.equal(n, 1, '实际发送张数应为 1');
+});
+
+test('跨模块去重不误伤：没发过的图照常发', async () => {
+  const db = makeDb();
+  db.prepare('INSERT INTO tasks (id, dot_id) VALUES (?, ?)').run('tk_1', 'dot1');
+  const p1 = '/dot/home/screenshots/a.png';
+  insertShot(db, 'tk_1', 4, JSON.stringify({ output: JSON.stringify({ path: p1 }) }));
+
+  const sends: string[] = [];
+  const deps = makeDeps(db, { files: new Map([[p1, Buffer.from('aaa')]]) });
+  const origRead = deps.readHomeFile;
+  deps.readHomeFile = async (dotId: string, path: string) => {
+    sends.push(path);
+    return origRead(dotId, path);
+  };
+  const n = await pushTaskScreenshots('tk_1', 'oc_1', deps);
+  assert.equal(sends.length, 1);
+  assert.equal(n, 1);
+});
+
+test('跨模块去重看 ok=1：发失败过的图仍要重试', async () => {
+  // 发失败不该算"已发过"，否则那条最该看的永远丢了。
+  const db = makeDb();
+  db.prepare('INSERT INTO tasks (id, dot_id) VALUES (?, ?)').run('tk_1', 'dot1');
+  const p1 = '/dot/home/screenshots/a.png';
+  insertShot(db, 'tk_1', 4, JSON.stringify({ output: JSON.stringify({ path: p1 }) }));
+  db.prepare(
+    `INSERT INTO surf_outbound_log (kind, dedup_key, chat_id, ok, error, text_preview, at)
+     VALUES ('progress_image', ?, 'oc_1', 0, 'boom', 'x', '2026-10-21T00:00:00Z')`,
+  ).run(`progress:tk_1:${p1}`);
+
+  const sends: string[] = [];
+  const deps = makeDeps(db, { files: new Map([[p1, Buffer.from('aaa')]]) });
+  const origRead = deps.readHomeFile;
+  deps.readHomeFile = async (dotId: string, path: string) => {
+    sends.push(path);
+    return origRead(dotId, path);
+  };
+  const n = await pushTaskScreenshots('tk_1', 'oc_1', deps);
+  assert.equal(sends.length, 1, '失败过的不算已发过，应重试');
+  assert.equal(n, 1);
 });

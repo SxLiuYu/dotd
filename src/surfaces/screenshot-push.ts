@@ -94,10 +94,39 @@ export async function pushTaskScreenshots(
     deps.log(`[screenshot-push] 任务不存在 ${taskId}`);
     return 0;
   }
+  // 2026-10-21：跨模块去重。
+  //
+  // 现场（任务 tk_mvi2zm3nah32ks，实测）：progress_image 台账里有 5 条，
+  // 其中 shot-mvi2zy1f.png 被发了两次 —— 一次来自进度推送（过程中的新截图），
+  // 一次来自这里的随单推送（任务结束时把最近 3 张再发一遍）。
+  // 主人在手机上看到同一张图重复出现。
+  //
+  // 判据：这张图**已经成功发到同一个会话**过，就不再发。
+  // 用 surf_outbound_log 当共享台账 —— 两个模块本来就都写它，
+  // 不能各自维护内存状态（进程重启就丢，且互不可见）。
+  const alreadySent = (path: string): boolean => {
+    try {
+      const row = deps.db
+        .prepare(
+          `SELECT 1 AS hit FROM surf_outbound_log
+           WHERE kind='progress_image' AND chat_id=? AND dedup_key=? AND ok=1 LIMIT 1`,
+        )
+        .get(chatId, `progress:${taskId}:${path}`) as { hit?: number } | undefined;
+      return row !== undefined;
+    } catch {
+      // 查不到就当没发过（宁可重复，不可漏发）
+      return false;
+    }
+  };
+
   let sent = 0;
   for (const r of rows) {
     const path = screenshotPathOf(r.result_json);
     if (path === null) continue;
+    if (alreadySent(path)) {
+      deps.log(`[screenshot-push] 跳过（进度推送已经发过）${path}`);
+      continue;
+    }
     let png: Buffer | null = null;
     try {
       png = await deps.readHomeFile(task.dot_id, path);
