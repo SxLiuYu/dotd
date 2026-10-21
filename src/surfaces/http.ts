@@ -102,6 +102,7 @@ export type Route =
   | 'heartbeat_admin'
   | 'hook_ingest'
   | 'task_by_id'
+  | 'activity'
   | 'logs'
   | 'memory_archive'
   | 'memory_restore'
@@ -201,6 +202,12 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   mm = /^\/api\/tasks\/([^/]+)$/.exec(p);
   if (m === 'GET' && mm !== null) {
     return { route: 'task_by_id', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+
+  // 9.3（2026-10-21）活动/回执总览：`dotd activity` 与 Web 活动页的数据源。
+  // 与 task_by_id 是「一个任务」vs「最近一批任务」的关系，同一数据投影面。
+  if (m === 'GET' && p === '/api/activity') {
+    return { route: 'activity', params: {} };
   }
 
   mm = /^\/hooks\/([^/]+)$/.exec(p);
@@ -340,6 +347,21 @@ function safeEqualStr(a: string, b: string): boolean {
 }
 
 // ── HTTP 服务 ────────────────────────────────────────────────────────
+
+/** 9.3 活动总览的一行（`GET /api/activity` 的投影，不是表结构）。 */
+interface ActivityRow {
+  id: string;
+  title: string;
+  status: string;
+  priority: number;
+  attempt: number;
+  createdAt: string | number;
+  updatedAt: string | number;
+  /** 该任务累计步数（steps 表计数）。 */
+  stepCount: number;
+  /** 其中失败的步数 —— 「卡在哪」的第一眼线索。 */
+  failedSteps: number;
+}
 
 export interface MemoryArchiveEntry {
   /** .archive/ 里的文件名（含时间戳前缀）。 */
@@ -854,6 +876,57 @@ export function createHttpServer(deps: HttpDeps): Server {
        * 本路由只做"读 + 投影"，不写库、不新增表。
        * `verbose=1` 时附带 `taskView`（成本/耗时/瓶颈三段），`dotd task <id> --verbose` 直接渲染它。
        */
+      /**
+       * 9.3（2026-10-21）`GET /api/activity` —— 「它最近都干了什么」。
+       *
+       * 与 `task_by_id` 的分工：那个回答"这一个任务每一步如何"，
+       * 这个回答"最近这一批任务各自结果如何"。两者都是只读投影，不写库。
+       *
+       * query：
+       *   limit  返回条数（默认 20，上限 100）
+       *   status 只看某状态（done/failed/running/...）；缺省全部
+       *
+       * 为什么不复用 /api/queue：queue 只有**在途**（queued/running），
+       * 而"干过什么"的主体是**已完成**的。两者的 SQL 谓词正好互补。
+       */
+      case 'activity': {
+        const rawLimit = Number(url.searchParams.get('limit') ?? '20');
+        const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 100) : 20;
+        const statusFilter = url.searchParams.get('status');
+        const where = statusFilter !== null && statusFilter !== '' ? 'WHERE status = ?' : '';
+        const params: Array<string | number> =
+          statusFilter !== null && statusFilter !== '' ? [statusFilter] : [];
+        let rows: ActivityRow[] = [];
+        try {
+          rows = deps.db
+            .prepare(
+              `SELECT t.id, t.title, t.status, t.priority, t.attempt,
+                      t.created_at AS createdAt, t.updated_at AS updatedAt,
+                      (SELECT count(*) FROM steps s WHERE s.task_id = t.id) AS stepCount,
+                      (SELECT count(*) FROM steps s WHERE s.task_id = t.id AND s.status = 'failed') AS failedSteps
+                 FROM tasks t
+                 ${where}
+                ORDER BY t.created_at DESC
+                LIMIT ?`,
+            )
+            .all(...params, limit) as unknown as ActivityRow[];
+        } catch (cause) {
+          json(res, 500, { error: 'db', message: `读活动失败：${String(cause)}` });
+          return;
+        }
+        // 总览数字：按状态分组（不受 limit 影响，回答"整体如何"而不是"这页如何"）
+        let counts: Array<{ status: string; n: number }> = [];
+        try {
+          counts = deps.db
+            .prepare('SELECT status, count(*) AS n FROM tasks GROUP BY status')
+            .all() as unknown as Array<{ status: string; n: number }>;
+        } catch {
+          counts = [];
+        }
+        json(res, 200, { tasks: rows, counts, limit });
+        return;
+      }
+
       case 'task_by_id': {
         const id = match.params.id!;
         const task = deps.cp.getTask(id);

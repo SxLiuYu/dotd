@@ -1590,6 +1590,25 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
         })
       : null;
 
+  // 截图取回 / 发图：两个消费方（随单推送 A3、进度推送 9.1）共用同一份实现。
+  // 分开写会漂 —— 比如一边加了 8MB 上限、另一边忘了，症状是"有时能发有时不能"。
+  const readHomeFileForShot = async (dotId: string, path: string): Promise<Buffer | null> => {
+    const call: ExecToolCall = {
+      call_id: `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      task_id: 'screenshot-push',
+      dot_id: dotId,
+      tool: 'fs.read',
+      args: { path, encoding: 'base64' },
+      deadline_ms: 30_000,
+      issued_at: new Date().toISOString(),
+    };
+    const r = await exec.runTool(call);
+    if (r.status !== 'ok') return null;
+    const b64 = (r.result as { content_base64?: string } | undefined)?.content_base64;
+    return typeof b64 === 'string' && b64.length > 0 ? Buffer.from(b64, 'base64') : null;
+  };
+  const sendImageToChat = (chatId: string, png: Buffer) => feishuGw.sendImage(chatId, png);
+
   // ⑧c 飞书出站回路：feishu 来源任务终态（done/failed）→ 回复发回原会话。
   // 订阅方永远排在发布方前（handler 同步入 emitter 数组，runner 的 cp.finish
   // 触发 publish 时本订阅已就位）；发送失败只落日志，不影响任务落库。
@@ -1607,25 +1626,12 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
             surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0] ?? null,
           // A3：截图随单推送 —— 文本回复发出成功后触发（见 screenshot-push.ts）。
           // 读图走容器 fs.read(base64)；发图走 FeishuGateway.sendImage。
+          // 9.1（2026-10-21）：这两个能力现在也供进度推送复用（见 readHomeFileForShot 注释）。
           screenshotPush: {
             db,
             log,
-            readHomeFile: async (dotId, path) => {
-              const call: ExecToolCall = {
-                call_id: `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                task_id: 'screenshot-push',
-                dot_id: dotId,
-                tool: 'fs.read',
-                args: { path, encoding: 'base64' },
-                deadline_ms: 30_000,
-                issued_at: new Date().toISOString(),
-              };
-              const r = await exec.runTool(call);
-              if (r.status !== 'ok') return null;
-              const b64 = (r.result as { content_base64?: string } | undefined)?.content_base64;
-              return typeof b64 === 'string' && b64.length > 0 ? Buffer.from(b64, 'base64') : null;
-            },
-            sendImage: (chatId, png) => feishuGw.sendImage(chatId, png),
+            readHomeFile: readHomeFileForShot,
+            sendImage: sendImageToChat,
           },
         })
       : null;
@@ -1641,7 +1647,14 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     db,
     bus: { on: (t, h) => bus.on(t, h) },
     ...(feishuGw !== NULL_FEISHU_GATEWAY && ownerChatForApproval !== ''
-      ? { sender: { send: (chat: string, text: string) => feishuGw.sendText(chat, text) }, chatId: ownerChatForApproval }
+      ? {
+          sender: { send: (chat: string, text: string) => feishuGw.sendText(chat, text) },
+          chatId: ownerChatForApproval,
+          // 9.1（2026-10-21）：进度也能带真截图了。
+          // 条件是"读得到字节 + 发得出图"，两个能力都要有；缺一个就退化为纯文字
+          // （旧行为），而不是发一条没有图的空消息。
+          image: { readHomeFile: readHomeFileForShot, sendImage: sendImageToChat },
+        }
       : {}),
     cfg: surfCfg.progress,
     log,

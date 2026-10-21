@@ -16,7 +16,8 @@
  *   为它加表加迁移不值得。
  */
 import type { DatabaseSync } from 'node:sqlite';
-import { decideProgress, type ProgressConfig, DEFAULT_PROGRESS } from './progress.ts';
+import { decideProgress, decideScreen, type ProgressConfig, DEFAULT_PROGRESS } from './progress.ts';
+import { screenshotPathOf } from './screenshot-push.ts';
 
 export interface ProgressPushDeps {
   db: DatabaseSync;
@@ -25,6 +26,18 @@ export interface ProgressPushDeps {
   sender?: { send(chatId: string, text: string): Promise<{ ok: boolean; error?: string }> };
   /** 目标会话。sender 存在时必填；两者都给了才启用。 */
   chatId?: string;
+  /**
+   * 发图能力（9.1，2026-10-21）。不注入 = 进度只有文字（旧行为）。
+   *
+   * 两个能力都要有才启用附图：读得到字节（容器 home 卷）+ 发得出图片消息。
+   * 只给一个没有意义 —— 读到了发不出去，或能发但没东西可发。
+   */
+  image?: {
+    /** 从容器 home 取回文件字节；失败 null。 */
+    readHomeFile(dotId: string, path: string): Promise<Buffer | null>;
+    /** 上传 PNG 并发图片消息。 */
+    sendImage(chatId: string, png: Buffer): Promise<{ ok: boolean; error?: string }>;
+  };
   cfg?: ProgressConfig;
   log: (line: string) => void;
   now?: () => number;
@@ -35,6 +48,8 @@ interface TaskProgressState {
   lastPushStep: number | null;
   /** 已经推过的最后一条 step seq，防同一事件重投 */
   lastSeenCallId: string | null;
+  /** 上一次随进度发出去的截图路径（没发过 = null）。用于去重，见 decideScreen。 */
+  lastImagePath: string | null;
 }
 
 /**
@@ -127,6 +142,55 @@ function hostOf(url: string): string {
 }
 
 /**
+ * 把一张截图随进度发出去（9.1，2026-10-21）。
+ *
+ * 失败语义与 screenshot-push 一致：**只落一行日志，绝不抛、绝不影响文字**。
+ * 进度是展示面，图发不出去最多是少一张图，不能因此丢掉"在干什么"这句话。
+ *
+ * 成功后把路径记进 st.lastImagePath —— 下次同一张图就不再发。
+ * 失败**不记** —— 下次还有机会补发（与文字发送同策）。
+ */
+async function sendShot(
+  taskId: string,
+  path: string,
+  st: TaskProgressState,
+  deps: ProgressPushDeps,
+): Promise<void> {
+  const img = deps.image!;
+  const task = deps.db.prepare('SELECT dot_id FROM tasks WHERE id=?').get(taskId) as
+    | { dot_id: string }
+    | undefined;
+  if (task === undefined) return;
+  let png: Buffer | null = null;
+  try {
+    png = await img.readHomeFile(task.dot_id, path);
+  } catch (cause) {
+    deps.log(`[progress] 读图失败 ${path}：${String(cause)}`);
+    return;
+  }
+  if (png === null || png.byteLength === 0) {
+    deps.log(`[progress] 读图为空 ${path}`);
+    return;
+  }
+  // 飞书图片上限 10MB；进度里带图宁缺毋滥，8MB 就截停（与 screenshot-push 同口径）
+  if (png.byteLength > 8 * 1024 * 1024) {
+    deps.log(`[progress] 跳过过大截图（${png.byteLength}B）${path}`);
+    return;
+  }
+  try {
+    const res = await img.sendImage(deps.chatId!, png);
+    if (res.ok) {
+      st.lastImagePath = path;
+      deps.log(`[progress] ${taskId} 随进度发了截图（${png.byteLength}B）`);
+    } else {
+      deps.log(`[progress] 截图发送失败 ${path}：${res.error ?? '?'}`);
+    }
+  } catch (cause) {
+    deps.log(`[progress] 截图发送异常 ${path}：${String(cause)}`);
+  }
+}
+
+/**
  * 启动进度推送。返回 stop。
  *
  * 注意：**默认不启用**（ProgressConfig.enabled 默认 false）。
@@ -149,7 +213,12 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
 
     const taskId = p.taskId;
     const callId = typeof p.callId === 'string' ? p.callId : '';
-    const st = state.get(taskId) ?? { lastPushAt: null, lastPushStep: null, lastSeenCallId: null };
+    const st = state.get(taskId) ?? {
+      lastPushAt: null,
+      lastPushStep: null,
+      lastSeenCallId: null,
+      lastImagePath: null,
+    };
 
     // 同一 callId 重投直接忽略（总线不保证不重投）
     if (callId !== '' && st.lastSeenCallId === callId) return;
@@ -161,6 +230,8 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     let recent: Array<{ kind: 'llm' | 'tool'; toolName: string | null; status: string }> = [];
     let title = '';
     let screen: string | null = null;
+    /** 本次可附的截图路径（最近一条成功的 browser.screenshot）。 */
+    let imagePath: string | null = null;
     try {
       const row = deps.db
         .prepare('SELECT count(*) AS c FROM steps WHERE task_id=?')
@@ -177,6 +248,21 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
         resultJson: string | null;
       }>;
       recent = rows.map((r) => ({ kind: r.kind, toolName: r.toolName, status: r.status }));
+      // 9.1：找最近一张真截图（browser.screenshot 落盘 PNG）。
+      // 只取一张 —— 进度是"现在看到什么"，不是相册。
+      if (deps.image !== undefined) {
+        const shot = deps.db
+          .prepare(
+            `SELECT result_json AS resultJson FROM steps
+             WHERE task_id=? AND tool_name='browser.screenshot' AND status='succeeded'
+               AND result_json IS NOT NULL
+             ORDER BY seq DESC LIMIT 1`,
+          )
+          .get(taskId) as { resultJson?: string | null } | undefined;
+        if (typeof shot?.resultJson === 'string') {
+          imagePath = screenshotPathOf(shot.resultJson);
+        }
+      }
       // 画面：取最近一个成功的 browser.* 步骤的结果摘要
       for (const r of rows) {
         if (r.toolName === null || !r.toolName.startsWith('browser.')) continue;
@@ -220,6 +306,9 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
       return;
     }
 
+    // 9.1：先定要不要带图（纯判断，可测），再发。
+    const wantImage = decideScreen(imagePath, st.lastImagePath, needsAttention);
+
     const r = await deps.sender!.send(deps.chatId!, decision.text);
     if (r.ok) {
       st.lastPushAt = now();
@@ -229,6 +318,14 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
       // 发失败不落账 —— 下一次还有机会补。落账会让"正好那条最该看的"永久丢失。
       deps.log(`[progress] ${taskId} 进度推送失败：${r.error ?? '?'}`);
     }
+
+    // 图独立于文字成败：文字发失败也值得试一次图？（不）
+    // 理由：图文是一条消息的两半，文字都没发出去说明这个 chat 有问题，
+    //       再发图大概率也失败，还会把限流打满。所以只在文字成功后才发图。
+    if (r.ok && wantImage !== null && deps.image !== undefined) {
+      await sendShot(taskId, wantImage, st, deps);
+    }
+
     state.set(taskId, st);
   });
 

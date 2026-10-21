@@ -156,6 +156,48 @@ function extractRisk(v: ApprovalView): string | null {
   return null;
 }
 
+/** 大额提示阈值：50000 分 = 500 元。只影响卡片上的提示，不改变审批与否。 */
+export const LARGE_SPEND_WARN_CENTS = 50_000;
+
+/**
+ * 分 → 人话金额（2026-10-21，9.2）。
+ *
+ * 为什么需要这个函数：`amountCents` 里存的是**分**（spend 契约、spend_ledger.amount_cents
+ * 都是分），但卡片原来直接 `String(amt)` 打出来。于是 12500 分被显示成
+ * "12500 CNY" —— 主人会以为要花一万二，实际是 125 元。**差 100 倍，且在花钱的卡上。**
+ *
+ * 小币种零位（JPY/KRW 等）不分转元，直接显示整数 —— 它们的"分"没有意义。
+ *
+ * @param cents 金额，单位分（整数）
+ * @param currency ISO4217 三字母
+ */
+export function formatMoney(cents: number, currency: string): string {
+  const zeroDecimal = new Set(['JPY', 'KRW', 'VND', 'CLP', 'ISK', 'HUF']);
+  const cur = currency !== '' ? currency : 'CNY';
+  if (zeroDecimal.has(cur)) return cur + ' ' + String(cents);
+  const sign = cents < 0 ? '-' : '';
+  const abs = Math.abs(cents);
+  const yuan = Math.floor(abs / 100);
+  const fen = abs % 100;
+  return sign + cur + ' ' + String(yuan) + '.' + String(fen).padStart(2, '0');
+}
+
+/**
+ * 金额是否超过预设的"多看一眼"阈值（9.2，2026-10-21）。
+ *
+ * ⚠️ 这**不是**用来"低于阈值就自动放行"的 —— spend 档一律人工审批是
+ * GOV §4.1/§4.5 的硬边界（记忆规则对其永不生效），不做数值放宽。
+ * 它只决定两件事：
+ *   ① 卡片上要不要加一行明显提示（"金额较大，请确认"）
+ *   ② 排序/视觉上要不要标红
+ * 即：只加严可见性，不减审批。
+ *
+ * 默认阈值 50000 分 = 500 元。可由 govConfig.spendWarnCents 覆盖。
+ */
+export function isLargeSpend(cents: number, warnCents: number): boolean {
+  return Math.abs(cents) >= warnCents;
+}
+
 /**
  * 从 params 里挑出"主人做决定必须知道的"字段。
  * 刻意只挑有限的几个：卡片上信息太多等于没信息。
@@ -182,11 +224,18 @@ function extractKeyParams(v: ApprovalView): Array<[string, string]> {
   pick('attachments', '附件');
   pick('draftId', '草稿编号');
 
-  // 花钱类
-  const amt = o.amountCents ?? o.amount;
-  if (amt !== undefined) {
-    const cur = typeof o.currency === 'string' ? o.currency : '';
-    out.push(['金额', String(amt) + ' ' + cur]);
+  // 花钱类。amountCents 是**分**，必须换算后再显示（见 formatMoney 注释里的 100 倍事故）。
+  // amount 是裸值（旧形态），单位不明 —— 原样显示并标注，不猜。
+  const cents = o.amountCents;
+  const cur = typeof o.currency === 'string' ? o.currency : '';
+  if (typeof cents === 'number') {
+    const shown = formatMoney(cents, cur);
+    out.push([
+      '金额',
+      isLargeSpend(cents, LARGE_SPEND_WARN_CENTS) ? shown + '  ⚠️ 金额较大，请确认' : shown,
+    ]);
+  } else if (o.amount !== undefined) {
+    out.push(['金额', String(o.amount) + ' ' + cur + '（未标明单位）']);
   }
   pick('url', '目标地址', 100);
   pick('command', '要执行的命令', 150);

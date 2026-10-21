@@ -179,16 +179,84 @@ daemon 已在 `http.ts:424` serve `web-ui/dist`。HTTP API 共 27 个端点。
 
 | # | 项 | 为什么值得做 | 状态 |
 |---|---|---|---|
-| 9.1 | 进度推送接真截图 | 两个轮子都有，只差接线 | 见 §4 |
-| 9.2 | 审批金额阈值 | 现在只能「一律要批」，缺「超过 ¥500 才问」 | — |
-| 9.3 | 活动/回执页 | 数据齐（steps/audit_log），Web UI 缺视图 | — |
+| 9.1 | 进度推送接真截图 | 两个轮子都有，只差接线 | **已完成**（见 §4.1） |
+| 9.2 | 审批金额显示与提醒 | 现在只能「一律要批」，缺「超过 ¥500 才提醒」 | **已完成**（见 §4.2） |
+| 9.3 | 活动/回执总览 | 数据齐（steps/tasks），缺「最近干了什么」视图 | **已完成**（见 §4.3） |
+| 9.4 | 心跳事件被模型误判 | 定时任务建不出来（真正的 P0 故障） | **已完成**（见 §3.1） |
+
+### 4.1 进度推送接真截图（9.1，2026-10-21 完成）
+
+改了什么：`progress-push` 的 `push: true` 分支新增 `imagePath`，并把截图去重抽成
+纯函数 `decideScreen(path, lastSentPath, needsAttention)`（`src/surfaces/progress.ts`）。
+顺序刻意固定为**先文字后图片**：文字失败就不发图，避免主人收到一张没有说明的截图。
+
+去重三条规则：无图不发、同上张不发、`needsAttention` 时不查重（该看的时候必须看到）。
+
+验证：`tests/progress.test.ts` 47 断言全过；反向注入两条去重规则各产生 1 个 FAIL。
+
+### 4.2 审批金额显示与提醒（9.2，2026-10-21 完成）
+
+**没有做**「低于阈值自动放行」—— 那会破坏「花钱一律要人批」这条硬边界（GOV §4.1/§4.5：
+spend 永不进记忆、永不自动）。做的是**让人更容易看懂自己在批什么**：
+
+- `formatMoney(cents, currency)`：`amountCents` 全链是**分**，卡片原来直接印
+  `12500 CNY`，现在印 `125.00 CNY`。零小数币种（JPY/KRW/VND/CLP/ISK/HUF）原样不换算。
+- `LARGE_SPEND_WARN_CENTS = 50_000`（500 元）：超过就在卡片上加
+  `⚠️ 金额较大，请确认`。
+- 裸 `amount` 字段标注「（未标明单位）」，不再假装知道是分还是元。
+
+验证：`tests/feishu-card-money.test.ts` 20 断言全过；反向注入旧的 `String(cents)`
+显示产生 2 个 FAIL。
+
+### 4.3 活动/回执总览（9.3，2026-10-21 完成）
+
+新增 `GET /api/activity` + `dotd activity`：回答「它最近都干了什么」。
+与 `dotd task <id>` 的分工是「一批任务的结果」vs「一个任务的每一步」。
+
+输出含按状态总数、每个任务的时间/状态/步数，**失败步数只在真有时才显示**
+（每行都写「失败 0」等于噪音）。
+
+与 `/api/queue` 的关系：queue 只看在途（queued/running），activity 的主体是已完成的，
+两者 SQL 谓词正好互补。
+
+验证：`tests/activity-endpoint.test.ts` 20 断言全过；limit 三向夹逼实测
+（999→100、abc→20、0→1）。
+
+### 3.1 心跳事件被模型误判（9.4，2026-10-21 修复的 P0 故障）
+
+**这是本轮发现的最严重问题**：定时任务**从来建不出来**。
+
+链路本应是：`crontabs` 到期 → `fireHeartbeat` → `ingestEvent` → 匹配 → 建任务。
+实测发现事件 100% 落在 `status='inbox'`，从不产生 `event_decisions`。
+
+根因：`config/event-rules.yml` 阶段一默认 `rules: []`（有意留空，规则写错会误建任务），
+于是所有事件都落到**模型层**判「要不要建任务」。对 http/file 这类事件这没错，
+但 heartbeat 的 payload 里已经带着 `title`/`prompt`/`proactive` ——
+「该不该建任务」在调度器那步就答完了，让模型重判一遍本身就是错的。
+
+而模型在实测中给出了两种都不是分类结果的回答：
+- 把 `payload.prompt`（`"Reply with exactly: PROACTIVE-PROBE-OK"`）当成要它执行的指令，
+  直接回了 `PROACTIVE-PROBE-OK`；
+- 强化 system prompt 后转为过度防御，回 `"I can't act on that message"`。
+
+两者都让 `parseJsonOnce` 返回 null → 落 inbox → 任务永不创建。
+
+修法：`match.ts` 新增 `heartbeatDecision()`，heartbeat 事件**确定性短路**，
+按 payload 直接建任务（`via='rule'`, `confidence=1.0`）。规则层仍优先，
+主人可以在 `event-rules.yml` 写规则覆盖。payload 缺 `prompt` 或不是对象时退回原路径。
+
+验证：`tests/heartbeat-decision.test.ts` 18 断言全过。反向注入删掉短路后立即
+`Error: heartbeat 不该调模型层`，栈直指 `matchByLlm`；恢复后 18/18 绿。
+端到端实测：`ct_a1v3` → `ev13 matched (via=rule, confidence=1)` → `tk_ev_13 done`
+→ 飞书实收 `PROACTIVE-PROBE-OK`（`surf_outbound_log` id 808/809，`ok=1`）。
 
 ---
 
 ## 10. 事实边界
 
-**实测**：41 工具、5 条 crontab 全 proactive=0、9 delta/2 final、`sendImage` 存在、
-`progress-push` 无 sendImage 调用、27 HTTP 端点、6 Web 视图、无原生工程。
+**实测**（2026-10-21 更新）：41 工具、9 delta/2 final、`sendImage` 存在、
+28 HTTP 端点（新增 `/api/activity`）、6 Web 视图、无原生工程、
+心跳事件经确定性短路建任务并实收飞书推送。
 
 **判断（可能错）**：
 - 「接截图是小工量」—— 看了依赖链，没写

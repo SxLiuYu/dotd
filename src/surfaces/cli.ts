@@ -577,6 +577,67 @@ export function buildCli(opts: CliOptions = {}): Command {
     });
 
   program
+    .command('activity')
+    .description('最近干过什么（GET /api/activity：一批任务的结果与步数，含失败步数）')
+    .option('--limit <n>', '返回条数（默认 20，上限 100）', '20')
+    .option('--status <s>', '只看某状态（done|failed|running|cancelled…）')
+    .action(async (opts: { limit?: string; status?: string }) => {
+      const o = merged();
+      const qs = new URLSearchParams();
+      if (opts.limit !== undefined && opts.limit !== '') qs.set('limit', opts.limit);
+      if (opts.status !== undefined && opts.status !== '') qs.set('status', opts.status);
+      const q = qs.toString() === '' ? '' : '?' + qs.toString();
+      const r = await api<{
+        tasks: Array<{
+          id: string;
+          title: string;
+          status: string;
+          attempt: number;
+          createdAt: string | number;
+          stepCount: number;
+          failedSteps: number;
+        }>;
+        counts: Array<{ status: string; n: number }>;
+        limit: number;
+        message?: string;
+      }>('GET', `/api/activity${q}`, undefined, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      const lines: string[] = [];
+      // 总览：按状态分组，回答「整体如何」而不是「这页如何」
+      if (r.body.counts.length > 0) {
+        const parts = r.body.counts
+          .slice()
+          .sort((a, b) => b.n - a.n)
+          .map((c) => `${statusInChinese(c.status)} ${c.n}`);
+        lines.push('全部任务：' + parts.join(' · '));
+        lines.push('');
+      }
+      if (r.body.tasks.length === 0) {
+        lines.push('没有任务。用 `dotd ask "…"` 起一个。');
+        emit(o, lines.join('\n'));
+        return;
+      }
+      lines.push(`最近 ${r.body.tasks.length} 个任务：`);
+      for (const tk of r.body.tasks) {
+        const when = formatWhen(tk.createdAt);
+        const marks: string[] = [];
+        if (tk.stepCount > 0) marks.push(`${tk.stepCount} 步`);
+        // 失败步数只在真的有时才说 —— 每个任务都写「失败 0」等于噪音
+        if (tk.failedSteps > 0) marks.push(`⚠️ 失败 ${tk.failedSteps} 步`);
+        const mark = marks.length > 0 ? '（' + marks.join('，') + '）' : '';
+        lines.push(`  ${when}  ${statusInChinese(tk.status).padEnd(4)}  ${tk.title.slice(0, 48)}${mark}`);
+        lines.push(`    ${tk.id}`);
+      }
+      lines.push('');
+      lines.push('看单条细节：dotd task <taskId> --verbose');
+      emit(o, lines.join('\n'));
+    });
+
+  program
     .command('cancel <taskId>')
     .description('取消任务（cp.cancel(id, "user")）')
     .action(async (taskId: string) => {
@@ -794,6 +855,28 @@ function isMainModule(): boolean {
 
 if (isMainModule()) {
   void main();
+}
+
+/** 任务状态 → 中文（活动页与任务页共用口径；认不出就原样返回，不编）。 */
+function statusInChinese(status: string): string {
+  const m: Record<string, string> = {
+    queued: '排队',
+    running: '在跑',
+    done: '完成',
+    failed: '失败',
+    cancelled: '取消',
+    awaiting_approval: '等批',
+  };
+  return m[status] ?? status;
+}
+
+/** created_at → "10-21 16:39"。epoch 毫秒字符串与 ISO 都能吃；认不出就说"时间未知"。 */
+function formatWhen(v: string | number): string {
+  const n = typeof v === 'number' ? v : Number(v);
+  const d = Number.isFinite(n) ? new Date(n) : new Date(String(v));
+  if (Number.isNaN(d.getTime())) return '时间未知';
+  const p = (x: number) => String(x).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 /** 供 daemon 装配层/测试写 CLI token 文件（§5.6 第三顺位）。 */

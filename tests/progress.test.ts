@@ -6,7 +6,7 @@
  *   2. 节流双阈值（步数 + 时间）都要真的生效 —— 只查一个就会刷屏或从不说话
  *   3. "需要人介入"必须**突破节流**（这种消息漏掉比多推一条糟得多）
  */
-import { decideProgress, humanizeTool, DEFAULT_PROGRESS } from '../src/surfaces/progress.ts';
+import { decideProgress, decideScreen, humanizeTool, DEFAULT_PROGRESS } from '../src/surfaces/progress.ts';
 import { screenOf } from '../src/surfaces/progress-push.ts';
 import type { ProgressInput } from '../src/surfaces/progress.ts';
 
@@ -212,6 +212,43 @@ const mk = (over: Partial<ProgressInput> = {}): ProgressInput => ({
   const n = decideProgress(mk({ lastPushStep: 5, stepCount: 10, screen: null }), ON);
   ok('无画面时不写"页面："', n.push && !n.text.includes('页面：'));
 }
+
+// ── 9.1（2026-10-21）：进度要不要附真截图 ────────────────────────────────
+//
+// 这一组只测**判断**，不测 IO。真正取图/发图在 progress-push 的 sendShot 里，
+// 那部分靠集成验证（读容器 home + 发飞书），单测拿 Buffer 假不出来。
+console.log('');
+console.log('  9.1 截图附带的去重与优先级');
+
+// 没有图就是没有图，不该编一个出来
+ok('无图 → 不带', decideScreen(null, null, false) === null);
+ok('空串当无图', decideScreen('', null, false) === null);
+
+// 第一次见到这张图 → 带
+ok('首次出现 → 带', decideScreen('/dot/home/screenshots/a.png', null, false) === '/dot/home/screenshots/a.png');
+
+// 同一张图已经发过 → 不重复发（否则连续两步推一模一样的图）
+ok(
+  '同上一条路径 → 不重复发',
+  decideScreen('/dot/home/screenshots/a.png', '/dot/home/screenshots/a.png', false) === null,
+);
+
+// 换了新图 → 带
+ok(
+  '换了新图 → 带',
+  decideScreen('/dot/home/screenshots/b.png', '/dot/home/screenshots/a.png', false) ===
+    '/dot/home/screenshots/b.png',
+);
+
+// 需要人介入 → 即使重复也带（这是最该被看见的时刻，去重让位于可见性）
+ok(
+  'attention 时重复也要发',
+  decideScreen('/dot/home/screenshots/a.png', '/dot/home/screenshots/a.png', true) ===
+    '/dot/home/screenshots/a.png',
+);
+
+// attention 且无图 → 仍然不带（没有就是没有，不能拿别的东西冒充）
+ok('attention 但无图 → 不带', decideScreen(null, '/dot/home/screenshots/a.png', true) === null);
 
 console.log('\n  合计 ' + pass + ' 通过 / ' + fail + ' 失败\n');
 process.exit(fail === 0 ? 0 : 1);

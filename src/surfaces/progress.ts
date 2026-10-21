@@ -68,7 +68,49 @@ export interface ProgressInput {
 
 export type ProgressDecision =
   | { push: false; reason: 'disabled' | 'too_soon' | 'too_few_steps' | 'nothing_to_say' }
-  | { push: true; text: string; reason: 'start' | 'attention' | 'interval' };
+  | {
+      push: true;
+      text: string;
+      reason: 'start' | 'attention' | 'interval';
+      /**
+       * 要附带的截图路径（容器内绝对路径）。null = 这次只发文字。
+       *
+       * 2026-10-21（9.1）：T5 当时只有 screenOf() 的文字摘要，因为
+       * "真截图要改容器协议 + 飞书发图"。后来这两件事都做了
+       * （browser.screenshot 落盘 + FeishuGateway.sendImage），
+       * 所以进度里可以带图了 —— 但**要不要带**是策略问题，由 decideScreen() 决定。
+       */
+      imagePath?: string | null;
+    };
+
+/**
+ * 决定这次进度要不要附截图（9.1，2026-10-21）。
+ *
+ * 为什么单独一个函数而不是塞进 decideProgress：
+ *   要不要说话（开关/步数/节流）和要不要带图是**两件事**。
+ *   带图代价高得多（取回字节 + 上传飞书，8MB 上限），
+ *   而且价值和文字不同 —— 文字说"在干什么"，图说"看到了什么"。
+ *
+ * 去重靠 path：browser.screenshot 的 result 是
+ *   {"path":"/dot/home/screenshots/shot-mvhqow41.png","bytes":67006}
+ * 文件名带 ULID，同一张图不会重名，不同图必然路径不同。
+ * 所以"上一条已发过的 path"就是全部去重所需，不必再算 sha256。
+ *
+ * 规则：
+ *   - 没有图 → 不带
+ *   - 需要人介入（attention）→ 一定带，即使和上一条重复（这是最该被看见的时刻）
+ *   - 其余 → 只在路径变化时带，避免连续两步推一模一样的图
+ */
+export function decideScreen(
+  path: string | null,
+  lastSentPath: string | null,
+  needsAttention: boolean,
+): string | null {
+  if (path === null || path === '') return null;
+  if (needsAttention) return path;
+  if (lastSentPath !== null && path === lastSentPath) return null;
+  return path;
+}
 
 /**
  * 决定要不要推，要推就给出说人话的文本。
