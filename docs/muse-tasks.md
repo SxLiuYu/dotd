@@ -570,3 +570,47 @@ agent-browser install --with-deps   # 首次约 190MB，并装 Chrome 依赖库
 动作显式点名白名单（open/snapshot/screenshot/close）跳过登录态审批。
 `browser.act` 会点/填/提交，可能下单改设置发消息，仍然人批。契约 G1 的
 `isLoginSensitive` 本身没动，identity 照旧进 decision 记录，审计不失真。
+
+## 浏览器统一（2026-10-21 收口）
+
+上一轮接 agent-browser 时是"多一条路"：新的 `web.*` 好用，旧的 `browser.*` 还在
+容器里跑 playwright、只能猜 CSS 选择器。现在合成一条。
+
+**做法**：`ExecService.runToolInner` 先查 `hostTools` 再发容器，所以在宿主侧
+注册同名 `browser.*` 就是**覆盖**。容器里的 playwright 代码原样保留 —— 删掉
+`src/daemon.ts` 里那 5 行注册即可回滚，不用改别的。
+
+**参数形状一个字没动**：老的 `browser.act` 传 `{action, selector, value}` 照样能用；
+`selector` 里写 `@e1` 行、写 CSS 也行（agent-browser 本来就都接受）。
+
+### 两个坑（都是实机撞出来的，不是推演）
+
+1. **identity 得在宿主侧重算。** 宿主工具只收到 `call.args`，runner 派生的
+   `call.identity` 不会进 args。所以 `webtools.ts` 自己复刻
+   `resolveBrowserIdentity` 的规则，再映射成 `--session`。映射做 FNV-1a 哈希：
+   identity 形如 `site:example.com` 带冒号，直接当目录名会出事；哈希保证
+   同 identity 同 session、不同 identity 不撞车（撞车 = 两站共用 cookie，比不持久更糟）。
+
+2. **会话必须继承，否则快照看到空白页。** `browser.open` 带 url 能派生 session，
+   但紧接着的 `browser.snapshot` **没有 url**，派生不出 identity。最初让它退化成
+   匿名 session，结果 open 打开的页面根本不在那个 session 里，
+   `browser.snapshot` 返回 `(no interactive elements)`。修法：按 taskId 记住当前
+   站点，`close` 后清除，`anon` 不记入。
+
+### 登录态等价性
+
+容器版靠 `launchPersistentContext` + `/dot/profiles` 卷；agent-browser 的等价物是
+具名 `--session`。**实测跨进程保留 cookie**：开一次百度，另一个进程
+`--session t2 cookies` 读得到 `BAIDUID` / `PWD` 等。所以"登进去"这个能力没丢。
+
+### 实测
+
+用**旧工具名**（正是之前 `browser_crashed` 那条路径）：
+
+| 调用 | 耗时 | 返回 |
+|---|---|---|
+| `browser.open` | 765ms | `{"url":"https://example.com/","title":"Example Domain"}` |
+| `browser.snapshot` | 41ms | `- link "Learn more" [ref=e1]` |
+
+单测 `web-tools.test.ts` 24/24（新增 10 条兼容层 + 4 条会话继承）；
+判据 `web-tools-criteria.sh` 18/18；全量 1636 通过 / 0 失败。
