@@ -75,6 +75,43 @@ export const FINISHED_JOBS_KEEP = 64;
  * 真实类型来自镜像内的 `playwright@1.49.1`（§9.6 严格锁）；此处不引该包的类型，
  * 使容器外 typecheck 不依赖 playwright 安装。
  */
+/** 真实 playwright Page 的结构子集（W1：只为补 snapshot() 用）。 */
+interface PlaywrightPageLike {
+  context(): { newCDPSession(page: unknown): Promise<PlaywrightCdpSession> };
+}
+
+/** 真实 playwright Context 的结构子集。 */
+interface PlaywrightContextLike {
+  pages(): Promise<PlaywrightPageLike[]>;
+  newPage(): Promise<PlaywrightPageLike>;
+  close(): Promise<void>;
+  kind?: 'persistent' | 'ephemeral';
+}
+
+/** 真实 playwright Browser 的结构子集。 */
+interface PlaywrightBrowserLike {
+  newContext(opts?: Record<string, unknown>): Promise<unknown>;
+  close(): Promise<void>;
+  isConnected(): boolean;
+}
+
+/** CDP 会话（playwright newCDPSession 返回值的结构子集）。 */
+interface PlaywrightCdpSession {
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  detach(): Promise<void>;
+}
+
+/** CDP Accessibility 节点（只声明本项目用到的字段）。 */
+interface AxNode {
+  nodeId: string;
+  parentId?: string;
+  childIds?: string[];
+  ignored?: boolean;
+  role?: { value?: string };
+  name?: { value?: string };
+  backendDOMNodeId?: number;
+}
+
 interface PlaywrightChromium {
   launchPersistentContext(
     userDataDir: string,
@@ -213,6 +250,90 @@ export class AgentRuntime {
       budgetMb: cfg.memBudgetMb ?? 1536,
       onEvent: (kind, detail) => this.log(`[event] exec.browser.${kind} ${JSON.stringify(detail)}`),
     });
+  }
+
+
+  /**
+   * 把真实 playwright context 适配成 BrowserContextLike（W1，2026-10-21）。
+   *
+   * 为什么需要这层：`BrowserPage.snapshot()` 是 browser.ts 里声明的契约，但
+   * playwright-core 1.49.1 的 Page 上**没有** snapshot()，也没有 ariaSnapshot()
+   * （实测 getOwnPropertyNames 两者皆无；ariaSnapshot 是 1.49 之后才加的）。
+   * 之前直接 `as unknown as BrowserContextLike` 强转，类型上通过、运行时一调就
+   * browser_crashed —— 契约和实现之间是断的。
+   *
+   * 这里给每个 page 补一个真正的 snapshot()：走 CDP 的
+   * Accessibility.getFullAXTree，这正是 ariaSnapshot 内部的同一数据源，
+   * 等于手工实现官方新 API，零新依赖。其余方法原样转发。
+   */
+  private adaptContext(ctx: PlaywrightContextLike): import('./browser.ts').BrowserContextLike {
+    const wrapPage = (p: PlaywrightPageLike): import('./browser.ts').BrowserPage =>
+      new Proxy(p as unknown as import('./browser.ts').BrowserPage, {
+        get: (target, prop, receiver) => {
+          if (prop === 'snapshot') {
+            return async () => this.axSnapshot(p);
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    return {
+      pages: async () => (await ctx.pages()).map((p) => wrapPage(p)),
+      newPage: async () => wrapPage(await ctx.newPage()),
+      close: () => ctx.close(),
+      kind: ctx.kind ?? 'ephemeral',
+    };
+  }
+
+  /** 取可读快照：CDP AX 树 → 缩进文本（见 adaptContext 注释）。 */
+  private async axSnapshot(page: PlaywrightPageLike): Promise<{ text: string; html?: string }> {
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await cdp.send('Accessibility.enable', {});
+      const { nodes } = (await cdp.send('Accessibility.getFullAXTree', {})) as {
+        nodes: AxNode[];
+      };
+      const byId = new Map<string, AxNode>();
+      for (const n of nodes) byId.set(n.nodeId, n);
+      const lines: string[] = [];
+      const emit = (node: AxNode, depth: number): void => {
+        const role = node.role?.value ?? '';
+        const name = (node.name?.value ?? '').replace(/\s+/g, ' ').trim();
+        // 跳过的四类，共同点是"自身不产出信息"，但**子节点必须继续下探**：
+        //  - ignored：Chrome 标记为对辅助技术不可见的中间层，实际内容全在其下
+        //    （实测 RootWebArea 的子节点就是 ignored:none，整棵页面都挂在它下面，
+        //    早期版本在这里直接 return，导致快照只剩一行 RootWebArea）。
+        //  - none / generic / InlineTextBox：纯排版容器与文本盒，无语义。
+        //  - StaticText：其文本已被父节点（heading/button/link…）的 name 覆盖，
+        //    再输出一遍就是重复。
+        // StaticText 的取舍要更细：父节点已有同名 name 时它是重复（heading: X
+        // 下面再挂一条 StaticText: X），但 listitem/cell/paragraph 这类父节点
+        // 自身没有 name，文字就全在 StaticText 里 —— 一律跳过会把正文吞掉。
+        const parent = node.parentId === undefined ? undefined : byId.get(node.parentId);
+        const parentName = (parent?.name?.value ?? '').replace(/\s+/g, ' ').trim();
+        const redundantText = role === 'StaticText' && parentName !== '' && parentName === name;
+        const skip =
+          node.ignored === true ||
+          role === '' ||
+          role === 'none' ||
+          role === 'generic' ||
+          role === 'InlineTextBox' ||
+          redundantText;
+        let next = depth;
+        if (!skip) {
+          const shown = name.length > 120 ? `${name.slice(0, 117)}…` : name;
+          lines.push(`${'  '.repeat(depth)}${role}${shown === '' ? '' : `: ${shown}`}`);
+          next = depth + 1;
+        }
+        for (const childId of node.childIds ?? []) {
+          const child = byId.get(childId);
+          if (child !== undefined) emit(child, next);
+        }
+      };
+      for (const root of nodes.filter((n) => n.parentId === undefined)) emit(root, 0);
+      return { text: lines.join('\n') };
+    } finally {
+      await cdp.detach().catch(() => undefined);
+    }
   }
 
   private requireBrowserFactory(cfg: RuntimeConfig): import('./browser.ts').ChromiumFactory {
