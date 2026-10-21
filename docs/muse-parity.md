@@ -198,6 +198,53 @@ daemon 已在 `http.ts:424` serve `web-ui/dist`。HTTP API 共 27 个端点。
 
 验证：`tests/progress.test.ts` 47 断言全过；反向注入两条去重规则各产生 1 个 FAIL。
 
+### 4.1b 截图其实一张都没发出去过（2026-10-21 实机发现并修复）
+
+9.1 把 `imagePath` 接进 `push: true` 分支后，代码看着齐了：
+`readHomeFile` 读图、`sendImage` 发图、`decideScreen` 去重。测试也 47 条全过。
+
+**但真跑一遍才发现一张图都没发出去。**
+
+实测：发一个 `browser.open` + `browser.screenshot` 的任务，
+进度推了 7 次（日志有 7 行「推了进度」），**零行「随进度发了截图」**，
+也没有任何「读图失败」——因为 `sendShot()` 压根没被调用。
+
+**根因**：`screenshotPathOf()` 只认 `{path}` 与 `{result:{path}}`，
+而 `steps.result_json` 实际存的是：
+
+```json
+{"output":"{\"path\":\"/dot/home/screenshots/shot-mvhqow41.png\",\"bytes\":67006}"}
+```
+
+工具输出先被字符串化、又包了一层。于是解析**永远返回 null**，
+`decideScreen(null, ...)` 返回 null，附图分支静默跳过。
+截图在容器里造得出来（67006 字节 PNG，`steps.result_json` 里有路径），
+但从来没送到主人手上。
+
+**为什么单测没抓到**：`tests/progress.test.ts` 测的是 `decideScreen` 的纯逻辑，
+输入是我手写的 `'/dot/home/screenshots/x.png'`。真实形状根本没进测试视野。
+这是「纯函数测对了，接线处的数据形状错了」的典型。
+
+**修法**：`screenshotPathOf` 三种形状都认，并递归解 `output`（是 JSON 再解一层），
+深度上限 3 防炸栈。解不出就返回 null，绝不拼路径。
+
+**验证**：
+
+```
+$ grep progress /tmp/dotd-wsl.log
+[dotd] [progress] tk_mvhxmalvwkgtab 推了进度（interval，3 步）
+[dotd] [progress] tk_mvhxmalvwkgtab 随进度发了截图（67006B）   ← 此前从未出现过
+```
+
+`tests/screenshot-path.test.ts` 14 断言，第一条用的就是**生产库捞出来的原文**，
+不是我构造的形状。反向注入（退回旧实现）→ 3 FAIL / rc=1；恢复 → 0 FAIL。
+
+**顺带说明节流参数**：正式配置是 `every_n_steps: 3` + `min_interval_ms: 90000`。
+一个 20 秒跑完的任务只会在第 1 步推一次，那时还没截图 —— 所以即使修好解析，
+短任务也可能一次图都赶不上。要验证链路必须临时把两个阈值调低
+（本次实测用 `1` / `0`，验完已恢复）。**这是节流在按设计工作，不是 bug**，
+但意味着「长任务才有过程图」，值得知道。
+
 ### 4.2 审批金额显示与提醒（9.2，2026-10-21 完成）
 
 **没有做**「低于阈值自动放行」—— 那会破坏「花钱一律要人批」这条硬边界（GOV §4.1/§4.5：

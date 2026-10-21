@@ -25,13 +25,42 @@ export interface ScreenshotPushDeps {
   sendImage(chatId: string, png: Buffer): Promise<{ ok: boolean; error?: string }>;
 }
 
-/** 从 step 的 result_json 里解析截图路径；坏 JSON/缺 path/不在 screenshots 目录 → null。 */
+/**
+ * 从 step 的 result_json 里解析截图路径；坏 JSON/缺 path/不在 screenshots 目录 → null。
+ *
+ * 2026-10-21 修真缺陷：此前只认 `{path}` 与 `{result:{path}}`，而 `steps.result_json`
+ * 实际存的是 `{"output":"{\"path\":\"/dot/home/screenshots/x.png\"}"}`
+ * —— 工具输出先被字符串化、又被包了一层。于是本函数**永远返回 null**，
+ * 下游 `screenshot-push` 与 `progress-push` 的附图分支全部静默失效：
+ * 截图在容器里造得出来（实测 67006 字节 PNG），却一张都没发出去过。
+ *
+ * 现在三种形状都认，并递归解 `output` 字符串（是 JSON 就再解一层）。
+ * 只多认不多猜：任何一层解不出合法路径就返回 null，绝不拼路径。
+ */
 export function screenshotPathOf(resultJson: string): string | null {
-  try {
-    const obj = JSON.parse(resultJson) as { result?: { path?: unknown }; path?: unknown };
-    const p = obj.result?.path ?? obj.path;
-    if (typeof p === 'string' && p.startsWith('/dot/home/screenshots/')) return p;
+  const okPath = (p: unknown): string | null =>
+    typeof p === 'string' && p.startsWith('/dot/home/screenshots/') ? p : null;
+
+  const fromObj = (obj: unknown, depth: number): string | null => {
+    if (depth > 3 || obj === null || typeof obj !== 'object') return null;
+    const o = obj as Record<string, unknown>;
+    const direct = okPath(o['path']);
+    if (direct !== null) return direct;
+    const nested = okPath((o['result'] as { path?: unknown } | undefined)?.path);
+    if (nested !== null) return nested;
+    const out = o['output'];
+    if (typeof out === 'string') {
+      try {
+        return fromObj(JSON.parse(out), depth + 1);
+      } catch {
+        return null;
+      }
+    }
     return null;
+  };
+
+  try {
+    return fromObj(JSON.parse(resultJson), 0);
   } catch {
     return null;
   }
