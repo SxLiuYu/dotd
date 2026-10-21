@@ -79,6 +79,45 @@ for p in $(pgrep -f 'src/daemon.ts'); do ls -l /proc/$p/fd/1 /proc/$p/fd/2; done
 于是你以为重启了、其实还是老进程——**而老进程加载的是老代码**。
 确认换代码生效看 `pgrep` 的 pid 变没变，不要只看脚本回了"就绪"。
 
+### 两个「跑通了但其实没通」的坑（2026-10-21 实测）
+
+这两个都是**链路的另一半没接上**，日志却显示正常。只有真跑一遍才会暴露。
+
+**① `browser.*` 的身份在 args 里，不在 call.identity 里**
+
+`ExecService.runToolInner` 只把 `call.args` 交给宿主工具
+（`host(call.args, call.task_id)`），**`call.identity` 不进 args**。
+所以宿主侧 `webtools.identityOf(args, taskKey)` 是身份的唯一来源。
+
+曾经在 runner 的 `toolCall()` 里剥掉 `args.identity`（怕容器 400 拒），
+结果 runner 决议出 `mybank`、宿主只看到 `undefined` → **静默退回匿名 session**，
+登录态丢了还不报错。剥离只该发生在 `ExecService.dispatch()`（确定要进容器时），
+已提成可测函数 `stripIdentityForContainer`。
+
+自检命令（真跑，不靠读代码）：
+
+```bash
+bash scripts/regress/browser-host-identity-e2e.sh
+```
+
+**② 审批卡片发得出去 ≠ 按钮点得动**
+
+卡片由 `sendCard` 发出（飞书 code=0、台账记「已发卡片」），但按钮点击是
+另一个事件 `card.action.trigger`，需要在 `feishu-ws.ts` 的
+`dispatcher.register({...})` 里单独注册。漏了就只会有：
+
+```
+[warn]: [ 'no card.action.trigger handle' ]
+```
+
+事件被 SDK 丢弃 → 审批永远 pending → 任务卡在 awaiting_approval。
+`feishu-inbound.ts` 里解析、主人闸门、`kind:'card_action'` 全都写好了，
+**缺的只是接线**，那是一段永不执行的死代码。
+
+判据：`tests/feishu-ws-card-callback.test.ts` 会枚举 inbound 里的
+`eventType === 'xxx'` 分支，逐个要求 ws 有对应注册。
+以后加新事件类型，这条会先报。
+
 ### CLI（没有 `tasks` 命令，别猜）
 
 ```bash
