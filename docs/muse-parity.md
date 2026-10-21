@@ -22,7 +22,7 @@
 |---|---|---|
 | 能力（能干什么） | ✅ 对齐并超过 | 41 个工具 vs Muse 10 个，见 §2 |
 | 主动打扰（Muse 最核心） | ✅ 通，闸门齐 | 代码+DB 全通，仅 `proactive=0`，见 §3 |
-| 过程可视 | ⚠️ 文字版可用，位图未接 | `progress-push.ts` 无 `sendImage` 调用，见 §4 |
+| 过程可视 | ✅ 文字 + 位图，且已启用 | 启动日志「已启用（每 3 步 / 至少隔 90 秒）」，见 §4 |
 | 流式输出 | ✅ **已通** | 实测 9 delta / 2 final，见 §5 |
 | Web 控制台 | ✅ 有 | 6 视图 + daemon serve，见 §6 |
 | 多端 App | ❌ 无原生工程 | 见 §7 |
@@ -93,10 +93,12 @@ console.log(db.prepare('SELECT proactive,enabled FROM crontabs').all());"
 | 节流判定 | ✅ `progress.ts`：`everyNSteps=3` + `minIntervalMs=90_000` 双阈值 |
 | 接线 | ✅ `progress-push.ts` 订阅 `exec.call.finished` |
 | 文案 | ✅ `现在：读文件` / `卡在：打开网页` |
-| **位图** | ❌ **未接** |
+| **位图** | ✅ 已接（9.1） |
+| **启用** | ✅ 已开启（2026-10-21，见 §4.4） |
 
-`grep sendImage src/surfaces/progress-push.ts` → **零结果**。
-所以进度里只有 `screenOf()` 抽出的文字（"示例站 — example.com"），没有图。
+（历史记录：本节早先写的是「未接」。9.1 已把 `imagePath` 接进 `push: true` 分支，
+`grep sendImage src/surfaces/progress-push.ts` 现在有结果。保留这段是为了标明
+结论变过，不是一直如此。）
 
 **但两个轮子都已造好**：
 - `browser.screenshot` 能出 PNG（实测 `agent-browser screenshot` 产出 90903 字节）
@@ -183,6 +185,8 @@ daemon 已在 `http.ts:424` serve `web-ui/dist`。HTTP API 共 27 个端点。
 | 9.2 | 审批金额显示与提醒 | 现在只能「一律要批」，缺「超过 ¥500 才提醒」 | **已完成**（见 §4.2） |
 | 9.3 | 活动/回执总览 | 数据齐（steps/tasks），缺「最近干了什么」视图 | **已完成**（见 §4.3） |
 | 9.4 | 心跳事件被模型误判 | 定时任务建不出来（真正的 P0 故障） | **已完成**（见 §3.1） |
+| 9.5 | 金额阈值规则谓词 | 清单 B3「超过 ¥500 才问」 | **已完成**（受限形式，见 §4.4） |
+| 9.6 | 开启 ui.progress | 目标要求，且挖出一个配置缩进缺陷 | **已完成**（见 §4.4） |
 
 ### 4.1 进度推送接真截图（9.1，2026-10-21 完成）
 
@@ -221,6 +225,89 @@ spend 永不进记忆、永不自动）。做的是**让人更容易看懂自己
 
 验证：`tests/activity-endpoint.test.ts` 20 断言全过；limit 三向夹逼实测
 （999→100、abc→20、0→1）。
+
+### 4.4 开启进度推送（9.6，2026-10-21）
+
+目标只是「把 `progress.enabled` 打开」，但打开的过程挖出一个**真缺陷**。
+
+**症状**：无论怎么改 `enabled`，启动日志永远是
+`[progress] 过程可视化未启用（需要 enabled + sender + chatId 三者齐备）`。
+
+**根因**：`_config_src.yml` 里 `progress:` 的缩进是 6/8 空格（应为 2/4），
+于是它被 YAML 解析成 `ui.stream_deltas` 的**子节点**：
+
+```yaml
+  ui:
+    stream_deltas: true
+      progress:          # ← 6 空格，挂错层了
+        enabled: false
+```
+
+结果 `surfaces.progress` 恒为 `undefined`，由 zod 的
+`.default({ enabled: false, ... })` 兜底 —— 所以**看起来配了，实际从没生效过**。
+而 `scripts/wsl-daemon.sh:37` 每次启动都 `cp _config_src.yml ~/.dotd/config.yml`，
+这个错误配置一直跟着跑，谁改 `~/.dotd/config.yml` 都会被覆盖回去。
+
+**修法**：修正 `_config_src.yml` 缩进（2/4 空格），`config/dotd.yml` 的
+`progress.enabled` 置 `true`。
+
+**验证**：
+
+```
+$ grep progress /tmp/dotd-wsl.log
+[dotd] [progress] 过程可视化已启用（每 3 步 / 至少隔 90 秒）
+```
+
+判据是**清空日志后重启**再看 —— 旧日志里那条「未启用」是历史残留，
+不清理会误判成没修好（本轮踩过这个坑）。
+
+顺带记一个排查教训：`loadSurfacesConfig` 明明返回 `enabled:true`，
+但 daemon 里探针打印 `enabled:false`。原因是 daemon 启动于 `17:41:27`，
+而我在 `17:41:28` 才写文件 —— 差 1 秒，它读的是旧内容。
+**改配置后必须确认新进程的启动时间晚于文件 mtime**，否则验的是旧进程。
+
+### 4.5 金额阈值规则（9.5，2026-10-21 的受限实现）
+
+清单原话是「加数值阈值规则（"超过 ¥500 才问"）」，字面读 = **低于阈值不问**。
+
+**这条读法与项目自己的硬约束冲突**：
+
+- GOV §2.1 表格：`spend | approve | 一律人工审批；记忆规则对其永不生效`；
+- GOV §2.6：`rules.yml` **只能收紧**（降档在加载时拒绝并告警）。
+
+`rules.yml` 的 `decision` 只有 `allow/review/approve/deny`，命中后只能升级不能降级。
+所以「加个谓词就能免审批花钱」在本架构里**结构上做不到** —— 这不是没实现，是设计上拒绝。
+
+**实现的是阈值的可用形式**：新增谓词 `match.amountAtLeast`（单位**分**）。
+
+```yaml
+rules:
+  - match:
+      tool: shop.checkout
+      amountAtLeast: 50000        # ≥ ¥500
+    decision: approve             # 必问
+    reason: "单笔 500 元以上必须人工确认"
+```
+
+命中条件 `amountCents >= amountAtLeast`。因为命中后只能转 `approve`/`deny`，
+这个谓词**不可能**产生「低于阈值放行」。写 `decision: allow` 配它会被拒：
+
+```
+rules.yml 条目 {"tool":"shop.buy","amountAtLeast":50000} 试图把 approve 放宽为 allow，已拒绝
+```
+
+**验证**：`tests/amount-threshold-rule.test.ts` 10 断言，两个方向都钉住：
+
+- 能达到：≥N 必问、≥N 直接拒、坏值（0/负数/小数）被 zod 拒绝；
+- 做不到：`spend + allow`、`spend + review` 均被拒并给出 `rule_not_stricter`。
+
+实测把规则写进真实 `config/rules.yml`：`loadCatalog` 接受（accepted=1，无告警），
+`match` 保留 `{"tool":"fs.write","amountAtLeast":50000}`。
+
+**当前限制**：阶段一 `config/tools.yml` **没有登记任何 spend 档工具**
+（`shop.checkout` 是注释掉的结构示例，GOV §9.1/M5 阶段一工具词表无 spend 项）。
+所以这个谓词现在可用于 `fs.write` 等收紧场景，真正用在花钱上要等
+阶段二接入支付类工具 —— **那时不需要改代码，只加配置**。
 
 ### 3.1 心跳事件被模型误判（9.4，2026-10-21 修复的 P0 故障）
 
