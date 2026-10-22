@@ -63,6 +63,20 @@ db:
 
 surfaces:
   http:
+    # 监听地址（F6：2026-10-22 起可配置）。留着 127.0.0.1 是本机部署的选择；
+    # **代码默认值**在 src/surfaces/config.ts 的 DEFAULT_HTTP_HOST，判据
+    # scripts/regress/web-console-criteria.sh 钉的是后者 —— 升级 daemon 不该
+    # 静默把「只有本机能碰」的端口变成「局域网能碰」（master token = 全权凭据）。
+    # 也可以不改这个文件、临时用环境变量 DOTD_HTTP_HOST 覆盖
+    #（优先级：DOTD_HTTP_HOST > 本行 host > 默认 127.0.0.1）。
+    # 扩到非回环地址前先知道四件事：
+    #   ① master token 从「本机凭据」降级为「局域网凭据」，而这里是明文 HTTP、没有 TLS；
+    #   ② allowed_origins 必须显式写全来源：留空或含 * 时 daemon **拒启动**（空 = 放行
+    #      任何 Origin，非回环下等于 DNS rebinding 防护形同不存在）；
+    #   ③ 保险库写路径（dotd vault add/rm）自动只对本机回环对端开放（其他对端 403）；
+    #   ④ 收回办法：把本行改回 127.0.0.1（或撤掉 DOTD_HTTP_HOST）并重启 daemon。
+    # SSE 的 ?token= 通道依旧保留（EventSource 设不了请求头），但它把 token 写进 URL；
+    # 非回环监听时 /api/stream 也已接受 Authorization 头，前端建议走头通道。
     host: 127.0.0.1
     # 契约 H2 唯一监听端口。改它 = 制造漂移：CLI 的默认 base URL 写死 7788
     # （src/surfaces/cli.ts:23），assertHttpConfig 也会告警，而 ~/.dotd/config.yml
@@ -75,6 +89,8 @@ surfaces:
     # 浏览器从 http://localhost:7788 打开 Web UI 时，Origin 就是这两个之一；
     # 少写一个 = 该来源的 /api 全部 403，而 curl/CLI（无 Origin）不受影响，
     # 所以症状是"命令行好使、网页全 403"，很难一眼看穿。
+    # 手机经局域网访问时，把 http://<监听地址>:7788 也加进来：Origin 是精确匹配，
+    # 通配 * 不被识别（写了等于没写），而非回环监听时留空/写 * 会直接拒启动。
     allowed_origins: ["http://localhost:7788", "http://127.0.0.1:7788"]
   hooks:
     - source: grafana
