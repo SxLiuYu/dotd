@@ -1042,6 +1042,23 @@ export class DotRunner {
   private readonly toolCallCounts = new Map<string, Map<string, number>>();
 
   /**
+   * 被治理拒掉的调用，按**工具名**记账（2026-10-22，真机 72 步失控）。
+   *
+   * 为什么不复用 repeatGuard：那张表按 (工具, 参数签名) 记，而治理判定 deny
+   * 走的是 `lookupTool(name)` —— **只看工具名，不看参数**。模型只要在参数里
+   * 塞点无关字段（实测是 description 换措辞），就得到一个新的 key：
+   *
+   *   bash :: {"command":"ls -la","description":"Inspect repo root"}
+   *   bash :: {"command":"ls -la","description":"List working directory"}
+   *
+   * 25 次 bash、21 个不同 key、结果全是同一句 `deny:工具未登记`。
+   * 每 key 的 sameResultCount 都到不了 3，护栏继续沉默。
+   *
+   * 判定与参数无关，记账就不能按参数分流 —— 这里只认工具名。
+   */
+  private readonly deniedByTool = new Map<string, Map<string, number>>();
+
+  /**
    * 每任务 × 每路径的「整篇重写」追踪（2026-10-19）：记住上一次写进去的内容，
    * 用来判断下一次写入是不是"在旧内容尾巴上又接了一段"。
    * 见 {@link SAME_PATH_REWRITE_LIMIT} 的现场说明。
@@ -1882,6 +1899,31 @@ export class DotRunner {
     }
   }
 
+  /**
+   * 记忆补写轮的工具白名单。
+   *
+   * 这个回合只该做一件事：把这次学到的东西写成文件。所以给的能力也就这几样——
+   * 读（防止它盲写覆盖）、写、列目录（确认 notes/ 在不在）。
+   *
+   * **刻意不给**：shell.run、net.*、browser.*、mail.*、任何 spend 档。
+   * 补写轮跑在任务收口之后，此时主人已经拿到结论，不该再有任何副作用机会。
+   *
+   * 从 toolSpecs() 里筛而不是另建清单：能力目录是唯一事实源，
+   * 另建一份就会像 §1.1 记的那些缺陷一样，两边迟早漂移。
+   */
+  private async redoToolSpecs(task: Task): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
+    const ALLOWED = new Set(['fs.write', 'fs.read', 'fs.list', 'fs.stat']);
+    try {
+      const all = await this.toolSpecs(task);
+      return all.filter((s) => ALLOWED.has(s.name));
+    } catch (err) {
+      // 筛不出来也不能退化成「不给工具」——那正是这次要修的缺陷。
+      // 宁可这一轮没有工具（模型回 SKIP），也不要悄悄把写入能力吃掉。
+      this.log(`runner: 补写轮工具清单构建失败 ${task.id}：${errText(err)}`);
+      return [];
+    }
+  }
+
   /** 读 tools/ 下所有工具，转成 tool schema。 */
   private async dynamicToolSpecs(task: Task): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
     if (!(await this.hasToolList())) return [];
@@ -2054,6 +2096,19 @@ export class DotRunner {
       };
     }
 
+    // **被拒计数优先**（2026-10-22，真机 72 步失控）：治理 deny 只看工具名不看参数，
+    // 所以「这个工具被拒了几次」比「这组参数重复了几次」更能说明它在撞墙。
+    // 读的是上一次 noteDeniedCall 的结果（checkRepeat 在派发前跑）。
+    const denied = this.deniedByTool.get(taskId)?.get(call.name) ?? 0;
+    if (denied >= 3) return 'stop';
+    if (denied === 2) {
+      return {
+        note:
+          '`' + call.name + '` 已经因为「不在允许的工具清单里」被拒绝了两次。' +
+          '**改参数不会让它变合法** —— 拒绝的理由是工具名本身。' +
+          '换一个清单里有的工具，或者用现有信息把结论写出来。',
+      };
+    }
     // **结果没变化才是真打转**（2026-10-18 校准）：次数本身不可靠 ——
     // 有的任务合法地重复同一动作 8 次（tests/runner-plan.test.ts 的抗跑偏用例），
     // 靠次数拦会误伤；而"同一调用 + 结果一字不差"几乎必然是原地打转。
@@ -2168,6 +2223,18 @@ export class DotRunner {
         `再写一次只会变成重复的两行。现在直接停止调用工具，用一句话告诉主人结果。`,
     };
   }
+  /**
+   * 记一次「被治理拒掉的调用」。按工具名累计，与参数无关（见 deniedByTool 注释）。
+   */
+  private noteDeniedCall(taskId: string, toolName: string): void {
+    let m = this.deniedByTool.get(taskId);
+    if (m === undefined) {
+      m = new Map();
+      this.deniedByTool.set(taskId, m);
+    }
+    m.set(toolName, (m.get(toolName) ?? 0) + 1);
+  }
+
   /** 派发后回填该调用的结果摘要，供下一次重复时的注记引用（让模型看到真实结果）。 */
   private recordRepeatResult(
     taskId: string,
@@ -2208,6 +2275,7 @@ export class DotRunner {
     this.repeatGuard.delete(taskId);
     this.repeatSkipsByTask.delete(taskId);
     this.toolCallCounts.delete(taskId);
+    this.deniedByTool.delete(taskId);
     this.rewritesByPath.delete(taskId);
     browserIdentityByTask.delete(taskId); // A1：浏览器身份表同样随任务终态释放
   }
@@ -2341,13 +2409,42 @@ export class DotRunner {
       // 接缝 ⑦ deny 支线：步标 skipped + 结果回喂（任务改道，不直接失败）。
       // 没有实际派发 → dispatched:false，走系统注记（否则会造出一条无主 tool_result）。
       this.cp.journal.skipStep(callId, `deny:${verdict.reason}`);
+      const deniedResult = { denied: true, tool: call.name, reason: verdict.reason };
       ctx.feed({
         ok: false,
         callId,
         toolName: call.name,
         dispatched: false,
-        value: { denied: true, tool: call.name, reason: verdict.reason },
+        value: deniedResult,
       });
+      // **被拒的调用也必须进判重记录**（2026-10-22 真机，147 步失控）。
+      //
+      // 现场：容器隔离后所有工具回 `container_not_ready`，模型转而反复发 `bash`
+      // （不在白名单）→ 治理 deny「工具未登记」→ 这里 skipStep + 回喂 → continue。
+      // 但 recordRepeatResult 只挂在**派发成功/失败**那条路上（:2442），
+      // 被拒的调用压根没进 repeatGuard 的账本 —— 于是：
+      //   · 同一个被拒的调用重复了 **70 次**，sameResultCount 一直是 0；
+      //   · 护栏一声不响，任务一路烧到 147 步；
+      //   · 步数硬上限是 2000（journal.ts:494），远在它够不着的地方。
+      //
+      // 「被拒」也是结果，而且是**最能说明模型在打转**的那种结果：
+      // 它不是在等新信息，它是在反复撞同一堵墙。这种情形比正常重复更该早停。
+      //
+      // **按工具名记账，不看参数**（2026-10-22 第二次真机修，同一现场）。
+      //
+      // 先按 (工具,参数) 记账是不够的：治理判定 deny 走的是 `lookupTool(name)`
+      // ——**只看工具名，压根不看参数**。于是模型只要在参数里塞点无关字段
+      // （实测是 description 换措辞），就得到一个新的 key：
+      //
+      //   bash :: {"command":"ls -la","description":"Inspect repo root"}
+      //   bash :: {"command":"ls -la","description":"List working directory"}
+      //   bash :: {"command":"ls -la","description":"List repo root and notes"}
+      //
+      // 25 次 bash、21 个不同 key、结果**全部**是同一句 `deny:工具未登记`。
+      // 每个 key 的 sameResultCount 都到不了 3，护栏继续沉默，任务烧到 72 步以上。
+      //
+      // 参数无关的判定，记账就不该按参数分流 —— 只认工具名。
+      this.noteDeniedCall(task.id, call.name);
       return { kind: 'continue' };
     }
 
@@ -2764,11 +2861,24 @@ export class DotRunner {
       const begin = this.cp.journal.beginLlm(task.id, epoch, digestOf(MEMORY_REDO_PROMPT));
       seq = begin.seq;
       callId = begin.callId;
-      // 请求体刻意**不带 tools**：这一步只允许"写记忆或 SKIP"，不给它别的动作面。
-      // 有的模型会无视约束照样发 tool_calls（尤其 tool_choice:'none' 不被支持时），
-      // 那种情况在下面按"不认识的名字 → deny 回喂"处理，不派发。
+      // **工具集：只给写记忆需要的几个**（2026-10-22 真机修）。
+      //
+      // 原来这里是「刻意不带 tools」，注释写的意图是「这一步只允许写记忆或 SKIP，
+      // 不给它别的动作面」—— 但实现成「不给任何工具」，于是模型想写也写不了：
+      //
+      //   提示词：「如果有：用 fs.write 把它写进 notes/ 或 manuals/」
+      //   请求体：没有 tools
+      //   模型回：「我这边没有可用的 fs.write 工具，所以这条经验没法落盘」
+      //
+      // 意图是「只允许写」，实现成了「一律不许」。模型没犯错，是被自相矛盾的要求卡住。
+      // 现在按原意收紧成一个白名单：能读写文件、能列目录，仅此而已。
+      // 目录外的一切（shell、网络、浏览器、付款）仍然拿不到——动作面照样是窄的。
+      //
+      // 仍然存在的风险：模型无视约束发别的工具名。那种情况在下面按
+      // 「不认识的名字 → deny 回喂」处理，不派发（这一层没变）。
       const req: RouteRequest = {
         track: 'primary',
+        tools: await this.redoToolSpecs(task),
         messages: [
           { role: 'system', content: MEMORY_REDO_PROMPT },
           {
@@ -2781,19 +2891,36 @@ export class DotRunner {
         ],
         attemptId: callId,
         maxTokens: 1024,
-        // 不组网、不流式：这是收口路径上的附加回合，必须最短最可控
-        tool_choice: 'none',
+        // 不组网、不流式：这是收口路径上的附加回合，必须最短最可控。
+        // tool_choice 保持 'auto'：给了工具就必须允许它真的调，
+        // 否则又回到「提示词说能写、协议层不让写」的自相矛盾。
+        tool_choice: 'auto',
       };
       const resp = await this.router.complete(req);
       const chat = resp.response as { content?: string; toolCalls?: Array<{ id: string; name: string; arguments: string }> };
-      const content = typeof chat.content === 'string' ? chat.content : '';
+      const rawContent = typeof chat.content === 'string' ? chat.content : '';
       const tokens = (resp.usage?.promptTokens ?? 0) + (resp.usage?.completionTokens ?? 0);
 
-      const calls = (chat.toolCalls ?? []).map((c) => ({
+      let calls = (chat.toolCalls ?? []).map((c) => ({
         id: c.id,
         name: c.name,
         arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
       }));
+      // DSML 兜底在这里同样要有（2026-10-22 真机漏掉的第三处）。
+      // 主循环的 completeLlm 早就接了（见 :1645 那段注释与 shared/recover-text-calls.ts），
+      // 唯独补写轮是直接调 router.complete、绕过了那层归一 —— 于是模型用正文发意图时，
+      // calls 为空、正文是裸标签，落到下面 else 分支，被记成「补写轮无工具调用」，
+      // 想写的那条经验**静默丢掉**，日志里还看不出异常。
+      // 用同一个 recover/strip 对（与主循环同一套语义），不另造判据。
+      let content = rawContent;
+      if (calls.length === 0) {
+        const recovered = recoverTextToolCalls(rawContent);
+        if (recovered.length > 0) {
+          calls = recovered;
+          content = stripTextToolCalls(rawContent);
+          this.log(`runner: 补写轮从正文里捞回 ${String(recovered.length)} 个工具调用 ${task.id}`);
+        }
+      }
       const skipped = calls.length === 0 && /^\s*SKIP\s*$/i.test(content);
 
       if (skipped) {
