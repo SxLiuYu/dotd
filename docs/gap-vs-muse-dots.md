@@ -193,6 +193,41 @@ $ 查 config/tools.yml 的 spend 档条目       →（只有一份注释形式�
 
 ## 3. 已经追平甚至超过的部分
 
+### 3.0 分级审批：Dots 有，dotd 也有（此文档此前漏记）
+
+报道里明确写过一句：**「只知道付款要按，不知道能不能设『超过 $X 就要问』」**
+（`docs/meta-muse.md:211`）—— 并注明**这是 OpenAI Dots 明确有的功能，Muse 报道里没提**。
+
+所以「按金额分级审批」是 Dots 相对 Muse 的差异点，也必须是本目标的验收项之一。
+
+**实测结论：dotd 已具备，且比 Dots 的描述更通用。**
+
+| 能力 | Dots | dotd | 证据 |
+|---|---|---|---|
+| 按金额决定要不要问人 | ✅ | ✅ | `src/governance/gate.ts:781-789`（`amountAtLeast` 谓词）|
+| 单位 | 美元 | 分（ISO 4217 三字母币种）| `gate.ts:1655` `SpendParams` |
+| 与其他条件组合 | 未提及 | ✅ tool / urlHost / pathPrefix / 金额 可叠加 | `gate.ts:772`（urlHost）/ `:777`（pathPrefix）/ `:781`（金额）|
+| 只可收紧不可放宽 | 未提及 | ✅ 降档在加载时被拒绝并告警 | `config/rules.yml:1-9` |
+| 花钱留痕 | 未提及 | ✅ `spend_ledger` + 人工补录 | `gate.ts:1679` `recordSpendAdjustment` |
+
+配置形状（`config/rules.yml`，当前是空列表 —— 默认不预设任何收紧规则）：
+
+```yaml
+rules:
+  - match:
+      tool: shop.buy
+      amountAtLeast: 50000        # 500.00 元（单位：分）
+    decision: approve
+    reason: "单笔 >= 500 元必须人工确认"
+```
+
+**为什么生产配置是空的**：空是**有意的默认值**，不是没做完 ——
+不预设收紧规则意味着「没登记的工具一律 deny」，这是更保守的起点。
+要用的人按上面的形状自己加一行即可，不用改代码。
+已有 9 条断言覆盖这个谓词（`tests/amount-threshold-rule.test.ts`），含坏值校验
+（`amountAtLeast: 0` 会被拒，不会被当成"配好了"）。
+
+
 | 能力 | dotd 现状 | 说明 |
 |---|---|---|
 | 常驻运行 | ✅ | daemon + 每 Dot 一个 Docker 容器 |
