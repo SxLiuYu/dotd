@@ -187,7 +187,16 @@ else
   # 这时**不能**当作「干净」放过去 —— 第⑰类：没测到不能编码成合法值。
   # 保持 ⏳ 并明说去哪验，而不是假装检查过。
   S1_ST=WAIT
-  S1_MSG="$S1_MSG；**没找到 git 仓库**（试过 ${DOTD_GIT_REPO:-$(pwd)}），git 半边没验"" —— 用 `DOTD_GIT_REPO=D:\\toagi\\dotd bash scripts/verify-goal.sh` 或在 D: 侧跑"
+  # 2026-10-22 修（原线是 fork bomb）：原文在「没验」后多了一个 "
+  #   → 字符串提前闭合，后面那段含反引号的示例命令被 bash
+  #   当成**命令替换**执行 → 脚本递归调用自己 → 无限子进程。
+  #   实测：在 WSL 里跑 5 秒内出现 **84 个并发 verify-goal.sh 进程**（pgrep -cf）。
+  #   为什么会陷进这条路径：/root/dotd 不是 git 仓库（源码权威在 D: 侧），
+  #   所以 WSL 里始终走 else 分支 → 永远递归。之前调这个脚本「卡住」、
+  #   拿不到退出码，就是这个原因。
+  #   修法：去掉多余的 "，并把示例命令的反引号改成普通字符 ——
+  #   例子命令应该被**打印出来**，不是被执行。
+  S1_MSG="$S1_MSG；**没找到 git 仓库**（试过 ${DOTD_GIT_REPO:-$(pwd)}），git 半边没验 —— 用 DOTD_GIT_REPO=D:/toagi/dotd bash scripts/verify-goal.sh 或在 D: 侧跑"
 fi
 row "S1 修绿基线" "$S1_ST" "$S1_MSG" "npm test + git status"
 

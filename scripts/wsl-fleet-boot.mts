@@ -11,7 +11,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { openDb } from '../db/conn.ts';
-import { migrate } from '../db/migrate.ts';
+import { migrate, latestMigrationVersion } from '../db/migrate.ts';
 import { EventBus } from '../src/shared/bus.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
 import { execConfigFromEnv } from '../src/exec/types.ts';
@@ -19,7 +19,10 @@ import { execConfigFromEnv } from '../src/exec/types.ts';
 const dataDir = join(homedir(), '.dotd');
 mkdirSync(dataDir, { recursive: true });
 const db = openDb(join(dataDir, 'fleet-verify.db'));
-const res = migrate(db, { expectedVersion: 50 });
+// expectedVersion 从迁移目录推（2026-10-22）：这里钉死 50 已经让本脚本在
+// 迁移 60 之后就一直起不来 —— 实测 MigrationError: 迁移后 user_version=185，期望 50。
+// README:350 记录的正是这条"生产路径不经模型"的验证入口，它静默坏掉比没有更糟。
+const res = migrate(db, { expectedVersion: latestMigrationVersion() });
 console.log(`migrate ${res.from}→${res.to}`);
 
 const bus = new EventBus();

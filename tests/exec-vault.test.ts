@@ -5,7 +5,10 @@
  * 被洗回占位符；缺条目 vault_missing；没配钥匙 vault_unconfigured。
  */
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+// 2026-10-22 修（Windows）：原来直接 rmSync 会在 Windows 上报 EPERM
+// （SQLite 的 WAL/SHM 句柄还打着，删不掉）→ 整个测试报红。
+// 改用 helpers 的 forceRemoveTempPath（内存带重试）。
+import { forceRemoveTempPath } from './helpers.ts';
 import { test } from 'node:test';
 
 import { makeTempDataDir } from './helpers.ts';
@@ -56,7 +59,7 @@ test('exec：$vault: 占位符在宿主工具手上已是明文；回包被清�
     else process.env.DOTD_MAIL_KEY = savedKey;
     if (savedDir === undefined) delete process.env.DOTD_VAULT_DIR;
     else process.env.DOTD_VAULT_DIR = savedDir;
-    rmSync(t.root, { recursive: true, force: true });
+    forceRemoveTempPath(t.root);
   }
 });
 
@@ -86,7 +89,7 @@ test('exec：缺条目 → vault_missing（fail-closed，占位符不出门）',
     else process.env.DOTD_MAIL_KEY = savedKey;
     if (savedDir === undefined) delete process.env.DOTD_VAULT_DIR;
     else process.env.DOTD_VAULT_DIR = savedDir;
-    rmSync(t.root, { recursive: true, force: true });
+    forceRemoveTempPath(t.root);
   }
 });
 
@@ -110,6 +113,6 @@ test('exec：有占位符但没配钥匙 → vault_unconfigured', async () => {
     assert.equal(r.error?.code, 'vault_unconfigured');
   } finally {
     if (savedKey !== undefined) process.env.DOTD_MAIL_KEY = savedKey;
-    rmSync(t.root, { recursive: true, force: true });
+    forceRemoveTempPath(t.root);
   }
 });

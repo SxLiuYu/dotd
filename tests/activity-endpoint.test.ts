@@ -11,6 +11,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 let pass = 0;
 let fail = 0;
@@ -24,7 +25,14 @@ const ok = (name: string, cond: boolean, detail = '') => {
   }
 };
 
-const HERE = resolve(import.meta.url.replace('file://', ''), '..');
+// 2026-10-22 修（Windows 上这行拉了整套测试）：
+// `import.meta.url.replace('file://','')` 在 Windows 上留下 `/D:/...`，再过 resolve() 就变成
+// `D:\D:\toagi\dotd\...`（盘符相对解析）→ ENOENT。
+// 正确写法是 fileURLToPath（Node 官方，两平台都对）。
+// 注：fileURLToPath(new URL('.', import.meta.url)) 本身就是 tests/ 目录（带末尾分隔符），
+// 不再额外 resolve(..)：原写法 resolve(文件路径, '..') 本来就取的是 tests/，
+// 而目录路径再多去一层就多了。
+const HERE = fileURLToPath(new URL('.', import.meta.url));
 const httpSrc = readFileSync(resolve(HERE, '../src/surfaces/http.ts'), 'utf8');
 const cliSrc = readFileSync(resolve(HERE, '../src/surfaces/cli.ts'), 'utf8');
 

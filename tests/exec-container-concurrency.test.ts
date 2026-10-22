@@ -170,7 +170,14 @@ test('生产路径：配了 browser 闸后，真 ExecService 的第二个 browse
   const tmp = makeTempDataDir({ pool: true });
   tmps.push(tmp);
 
+  // 粘门（2026-10-22 修死锁）：pollJob 每 pollIntervalMs 调一次 getJob，
+  // 而 getJob 每次都 push 一个新 resolver 并等它 —— 原来的"每次调用一个门"
+  // 跟轮询语义天然冲突：gates.splice(0) 只放行当刻排队的那些，2ms 后下一轮
+  // 又 push 一个**永远不会被放行**的门，await p1 死等在那里
+  // （实测 'Promise resolution is still pending but the event loop has already resolved'）。
+  // 改成粘的：放行之后，后续 getJob 立刻返回，测试想验证的时序不变。
   const gates: Array<() => void> = [];
+  let released = false;
   const started: string[] = [];
   const runtime = {
     async startJob(_e: string, _t: string, c: { call_id: string }) {
@@ -179,7 +186,7 @@ test('生产路径：配了 browser 闸后，真 ExecService 的第二个 browse
     },
     async getJob(_e: string, _t: string, jobId: string) {
       const id = jobId.replace(/^job_/, '');
-      await new Promise<void>((r) => gates.push(r));
+      if (!released) await new Promise<void>((r) => gates.push(r));
       return { call_id: id, job_id: jobId, status: 'ok', result: {} };
     },
     async cancelJob() {},
@@ -230,6 +237,7 @@ test('生产路径：配了 browser 闸后，真 ExecService 的第二个 browse
   await new Promise((r) => setTimeout(r, 200));
   assert.deepEqual(started, ['b1'], 'browser 闸=1：b2 必须排队，不能同时进容器');
 
+  released = true;
   gates.splice(0).forEach((f) => f());
   const r1 = await p1;
   assert.equal(r1.status, 'ok', 'b1 正常成功');
@@ -237,6 +245,7 @@ test('生产路径：配了 browser 闸后，真 ExecService 的第二个 browse
   for (let i = 0; i < 400 && started.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
   assert.deepEqual(started, ['b1', 'b2'], 'b1 结束后 b2 才进入（依次放行）');
 
+  released = true;
   gates.splice(0).forEach((f) => f());
   const r2 = await p2;
   assert.equal(r2.status, 'ok', 'b2 排队后成功，不是失败');

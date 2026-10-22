@@ -9,6 +9,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 let pass = 0;
 let fail = 0;
@@ -22,7 +23,11 @@ const ok = (name: string, cond: boolean, detail = '') => {
   }
 };
 
-const HERE = resolve(import.meta.url.replace('file://', ''), '..');
+// 2026-10-22 修（Windows）：`import.meta.url.replace('file://','')` 在 Windows 上留下 `/D:/...`，
+// 过 resolve() 就变成 `D:\D:\toagi\dotd\...`（盘符相对解析）→ ENOENT。
+// 正确写法是 fileURLToPath（两平台都对）。注意：这里 HERE 要的是 tests/ 目录，
+// 而 fileURLToPath(new URL('.', import.meta.url)) 本身就是 tests/（带末尾分隔符），不再额外 resolve(..)。
+const HERE = fileURLToPath(new URL('.', import.meta.url));
 const read = (rel: string): string => readFileSync(resolve(HERE, '..', rel), 'utf8');
 
 const view = read('web-ui/src/views/ActivityView.tsx');

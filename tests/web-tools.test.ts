@@ -22,10 +22,79 @@ import { join } from 'node:path';
  * 放在 temp 目录里，通过 DOTD_AGENT_BROWSER_BIN 指过去。
  */
 function fakeBin(dir: string, script: string): string {
+  // 2026-10-22 修（Windows 上这个测试整套报红）：
+  // 原实现只会写一个 **bash 脚本**（无扩展名），Windows 上
+  // spawn 无法执行它 → 全部 web.* 断言失败（实测 19 个红）。
+  //
+  // Windows 上为什么不用 .cmd/.bat：产品用 execFile 的**数组形式且不过 shell**
+  // （安全要求：不能为了测试放开），而 Node 从 18.20/20.12 起禁止无 shell
+  // 调用 .cmd/.bat（CVE-2024-27980）→ spawn EINVAL（实测确认）。
+  //
+  // 解法：Windows 上直接把 **node.exe 本身**当假 CLI（真 .exe，能被 execFile 调起），
+  // 再用 NODE_OPTIONS=--require 预载一个 shim：shim 打印并 exit(0)，node 还没开始解析
+  // "open" 这个主脚本就退出了。实测：execFile(node.exe,['open','https://x'])
+  // 输出 SHIM-OK args=...，退出码 0。
+  // 两边输出必须一致：测试断言的是 stdout 内容（如 ARGS:$* 的参数串接）。
+  if (process.platform === 'win32') {
+    writeFileSync(join(dir, 'ab-shim.cjs'), nodeFake(script), 'utf8');
+    return process.execPath; // 真正的 BIN 返回值 = node.exe
+  }
   const p = join(dir, 'agent-browser');
   writeFileSync(p, `#!/usr/bin/env bash\n${script}\n`, 'utf8');
   chmodSync(p, 0o755);
   return p;
+}
+
+/**
+ * Windows 版假 CLI：把测试里那些 bash 片段的**输出**等价地用 Node 重现。
+ * 只支持测试实际用到的几种：
+ *   - `echo X`            → 输出 X
+ *   - `echo "ARGS:$*"`    → 输出 ARGS: + 全部参数（逐个用空格分隔）
+ *   - `python3 -c "print(...)"` → 用 Node 的等价表达（输出长字符串）
+ *   - 其余：原样输出一行文本（让测试能看到可诊断的错误）
+ */
+function nodeFake(script: string): string {
+  const echoArgs = script.match(/echo "ARGS:\$\*"/);
+  // 双引号的 echo 要把引号内容取出来（否则输出的是原始脚本文本）：
+  //   echo "✓ My Title"      → ✓ My Title
+  //   echo "- link \"x\" [ref=e1]" → - link "x" [ref=e1]
+  // 原实现用了 `(?!")` 负向预览，导致**引号形式全部走到 else 分支**→
+  // 输出的是脚本原文（测试断言的 title 就是「✓ My Title」。实测：14 个 web.* 断言全红。
+  const echoQuoted = script.match(/^echo "(.*)"$/);
+  const echoPlain = script.match(/^echo (.*)$/);
+  // 长输出：python3 -c "print(\"x\" * 200000)"。脚本里的引号是**转义输的**（\"），
+  // 原正则只匹配未转义的引号，因此这条落到 else 分支 → 输出的是脚本原文。
+  const longStr = script.match(/print\(\\?"([^"]*)\\?" \* (\d+)\)/) ?? script.match(/print\(\?"([^"]*)\?" \* (\d+)\)/);
+  // Windows 版的 argv 形状（实测）：用 --require 预载 shim 时，
+  // node 把第一个位置参数当作"主脚本路径"并位于 argv[1]（已被解析成
+  // 绝对路径，如 D:\toagi\dotd\press），真正的 CLI 参数从 argv[1] 开始。
+  // bash 版的 $*是"脚本名之后的全部参数"，所以这里取 argv[1..] 并把第一个
+  // 只留本名（否则断言会看到一个绝对路径）。
+  const argsExpr = "process.argv.slice(1).map((a, i) => (i === 0 ? a.split(/[\\\\/]/).pop() : a)).join(' ')";
+  let body: string;
+  if (echoArgs !== null) {
+    body = `process.stdout.write('ARGS:' + ${argsExpr} + '\\n');`;
+  } else if (longStr !== null && longStr[1] !== undefined && longStr[2] !== undefined) {
+    const text = longStr[1].replace(/\\\\"/g, '"').replace(/\\\\\\\\/g, '\\');
+    const times = Number(longStr[2]);
+    body = `process.stdout.write(${JSON.stringify(text)}.repeat(${times}));`;
+  } else if (echoQuoted !== null && echoQuoted[1] !== undefined) {
+    // 双引号内容：去掉外层引号，内容里的 \" 恢复为普通引号
+    const inner = echoQuoted[1].replace(/\\\\"/g, '"').replace(/\\\\\\\\/g, '\\');
+    body = `process.stdout.write(${JSON.stringify(inner)} + '\\n');`;
+  } else if (echoPlain !== null && echoPlain[1] !== undefined) {
+    body = `process.stdout.write(${JSON.stringify(echoPlain[1].replace(/\\\\/g, '\\'))} + '\\n');`;
+  } else {
+    body = `process.stdout.write(${JSON.stringify(script)} + '\\n');`;
+  }
+  return [
+    '// 自动生成：Windows 上的假 agent-browser（与 bash 版输出等价）',
+    body,
+    // 必须 exit(0)：bash 版假 CLI 执行完 echo 就自然退出 0；而 node 预载 shim 写完
+    // 输出后会继续把第一个位置参数（如 "open"）当主脚本去解析 → 报
+    // "Cannot find module 'D:\toagi\dotd\open'"，下游把这个错误当成 CLI 失败（实测 14 个 web.* 全红）。
+    'process.exit(0);',
+  ].join('\n');
 }
 
 /** 每个用例独立设环境变量并重新 import（BIN 在模块加载时读取）。 */
@@ -33,6 +102,11 @@ async function withBin<T>(script: string, fn: (m: typeof import('../src/exec/web
   const dir = mkdtempSync(join(tmpdir(), 'webtools-'));
   const bin = fakeBin(dir, script);
   const prev = process.env['DOTD_AGENT_BROWSER_BIN'];
+  const prevNodeOpts = process.env['NODE_OPTIONS'];
+  if (process.platform === 'win32') {
+    // 让 node.exe 以 shim 起手（见 fakeBin 的说明）
+    process.env['NODE_OPTIONS'] = `--require ${join(dir, 'ab-shim.cjs').replace(/\\/g, '/')}`;
+  }
   process.env['DOTD_AGENT_BROWSER_BIN'] = bin;
   try {
     // 缓存 busting：每次换 query 让 ESM 重新求值，从而重读 BIN
@@ -41,6 +115,8 @@ async function withBin<T>(script: string, fn: (m: typeof import('../src/exec/web
   } finally {
     if (prev === undefined) delete process.env['DOTD_AGENT_BROWSER_BIN'];
     else process.env['DOTD_AGENT_BROWSER_BIN'] = prev;
+    if (prevNodeOpts === undefined) delete process.env['NODE_OPTIONS'];
+    else process.env['NODE_OPTIONS'] = prevNodeOpts;
     rmSync(dir, { recursive: true, force: true });
   }
 }

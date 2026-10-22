@@ -129,12 +129,14 @@ t "端到端：steps 里的画面变人话"      test "$SCREEN" = "OK"
 cat > .t5-e2e.ts <<'NODE'
 import { DatabaseSync } from 'node:sqlite';
 import { ensurePragmas } from './db/conn.ts';
-import { migrate } from './db/migrate.ts';
+import { migrate, latestMigrationVersion } from './db/migrate.ts';
 import { startProgressPush } from './src/surfaces/progress-push.ts';
 
 const db = new DatabaseSync(':memory:');
 ensurePragmas(db);
-migrate(db, { expectedVersion: 170 });
+// 版本号从 db/migrations/ 目录推，不写死（2026-10-22：这里钉死 170，加第一个新迁移包
+// 就整条判据红 —— 而红的理由是"脚本自己过期"，不是"进度功能坏了"。
+migrate(db, { expectedVersion: latestMigrationVersion() });
 const now = Date.now();
 db.prepare(
   'INSERT INTO tasks (id,dot_id,title,goal,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)',
