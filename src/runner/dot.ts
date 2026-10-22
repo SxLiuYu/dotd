@@ -413,12 +413,36 @@ function normalizeResultForRepeat(value: unknown): string {
     const clean: Record<string, unknown> = {};
     const src = obj as Record<string, unknown>;
     for (const k of Object.keys(src).sort()) {
-      if (!VOLATILE.has(k)) clean[k] = src[k];
+      if (!VOLATILE.has(k)) clean[k] = stabilizeVolatileText(src[k]);
     }
     return JSON.stringify(clean);
   } catch {
     return '';
   }
+}
+
+/**
+ * 抹平字符串**内部**那些「每轮都不一样、但不代表进展」的记号。
+ *
+ * 2026-10-22 真机缺陷：browser.snapshot 返回的 @eN 引用是**会话内单调递增**的，
+ * 重新 open 一次就整体上移一段。实测同一页面三次快照：
+ *
+ *   #0 ref=e1,e2,e3    #1 ref=e91,e92,e93    #2 ref=e181,e182,e183
+ *
+ * 页面内容一个字没变，但字符串比较全不相等 → sameResultCount 永远停在 1 →
+ * 重复护栏一声不响，模型把「open→snapshot」重复了 3 轮（15 步才收尾）。
+ *
+ * 这与 2026-10-18 的 written_at 缺陷同源（那次的教训写在上面），区别只是
+ * 那次在**顶层键**上，顶层过滤能剔；这次的编号长在 output **字符串内部**，
+ * 所以必须在文本层做替换。
+ *
+ * 只替换 `[ref=eN]` 里的编号，其余一个字符都不动：
+ * 这样「同一页面两次快照」判同，「两个不同页面」仍然判不同
+ * （商品名/价格/元素角色都原样保留）。
+ */
+function stabilizeVolatileText(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  return v.replace(/ref=e\d+/g, 'ref=e#');
 }
 
 /**
@@ -1347,7 +1371,18 @@ export class DotRunner {
           }
           this.log(`runner: 原地打转护栏触发，跳过派发并强制模型收尾 ${session.id}`);
           ctx.feedSystemNote(
-            '你已经反复调用同一个工具且结果没有变化。现在不要再调用任何工具，直接给出最终结论。',
+            // **必须讲清楚「你已经有材料了」**（2026-10-22 真机）。
+            // 原话只有「不要再调用任何工具，直接给出最终结论」，实测模型给出的是
+            //   「我没有可用的浏览器工具，因此无法打开该页面并读取内容」
+            // ——它把「这一轮没给工具」读成了「这个任务根本没有工具」。
+            // 而真相是：前几轮的 browser.snapshot 结果就在上文，商品名和价格都在里面。
+            // 收口轮之所以摘掉工具（:1505），是物理上不让它再重复，不是它没有能力。
+            // 所以这里必须显式告诉它：材料在上文，从那里取，别再调工具。
+            '你已经反复调用同一个工具，且每次都返回一样的结果——这一步已经做完了。' +
+              '注意：**前几轮的工具返回结果就在上面的对话里**，你要的答案通常已经在其中，' +
+              '不要再说「我没有某个工具」，也不要再调用任何工具。' +
+              '现在请直接从上文的工具结果中提取信息，给出最终结论；' +
+              '如果确实拿不到，就说明你已经查到了什么、还差什么。',
           );
           break;
         }
