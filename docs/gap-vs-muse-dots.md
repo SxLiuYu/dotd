@@ -144,6 +144,88 @@ bash :: {"command":"ls -la","description":"List repo root and notes"}
 **真机上模型不老实** —— 它会微调参数来绕开任何按参数记账的守卫。
 `tests/runner-deny-repeat-guard.test.ts` 现在两条都测：参数不变、参数每轮微调。
 ---
+## 0.2 一轮「真机验收」全部作废：跑的是内存模拟
+
+这一节的结论是给**我自己**的，不是给产品的。
+
+上面 §0.1 那些 mail.list succeeded、browser.open title:...、fs.write size:1545 的证据，
+**有一大半是在 stub 模式下拿的**，而 stub 的文件系统是内存里的一张 Map。
+
+### 怎么发现的
+
+两个数对不上：
+
+```
+fs.list  （经 daemon）→ notes/ 里 2 个文件
+docker exec ls        → notes/ 里 25 个文件
+```
+
+两边都报「成功」。再追一层，/api/container 返回：
+
+```json
+{"dockerId":"stub0c9ca850f5834f.8"}
+```
+
+`stub` 三个字母就写在那里。而真实容器 dotd-dot-dot1 一直好好地跑着 ——
+daemon 从头到尾没碰过它。
+
+### 为什么会这样
+
+`DOTD_FLEET` 没设时，fleet 的默认值是 `'stub'`（types.ts:192）。
+于是 ExecService 装配的是 StubRuntime：
+
+- fs.write → 写进内存 Map，返回一个**看起来很真**的 `{path, size}`；
+- fs.read → 从同一张 Map 读，回吐刚写的字节，内容完全正确；
+- fs.list → 列出这张 Map 里有的东西。
+
+**它自洽得可怕。** 写进去能读出来，大小对得上，内容一字不差。
+整条链路（runner → governance → journal → 结果回喂 → 模型据此继续）都是真的，
+只有最底下那一层是假的。
+
+而启动日志里**一个字都没有**。没有 warn，没有 degraded，API 全部 200。
+
+### 教训
+
+> **默认值即文档。** 一个会让所有验收失效的默认值，必须在启动时喊出来。
+
+这不是「不够仔细」的问题。我当时**确实**在逐条核对证据，
+fs.write 的返回里连字节数都对 —— 因为那本来就是刚写进去的字节数。
+
+唯一能发现它的方式是**跨层对账**：不信任任何单一视角的「成功」，
+拿两个独立的视角（daemon 的 API vs docker exec）去撞。
+
+上一轮刚总结过「自造样本只能验证我想到的写法，真实世界要用真实数据回灌」，
+这一轮是同一句话更狠的版本：
+
+> **自造的运行时只能验证我想到的行为。要验证真实行为，得先确认跑的是真实运行时。**
+
+### 已修
+
+fleet === 'stub' 时启动就打一行：
+
+```
+[exec] ⚠️  fleet=stub：容器是**内存模拟**，fs/shell 的写入**不会落到任何真实文件系统**，
+        重启即蒸发。 真机验收必须 DOTD_FLEET=docker 启动（默认就是 stub，别拿它当验收环境）。
+```
+
+两个方向都验过：stub 启动必现这行，DOTD_FLEET=docker 启动不出现。
+
+### 重做的验收
+
+切到 DOTD_FLEET=docker 后重跑写入探针，这次**跨层核对**：
+
+```
+[40] fs.write succeeded  {"path":"notes/2026-10-22-realprobe.md","size_bytes":24}
+[44] fs.read  succeeded  {"content":"真实容器写入验证","size_bytes":24}
+
+$ docker exec dotd-dot-dot1 cat /dot/home/notes/2026-10-22-realprobe.md
+真实容器写入验证
+```
+
+daemon 说写了、daemon 说读到了、真实容器里 cat 也有 —— 三个视角一致，这次才算数。
+
+---
+
 ## 1. 工具面：46 个，覆盖 Muse 公开清单
 
 实测 **46 个能力**（`CAPABILITY_CATALOG`，见 `src/exec/protocol.ts:98`）：
