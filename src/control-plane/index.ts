@@ -35,6 +35,12 @@ import { Guard } from './guard.ts';
 import type { ExecPorts, GuardDeps } from './guard.ts';
 import { Scheduler } from './scheduler.ts';
 import { shouldPush } from '../surfaces/proactive.ts';
+import {
+  decideEventPush,
+  readEventPushPolicy,
+  recordEventFire,
+} from '../surfaces/proactive.ts';
+import type { EventPushPolicy } from '../surfaces/proactive.ts';
 import type { InternalJobSpec } from './scheduler.ts';
 import { recoverOnStartup } from './recovery.ts';
 import type { ApprovalsReader, RecoveryReport } from './recovery.ts';
@@ -356,8 +362,85 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     },
 
     // ── 事件（契约 E2）──
+    /**
+     * F7（2026-10-22）：非 cron 机器事件的**唯一漏斗**，也是事件驱动主动打扰
+     * 唯一的闸门接入点。
+     *
+     * 为什么接在这里而不是别处：http / file / telegram / email 四类机器事件全部
+     * 从这里进（src/surfaces/ingress.ts、src/surfaces/feishu-inbound.ts 都调它）。
+     * cron 路径**不经过这里** —— scheduler.fireHeartbeat 直接调 matcher.ingestEvent，
+     * 所以这里加闸不会给定时任务判第二遍（那边已经用 shouldPush 判过一次）。
+     *
+     * 三道闸复用 src/surfaces/proactive.ts 里那份实现，只是输入换读
+     * event_push_policy(source, actor) 一行。**不是再造一套**：
+     *   ① 开关（enabled，默认 0）—— 拦在发送层：事件照常进管线、任务照常跑、
+     *      结果照常进记忆，只是 payload.proactive=false 让下游不推给主人。
+     *   ② 安静时段 —— 拦在**调度层**：事件根本不进门（不建任务），
+     *      策略行记 last_fire_status='skipped_quiet'。与 crontabs 同语义，
+     *      半夜来的事件不该换来半夜的一次任务执行。
+     *   ③ 节流（throttle_hours + last_push_at **落库**）—— 也拦在发送层，
+     *      daemon 重启不会让节流归零。命中节流时**不更新 last_push_at**，
+     *      否则窗口被每次拦截往后推，低频事件永远推不出去。
+     *
+     * 查不到策略行 → 闸门完全不介入、payload 原样透传：任何升级后已有的事件源
+     * 既不会突然开始给主人发消息，也不会突然收不到已经在收的东西。
+     */
     ingestEvent(e: IngestEventReq): IngestEventResult {
-      return matcher.ingestEvent(e);
+      const nowMs = Date.now();
+      const policy: EventPushPolicy | null = readEventPushPolicy(db, e.source, e.actor);
+      const gate = decideEventPush({ policy, now: nowMs, hasTarget: true });
+
+      if (!gate.ingest) {
+        // 安静时段：不落 events、不建任务，只留一条"拦过"的证据 + 一行日志。
+        recordEventFire(db, e.source, e.actor, gate, nowMs);
+        bus.publish('log', {
+          level: 'info',
+          msg: `事件 ${e.source}/${e.actor} 未进管线：${gate.detail ?? gate.reason}`,
+        });
+        // eventId=0 表示"没有事件行"。调用方（ingress/feishu-inbound）只把它
+        // 放进响应体与日志，不当外键用；不建事件行才是这里想要的语义。
+        return { eventId: 0, dup: false };
+      }
+
+      let req = e;
+      if (gate.intervenes) {
+        // 判定结论随 payload 传给下游（feishu-outbound 的 shouldAnnounce 读它）。
+        // 用 spread 而不是改写原对象：调用方的 payload 可能是复用的字面量。
+        //
+        // 只给"能挂字段的对象"打标：payload 是字符串/数字/数组/null 时不硬造
+        // 一层包装（那会改掉规则层和 defaultGoal 读的形状）。这种情况闸门只能
+        // 记账、不能拦推送 —— 行为与升级前逐字相同（不会更吵），并留一条 warn
+        // 让人看得见，而不是静默吞掉主人的东西。
+        const stampable =
+          typeof e.payload === 'object' && e.payload !== null && !Array.isArray(e.payload);
+        if (stampable) {
+          const stamped = { ...(e.payload as Record<string, unknown>), proactive: gate.announce };
+          req = { ...e, payload: stamped };
+        } else if (!gate.announce) {
+          bus.publish('log', {
+            level: 'warn',
+            msg: `事件 ${e.source}/${e.actor} 的 payload 不是对象，主动打扰闸门无法打标，按原样透传`,
+          });
+        }
+      }
+
+      // 先落事件行、后记账：撞 dedup_key 的重复投递（matcher 幂等返回 dup）不该
+      // 消耗一次节流额度 —— 它没产生任何新的打扰。把 last_push_at 往后推会让
+      // 低频事件永远推不出去。安静时段那条分支在上面已经 return，不经过这里。
+      const res = matcher.ingestEvent(req);
+      if (gate.intervenes && !res.dup) {
+        recordEventFire(db, e.source, e.actor, gate, nowMs);
+        if (!gate.announce && gate.reason !== 'disabled') {
+          // disabled 是主人主动关的，天天记日志是噪音；其他原因值得记：
+          // 说明系统在工作。走 bus 而不是 record()，理由同 fireHeartbeat
+          // ——resource_events.kind 是资源治理词表，别塞进来。
+          bus.publish('log', {
+            level: 'info',
+            msg: `事件 ${e.source}/${e.actor} 不主动推送：${gate.detail ?? gate.reason}`,
+          });
+        }
+      }
+      return res;
     },
     listUndecidedEvents(limit?: number): EventsRow[] {
       return matcher.listUndecidedEvents(limit);
