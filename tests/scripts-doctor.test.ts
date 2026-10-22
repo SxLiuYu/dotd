@@ -110,7 +110,7 @@ test('parseTier1Endpoint：从仓库真实 models.yml 里认出 tier1 与它的 
       '  - id: openrouter-main',
       '    tier: 1',
       '    base_url: http://127.0.0.1:7863/v1   # 注释不算',
-      '    api_key_env: WB2API_KEY',
+      '    api_key_env: HY3_API_KEY',
       '    models:',
       '      primary: hy3',
       '  - id: local',
@@ -124,7 +124,7 @@ test('parseTier1Endpoint：从仓库真实 models.yml 里认出 tier1 与它的 
   const ep = endpoints[0]!;
   assert.equal(ep.id, 'openrouter-main');
   assert.equal(ep.baseUrl, 'http://127.0.0.1:7863/v1', '行尾注释必须剥掉');
-  assert.equal(ep.apiKeyEnv, 'WB2API_KEY');
+  assert.equal(ep.apiKeyEnv, 'HY3_API_KEY');
   assert.equal(ep.primaryModel, 'hy3');
 });
 
@@ -264,7 +264,7 @@ test('tier1 端点连不上 → fail；连得上但没 key → 也 fail（这是
     assert.match(key.next ?? '', /tokens\.env/, '要告诉人怎么写进 tokens.env（否则重启即丢）');
 
     const upKey = await runChecks({
-      env: { ...env, WB2API_KEY: 'sk-某值' },
+      env: { ...env, HY3_API_KEY: 'sk-某值' },
       home: s.home,
       repoRoot,
       probe: probeOk,
@@ -287,7 +287,7 @@ test('全部正常时退出码为 0，且报告里给得出结论', async () => 
         DOTD_RO_TOKEN: 'r',
         HOOK_GRAFANA: 'h',
         DOTD_FLEET: 'docker',
-        WB2API_KEY: 'k',
+        HY3_API_KEY: 'k',
       },
       home: s.home,
       repoRoot,
@@ -315,7 +315,7 @@ test('MCP：未声明任何 server（仓库默认 servers: []）→ skip「未�
   const s = sandbox();
   try {
     writeConfig(s.home, BASE_CFG);
-    const env = { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', WB2API_KEY: 'k' };
+    const env = { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', HY3_API_KEY: 'k' };
     // 用仓库里真实的那份（默认空）
     const results = await runChecks({
       env: { ...env, DOTD_MCP_CONFIG: join(repoRoot, 'config', 'mcp-servers.yml') },
