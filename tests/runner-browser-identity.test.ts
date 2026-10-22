@@ -15,6 +15,19 @@ describe('A1 siteIdentityOf：网址 → 站点身份', () => {
   it('端口号不进身份（host 不含 port）', () => {
     assert.equal(siteIdentityOf('http://127.0.0.1:8899/read'), 'site:127.0.0.1');
   });
+  it('无 hostname 的 URL（file:/data:/about:）→ undefined，治理 fail-closed 拒绝', () => {
+    // 2026-10-22 真机实测反复踩到：用 file:// 试浏览器时，browser.open 连续拿到
+    // 8 次一模一样的 `deny:identity_missing`，很像是「浏览器坏了」。
+    // 实际是**设计正确**：这些 URL 解析不出 hostname，派生不出 site:<host> 身份，
+    // 于是 identity=undefined → isLoginSensitive 判 true → 治理按登录态 fail-closed。
+    // 这条判据必须留住：它是「不许用浏览器读宿主本地文件」的底层保证之一
+    // （另一层在 webtools 里只放行 http(s)）。
+    assert.equal(siteIdentityOf('file:///tmp/form.html'), undefined);
+    assert.equal(siteIdentityOf('data:text/html,hi'), undefined);
+    assert.equal(siteIdentityOf('about:blank'), undefined);
+    // 对照：正常站点必须能派生，否则上面的断言会因为「全都返回 undefined」而假绿
+    assert.equal(siteIdentityOf('https://example.com/'), 'site:example.com');
+  });
   it('解析不了 → undefined（不派发，fail-closed 由治理兜）', () => {
     assert.equal(siteIdentityOf('not a url'), undefined);
     assert.equal(siteIdentityOf(''), undefined);
