@@ -62,6 +62,74 @@ t "approval:created 只有 1 个订阅者"   test "$SUBS" = "1"
 t "卡片走 claimAndSend 去重"          grep -q 'cardView !== undefined && cards !== undefined' src/surfaces/feishu-outbound.ts
 t "卡片失败退回纯文本"                grep -q '改发纯文本' src/surfaces/feishu-outbound.ts
 
+# ── F. 多主人会话投递（B1 / F5，2026-10-22）──────────────────
+#
+# 现场：FEISHU_OWNER_CHAT_ID 配了两个 oc_ 会话（长度 71），出站三处写死
+# split(',')[0] → 第二个会话永远收不到审批卡片，任务卡在 awaiting_approval
+# 直到过期。入站闸门本来就是多会话 Set，所以这是纯出站缺陷。
+#
+# 判据分两组：
+#   F-1 语义（我写的 feishu-approval.ts / feishu-outbound.ts）—— 现在就该全绿；
+#   F-2 接线（daemon.ts，lead 独占写权限）—— **落盘前必红**，红着就说明
+#       「广播函数写对了但装配层还在传第一个」这个半改状态没被放行。
+# 两组都只断言**不变量**（不许出现截断模式 / 必须真的遍历发送），
+# 不断言任何部署配置值（不把具体 chat id、会话个数写死）。
+
+# ===== F-1 广播语义 =====
+t "切换点存在：配置串 → 会话列表"      grep -q 'export function parseOwnerChatIds' src/surfaces/feishu-approval.ts
+t "去重保序入口存在"                  grep -q 'export function dedupeChatIds' src/surfaces/feishu-approval.ts
+t "广播版推送函数存在"                grep -q 'export async function pushApprovalCards' src/surfaces/feishu-approval.ts
+t "遍历版改卡片函数存在"              grep -q 'export async function resolveApprovalCards' src/surfaces/feishu-approval.ts
+# 一个 approvalId 现在对应 N 张卡片：旧单值 get() 就是 F5 本身，必须彻底消失，
+# 否则装配层「编译通过但只改第一张」，其余会话挂着可点按钮 → 迟到裁决噪音。
+t "CardRegistry 不再有单值 get()"      bash -c '! grep -qE "^  get\(" src/surfaces/feishu-approval.ts'
+t "CardRegistry 提供 getMany 遍历口"   grep -q 'getMany(approvalId: number): string\[\]' src/surfaces/feishu-approval.ts
+t "改卡片逐条 catch（一条挂不搞崩整批）" bash -c "grep -A40 'export async function resolveApprovalCards' src/surfaces/feishu-approval.ts | grep -q catch"
+t "卡片能力接口是复数 chatIds"        grep -q 'chatIds: string\[\];' src/surfaces/feishu-outbound.ts
+t "发送回调按会话逐个发"              grep -q 'send(view: ApprovalView, chatId: string)' src/surfaces/feishu-outbound.ts
+t "兜底会话字段是复数"                grep -q 'fallbackChatIds?: string\[\];' src/surfaces/feishu-outbound.ts
+t "复数字段优先（单值只作迁移桥）"      bash -c "sed -n '/const fallbackIds: string\[\] =/,/:\s*\[\];/p' src/surfaces/feishu-outbound.ts | head -3 | grep -q fallbackChatIds"
+# 唯一投递决策点：有来源会话 → 只回那一个；没有 → 广播。这两行是分野本体。
+t "投递决策点：有来源会话只回它自己"  bash -c "grep -q 'if (chatId !== null \&\& chatId.length > 0) return \[chatId\];' src/surfaces/feishu-outbound.ts"
+t "投递决策点：无来源会话走广播"      grep -q 'const chats = deliveryChats(threadChat);' src/surfaces/feishu-outbound.ts
+# **反向不变量**（B1 唯一禁止项）：主人 A 群问的话不能回答到 B 群。
+# 回复路径只能经 deliveryChats 的分支，绝不许直接引用兜底列表。
+t "回复路径禁止直接引用兜底列表"      bash -c "! sed -n '/async function taskStateText/,/approvalText(view/p' src/surfaces/feishu-outbound.ts | grep -q fallbackIds"
+t "审批文本兜底保持单会话（免重复打扰）" grep -q 'return { chatIds: \[chatId\], text: renderApprovalCard' src/surfaces/feishu-outbound.ts
+t "隔离通知走广播"                    bash -c "sed -n '/governance:quarantine/,/async function taskStateText/p' src/surfaces/feishu-outbound.ts | grep -q 'deliveryChats(null)'"
+# 「函数对但没人调用」是本项目踩过的坑，所以钉循环体本身，不钉函数存在。
+t "卡片循环真的逐个调 send"            bash -c "grep -A3 'for (const chatId of targets)' src/surfaces/feishu-outbound.ts | grep -q 'cards.send(cardView, chatId)'"
+t "文本循环真的逐个调 sendText"        bash -c "grep -A3 'for (const chatId of targets)' src/surfaces/feishu-outbound.ts | grep -q 'deps.gateway.sendText(chatId, out.text)'"
+# 广播后必须能回答「第二个群到底收到没有」→ 每个会话各一行审计。
+t "卡片审计逐会话留痕"                bash -c "grep -A5 \"kind: 'approval_card'\" src/surfaces/feishu-outbound.ts | grep -q 'chatId,'"
+t "文本审计逐会话留痕"                bash -c "grep -A5 \"kind: 'task_reply'\" src/surfaces/feishu-outbound.ts | grep -q 'chatId,'"
+# 幂等键是整条事件而非「事件×会话」：广播在同一次认领里发完，重投整条跳过，
+# 不会出现「只补发第二个会话、第一个会话发两遍」的半截状态。
+t "幂等键是事件级（不是事件×会话级）"  bash -c "grep -B8 'async function claimAndSend' src/surfaces/feishu-outbound.ts | grep -q '幂等键是\*\*整条事件'"
+
+# ===== F-2 装配层接线（daemon.ts = lead 独占写权限；未落盘时预期为红）=====
+t "接线：daemon 用 parseOwnerChatIds 而非 split[0]"  bash -c "grep -q parseOwnerChatIds src/daemon.ts"
+# 缺陷签名精确到「把逗号串 split 之后取第一个」。注意**不能**写成「ownerChatId
+# 所在的行不许出现 [0]」—— 求救出站那一行本该取 parseOwnerChatIds(...)[0]（单值
+# 语义，见下下条），那样写会和它自相矛盾，lead 改完仍是红、变成追不上真相的判据。
+t "接线：daemon 里 ownerChatId 不再手切第一个"        bash -c "! grep -nE 'ownerChatId.{0,12}split[(]' src/daemon.ts | grep -qF '[0]'"
+# 只钉**我自己的接口字段名**（chatIds / fallbackChatIds / getMany / resolveApprovalCards /
+# parseOwnerChatIds），不钉 daemon 里的变量叫什么 —— 否则 lead 换个局部变量名就红，
+# 判据就成了绊脚石而不是防线。
+t "接线：daemon 把整份会话列表交给卡片能力"          bash -c "grep -q 'chatIds:' src/daemon.ts"
+t "接线：daemon 落定卡片走 getMany 遍历"              bash -c "grep -q 'cardRegistry.getMany(' src/daemon.ts"
+t "接线：daemon 调复数版 resolveApprovalCards"        bash -c "grep -q 'resolveApprovalCards(' src/daemon.ts"
+t "接线：daemon 兜底通知传 fallbackChatIds"          bash -c "grep -q 'fallbackChatIds:' src/daemon.ts"
+# 求救通道（src/surfaces/channels.ts 的 `feishuChatId?: string`）是**单值语义**：
+# deliverFeishu 把入参原样塞进飞书 API 的 chat_id。把整串 'oc_a,oc_b' 传下去会 400
+# → 求救静默降级到 OUTBOX.md，比「只发第一个」更糟。所以钉「交给单值口的必须是单个
+# chat（行尾取 [0]）」。将来若真要广播求救，得先改 channels.ts 的接口成 chatIds: string[]
+# （见我报给 lead 的 backlog），那时这条判据**连同 channels.ts 一起**改，不许只改 daemon.ts。
+t "接线：求救出站交给单值口的必须是单个 chat"      bash -c "grep -qE 'feishuChatId:.*\[0\],' src/daemon.ts"
+
+# ===== F-3 多会话投递的单元判据（真投递事件，不看源码）=====
+MO=$(node --import tsx --test tests/feishu-owner-chats.test.ts 2>&1 | grep -aoE 'fail [0-9]+' | tail -1)
+t "多主人会话投递判据全过"        bash -c '[[ "$1" = "fail 0" ]]' _ "$MO"
 # ── D. 类型检查 ───────────────────────────────────────────────
 TSC=$(npx tsc --noEmit 2>&1 | grep -v 'exec-state' | grep -c 'error TS')
 t "tsc 无新增错误"                    test "$TSC" = "0"

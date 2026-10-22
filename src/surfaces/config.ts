@@ -222,10 +222,64 @@ export function expandHome(p: string): string {
   return p;
 }
 
+// ── 监听地址（F6：可配置 bind，但默认必须是回环）─────────────────────────
+
+/**
+ * **代码默认监听地址**（安全默认值，判据钉死这一行）。
+ *
+ * 为什么默认回环而不是 0.0.0.0：dotd 的 master token 就是这台机器的全权凭据，
+ * 监听 0.0.0.0 = 把它交给整个二层网络。升级 daemon 不应突然让原本只有本机能碰的
+ * 端口变成局域网可碰 —— 那是「静默扩面」，最难被发现、也最难归责。
+ * 因此扩大监听面必须是**显式**的：改 config/dotd.yml 的 host，或设 DOTD_HTTP_HOST。
+ *
+ * 参照 progress-criteria.sh 的写法：判据守的是**代码默认值**（DEFAULT_HTTP_HOST /
+ * zod .default），不是部署配置值（config/dotd.yml 的 host 是主人的选择）。
+ */
+export const DEFAULT_HTTP_HOST = '127.0.0.1';
+
+/** 环境变量覆盖名：不改配置文件也能换 bind（容器/ systemd 场景更顺手）。 */
+export const HTTP_HOST_ENV = 'DOTD_HTTP_HOST';
+
+/**
+ * 解析最终监听地址。优先级：`DOTD_HTTP_HOST` > 配置里的 `host:` > DEFAULT_HTTP_HOST。
+ *
+ * 三个细节：
+ * - 配置里的 host 也走一次**非严格** ${VAR} 展开，这样写成 "${DOTD_HTTP_HOST}"
+ *   这种模板时，变量未设置就回落到默认（而不是像严格展开那样直接拒启动）；
+ * - 展开后为空（写了空串 / 占位符没值）→ 回落到 DEFAULT_HTTP_HOST：fail-closed 到回环，
+ *   绝不回落 0.0.0.0；
+ * - 环境变量优先级最高，是为了运维能在不改文件的情况下临时开一次（测完就把变量撤掉）。
+ */
+export function resolveHttpHost(configured: string | undefined, env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = (env[HTTP_HOST_ENV] ?? '').trim();
+  if (fromEnv.length > 0) return fromEnv;
+  const raw = configured === undefined ? '' : expandEnv(String(configured), { strict: false }).trim();
+  return raw.length > 0 ? raw : DEFAULT_HTTP_HOST;
+}
+
+/**
+ * 该 bind 值是否只落在回环上（true = 本机可达）。
+ *
+ * `0.0.0.0` / `::` / `*` 是**所有网卡**，不是回环 —— 这是最容易搞错的一条：
+ * 它们看着像「占位符」，实际是把端口开到整个局域网。判据里必须分开。
+ */
+export function isLoopbackBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  if (h.length === 0) return false;
+  if (h === 'localhost') return true;
+  if (h.startsWith('127.')) return true;
+  if (h === '::1') return true;
+  // IPv4-mapped IPv6（::ffff:127.0.0.1）
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+  if (mapped !== null) return mapped[1]!.startsWith('127.');
+  return false;
+}
+
 // ── zod schema（surfaces: 节） ────────────────────────────────────────
 
+
 const httpSchema = z.object({
-  host: z.string().min(1).default('127.0.0.1'),
+  host: z.string().min(1).default(DEFAULT_HTTP_HOST),
   port: z.coerce.number().int().min(1).max(65535).default(7788),
   master_token: z.string().min(1),
   readonly_tokens: z.array(z.string()).default([]),
@@ -332,7 +386,7 @@ export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
   const s = parsed.data;
   return {
     http: {
-      host: s.http.host,
+      host: resolveHttpHost(s.http.host),
       port: s.http.port,
       masterToken: expandEnv(s.http.master_token),
       readonlyTokens: s.http.readonly_tokens.map((t) => expandEnv(t)),

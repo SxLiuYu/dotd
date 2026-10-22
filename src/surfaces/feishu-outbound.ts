@@ -31,6 +31,10 @@ import type { ApprovalView } from '../shared/contracts.ts';
 import type { EventBus } from '../shared/bus.ts';
 import { renderQuarantineNotice } from '../governance/review.ts';
 import { pushTaskScreenshots, type ScreenshotPushDeps } from './screenshot-push.ts';
+// B1（F5，2026-10-22）：多主人会话的唯一切换点在 feishu-approval.ts。
+// 这里只 import 它的两个工具函数，不 import 发送实现 —— 卡片能力仍是注入的，
+// 免得出站回路和审批卡片模块互相绑死（此前 feishu-approval 刻意不订阅事件，理由见其注释）。
+import { dedupeChatIds } from './feishu-approval.ts';
 
 /** 只需要 sendText 的能力面（真 FeishuGateway 满足；测试注 fake）。 */
 export interface FeishuSendPort {
@@ -48,8 +52,22 @@ export interface FeishuOutboundDeps {
    * 所以把卡片能力**注入进来**，在这里做一次判断：能发卡片就发卡片。
    */
   approvalCards?: {
-    chatId: string;
-    send(view: ApprovalView): Promise<{ ok: boolean; messageId?: string; error?: string }>;
+    /**
+     * B1（F5，2026-10-22）：**广播目标 = 全部主人会话**，不再是第一个。
+     * 为什么广播：Muse 的「人保留最后一击」要求主人在**任何一端**都能看到待批事项；
+     * 少一个会话看到，就多一个任务卡死在 awaiting_approval 的地方。
+     * 为什么广播安全：裁决写路径 gate.decide() 对非 pending 单一律走「迟到裁决」
+     * （gate.ts:1106 changes==0 ⇒ 只记账、不二次执行），两个会话各点一次 = 一次执行。
+     */
+    chatIds: string[];
+    /**
+     * 逐会话发送：由**本模块**驱动循环，卡片和文本走同一套幂等纪律。
+     * 为什么不由装配层自己循环：那样发送结果/审计/去重就散在两处，
+     * 而 B1 要钉的恰恰是「每个会话都送到、且只送一次」这件事。
+     * 实现方（daemon 的 approvalCardSender）在里面调 cardRegistry.set(approvalId, messageId) ——
+     * 它是幂等追加，所以 N 次调用自然收集齐 N 张卡片。
+     */
+    send(view: ApprovalView, chatId: string): Promise<{ ok: boolean; messageId?: string; error?: string }>;
   };
   db: DatabaseSync;
   bus: EventBus;
@@ -62,7 +80,20 @@ export interface FeishuOutboundDeps {
   mirrorWebToFeishu?: boolean;
   /**
    * 不绑定 thread 的系统级通知（隔离、异常）发到哪（2026-10-19）。
-   * 取 surfaces.feishu.owner_chat_id 的第一个；未配置则跳过这类通知。
+   *
+   * B1（F5，2026-10-22）：owner_chat_id 是**逗号分隔的多会话**，这类通知是
+   * 广播到全部主人会话的，取第一个会把第二个会话永久排除在外。
+   * 未配置（空列表）则跳过这类通知。
+   *
+   * ⚠️ 这个列表**只**用于「没有来源会话、需要兜底找主人」的路径。
+   * 「线程已经有 chatId → 回原会话」那条路绝不能拿它当广播目标
+   * （见 taskStateText 里 threadChat !== null 的分支），否则主人的回复会跑到别的群去。
+   */
+  fallbackChatIds?: string[];
+  /**
+   * 旧的单值写法，**迁移桥**（B1）：装配层改完 chatIds 后就不该再传它。
+   * 留着它的唯一理由是让「装配层还没改」这件事在编译期不报错 —— 语义上
+   * 它等价于只有一个会话的 fallbackChatIds。请在 daemon.ts 落地后由 lead 删除。
    */
   fallbackChatId?: string | null;
   /**
@@ -318,6 +349,19 @@ function threadIdOfTask(db: DatabaseSync, taskId: string): string | null {
  */
 export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
   const sent = new Map<string, number>(); // 去重键 -> 发送时刻
+
+  /**
+   * 兜底主人会话列表（B1/F5）。
+   * 优先读新的复数 `fallbackChatIds`；兼容旧的单值 `fallbackChatId`
+   * —— 装配层还没改时行为等于「只有一个会话」，不会像原来那样把第二个静默丢掉，
+   * 因为第二个是**装配层**切掉的，那一步由 daemon.ts 的替换说明一起落地。
+   */
+  const fallbackIds: string[] =
+    deps.fallbackChatIds !== undefined
+      ? dedupeChatIds(deps.fallbackChatIds)
+      : deps.fallbackChatId !== null && deps.fallbackChatId !== undefined && deps.fallbackChatId !== ''
+        ? [deps.fallbackChatId]
+        : [];
   /**
    * 正在发但还没落 entry 的键。
    *
@@ -332,14 +376,35 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
   };
 
   /**
+   * 这次事件该投到哪些会话（B1/F5 的**唯一**投递决策点）。
+   *
+   * B1（F5）的两条路径**必须分开**，混起来就是回归：
+   * - `chatId`（非 null）= 线程已有来源会话 → **只回原会话**。绝不广播，
+   *   否则主人在 A 群问的话，回答跑到 B 群去（这是把回复投递改成广播的唯一禁止项）。
+   * - `chatId`（null）= 没有来源会话（event/web 线程、不绑线程的系统通知）
+   *   → 兜底给主人 = **广播到全部 fallbackChatIds**。
+   * - 两者都拿不到 → 空列表 = 不发（与旧行为一致，不静默假装成功）。
+   */
+  function deliveryChats(chatId: string | null): string[] {
+    if (chatId !== null && chatId.length > 0) return [chatId];
+    return fallbackIds;
+  }
+
+  /**
    * 认领 + 发送 + 落键。三条纪律在这里一次性落实：
    * - 去重：已发的键、正在发的键都直接返回（同 tick 重投会起并发协程，只靠 sent 防不住）；
    * - 尽力而为：发送失败只落日志、**不落键**，让下一次同态事件还有机会补发；
    * - 不炸总线：任何异常都吞成日志（handler 是 fire-and-forget，抛出去没人接）。
+   *
+   * 幂等键是**整条事件**（approval:<id> / taskId / quarantine:...），不是「事件×会话」。
+   * 这是刻意的：广播在同一次认领里循环发完，重投时整条跳过 —— 不会出现
+   * 「第二次重投只补发了第二个会话、第一个会话发两遍」这种半截状态。
+   * 代价是某个会话因网络抖动漏掉时不会单独补发，只能在日志/审计里看见；
+   * 相比「主人收到两张一样的卡片」，我们选了这个。
    */
   async function claimAndSend(
     key: string,
-    build: () => Promise<{ chatId: string; text: string } | null>,
+    build: () => Promise<{ chatIds: string[]; text: string } | null>,
     /**
      * T3：如果给了审批单且装配层提供了卡片能力，就先试卡片。
      * 卡片带同意/拒绝按钮 —— 这是 Muse 那种"点一下就办"的体验。
@@ -354,49 +419,74 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
     try {
       const cards = deps.approvalCards;
       if (cardView !== undefined && cards !== undefined) {
-        const cr = await cards.send(cardView);
-        if (cr.ok) {
-          sent.set(key, Date.now());
-          claimed = true;
-          prune();
-          recordOutbound(deps.db, {
-            kind: 'approval_card',
-            dedupKey: key,
-            chatId: cards.chatId,
-            ok: true,
-            error: null,
-            textPreview: `审批 #${cardView.id} 卡片`,
-            at: new Date().toISOString(),
-          });
-          deps.log(`[feishu-outbound] 审批 #${cardView.id} 已发卡片`);
-          return;
+        // B1（F5）：审批卡片**逐个主人会话**投。卡片是幂等的（裁决先到先得），
+        // 所以每个会话各一张不是重复打扰，而是「在任何一端都能看到待批事项」。
+        // 全部会话都失败才退回纯文本 —— 只要有一个会话送达就算成功，
+        // 否则失败的那个会话会被文本再打扰一遍。
+        const targets = dedupeChatIds(cards.chatIds);
+        if (targets.length > 0) {
+          let okCount = 0;
+          let lastError = '?';
+          for (const chatId of targets) {
+            const cr = await cards.send(cardView, chatId);
+            recordOutbound(deps.db, {
+              kind: 'approval_card',
+              dedupKey: key,
+              chatId,
+              ok: cr.ok,
+              error: cr.ok ? null : (cr.error ?? 'sendCard 返回 ok=false'),
+              textPreview: `审批 #${cardView.id} 卡片`,
+              at: new Date().toISOString(),
+            });
+            if (cr.ok) okCount += 1;
+            else lastError = cr.error ?? '?';
+          }
+          if (okCount > 0) {
+            sent.set(key, Date.now());
+            claimed = true;
+            prune();
+            deps.log(
+              `[feishu-outbound] 审批 #${cardView.id} 已发卡片 ${okCount}/${targets.length} 个主人会话` +
+                (okCount < targets.length ? `（${targets.length - okCount} 个失败：${lastError}）` : ''),
+            );
+            return;
+          }
+          deps.log(`[feishu-outbound] 审批 #${cardView.id} 卡片失败（${lastError}），改发纯文本`);
         }
-        deps.log(`[feishu-outbound] 审批 #${cardView.id} 卡片失败（${cr.error ?? '?'}），改发纯文本`);
       }
       const out = await build();
       if (out === null) return;
-      const res = await deps.gateway.sendText(out.chatId, out.text);
+      const targets = dedupeChatIds(out.chatIds);
+      if (targets.length === 0) return; // 没有可投会话：不发，也不落键（配好了还能补发）
       // **落库**（2026-10-19）：原来出站只写日志，而日志在 daemon 重启时会被清空
       // （wsl-daemon.sh 用 `: > "$LOG"`）。结果"这条任务到底回没回主人、发到哪个会话"
       // 事后完全查不到 —— 主人问"我没收到回复"时无从回答。
-      // 落一张小表，成功失败都记。
-      recordOutbound(deps.db, {
-        kind: 'task_reply',
-        dedupKey: key,
-        chatId: out.chatId,
-        ok: res.ok,
-        error: res.error ?? null,
-        textPreview: out.text.slice(0, 200),
-        at: new Date().toISOString(),
-      });
-      if (res.ok) {
+      // 落一张小表，成功失败都记。广播时**每个会话一行**（表本来就是按 chat_id 记的）。
+      let sentAny = false;
+      for (const chatId of targets) {
+        const res = await deps.gateway.sendText(chatId, out.text);
+        recordOutbound(deps.db, {
+          kind: 'task_reply',
+          dedupKey: key,
+          chatId,
+          ok: res.ok,
+          error: res.error ?? null,
+          textPreview: out.text.slice(0, 200),
+          at: new Date().toISOString(),
+        });
+        if (res.ok) {
+          sentAny = true;
+          deps.log(`飞书出站：已发送 ${key} → ${chatId}`);
+          // 截图随单：跟着这条回复落到**同一个**会话，广播时每个收到的会话都要有图。
+          onSent?.(chatId);
+        } else {
+          deps.log(`飞书出站失败：${key} ${res.error ?? '?'}`);
+        }
+      }
+      if (sentAny) {
         sent.set(key, Date.now());
         claimed = true;
         prune();
-        deps.log(`飞书出站：已发送 ${key} → ${out.chatId}`);
-          onSent?.(out.chatId);
-      } else {
-        deps.log(`飞书出站失败：${key} ${res.error ?? '?'}`);
       }
     } catch (cause) {
       deps.log(`飞书出站异常：${key} ${String(cause)}`);
@@ -446,33 +536,41 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
   }>('governance:quarantine', (ev) => {
     const q = ev.payload;
     void claimAndSend(`quarantine:${q.dotId}:${q.decisionId}`, async () => {
-      // 隔离通知发给主人默认会话（它不绑定某个 thread，走配置里的 owner chat）
-      const chatId = deps.fallbackChatId ?? null;
-      if (chatId === null) {
+      // 隔离通知不绑定任何 thread → 走兜底路径 = **广播到全部主人会话**（B1/F5）。
+      // dot 被隔离意味着所有依赖容器的任务都会莫名失败，主人任何一端都得看到；
+      // 只投第一个会话时，第二个会话的主人看到的只有「任务莫名其妙挂了」。
+      const chats = deliveryChats(null);
+      if (chats.length === 0) {
         deps.log(`隔离通知跳过：未配置 fallback chat（dot=${q.dotId}）`);
         return null;
       }
       const text = renderQuarantineNotice(q.dotId, q.decisionId, q.reason);
-      return { chatId, text: `${text}\n\n（这条由系统主动发出：dot 已暂停，需要人工复核后解除）` };
+      return { chatIds: chats, text: `${text}\n\n（这条由系统主动发出：dot 已暂停，需要人工复核后解除）` };
     });
   });
 
   /** task.state 的文案（含发送目标解析）；不需要发时返回 null。 */
-  async function taskStateText(p: TaskStatePayload): Promise<{ chatId: string; text: string } | null> {
+  async function taskStateText(p: TaskStatePayload): Promise<{ chatIds: string[]; text: string } | null> {
     const task = deps.db.prepare('SELECT title, thread_id FROM tasks WHERE id = ?').get(p.taskId) as
       | { title: string; thread_id: string | null }
       | undefined;
     if (!task || task.thread_id === null) return null;
-// **回退到主人默认会话**（2026-10-19 实测发现的定时任务缺口）：
+    // **回退到主人会话**（2026-10-19 实测发现的定时任务缺口；2026-10-22 B1 改成多会话）：
     // 定时触发的任务挂在 channel='event' 的线程上（external_ref=null），
     // feishuChatIdForThread 返回 null → 出站直接跳过 → **主人永远收不到定时任务的结果**。
     // 而"定时提醒"的全部意义就是主动告诉主人，发不出去等于没做。
     //
-    // 判据：线程不是飞书来源（event/web）时，回退到 surfaces.feishu.owner_chat_id 的第一个。
-    // 这不会误伤：真正的飞书会话仍按 chat_id 精确回原会话。
+    // 判据：线程不是飞书来源（event/web）时，回退到 surfaces.feishu.owner_chat_id ——
+    //   B1（F5）改后是**全部**会话，不再只是第一个（第一个之外的主人同样该收到定时提醒）。
+    // 这不会误伤：真正的飞书会话仍按 chat_id 精确回原会话（见 deliveryChats 的分野）。
     const threadChat = feishuChatIdForThread(deps.db, task.thread_id);
-    const chatId = threadChat ?? deps.fallbackChatId ?? null;
-    if (chatId === null) return null;
+    // B1（F5）：**这一行的语义是分野，改错了就是回归。**
+    //   threadChat 非 null = 任务本来就是从这个飞书会话来的 → 只回它，绝不广播。
+    //   threadChat 为 null = 定时任务/web 线程，没有来源会话 → 兜底给主人 = 广播到
+    //     全部 fallback 会话（这就是原来「只投第一个、第二个永远收不到定时提醒」的修法）。
+    // 把上面那种情况也改成广播 = 主人在 A 群问的话回答跑到 B 群，明确禁止。
+    const chats = deliveryChats(threadChat);
+    if (chats.length === 0) return null;
 
     // ── 2026-10-21：主动推送判定的**消费端**（此前判定了但没人用）──
     //
@@ -501,7 +599,7 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
       return null;
     }
     if (threadChat === null) {
-      deps.log(`飞书出站：${p.taskId} 非飞书会话，改投默认会话 ${chatId}`);
+      deps.log(`飞书出站：${p.taskId} 非飞书会话，改投全部主人会话（${chats.length} 个）`);
     }
     const body = lastAssistantText(deps.db, task.thread_id, p.taskId);
     if (p.to === 'done') {
@@ -529,7 +627,7 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
           return null;
         }
         return {
-          chatId,
+          chatIds: chats,
           text: `${stop}\n\n（系统收口说明：模型收尾前反复调用同一个工具、没有产出正式回复；以上面已完成的动作结果为准。可以让它再试一次。）`,
         };
       }
@@ -548,20 +646,26 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
         `飞书出站裁剪：${p.taskId} 正文 ${body.length} 字 → 发出 ${clipped.length} 字` +
           (clipped.length < body.length ? '（已折叠，末尾带完整内容指引）' : '（未触发上限）'),
       );
-      return { chatId, text: clipped };
+      return { chatIds: chats, text: clipped };
     }
-    return { chatId, text: `任务未完成（${task.title.slice(0, 40)}）` };
+    return { chatIds: chats, text: `任务未完成（${task.title.slice(0, 40)}）` };
   }
 
-  /** approval:created 的文案（审批属于哪个任务 → 该任务的会话）。 */
-  async function approvalText(view: ApprovalView): Promise<{ chatId: string; text: string } | null> {
+  /**
+   * approval:created 的纯文本兜底文案（审批属于哪个任务 → 该任务的会话）。
+   *
+   * B1：这里**保持只回原会话**，不广播。它只在「卡片发不出去」时才会被用到，
+   * 而卡片已经把审批广播给全部主人会话了；再对文本做一次广播就是重复打扰。
+   * 非飞书来源任务照旧不外发（主人就在电脑前，Web UI 会亮）。
+   */
+  async function approvalText(view: ApprovalView): Promise<{ chatIds: string[]; text: string } | null> {
     const taskId = view.taskRef?.taskId;
     if (typeof taskId !== 'string' || taskId.length === 0) return null; // 合成审批（无任务）不外发
     const threadId = threadIdOfTask(deps.db, taskId);
     if (threadId === null) return null;
     const chatId = feishuChatIdForThread(deps.db, threadId);
     if (chatId === null) return null; // 非飞书来源任务：主人就在电脑前，Web UI 会亮
-    return { chatId, text: renderApprovalCard(view, taskTitleOf(deps.db, taskId)) };
+    return { chatIds: [chatId], text: renderApprovalCard(view, taskTitleOf(deps.db, taskId)) };
   }
 
   return () => {
