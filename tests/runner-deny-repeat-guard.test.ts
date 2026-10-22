@@ -329,3 +329,86 @@ test('参数完全一样、结果每轮都不同，也必须被护栏收口（�
     tmp.cleanup();
   }
 });
+test('易变输出的整类形态都必须收敛（时间戳/ISO/uuid/pid/耗时）', async () => {
+  // 上一条测试只锁住了 $(date +%s) 这一种。但「易变输出」是一整类：
+  // 任何带日期、随机 id、pid、耗时、自增序号的命令都会命中同一个盲区。
+  // 逐个修注释不解决问题，所以要锁**类**：换五种形态，都必须收敛。
+  //
+  // 这条测试的价值不在于多测了几个字符串，而在于它禁止了「只 patch 现场那一个
+  // 正则就交差」的做法 —— 那种修法下次换一个易变量就又漏。
+  const shapes: Array<{ name: string; stdout: () => string }> = [
+    { name: 'epoch 秒', stdout: () => `tick-${String(1792697858000 + Math.floor(Math.random() * 999999))}` },
+    { name: 'ISO 时间戳', stdout: () => `at ${new Date(Date.now() + Math.random() * 1e7).toISOString()}` },
+    { name: 'uuid', stdout: () => `id ${String(Math.random()).slice(2)}-${String(Math.random()).slice(2)}` },
+    { name: 'pid', stdout: () => `pid ${String(10000 + Math.floor(Math.random() * 60000))}` },
+    { name: '耗时 ms', stdout: () => `took ${String(Math.floor(Math.random() * 900) + 100)}ms` },
+  ];
+
+  for (const shape of shapes) {
+    const tmp = makeTempDataDir();
+    try {
+      let stepCount = 0;
+      const notes: string[] = [];
+      let llmRounds = 0;
+      const task = { id: `tk_v_${shape.name}`, dotId: 'dot1', runEpoch: 1, threadId: 'thr_x', title: 't', goal: 'g', budgetTokens: 10_000_000, resumeFromSeq: null };
+
+      const routerStub = {
+        async complete(req: RouteRequest): Promise<RouteResult> {
+          if ((req.tools ?? []).length === 0) {
+            return { response: { content: '收尾。', toolCalls: [] },
+              meta: { endpointId: 'stub', model: 'stub', tier: 1, degraded: false, tried: [] },
+              usage: { promptTokens: 1, completionTokens: 1 } } as unknown as RouteResult;
+          }
+          llmRounds += 1;
+          // 参数完全一致：现场模型就是不改参数，只靠输出变化"证明"自己在干活
+          return { response: { content: '', toolCalls: [{ id: `c${llmRounds}`, name: 'shell.run', arguments: '{"cmd":"run-probe"}' }] },
+            meta: { endpointId: 'stub', model: 'stub', tier: 1, degraded: false, tried: [] },
+            usage: { promptTokens: 1, completionTokens: 1 } } as unknown as RouteResult;
+        },
+      };
+
+      const cp = {
+        pop: () => null,
+        getTask: () => ({ ...task, status: 'running' }),
+        bindSession: () => {}, finish: () => {}, failTask: () => {}, pauseByReason: () => {},
+        setAwaitingApproval: () => {}, heartbeat: () => ({ aborted: false, overBudget: false }),
+        journal: {
+          beginLlm: () => ({ seq: ++stepCount, callId: `llm_${stepCount}` }),
+          endLlm: () => {}, beginTool: () => ({ seq: ++stepCount, callId: `tool_${stepCount}` }),
+          endTool: () => {}, skipStep: () => {}, markPending: () => {},
+          resumeStep: () => ({ callId: '' }), tail: () => [], getStepByCallId: () => null,
+        },
+      } as unknown as ControlPlane;
+
+      const runner = new DotRunner(
+        {
+          cp,
+          router: routerStub as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+          exec: {
+            runTool: async (c: { call_id: string }) => ({ call_id: c.call_id, status: 'ok', result: { exit_code: 0, stdout: shape.stdout(), signal: null } }),
+            getCapabilities: async () => [{ name: 'shell.run', mode: 'sync', max_deadline_ms: 60000, args_schema: {}, sideEffect: 'unknown' }],
+            reconcileCall: async () => 'unknown', getCallResult: async () => null, cancelTool: async () => {},
+          } as unknown as ConstructorParameters<typeof DotRunner>[0]['exec'],
+          memory: {
+            openThread: async () => 'thr_x', appendMessage: async () => ({ id: 'm', seq: 1 }),
+            appendSystemMessage: async () => ({ id: 'm', seq: 1 }),
+            buildContextBundle: async () => ({ memoryMd: '', manualExcerpts: [], summary: null }),
+            buildSessionReplay: async () => [], beforeWrite: async () => ({ ok: true }),
+            sealTask: async () => {}, needsMemoryRedo: async () => false,
+          } as unknown as MemoryServiceApi,
+          governance: {
+            evaluate: async () => ({ kind: 'allow' as const }), claim: async () => ({ ok: true }),
+            forceApproval: async () => ({ approvalId: 0 }),
+          } as unknown as GovernanceApi,
+        },
+        { idlePollMs: 5, log: (m: string) => notes.push(m) },
+      );
+
+      const out = await (runner as unknown as { runTask: (t: unknown) => Promise<{ status: string }> }).runTask(task);
+      assert.equal(out.status, 'done', `${shape.name}：应被收口成 done，实际 ${out.status}`);
+      assert.ok(llmRounds <= 9, `${shape.name}：易变输出不该成为免死牌，实际跑了 ${String(llmRounds)} 轮（真机曾 25 次不收口）`);
+    } finally {
+      tmp.cleanup();
+    }
+  }
+});
