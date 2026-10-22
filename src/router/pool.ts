@@ -422,7 +422,8 @@ function fmtEcho(t: string | null): string {
 /** 解析 free-models.yml（MR §2.2 条目形状）。 */
 export function parseFreeModelsYaml(text: string): FreeModelsFile {
   const out: FreeModelsFile = { version: 1, updated_at: null, models: [] };
-  const lines = text.split('\n');
+  // 行尾归一：与 parseModelsYaml 同口径（CRLF 文件不能让值带上 \r）。
+  const lines = text.split(/\r?\n/);
   let inModels = false;
   let cur: FreeModelEntry | null = null;
   const flush = (): void => {

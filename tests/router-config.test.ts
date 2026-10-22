@@ -373,4 +373,25 @@ alerts:
     assert.equal(cfg.breaker.consec_failures, 3);
     assert.equal(cfg.version, 1);
   });
+
+  // 2026-10-22 回归：Windows 工作区（core.autocrlf=true）检出的配置文件是 CRLF。
+  // 曾经的实现 `text.split('\n')` 把 `\r` 留在每行末尾 → 缩进判断/注释剥离/取值全部失真，
+  // 真实 models.yml 被解析成 0 个端点，daemon 直接报「models.yml 未定义任何端点」拒启动。
+  // 这里用**同一份真实文件**的两种行尾各解析一遍，断言结果必须一致。
+  it('CRLF 与 LF 解析结果一致（Windows 检出不会让整份配置解析成 0 个端点）', () => {
+    const crlfText = readFileSync(REAL_MODELS_YML, 'utf8').replace(/\r?\n/g, '\r\n');
+    assert.ok(crlfText.includes('\r\n'), '样本必须是 CRLF，否则这条测试没在测东西');
+    const fromCrlf = parseModelsYaml(crlfText.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n'));
+    const fromLf = parseModelsYaml(crlfText.replace(/\r\n/g, '\n'));
+    assert.deepEqual(fromCrlf, fromLf, 'CRLF 与 LF 必须解析出完全相同的配置');
+    // 硬断言几个"被 \r 污染就必然错"的字段，防 deepEqual 两边一起错
+    assert.ok(fromCrlf.endpoints.length > 0, '端点不能是 0 个');
+    // 不写死 key 名（配置会换凭据），只断言"取到的值干净"：非空、无 \r、无尾随空白。
+    const env = fromCrlf.endpoints[0]?.apiKeyEnv;
+    assert.equal(typeof env, 'string', 'api_key_env 必须被解析出来');
+    assert.ok((env as string).length > 0, 'api_key_env 不能是空串');
+    assert.ok(!(env as string).includes('\r'), '值里不能残留 \r');
+    assert.equal((env as string), (env as string).trim(), '值不能带尾随空白');
+    assert.ok(fromCrlf.routing.light_events.length > 0, '续行列表不能被 CRLF 吞掉');
+  });
 });

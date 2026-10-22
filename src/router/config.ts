@@ -299,7 +299,10 @@ const BLOCK_KEYS = new Set(['models', 'fallback_models', 'local', 'warm_check', 
 
 /** 解析 models.yml（MR §2.1 全量形状）。 */
 export function parseModelsYaml(text: string, file = 'models.yml'): ModelsConfig {
-  const lines = text.split('\n');
+  // 行尾归一：Windows 工作区（core.autocrlf=true）读出来是 CRLF，只按 '\n' 切行
+  // 会把 `\r` 留在每行末尾 —— 缩进判断、`# 注释`剥离、`key: value` 取值全部失真，
+  // 实测整份 models.yml 被解析成 **0 个端点**（daemon 报「未定义任何端点」拒启动）。
+  const lines = text.split(/\r?\n/);
   const cfg: ModelsConfig = {
     version: 1,
     reload_debounce_ms: 1500,
