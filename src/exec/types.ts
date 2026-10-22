@@ -103,8 +103,16 @@ export interface ExecConfig {
   dockerApiMax: string;
   /** docker unix socket（daemon 与 dockerd 同在 WSL，EX §2.1）。 */
   dockerSocketPath: string;
-  /** 镜像 tag 的 pw_version 段（EX §3.1/§3.2）。 */
-  pwVersion: string;
+  /**
+   * 镜像 tag 的第一段（EX §3.1/§3.2）。
+   *
+   * 名字历史：曾叫 pwVersion（playwright 版本）。2026-10-21 基座从
+   * mcr.microsoft.com/playwright 换成 node:24-slim 之后，仓库里已经没有任何
+   * playwright，这个值也不再是版本号，而是【基座标识】。名字与语义不符会让下次
+   * 构建出来的 tag 仍叫 1.49.1-0.1.0（handoff §7.2 记的就是这件事）。
+   * 现语义：docker 基座的短标识，只参与拼 tag 与 DB 记录，不再传给 Dockerfile。
+   */
+  baseImageTag: string;
   /** agent-runtime 版本（EX §3.2 tag 第二段；增删工具 bump）。 */
   runtimeVer: string;
   /** docker 网络名（EX §2.1：bridge + enable_icc=false）。 */
@@ -186,7 +194,7 @@ export const DEFAULT_EXEC_CONFIG: ExecConfig = {
   dockerApiMin: '1.44',
   dockerApiMax: '1.52',
   dockerSocketPath: '/var/run/docker.sock',
-  pwVersion: '1.49.1',
+  baseImageTag: 'slim',
   runtimeVer: '0.1.0',
   networkName: 'dotd',
   runtimePort: 9223,
@@ -420,7 +428,7 @@ export interface ImageBuildRow {
   id: number;
   tag: string;
   digest: string | null;
-  pw_version: string;
+  base_image_tag: string;
   status: 'building' | 'ready' | 'failed' | 'superseded';
   log_tail: string | null;
   started_at: string;
@@ -450,6 +458,10 @@ export interface DockerContainerState {
 export interface DockerContainerListItem {
   Id: string;
   Names: string[];
+  /** 镜像可读 tag（dockerode listContainers 的 Image 字段）。stub 可缺省。 */
+  Image?: string;
+  /** 镜像 digest（dockerode 的 ImageID，形如 sha256:...）。stub 可缺省 = 不参与漂移判定。 */
+  ImageID?: string;
   State: string;
   Labels: Record<string, string>;
 }
@@ -475,7 +487,7 @@ export interface ContainerBackend {
   /** `docker images` 是否含 tag。 */
   hasImage(tag: string): Promise<boolean>;
   /** `docker buildImage`（内存 tar 流）。返回日志行序列。 */
-  buildImage(tag: string, pwVersion: string, onLine?: (line: string) => void): Promise<{ digest: string }>;
+  buildImage(tag: string, baseImageTag: string, onLine?: (line: string) => void): Promise<{ digest: string }>;
   /** `docker create`。返回 64 位容器 id。 */
   createContainer(spec: ContainerSpec): Promise<string>;
   /** `docker start`。 */
@@ -491,6 +503,15 @@ export interface ContainerBackend {
   inspectContainer(id: string): Promise<DockerContainerState | null>;
   /** `docker ps -a` + label 过滤（EX §13.1：label.dotd.managed=1）。 */
   listManagedContainers(): Promise<DockerContainerListItem[]>;
+  /**
+   * 现有容器（含已停止的）在用的镜像标识，digest 与可读 tag 都收进来。
+   *
+   * 存在理由（F4，2026-10-22）：`reapOldImages()` 构建成功后会删掉其它 ready 行的镜像，
+   * 而**线上正在跑的那个容器用的就是其中之一**。删了它，等于在新镜像出问题时
+   * 把唯一能退回的东西删了（`docker rmi` 之后想 recreate 旧容器只会 No such image）。
+   * 回收前必须先问这一句。
+   */
+  listContainerImages(): Promise<string[]>;
   /** 容器 IP（bridge 网内，用于拼 endpoint http://IP:9223）。 */
   containerIp(id: string): Promise<string | null>;
   /** `docker stats`（契约 J5：归 EX，用 dockerode stats API，不写 CLI 子进程）。 */

@@ -1,32 +1,109 @@
 #!/usr/bin/env bash
+# scripts/rebuild-image.sh —— 重建 exec 镜像并让容器换到新基座。
+#
+# ⚠ 2026-10-22 重写（F3）。老版本第 6 行是：
+#     docker rmi -f dotd/exec:1.49.1-0.1.0
+# 那是**唯一可回滚的那份镜像**，脚本一上来就把它删了。也就是说：一旦新镜像构建失败
+# 或者构建出来更糟，没有任何东西可以退回去，只能干看着。"重建"脚本的第一步是销毁退路，
+# 顺序反了。现在改成【先给旧镜像打一个 rollback tag，构建成功后再删】，失败就原地退回。
+#
+# tag 不写死：从 src/exec/types.ts 的 execConfigFromEnv() 现算（唯一真相）（写死 1.49.1-0.1.0 是
+# F2 那一类问题——名字与真相脱钩，换基座后脚本删的是一个根本不存在的 tag，静默 no-op）。
+#
+# 用法：
+#   bash scripts/rebuild-image.sh            # 只构建，不动线上容器
+#   bash scripts/rebuild-image.sh --swap     # 构建成功后，删容器让 daemon 用新镜像重建
 set -uo pipefail
 cd /root/dotd || exit 1
 
-echo "=== 1. 删旧镜像 ==="
-docker rmi -f dotd/exec:1.49.1-0.1.0 >/dev/null 2>&1 && echo "  已删" || echo "  无需删除"
+SWAP=0
+[ "${1:-}" = "--swap" ] && SWAP=1
 
-echo "=== 2. 停 daemon + 删容器 ==="
-pkill -f 'daemon.ts' 2>/dev/null || true
-sleep 3
-CID=$(docker ps -aq --filter name=dotd-dot-dot1 | head -1)
-if [ -n "$CID" ]; then docker rm -f "$CID" >/dev/null 2>&1 && echo "  已删容器"; fi
+# ---------- 0. 现算 tag（唯一真相 = config/exec.yml） ----------
+# 路径必须是 ./src/... 而不是 ../src/...：node --eval 把相对说明符按 <cwd>/[eval1]
+# 解析，`../src` 会算成上一级目录（/root/src），实测直接 ERR_MODULE_NOT_FOUND。
+# 曾经写错，靠下面"读不到就中止"的守卫兜住了（脚本整段 no-op），没造成损失。
+read -r BASE RUNTIME < <(node --import tsx -e '
+  import { execConfigFromEnv } from "./src/exec/types.ts";
+  const c = execConfigFromEnv();
+  process.stdout.write(`${c.baseImageTag} ${c.runtimeVer}`);
+' 2>/dev/null || true)
+if [ -z "${BASE:-}" ] || [ -z "${RUNTIME:-}" ]; then
+  echo "!! 读不到 baseImageTag/runtimeVer（config/exec.yml？），中止：宁可什么都不做，"
+  echo "   也不能凭猜的 tag 去删镜像。"
+  exit 1
+fi
+TAG="dotd/exec:${BASE}-${RUNTIME}"
+ROLLBACK=""  # 第 1 步按"线上镜像 id"现算，见下（不能提前定名，名字要指向真正被备份的那份）
+echo "目标 tag : $TAG"
+echo "回滚 tag : $ROLLBACK"
 
-echo "=== 3. 重启（会重建镜像，约 2-3 分钟）==="
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
+# ---------- 1. 备份：给"线上这个容器此刻真正在跑的镜像"打 rollback tag（绝不 rmi） ----------
+# 为什么不按 $TAG 备份：现网 (2026-10-22) 容器用的是 digest fb98ec90ef9e，而 tag
+# dotd/exec:1.49.1-0.1.0 指向的是另一个 image 15fbed5219f3 —— 同一个 tag 在
+# image_builds 里有 15 行 ready，容器是用其中较早的一行建的。按 tag 备份会备到
+# 一份"线上根本没在跑"的镜像，真要回滚时退不回去。所以按容器实况的 image id 备份。
+CID0=$(docker ps -aq --filter name=dotd-dot-dot1 | head -1)
+OLD_ID=""
+if [ -n "$CID0" ]; then
+  OLD_ID=$(docker inspect "$CID0" --format '{{.Image}}' 2>/dev/null | sed 's/^sha256://' | cut -c1-12)
+fi
+if [ -z "$OLD_ID" ]; then
+  OLD_ID=$(docker images -q "$TAG" | head -1)   # 没有容器（首次换基座）→ 退回按 tag 找
+fi
+if [ -n "$OLD_ID" ]; then
+  ROLLBACK="dotd/exec:rollback-${OLD_ID}"       # 用被备份镜像的 id 命名，名字自带指向
+  docker tag "$OLD_ID" "$ROLLBACK" && echo "已备份  : live image ${OLD_ID} -> $ROLLBACK"
+else
+  echo "备份    : 既无运行中的容器也无 $TAG 镜像，无需备份"
+fi
 
-for i in $(seq 1 60); do
-  sleep 5
-  if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; then
-    echo "  daemon 就绪（$((i*5))s）"
-    break
+# ---------- 2. 构建 ----------
+echo "=== 构建（约 2-3 分钟）==="
+if ! node --import tsx scripts/wsl-build-image.mts --force; then
+  echo "!! 构建失败。$TAG 未被改动；如已被半成品覆盖，可退回："
+  echo "   docker tag $ROLLBACK $TAG"
+  exit 1
+fi
+NEW_ID=$(docker images -q "$TAG" | head -1)
+echo "新镜像 id: ${NEW_ID:0:12}  大小: $(docker images --format '{{.Size}}' "$TAG" | head -1)"
+
+# ---------- 3. 换容器（只在 --swap 时做）----------
+if [ "$SWAP" = "1" ]; then
+  echo "=== --swap：删容器，让 daemon 的 reconcile 用新镜像重建（F9 漂移检测会接手）==="
+  CID=$(docker ps -aq --filter name=dotd-dot-dot1 | head -1)
+  if [ -n "$CID" ]; then
+    docker rm -f "$CID" >/dev/null 2>&1 && echo "  已删旧容器 $CID"
+  else
+    echo "  无旧容器"
   fi
-done
+  if ! curl -s -m 3 -o /dev/null http://127.0.0.1:7788/api/health; then
+    echo "  daemon 没在跑，拉起…"
+    setsid bash scripts/wsl-daemon.sh >/tmp/dotd-wsl.log 2>&1 < /dev/null &
+  fi
+  for i in $(seq 1 60); do
+    sleep 5
+    if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; then
+      echo "  daemon 就绪（$((i*5))s）"; break
+    fi
+  done
+fi
 
+# ---------- 4. 验证 + 才清理回滚 ----------
 echo ""
-echo "=== 4. 结果 ==="
-docker images --format '{{.Repository}}:{{.Tag}}  {{.CreatedSince}}' | grep dotd | head -2
+echo "=== 结果 ==="
+docker images --format '{{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}  {{.CreatedSince}}' | grep dotd/exec | head -5
 curl -s -m 3 -o /dev/null -w '  daemon HTTP %{http_code}\n' http://127.0.0.1:7788/api/health
-
 CID2=$(docker ps --filter name=dotd-dot-dot1 --format '{{.ID}}' | head -1)
-echo "  容器: $CID2"
-docker exec "$CID2" sh -c 'grep -l "tool.create" /app/*.ts 2>/dev/null | head -2 || echo "  (容器内仍无 tool.create)"'
+echo "  容器: ${CID2:-无}"
+if [ -n "$CID2" ]; then
+  echo "  容器内 node: $(docker exec "$CID2" node -v 2>/dev/null || echo '取不到')"
+  echo "  /ms-playwright: $(docker exec "$CID2" sh -c 'du -sh /ms-playwright 2>/dev/null || echo 不存在' 2>/dev/null)"
+fi
+if [ -n "$ROLLBACK" ]; then
+  echo "回滚副本 $ROLLBACK **保留着**，确认新镜像没问题后再手动删："
+  echo "  docker rmi $ROLLBACK"
+  echo "（要立刻退回：docker tag $ROLLBACK ${TAG:-dotd/exec:*} 然后删掉新容器让 daemon 重建）"
+else
+  echo "无回滚副本（第 1 步没找到可备份的镜像），出问题只能重新构建。"
+fi

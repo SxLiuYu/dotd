@@ -42,7 +42,7 @@ const cfg: ExecConfig = {
   dockerApiMin: '1.44',
   dockerApiMax: '1.52',
   dockerSocketPath: '/var/run/docker.sock',
-  pwVersion: '1.49.1',
+  baseImageTag: 'slim',
   runtimeVer: '0.1.0',
   networkName: 'dotd',
   runtimePort: 9223,

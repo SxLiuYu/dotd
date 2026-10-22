@@ -227,6 +227,23 @@ export function loadPackages(dir: string = MIGRATIONS_DIR): MigrationPackage[] {
  * 启动序列（CP §7.1 步骤 1）：openDb → **migrate** → 其余模块 init。
  * 失败时抛 MigrationError，且**不留下半套表结构**（每包一个事务，失败即回滚）。
  */
+/**
+ * 迁移目录里最大的 NNN —— 「库应当到达的版本」的唯一权威来源。
+ *
+ * 为什么要导出它（2026-10-22）：user_version 的终态此前被 5 个测试文件钉死成字面量 170，
+ * 于是每加一个迁移包就得记得改那 5 处，漏一处就是一片红 —— 而红的原因是"数字没跟上"，
+ * 不是"迁移没跑"。docs/handoff.md §4.3 记的正是这类"把数字钉死"的坑。
+ * 断言改成 `user_version === latestMigrationVersion()` 之后：不变量（终态 = 最大 NNN）
+ * 仍然被钉住，具体数字不再需要人手抄一遍。
+ */
+export function latestMigrationVersion(dir: string = MIGRATIONS_DIR): number {
+  const packages = loadPackages(dir);
+  if (packages.length === 0) {
+    throw new MigrationError(`迁移目录 ${dir} 下没有 NNN_*.sql 迁移包`, null);
+  }
+  return packages[packages.length - 1]!.version;
+}
+
 export function migrate(
   db: DatabaseSync,
   opts: { dir?: string; expectedVersion?: number } = {},

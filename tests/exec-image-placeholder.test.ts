@@ -31,19 +31,19 @@ test('isPlaceholderDigest：全零 sha256 判真，真实 digest 判假', () => 
 test('readyBuild：最新一行是占位 digest 时，退回到更早的真实那一行', () => {
   const tmp = makeTempDataDir();
   try {
-    const tag = 'dotd/exec:1.49.1-0.1.0';
+    const tag = 'dotd/exec:slim-0.1.0';
     const ins = tmp.db.prepare(
-      `INSERT INTO image_builds (tag, digest, pw_version, status, log_tail, started_at, finished_at)
+      `INSERT INTO image_builds (tag, digest, base_image_tag, status, log_tail, started_at, finished_at)
        VALUES (?, ?, ?, 'ready', '', ?, ?)`,
     );
     const now = new Date().toISOString();
     // 先真实、后占位（模拟 stub 模式在之后跑过）
-    ins.run(tag, REAL, '1.49.1', now, now);
-    ins.run(tag, PLACEHOLDER, '1.49.1', now, now);
+    ins.run(tag, REAL, 'slim', now, now);
+    ins.run(tag, PLACEHOLDER, 'slim', now, now);
 
     const mgr = new ImageManager({
       db: tmp.db,
-      cfg: { pwVersion: '1.49.1', runtimeVer: '0.1.0', logTailChars: 100, repoRoot: '', dockerSocketPath: '' },
+      cfg: { baseImageTag: 'slim', runtimeVer: '0.1.0', logTailChars: 100, repoRoot: '', dockerSocketPath: '' },
     } as unknown as ConstructorParameters<typeof ImageManager>[0]);
 
     const row = mgr.readyBuild(tag);
@@ -58,18 +58,18 @@ test('readyBuild：最新一行是占位 digest 时，退回到更早的真实�
 test('readyBuild：只有占位 digest 时返回 null（触发重建，而不是拿假 ID 去 create）', () => {
   const tmp = makeTempDataDir();
   try {
-    const tag = 'dotd/exec:1.49.1-0.1.0';
+    const tag = 'dotd/exec:slim-0.1.0';
     const now = new Date().toISOString();
     tmp.db
       .prepare(
-        `INSERT INTO image_builds (tag, digest, pw_version, status, log_tail, started_at, finished_at)
-         VALUES (?, ?, '1.49.1', 'ready', '', ?, ?)`,
+        `INSERT INTO image_builds (tag, digest, base_image_tag, status, log_tail, started_at, finished_at)
+         VALUES (?, ?, 'slim', 'ready', '', ?, ?)`,
       )
       .run(tag, PLACEHOLDER, now, now);
 
     const mgr = new ImageManager({
       db: tmp.db,
-      cfg: { pwVersion: '1.49.1', runtimeVer: '0.1.0', logTailChars: 100, repoRoot: '', dockerSocketPath: '' },
+      cfg: { baseImageTag: 'slim', runtimeVer: '0.1.0', logTailChars: 100, repoRoot: '', dockerSocketPath: '' },
     } as unknown as ConstructorParameters<typeof ImageManager>[0]);
 
     assert.equal(mgr.readyBuild(tag), null, '全是占位 → 视为没有可用镜像 → 触发重建');

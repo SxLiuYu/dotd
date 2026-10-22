@@ -30,6 +30,8 @@ import {
   dispatchModeFor,
   endpointUrl,
   identityHash,
+  imageDrift,
+  isImageDigest,
   ledgerReplay,
   volumeNames,
   type LedgerRecord,
@@ -531,6 +533,48 @@ export class Fleet {
     for (const row of this.listActiveContainers()) {
       const match = live.find((c) => c.Id === row.docker_container_id);
       try {
+        // ── 镜像漂移（F9）：账上这个容器还活着，但它跑的是**旧镜像** ──────────
+        // 2026-10-22 现场：exec-image 已换 node:24-slim，而 reconcile 只看"容器在跑 +
+        // /healthz 通"就 adopted，于是不管 tag 怎么变，boot 永远接着旧 playwright 容器用
+        // —— 容器内 node 仍是 v22、/ms-playwright 仍占 1.4GB，而日志写着"容器已就绪"。
+        // handoff §7.1 那条"说上线了而实际没上线"走得就是这个路径：换基座必须让在跑的
+        // 容器被重建，否则等于改了个空。
+        //
+        // 放在循环体**第一件事**（早于 paused 采纳、也早于 lost→recreate 分支），
+        // 于是四种实况全过这一道：paused / running / exited / 未知状态。
+        // 只挡 running 是不够的：paused 的旧镜像容器同样会被原样收回来。
+        //
+        // 判据本身在 protocol.ts 的 imageDrift/isImageDigest（纯函数、可单测）：
+        // 期望是 digest 就拿容器 ImageID 比，是 tag 就拿 Image 比 —— 必须同一种标识，
+        // 混比会恒不相等、每次 boot 都重建一次；任一侧拿不到一律**不判漂移**，
+        // 不能把"读不到字段"当成"有问题"去重建生产容器。
+        //
+        // canRecreate 的必要性：image_ready/created/booting 里的容器是**本次 boot 用
+        // 新镜像刚建出来的**，按构造不可能漂移；而对它们调 recreate 会踩非法迁移
+        // （这几个状态没有 →removed 的边，见 types.ts CONTAINER_TRANSITIONS），
+        // 把一次"漂移"变成一条 boot 失败记录 —— 反而更糟。
+        // 判据用 canTransition(state,'removed') 现算而非手写状态名单：以后状态表加边，
+        // 这里自动跟上，不必记得来改这一段。
+        if (match !== undefined) {
+          const want = image.digest ?? image.tag;
+          const got = isImageDigest(want) ? match.ImageID : match.Image;
+          if (imageDrift(want, got) && canTransition(row.state, 'removed')) {
+            const brief = (x: string | undefined): string =>
+              (x === undefined ? '∅' : x.length > 24 ? `${x.slice(0, 19)}…` : x);
+            report.warnings.push(
+              `${row.dot_id} 镜像漂移（容器 ${brief(got)} ≠ 期望 ${brief(want)}）→ 重建`,
+            );
+            // 状态收敛交给 recreate 自己走（*→removed→absent→created→booting→ready）。
+            // 这里不抢先 transition：一是没必要，二是本判断现在跑在所有采纳分支之前，
+            // ready 之外的 stopped/quarantined 都不允许 →unhealthy，挑错目标态会抛
+            // IllegalContainerTransitionError。
+            const r = await this.recreate(row.dot_id, { image });
+            report.recreated.push(row.dot_id);
+            report.reconciled.push(...r.reconciled);
+            if (r.quarantined) report.warnings.push(`${row.dot_id} 进入 quarantined`);
+            continue;
+          }
+        }
         if (row.state === 'suspended' && match?.State === 'paused') {
           report.adopted.push(row.dot_id); // 保持
           continue;
@@ -1420,8 +1464,21 @@ function inApiRange(api: string, cfg: ExecConfig): boolean {
 
 export interface StubBackendOptions {
   cfg: ExecConfig;
-  /** 预置的 docker 侧容器实况（key = docker_container_id）。name/labels 可缺省。 */
-  seedContainers?: Array<{ id: string; state?: string; labels?: Record<string, string>; name?: string }>;
+  /**
+   * 预置的 docker 侧容器实况。name/labels/image 可缺省。
+   *
+   * image = 这个容器是用哪个镜像建的。有了它，F9（镜像漂移 -> 重建）和
+   * F4（有容器在用的镜像不许回收）才能在 stub 上跑端到端回归; 否则那两个修复
+   * 只有纯函数测试覆盖, 接线本身没有回归保护 —— 本轮项目吃过两次
+   * 「函数对但没人调用」的亏。
+   */
+  seedContainers?: Array<{
+    id: string;
+    state?: string;
+    labels?: Record<string, string>;
+    name?: string;
+    image?: string;
+  }>;
   /** ping 是否可用（默认 true）。 */
   pingOk?: boolean;
 }
@@ -1440,7 +1497,14 @@ export type StubBackend = ContainerBackend & {
   /** 注入宿主 MemAvailable（MB）—— §4.3 第三道闸门（内存，非磁盘）。 */
   setMemAvailable(mb: number): void;
   setState(id: string, status: string): void;
-  seedContainer(c: { id: string; state?: string; labels?: Record<string, string>; name?: string }): void;
+  /** image 见 StubBackendOptions.seedContainers 的注释（F9/F4 的端到端回归靠它）。 */
+  seedContainer(c: {
+    id: string;
+    state?: string;
+    labels?: Record<string, string>;
+    name?: string;
+    image?: string;
+  }): void;
   listAll(): Array<{ id: string; status: string; spec: ContainerSpec | null }>;
 };
 
@@ -1458,6 +1522,8 @@ export function createStubBackend(o: StubBackendOptions): StubBackend {
       memMb: number;
       seedName?: string;
       seedLabels?: Record<string, string>;
+      /** 这个 seed 容器是用哪个镜像建的; undefined = 不知道（见 StubBackendOptions 注）。 */
+      seedImage?: string;
     }
   >();
   for (const s of o.seedContainers ?? []) {
@@ -1470,6 +1536,7 @@ export function createStubBackend(o: StubBackendOptions): StubBackend {
       memMb: 128,
       seedName: s.name,
       seedLabels: s.labels,
+      seedImage: s.image,
     });
   }
   const images = new Set<string>();
@@ -1583,22 +1650,44 @@ export function createStubBackend(o: StubBackendOptions): StubBackend {
       };
     },
 
+    async listContainerImages(): Promise<string[]> {
+      const out: string[] = [];
+      for (const c of containers.values()) {
+        // 已停止的容器也算：它同样是"还能退回去"的证据（与 docker 后端 all:true 对齐）。
+        const img = c.spec !== null ? c.spec.image : c.seedImage;
+        if (img !== undefined && img.length > 0) out.push(img);
+      }
+      return out;
+    },
+
     async listManagedContainers(): Promise<import('./types.ts').DockerContainerListItem[]> {
       const out: import('./types.ts').DockerContainerListItem[] = [];
       for (const c of containers.values()) {
         if (c.spec === null) {
-          // seed 进来的容器：无 spec，按 seed name/labels 处理
+          // seed 进来的容器：无 spec，按 seed name/labels 处理。
+          // seedImage 缺省时**两个字段都不填** —— 那是"不知道"，不是"知道且不同";
+          // 瞎填会让 imageDrift() 拿到假证据、把测试里的容器判成漂移然后重建。
+          const img = c.seedImage;
+          const imgDigest = img !== undefined && isImageDigest(img);
           out.push({
             Id: c.id,
             Names: [c.seedName !== undefined ? `/${c.seedName}` : `/stub-${c.id}`],
+            Image: img !== undefined && !imgDigest ? img : undefined,
+            ImageID: img !== undefined && imgDigest ? img : undefined,
             State: c.status,
             Labels: c.seedLabels ?? {},
           });
           continue;
         }
+        // 回填 spec.image：stub 建容器时传进去的就是它的镜像标识，漂移判定因此在单测里
+        // 也拿得到真证据。按 kind 分流成和 docker 一样的两个字段（digest -> ImageID、
+        // tag -> Image）: 只塞一个的话，另一条判定路径在单测里永远走不到。
+        const specDigest = isImageDigest(c.spec.image);
         out.push({
           Id: c.id,
           Names: [`/${c.spec.name}`],
+          Image: specDigest ? undefined : c.spec.image,
+          ImageID: specDigest ? c.spec.image : undefined,
           State: c.status,
           Labels: c.spec.labels,
         });
@@ -1679,7 +1768,13 @@ export function createStubBackend(o: StubBackendOptions): StubBackend {
       setStatus(id, status);
     },
     /** 事后注入一个 docker 侧实况容器（boot 占名/孤儿场景）。 */
-    seedContainer(c: { id: string; state?: string; labels?: Record<string, string>; name?: string }): void {
+    seedContainer(c: {
+      id: string;
+      state?: string;
+      labels?: Record<string, string>;
+      name?: string;
+      image?: string;
+    }): void {
       containers.set(c.id, {
         id: c.id,
         spec: null,
@@ -1689,6 +1784,7 @@ export function createStubBackend(o: StubBackendOptions): StubBackend {
         memMb: 128,
         seedName: c.name,
         seedLabels: c.labels,
+        seedImage: c.image,
       });
     },
     listAll(): Array<{ id: string; status: string; spec: ContainerSpec | null }> {
@@ -1815,12 +1911,15 @@ export function createDockerBackend(cfg: ExecConfig): ContainerBackend {
       const imgs = (await client.listImages()) as Array<{ RepoTags?: string[] }>;
       return imgs.some((i) => (i.RepoTags ?? []).includes(tag));
     },
-    async buildImage(tag: string, pwVersion: string, onLine?: (line: string) => void): Promise<{ digest: string }> {
+    async buildImage(tag: string, baseImageTag: string, onLine?: (line: string) => void): Promise<{ digest: string }> {
       // §3.2：ctxTar = tar(exec-image/Dockerfile → Dockerfile, agent-runtime/**) 内存流，不落盘。
       // 上下文根 = cfg.repoRoot（DOTD_REPO_ROOT 可覆盖；WSL 部署时指向 ~/dotd）。
       const context = await buildContextTar(cfg.repoRoot);
       onLine?.(`context: ${(context.length / 1024).toFixed(1)} KB（Dockerfile + agent-runtime，内存 tar.gz）`);
-      const stream = await client.buildImage(context, { t: tag, buildargs: { PW_VERSION: pwVersion } });
+      // 2026-10-21 换 node:24-slim 基座后，Dockerfile 里已无 ARG PW_VERSION，不再传 buildarg
+      // （baseImageTag 只用于拼 tag 与落库；传一个没人读的 build arg 会让排障的人以为它在起作用）。
+      void baseImageTag;
+      const stream = await client.buildImage(context, { t: tag });
       await client.followBuild(stream, onLine);
       const imgs = (await client.listImages()) as Array<{ RepoTags?: string[]; Id?: string }>;
       const hit = imgs.find((i) => (i.RepoTags ?? []).includes(tag));
@@ -1877,16 +1976,42 @@ export function createDockerBackend(cfg: ExecConfig): ContainerBackend {
         return null; // 404
       }
     },
+    async listContainerImages(): Promise<string[]> {
+      // all: true —— 已停止的容器也算：它同样是"还能退回去"的证据（F4）。
+      // 不带 label 过滤：回收镜像时任何容器（包括不归本 daemon 管的）用它都算在用。
+      try {
+        const list = (await client.listContainers({ all: true })) as Array<{
+          Image?: string;
+          ImageID?: string;
+        }>;
+        const out: string[] = [];
+        for (const c of list) {
+          if (c.Image !== undefined && c.Image.length > 0) out.push(c.Image);
+          if (c.ImageID !== undefined && c.ImageID.length > 0) out.push(c.ImageID);
+        }
+        return out;
+      } catch {
+        // 拿不到就返回空数组。**调用方必须把"查询失败"当作"不许删"**，
+        // 见 image.ts 的 reapOldImages —— 少删一个只是占磁盘，多删一个是删掉生产退路。
+        return [];
+      }
+    },
+
     async listManagedContainers(): Promise<import('./types.ts').DockerContainerListItem[]> {
       const list = (await client.listContainers({ all: true, filters: { label: ['dotd.managed=1'] } })) as Array<{
         Id: string;
         Names?: string[];
+        Image?: string;
+        ImageID?: string;
         State?: string;
         Labels?: Record<string, string>;
       }>;
       return list.map((c) => ({
         Id: c.Id,
         Names: c.Names ?? [],
+        // 漂移判定（F9）要用这两个字段：ImageID 是 sha256 digest，Image 是可读 tag。
+        Image: c.Image,
+        ImageID: c.ImageID,
         State: c.State ?? 'unknown',
         Labels: c.Labels ?? {},
       }));

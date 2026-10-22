@@ -924,9 +924,40 @@ export function containerName(dotId: string): string {
   return `dotd-dot-${dotId}`;
 }
 
-/** 镜像 tag（§3.2：`dotd/exec:{PW_VERSION}-{runtimeVer}`）。 */
-export function imageTag(pwVersion: string, runtimeVer: string): string {
-  return `dotd/exec:${pwVersion}-${runtimeVer}`;
+/**
+ * 镜像漂移判定（2026-10-22，F9）。纯函数；调用点在 `fleet.ts` 的 reconcile 采纳分支
+ * （那里"容器在跑但跑的是旧镜像"必须重建，否则换基座形同没做）。
+ *
+ * 两个参数都是 docker 侧的镜像标识：期望值来自 ensureImage（digest 优先，退化成 tag），
+ * 实际值来自 listManagedContainers 的 ImageID 或 Image。
+ *
+ * 判 false（不漂移）的三种情形，都是有意的：
+ *  - 任一侧为空/缺字段 —— 读不到标识 = **没有证据**，不能据此重建生产容器
+ *    （与 backlog"判断不了不等于失败"同一原则；stub 后端就是这种，ImageID 缺省）。
+ *  - 两侧**不是同一种标识**（一个是 sha256 digest、一个是可读 tag）—— 拿 digest 比 tag
+ *    会恒不相等，于是每次 boot 都重建一次，那比原 bug 更糟。2026-10-22 我自己先写错过
+ *    一次（want=digest ?? tag 去比 ImageID），就是这条判据把它挡下来。
+ *  - 两侧相等 —— 正常采纳。
+ */
+export function imageDrift(
+  expected: string | null | undefined,
+  actual: string | null | undefined,
+): boolean {
+  if (typeof expected !== 'string' || expected.length === 0) return false;
+  if (typeof actual !== 'string' || actual.length === 0) return false;
+  // 只有同一种标识才可比：digest 对 digest、tag 对 tag。混比一律不判漂移。
+  if (isImageDigest(expected) !== isImageDigest(actual)) return false;
+  return expected !== actual;
+}
+
+/** 是不是镜像 digest（sha256: + 64 hex）；不是则视为可读 tag。 */
+export function isImageDigest(s: string): boolean {
+  return /^sha256:[0-9a-f]{64}$/i.test(s);
+}
+
+/** 镜像 tag（§3.2：`dotd/exec:{baseImageTag}-{runtimeVer}`；基座标识见 ExecConfig.baseImageTag）。 */
+export function imageTag(baseImageTag: string, runtimeVer: string): string {
+  return `dotd/exec:${baseImageTag}-${runtimeVer}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════

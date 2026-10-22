@@ -493,17 +493,20 @@ export async function runSetup({ argv = process.argv.slice(2), env = process.env
   const fleetRes = checkFleet({ raw: declaredFleet, dockerAvailable: hasDocker });
   add('docker', 'docker 可达性', hasDocker ? STEP.SKIP : fleetRes.effective === 'docker' ? STEP.ACT : STEP.SKIP, hasDocker ? 'docker 可用' : 'docker 不可用（stub 模式不需要它）', hasDocker ? null : fleetRes.next);
 
-  const pwVersion = (() => {
-    // 从 exec-image/Dockerfile 的 FROM 读 playwright 版本，避免与代码漂移
+  // 从 exec-image/Dockerfile 的 FROM 读【基座镜像】，避免与代码漂移。
+  // 2026-10-21 基座从 mcr.microsoft.com/playwright 换成 node:24-slim，
+  // 原来这段只匹配 playwright 的 FROM，换基座后正则恒为 null，体检报告打印
+  // "mcr.microsoft.com/playwright:<版本未识别>" —— 报告说"版本未识别"而真相是
+  // "早就不装 playwright 了"。现在从任意 FROM 取基座。
+  const baseTag = (() => {
     try {
       const t = readFileSync(join(REPO_ROOT, 'exec-image', 'Dockerfile'), 'utf8');
-      const m = /FROM\s+mcr\.microsoft\.com\/playwright:v([\w.-]+)-noble/.exec(t);
-      return m === null ? null : m[1];
+      const m = /^FROM\s+(\S+)/m.exec(t);
+      return m === null ? '<Dockerfile 未识别到 FROM>' : m[1];
     } catch {
-      return null;
+      return '<读不到 exec-image/Dockerfile>';
     }
   })();
-  const baseTag = pwVersion === null ? 'mcr.microsoft.com/playwright:<版本未识别>' : `mcr.microsoft.com/playwright:v${pwVersion}-noble`;
   if (hasDocker) {
     const imgRes = checkImage({
       basePresent: dockerImagePresent(baseTag),

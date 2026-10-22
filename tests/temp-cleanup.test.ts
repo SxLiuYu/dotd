@@ -27,6 +27,7 @@ import {
   sweepTempPaths,
   liveTempPathCount,
 } from './helpers.ts';
+import { latestMigrationVersion } from '../db/migrate.ts';
 
 const CREATED: string[] = [];
 before(() => {
@@ -112,8 +113,8 @@ test('池模式：借还之间数据隔离，cleanup 后临时目录同样消失
   const uv = b.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined;
   assert.equal(
     uv?.user_version,
-    170,
-    '迁移终态 170（P1-3 加 FTS、第十三轮加 task_paused、第四十三轮加 outbound_log、T2 加 mail、T4 加 proactive）',
+    latestMigrationVersion(),
+    `迁移终态应为最大迁移号（当前 ${latestMigrationVersion()}）—— 池化复用的库不能停在旧版本`,
   );
   const rootB = b.root;
   b.cleanup();

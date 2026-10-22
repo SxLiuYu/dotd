@@ -2,7 +2,7 @@
  * src/exec/image.ts —— ImageManager（execution.md §3.2 构建流程）。
  *
  * 职责（E1 的镜像半边）：
- *  - ensureImage()：tag = `dotd/exec:{PW_VERSION}-{runtimeVer}`；docker images 已含 tag 且
+ *  - ensureImage()：tag = `dotd/exec:{baseImageTag}-{runtimeVer}`；docker images 已含 tag 且
  *    image_builds 有 status='ready' 行 → 秒回 digest；否则构建并落库。
  *  - 构建锁（进程内互斥，防并发双建）；日志逐行经 EventBus.emit('exec.image.build') 外抛
  *    （本模块对外事件名表见 §10；build 日志另走 'exec.image.build'，骨架 TOPICS 未登记该名，
@@ -58,8 +58,8 @@ export class ImageManager {
 
   /** 当前生效镜像 tag（§3.2）。 */
   currentTag(): string {
-    const { pwVersion, runtimeVer } = this.deps.cfg;
-    return imageTag(pwVersion, runtimeVer);
+    const { baseImageTag, runtimeVer } = this.deps.cfg;
+    return imageTag(baseImageTag, runtimeVer);
   }
 
   /**
@@ -111,10 +111,10 @@ export class ImageManager {
     const startedAt = new Date().toISOString();
     const ins = this.deps.db
       .prepare(
-        `INSERT INTO image_builds (tag, digest, pw_version, status, log_tail, started_at, finished_at)
+        `INSERT INTO image_builds (tag, digest, base_image_tag, status, log_tail, started_at, finished_at)
          VALUES (?, NULL, ?, 'building', NULL, ?, NULL)`,
       )
-      .run(tag, cfg.pwVersion, startedAt);
+      .run(tag, cfg.baseImageTag, startedAt);
     const buildId = Number(ins.lastInsertRowid);
     const lines: string[] = [];
 
@@ -132,7 +132,7 @@ export class ImageManager {
       onLine('Step 2/4 : RUN apt-get install bash poppler-utils git python3');
       onLine('Step 3/4 : COPY agent-runtime/ → npm ci + tsc + prune');
       onLine(`Step 4/4 : userdel node + useradd dot(1000)/shell(1001) → USER dot / EXPOSE ${cfg.runtimePort}`);
-      const r = await this.deps.backend.buildImage(tag, cfg.pwVersion, onLine);
+      const r = await this.deps.backend.buildImage(tag, cfg.baseImageTag, onLine);
       const finishedAt = new Date().toISOString();
       this.deps.db
         .prepare("UPDATE image_builds SET status = 'ready', digest = ?, log_tail = ?, finished_at = ? WHERE id = ?")
@@ -155,9 +155,31 @@ export class ImageManager {
    */
   private async reapOldImages(currentTag: string, currentDigest: string): Promise<void> {
     const db = this.deps.db;
+    // F4（2026-10-22）：回收旧镜像前，先问"还有没有容器在用它"。
+    //
+    // 原实现只按 tag/digest 不等于当前值就删。线上新旧 tag 是两回事：换基座那一次，
+    // 15 条 ready 行**全是同一个旧 tag**，正在跑的容器也基于它，于是构建成功的
+    // 第一行代码就把唯一可回滚的镜像删了 —— 新镜像要是起不来，连退回的地方都没有。
+    // "构建成功后立刻销毁退路"这个顺序本身是反的。
+    //
+    // 查询失败/返回空时按【最保守】处理：一个都不删。判断不了不等于没有引用，
+    // 少删一个镜像只是占点磁盘，多删一个是把生产退路删掉。
+    let inUse: string[] = [];
+    let canSeeContainers = true;
+    try {
+      inUse = await this.deps.backend.listContainerImages();
+    } catch {
+      canSeeContainers = false;
+    }
+    const inUseSet = new Set(inUse);
     const stale = this.readyBuilds().filter((b) => b.tag !== currentTag && b.digest !== currentDigest);
+    let kept = 0;
     for (const b of stale) {
       db.prepare("UPDATE image_builds SET status = 'superseded' WHERE id = ?").run(b.id);
+      if (!canSeeContainers || inUseSet.has(b.tag) || inUseSet.has(b.digest ?? '')) {
+        kept += 1; // 有容器在用（或看不清有没有）→ 只标 superseded，镜像本体留着
+        continue;
+      }
       try {
         await this.deps.backend.removeImage(b.tag);
       } catch {
@@ -166,7 +188,7 @@ export class ImageManager {
     }
     this.deps.bus.publish('exec.disk.gardened', {
       freedMb: 0,
-      steps: [`image_prune:${stale.length}`],
+      steps: [`image_prune:${stale.length - kept}`, `image_kept_in_use:${kept}`],
       at: new Date().toISOString(),
     });
   }
