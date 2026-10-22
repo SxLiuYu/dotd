@@ -142,7 +142,16 @@ test('①c 增量摘要：第二次只把 upto_seq 之后的新消息喂给模�
   assert.equal(rig.calls.length, 2);
 
   const second = rig.calls[1]!;
-  assert.ok(second.transcript.includes('【已有摘要】'), '第二次要把旧摘要作为上下文带上');
+  // 2026-10-22 改：原来这里断言字符串 `【已有摘要】`，而那块内容会被摘要器
+  // 当成待压缩材料再压一遍（摘要的摘要），实测把 385 条历史压成一段
+  // 「你发来的是摘要，请给路径」的废话。现在它被明确标成「已知背景」并
+  // 附带"不要在摘要里复述它"——旧摘要仍会带上（供模型避免重复），
+  // 但不再是被压缩的对象。断言跟着改语义，不是放宽。
+  assert.ok(second.transcript.includes('【已知背景'), '第二次要把旧摘要作为背景带上');
+  assert.ok(
+    second.transcript.includes('不要在摘要里复述'),
+    '必须显式禁止把旧摘要再描述一遍（否则摘要会退化成"我在摘要一段摘要"）',
+  );
   assert.ok(second.transcript.includes('追加1'), '新消息要在里面');
   assert.ok(!second.transcript.includes('消息1\n'), '已经摘要过的旧消息不得重复进入 transcript（增量）');
   assert.ok(

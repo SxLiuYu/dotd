@@ -61,6 +61,7 @@ import type {
   ToolSpec,
 } from '../shared/contracts.ts';
 import { AllEndpointsDownError, DotdError, NoQualifiedPrimaryError, StepLimitError, StreamInterruptedError } from '../shared/errors.ts';
+import { recoverTextToolCalls, stripTextToolCalls } from '../shared/recover-text-calls.ts';
 import { newNonJournalAttemptId } from '../shared/ids.ts';
 import { composeSystemPrompt } from './system-prompt.ts';
 import { buildToolSpecs } from './tool-catalog.ts';
@@ -99,7 +100,31 @@ import {
  *   - 加上 8000 的历史，总计约 16000，对当前模型是舒适区；
  *   - packSessionReplay 从新到旧累加，超预算丢弃的是**最旧**的那部分。
  */
-const REPLAY_BUDGET_TOKENS = 8_000;
+/**
+ * 单轮会话重放的 token 预算（2026-10-19 引入，2026-10-22 提为可配置）。
+ *
+ * 8_000 的来历：修"整条线程无限重放"那个缺陷时定的（见 buildSessionReplay 调用处）。
+ * 它足够容纳几十轮对话，且远小于模型的 200k 上下文 —— 当时的病是 28k prompt 里
+ * 19878 是历史、其中 460 条是作废的工具输出，收紧预算是正解。
+ *
+ * **但 8k 也能把上下文切没**：一个聊了很久的线程，最近 8k 之外的一切（包括
+ * "我们之前定过什么"）模型都看不到，而摘要若已失真（2026-10-22 修的那个 bug），
+ * 就等于彻底没有记忆。实测：飞书主线程 385 条消息，可用回放预算只够最近几十条。
+ *
+ * 所以提为环境变量可调、默认 24_000：凭经验，**别让沉默的常数决定用户有多少记忆**。
+ * 上限由模型真实上下文兜底，这里只是"历史占多少"的软预算。
+ */
+const DEFAULT_REPLAY_BUDGET_TOKENS = 24_000;
+
+/** 读环境变量覆盖（非法/缺失就回默认；不因配置写错让 Runner 起不来）。 */
+function replayBudgetTokens(): number {
+  const raw = process.env['DOTD_REPLAY_BUDGET_TOKENS'];
+  if (raw === undefined || raw.length === 0) return DEFAULT_REPLAY_BUDGET_TOKENS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1_000 ? Math.floor(n) : DEFAULT_REPLAY_BUDGET_TOKENS;
+}
+
+const REPLAY_BUDGET_TOKENS = replayBudgetTokens();
 
 const REPEAT_SOFT_LIMIT = 2;
 const REPEAT_HARD_LIMIT = 4;
@@ -307,6 +332,28 @@ export function normalizeResultForRepeatForTest(value: unknown): string {
 
 export function repeatSignatureForTest(argumentsJson: string): string {
   return repeatSignature(argumentsJson);
+}
+
+/**
+ * 当前本地时间的可读形式（2026-10-22）。
+ *
+ * 刻意用 `sv-SE` 区域设置：它给的正是 `YYYY-MM-DD HH:MM` 这种无歧义格式，
+ * 不受运行环境 locale 影响（不像 `toLocaleString()` 在 zh-CN 下会变成
+ * "2026/10/22 下午5:30"，模型容易把 `2026/10/22` 当成分数或路径）。
+ */
+export function nowLine(d: Date = new Date()): string {
+  const s = d.toLocaleString('sv-SE', { hour12: false });
+  // sv-SE 是 "2026-10-22 17:30:05"，只留到分钟足够，秒会诱导模型做无意义的精确推算。
+  return s.slice(0, 16);
+}
+
+/** 本地时区相对 UTC 的偏移，形如 "+08:00"。 */
+export function utcOffsetStr(d: Date = new Date()): string {
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const hh = String(Math.floor(Math.abs(off) / 60)).padStart(2, '0');
+  const mm = String(Math.abs(off) % 60).padStart(2, '0');
+  return `${sign}${hh}:${mm}`;
 }
 
 function repeatSignature(argumentsJson: string): string {
@@ -687,6 +734,26 @@ class RunContext {
       kind: 'text',
       content: prompt,
       tokenEst: Math.ceil(prompt.length / 3.5),
+      createdAt: 0,
+    });
+
+    // ①b **当前时间**（2026-10-22 加）。
+    //
+    // 为什么单独一条而不是塞进 composeSystemPrompt：那份文本有 4700 字符硬预算
+    // （tests/runner-tool-catalog.test.ts 断言），已经用掉 4688，塞不进一行日期；
+    // 而日期天生是**每次请求都不同**的东西，塞进"应该恒定"的运行手册里在语义上也不对。
+    //
+    // 为什么必须有：实测（tk_mvjcnkpw582cas）模型为了知道"今天是哪天"，
+    // 第一步就去 shell.run 跑 date —— 白花一步，而且 shell.run 带某些参数会升级到
+    // dangerous 档触发审批。日期是环境事实，不该让模型去探。
+    out.push({
+      id: 'sys:now',
+      threadId: '',
+      seq: 0,
+      role: 'system',
+      kind: 'text',
+      content: `现在是 ${nowLine()}（UTC${utcOffsetStr()}）。涉及"今天/明天/下周末/今年"的推算一律以这个时间为准；需要某个日期是周几可以用 calendar.day，不要用 shell.run 跑 date 去猜。`,
+      tokenEst: 60,
       createdAt: 0,
     });
 
@@ -1534,14 +1601,27 @@ export class DotRunner {
     const resp = await this.router.complete(req);
     const usage = resp.usage ?? { promptTokens: 0, completionTokens: 0 };
     const chat = resp.response as { content?: string; toolCalls?: Array<{ id: string; name: string; arguments: string }> };
-    const step: LlmStep = {
-      content: typeof chat.content === 'string' ? chat.content : '',
-      toolCalls: (chat.toolCalls ?? []).map((c) => ({
-        id: c.id,
-        name: c.name,
-        arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
-      })),
-    };
+    const rawContent = typeof chat.content === 'string' ? chat.content : '';
+    let toolCalls = (chat.toolCalls ?? []).map((c) => ({
+      id: c.id,
+      name: c.name,
+      arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
+    }));
+    // 兜底（2026-10-22）：结构化 toolCalls 为空、正文里却是 DSML 调用块时捞回来。
+    // 现场见 shared/recover-text-calls.ts 的注释——否则这一轮被判成"完结轮"，
+    // 任务 status=done 而主人收到的最后一句是裸标签。
+    let content = rawContent;
+    if (toolCalls.length === 0) {
+      const recovered = recoverTextToolCalls(rawContent);
+      if (recovered.length > 0) {
+        toolCalls = recovered;
+        content = stripTextToolCalls(rawContent);
+        this.log(
+          `runner: 从正文里捞回 ${String(recovered.length)} 个工具调用（模型未按协议返回 tool_calls）`,
+        );
+      }
+    }
+    const step: LlmStep = { content, toolCalls };
     return { step, tokens: usage.promptTokens + usage.completionTokens };
   }
 
@@ -1611,16 +1691,29 @@ export class DotRunner {
     // 工具调用：**等流读完**才取（roadmap P0-2 第 4 条：不在流中途派发），
     // 由 MR 用 shared/tool-stream.ts 的聚合器收成成品，与 complete() 的
     // `chat.toolCalls` 同形——下游 `stepTool`/`ctx.noteToolCalls` 完全无感。
-    const toolCalls = stream.toolCalls().map((c) => ({
+    let toolCalls = stream.toolCalls().map((c) => ({
       id: c.id,
       name: c.name,
       arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
     }));
+    // 兜底（2026-10-22）：与上面非流式路径同一判据——结构化为空时从正文里捞。
+    let finalContent = content;
+    if (toolCalls.length === 0) {
+      const recovered = recoverTextToolCalls(content);
+      if (recovered.length > 0) {
+        toolCalls = recovered;
+        finalContent = stripTextToolCalls(content);
+        this.log(
+          `runner: 从流式正文里捞回 ${String(recovered.length)} 个工具调用（模型未按协议返回 tool_calls）`,
+        );
+      }
+    }
     // 防假完成硬兜底：既没有正文、也没有工具调用的回合不是完结轮，不能以 done 收口。
-    if (content.trim().length === 0 && toolCalls.length === 0) {
+    // 注意判据用 finalContent：捞回调用后正文已被抹空，此时"有调用"即为合法轮次。
+    if (finalContent.trim().length === 0 && toolCalls.length === 0) {
       throw new Error('流式回合既无正文也无工具调用，按模型错误收口以触发重试');
     }
-    return { step: { content, toolCalls }, tokens: approxTokens(content.length) };
+    return { step: { content: finalContent, toolCalls }, tokens: approxTokens(finalContent.length) };
   }
 
   // ── 3.3b chat.* 总线（roadmap P0-2：payload 照抄 http.ts:522 与 ChatView 的约定）────
@@ -1902,13 +1995,27 @@ export class DotRunner {
     const used = (perTool.get(call.name) ?? 0) + 1;
     perTool.set(call.name, used);
     this.toolCallCounts.set(taskId, perTool);
-    if (used === 6 && (call.name === 'net.get' || call.name === 'fs.stat')) {
+    //
+    // **不再写工具白名单**（2026-10-22 改）。
+    //
+    // 原实现是 `used === 6 && (name === 'net.get' || name === 'fs.stat')`，
+    // 两个缺陷：
+    //   1. 白名单：换任何别的工具就漏。实测 tk_mvjcnkpw582cas 里模型逐日调
+    //      calendar.day 达 38 次，护栏从第 6 次起一声不响；
+    //   2. `=== 6` 精确相等：一旦错过第 6 次（比如第 6 次因别的原因提前返回），
+    //      以后永远不再触发。
+    // 现在改成按"反复试探"本身判断，与工具名无关。阈值取 REPEAT_SOFT_LIMIT 的
+    // 倍数（8），比单参数护栏宽得多 —— 批量读文件、连续查多天这类合法用法
+    // 在 8 次以内不打扰；超过就提醒一次方向，**不阻断**。
+    //
+    // 只在**恰好**跨过 8 / 16 / 24 次时各提醒一次（用取模而非相等，避免错过）。
+    if (used >= 8 && used % 8 === 0) {
       return {
         note:
           `【检查方向】\`${call.name}\` 在这个任务里已经调用 ${used} 次了。` +
-          `如果你已经**拿到了需要的信息**（比如接口返回了内容、文件确实不存在），` +
-          `就不要再重复查询 —— 直接用已有结果完成任务（该写文件就写文件，该回答就回答）。` +
-          `重复同样的查询不会让答案变得更好。`,
+          `先停下来想一下：你要的信息**是不是已经在返回结果里**了，或者换个工具/换种参数形状能一次拿全？` +
+          `比如查一整段日期的上班安排，不该一天一天问；查一个范围不该逐条扫。` +
+          `重复同样的查询不会让答案变得更好 —— 拿到够用的信息就动手完成它。`,
       };
     }
 

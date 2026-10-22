@@ -102,13 +102,15 @@ test('端点表：八个 RUNTIME_PATHS 与契约逐字对应', () => {
   assert.equal(endpointUrl('172.18.0.3', 9223), 'http://172.18.0.3:9223');
 });
 
-test('能力目录：38 名工具（19 容器 + 8 宿主 mail + 3 日历写 + 4 连接器 + 1 保险库 + 3 浏览器 web.*）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
-  assert.equal(CAPABILITY_CATALOG.length, 38);
+test('能力目录：46 名工具（20 容器 + 1 记忆 + 8 宿主 mail + 7 日历（写 3 + 读 4）+ 4 连接器 + 1 保险库 + 3 浏览器 web.* + 2 搜索 search.*）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
+  assert.equal(CAPABILITY_CATALOG.length, 46); // 42 + fs.grep + memory.search + calendar.list + calendar.conflicts（2026-10-22）
   const by = new Map(CAPABILITY_CATALOG.map((c) => [c.name, c]));
   const expect: Record<string, [string, number, string]> = {
     'fs.read': ['sync', 60_000, 'safe'],
     'fs.write': ['sync', 60_000, 'replayable'],
     'fs.list': ['sync', 60_000, 'safe'],
+    'fs.grep': ['sync', 60_000, 'safe'],
+    'memory.search': ['sync', 60_000, 'safe'],
     'fs.stat': ['sync', 60_000, 'safe'],
     'shell.run': ['async', 1_800_000, 'unknown'],
     'browser.open': ['async', 1_800_000, 'unknown'],
@@ -524,9 +526,11 @@ test('getCapabilities：容器 /capabilities 优先，回退宿主 catalog；形
     const svc = new ExecServiceImpl({ db: t.db, bus: t.bus, cfg: { tokenDir: t.root } });
     await svc.boot(['dot-a']);
     const caps = await svc.getCapabilities('dot-a');
-    // 38 = 19 容器工具 + 8 宿主 mail + 3 日历写 + 4 连接器 + 1 保险库 + 3 浏览器 web.*
+    // 44 = 20 容器 + 1 记忆 + 8 宿主 mail + 5 日历（写 3 + 读 2）+ 4 连接器 + 1 保险库 + 3 浏览器 web.* + 2 搜索
     // （回退路径整目录可见）
-    assert.equal(caps.length, 38);
+    // 2026-10-22：fs.grep 进容器侧（19 → 20）。它是模型主动找回过去的手段，
+    // 见 MemoryService 摘要修复与 Letta 的 LoCoMo 结论。
+    assert.equal(caps.length, 46);
     for (const c of caps) {
       assert.ok(['safe', 'replayable', 'unknown'].includes(c.sideEffect));
       assert.ok(['sync', 'async'].includes(c.mode));

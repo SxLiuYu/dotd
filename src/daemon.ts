@@ -42,6 +42,7 @@ import { openDb, resolveDbPath } from '../db/conn.ts';
 import { MailService } from './mail/MailService.ts';
 import { CardRegistry, parseOwnerChatIds, resolveApprovalCards } from './surfaces/feishu-approval.ts';
 import { startProgressPush } from './surfaces/progress-push.ts';
+import { startProgressReaction } from './surfaces/progress-reaction.ts';
 import {
   addLocalEvent,
   deleteLocalEvent,
@@ -117,14 +118,23 @@ import {
   SurfacesNotificationChannels,
 } from './surfaces/channels.ts';
 import { startFeishuWs } from './surfaces/feishu-ws.ts';
-import { startFeishuOutbound } from './surfaces/feishu-outbound.ts';
+import { recordOutbound, startFeishuOutbound } from './surfaces/feishu-outbound.ts';
+import { briefDayKey } from './surfaces/daily-brief.ts';
+import { startDailyBriefPush } from './surfaces/daily-brief-push.ts';
+import { startConnectionWatch } from './surfaces/connection-watch-push.ts';
+import { buildBrief, buildConnectionsView, type InsightDeps } from './surfaces/insight.ts';
 import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
 
 /** A2：保险库目录（DOTD_VAULT_DIR 可覆盖；缺省 /root/.dotd——钥匙也在那台机上）。 */
 const vaultDir = (): string => process.env.DOTD_VAULT_DIR ?? '/root/.dotd';
+import { connectorCatalog } from './connectors/registry.ts';
+import { loadModelsConfig } from './router/config.ts';
 import { githubNotifications, githubIssues, githubPulls } from './connectors/github.ts';
 import { fetchFeed } from './connectors/rss.ts';
 import { legacyBrowser, webAct, webRead, webSnapshot } from './exec/webtools.ts';
+import { searchFetch, searchWeb } from './exec/searchtools.ts';
+import { fetchDay, weekdayOf } from './connectors/holiday.ts';
+import { restPlan } from './connectors/rest-plan.ts';
 import { DotRunner } from './runner/dot.ts';
 import { loadEventRules } from './event-rules.ts';
 
@@ -763,10 +773,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 185）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 190）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 185 });
+    const res = migrate(db, { expectedVersion: 190 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -1342,6 +1352,85 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     };
   });
 
+  // 2026-10-22：节假日/调休 —— 主人日常问的是「明天上不上班」「这个月还剩几天假」
+  // 「哪几天适合出去」，这些只要日历事实，不该要求主人先维护日历源。
+  // 数据源是公开节假日表（多源降级 + 本地缓存，见 src/connectors/holiday.ts）；
+  // 天气用 open-meteo（零 key）。两者都不碰主人的日历文件 ⇒ read 档，不审批。
+  const holidayCacheDir = join(cfg.dataDir, 'cache');
+
+  exec.registerHostTool('calendar.day', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const rawDate = a['date'];
+    const date =
+      typeof rawDate === 'string' && rawDate !== ''
+        ? rawDate
+        : new Date().toISOString().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return { ok: false as const, code: 'BAD_ARG', message: 'date 要 YYYY-MM-DD', retryable: false };
+    }
+    const r = await fetchDay(date, { cacheDir: holidayCacheDir });
+    if (!r.ok || r.day === undefined) {
+      return {
+        ok: false as const,
+        code: 'HOLIDAY_SOURCE_DOWN',
+        message: '节假日数据源暂时不可用（已试多个源）',
+        retryable: true,
+      };
+    }
+    const d = r.day;
+    return {
+      ok: true as const,
+      value: {
+        date: d.date,
+        weekday: weekdayOf(d.date),
+        rest: d.rest,
+        answer: d.rest ? '不用上班' : '要上班',
+        legalHoliday: d.legal,
+        weekend: d.weekend,
+        makeupWorkday: d.makeup,
+        holidayName: d.holiday,
+      },
+    };
+  });
+
+  exec.registerHostTool('calendar.rest', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const opt: { withinDays?: number; lookBackDays?: number; lat?: number; lon?: number; cacheDir?: string } = {
+      cacheDir: holidayCacheDir,
+    };
+    if (typeof a['withinDays'] === 'number') opt.withinDays = a['withinDays'];
+    if (typeof a['lookBackDays'] === 'number') opt.lookBackDays = a['lookBackDays'];
+    if (typeof a['lat'] === 'number' && typeof a['lon'] === 'number') {
+      opt.lat = a['lat'];
+      opt.lon = a['lon'];
+    }
+    const r = await restPlan(opt);
+    if (!r.ok) {
+      return {
+        ok: false as const,
+        code: 'HOLIDAY_SOURCE_DOWN',
+        message: '节假日数据源暂时不可用（已试多个源）',
+        retryable: true,
+      };
+    }
+    return {
+      ok: true as const,
+      value: {
+        windows: r.windows,
+        makeupDays: r.makeupDays,
+        holidayRuns: r.holidayRuns,
+        weather: r.weather,
+        assumedBeijing: r.assumedLocation === true,
+        note:
+          r.assumedLocation === true
+            ? '天气按北京坐标取的；主人没说地点时要在回复里说明这是假设。'
+            : undefined,
+      },
+    };
+  });
+
+  log('[calendar] 节假日工具已注册（2 个：day/rest，多源+本地缓存，不弹审批）');
+
   log(`[calendar] 日历工具已注册（5 个：读 2 + 写 3，写只动本地日历），日历目录：${calendarDir}`);
 
   // === 连接器第一批（2026-10-21，task-2 接线）：github x3 + rss.read ===
@@ -1403,6 +1492,17 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // 网页操作的唯一出口，每步都批等于网页能力不可用（主人 2026-10-21 明确：
   // "浏览器控制不需要审批，重大决定才需要我审批"）。危险动作（花钱、提交订单）
   // 由 tools.yml 的 spend 档单独把关。
+  /** search.* 的包装：与 hostWrap 同形，只是错误码分开，便于模型区分"搜索坏了"与"页面打不开"。 */
+  const searchWrap = (r: { ok: boolean; output?: string; error?: string }) =>
+    r.ok
+      ? { ok: true as const, value: { output: r.output ?? '' } }
+      : {
+          ok: false as const,
+          code: 'search_tool_error',
+          message: r.error ?? '搜索工具失败',
+          retryable: true,
+        };
+
   const hostWrap = (r: { ok: boolean; output?: string; error?: string }) =>
     r.ok
       ? { ok: true as const, value: { output: r.output ?? '' } }
@@ -1423,6 +1523,22 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     hostWrap(await webAct((args ?? {}) as Record<string, unknown>)),
   );
   log('[web] 浏览器工具已注册（3 个：snapshot/read/act，走 agent-browser CLI）');
+
+  // 2026-10-22：宿主侧搜索（argo CLI）。
+  //
+  // 为什么加：实测本机直连只到 baidu/bing/zhihu/github，jd/taobao/tmall/amazon
+  // 直连与代理都不通（docs/net-reachability-20261022.md）。模型查"某物多少钱"
+  // 时 net.get / web.read 全废，不是工具坏了而是通路本身不存在。
+  // argo 走自己的 272 个源，不受本机出口限制。
+  //
+  // 都不审批：只读网络，参数只影响 query/url，可执行文件与子命令名写死。
+  exec.registerHostTool('search.web', async (args) =>
+    searchWrap(await searchWeb((args ?? {}) as Record<string, unknown>)),
+  );
+  exec.registerHostTool('search.fetch', async (args) =>
+    searchWrap(await searchFetch((args ?? {}) as Record<string, unknown>)),
+  );
+  log('[search] 搜索工具已注册（2 个：web/fetch，走 argo CLI）');
 
   // 2026-10-21：browser.* 统一到 agent-browser。
   //
@@ -1515,8 +1631,20 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           {
             role: 'system',
             content:
+              // 2026-10-22：补三条硬约束，针对实测发现的"摘要写自己"退化。
+              //
+              // 现场：一段 501 字的摘要，正文是「你这次发来的还是摘要 + 上一轮对话，
+              // 没有新的指令……请给路径」。摘要把**自己的输入形态**写成了内容，
+              // 于是"上下文"变成了"抱怨没有上下文"。
+              // 这类输出有个共同点：都在描述压缩这件事本身，而不是对话里发生过什么。
               '你是会话压缩器。把下面的对话压成一段可长期沿用的摘要：保留事实、结论、' +
-              '未完成事项与关键约束；不要复述原话，不要编造，不要加标题或前言。只输出摘要正文。',
+              '未完成事项与关键约束；不要复述原话，不要编造，不要加标题或前言。只输出摘要正文。\n' +
+              '【硬约束】\n' +
+              '1. 只写对话里**确实发生过**的事实、决定、结论、未完成事项。\n' +
+              '2. **绝不描述你自己的处境**：不要写"你发来的是摘要""没有新指令""请提供路径/文件/"' +
+              '内容"这类话。这些是压缩器的内部状态，不是对话内容。\n' +
+              '3. 若新增对话里没有值得记住的东西，就**只保留背景里的既有事实**，' +
+              '不要为了凑字数而评论对话质量。',
           },
           { role: 'user', content: transcript },
         ],
@@ -1549,8 +1677,115 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   });
   memHolder.svc = memory;
 
+  // 2026-10-22：memory.search —— 把 MEM 早就有的 searchMessages 暴露给模型。
+  //
+  // 为什么放在这个位置：它要闭包引用 `memory`，所以必须在 createMemoryService
+  // 之后注册（前面的搜索/浏览器工具在 1535 行一带，那里 `memory` 还不存在）。
+  // ExecService.runTool 先查 hostTools 再发容器，所以注册名即生效。
+  //
+  // 为什么要这个工具：MEM 的 searchMessages（FTS5 + 中文 bigram + bm25）实现了很久，
+  // 但**没有任何工具入口**。模型手上的检索能力只有 fs.grep（只能搜 /dot/home 的文件），
+  // 而 11423 条历史对话全在 mem_messages 里 —— 够不着。于是被问"我们之前定过什么"
+  // 时只能答"我没有上下文"。能力在、入口不在，等于没有。
+  //
+  // 不审批：只读本地库，参数只影响 query/limit/sinceDays，无副作用。
+  exec.registerHostTool('memory.search', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const query = typeof a['query'] === 'string' ? a['query'].trim() : '';
+    if (query.length === 0) {
+      return { ok: false, code: 'bad_args', message: 'query 不能为空' };
+    }
+    const rawLimit = typeof a['limit'] === 'number' ? a['limit'] : 8;
+    const limit = Math.max(1, Math.min(50, Math.floor(rawLimit)));
+    const sinceDays =
+      typeof a['sinceDays'] === 'number' && a['sinceDays'] > 0
+        ? Math.floor(a['sinceDays'])
+        : undefined;
+    try {
+      // 不传 dotId = 搜全部会话。本机只有一个主人一个 dot，
+      // 而"想不起过去"恰恰最可能发生在这个 dot 的其它会话里 —— 按 dot 过滤
+      // 只会让模型搜得更少，不解决问题。
+      const hits = await memory.searchMessages(query, {
+        limit,
+        ...(sinceDays !== undefined ? { sinceDays } : {}),
+      });
+      // 只回模型需要的：谁说的、什么时候、说了什么。不带 id / token / 内部字段。
+      return {
+        ok: true,
+        value: {
+          query,
+          sinceDays: sinceDays ?? null,
+          count: hits.length,
+          hits: hits.map((h) => ({
+            at: h.message.createdAt,
+            role: h.message.role,
+            kind: h.message.kind,
+            text: h.snippet.length > 0 ? h.snippet : h.message.content.slice(0, 400),
+          })),
+          // 明确告诉模型"没搜到"时该怎么办，省一轮瞎试
+          ...(hits.length === 0
+            ? { hint: '没搜到。换关键词（中文按词搜，别整句）、放宽 sinceDays，或先用 fs.grep 搜 MEMORY.md/notes。' }
+            : {}),
+        },
+      };
+    } catch (cause) {
+      return { ok: false, code: 'search_failed', message: String(cause), retryable: false };
+    }
+  });
+  log('[memory] memory.search 已注册（搜对话历史，FTS5 + 中文 bigram）');
+
   // ⑧ SF：HTTP（listen 在此；契约 H2 唯一监听）。surfCfg/channels/feishuGw 已在
   // ④ 前置段装配（MR 要注入 channels），这里只起服务。
+  // ⑧a 只读洞察（D1/D3，2026-10-22）：简报与连接总览的取数。
+  //
+  // 两个闭包放在这里而不是 http.ts 里：它们要的四样事实（库、日历目录、连接器目录、
+  // 模型端点）只有装配层同时握在手上。HTTP 层只做序列化，CLI 只是瘦客户端，
+  // 于是「手机看到的」与「命令行看到的」永远是同一份数据。
+  //
+  // 模型端点与 MCP 都**只取展示字段**（tier / base_url / 模型名 / server 名 + 工具数），
+  // 不含 api_key 与任何 env 值 —— 总览是拿来判断"哪条线断了"的，不是凭证清单。
+  const insightDeps: InsightDeps = {
+    db,
+    calendarDir,
+    dotId: 'dot1',
+    connectors: connectorCatalog(process.env),
+    mcpServers: (() => {
+      try {
+        return loadMcpServers(process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')).map(
+          (s) => ({ name: s.name, toolCount: s.allowTools?.length ?? 0 }),
+        );
+      } catch {
+        // MCP 配置写坏时 daemon 早在装配 exec 时就该拒启动；走到这里说明只是没配。
+        return [];
+      }
+    })(),
+    models: (() => {
+      try {
+        return loadModelsConfig(join(cfg.configDir, 'models.yml')).endpoints.map((e) => ({
+          tier: String(e.tier),
+          endpoint: e.baseUrl,
+          model: e.models.primary ?? e.models.light ?? '',
+          enabled: e.enabled,
+        }));
+      } catch {
+        return [];
+      }
+    })(),
+  };
+  // enabled 只给 CLI/前端说人话（「已启用」还是「想每天自动收到」），
+  // 不参与简报内容，也不影响 daemon 内部任何判断。
+  const briefOf = (nowMs: number = Date.now()) => ({
+    ...buildBrief(insightDeps, nowMs, surfCfg.brief.maxChars),
+    enabled: surfCfg.brief.enabled,
+  });
+  const connectionsOf = () =>
+    buildConnectionsView(insightDeps, {
+      feishuAppId: surfCfg.feishu.appId,
+      ownerChatCount: ownerChats.length,
+      httpHost: surfCfg.http.host,
+      httpPort: surfCfg.http.port,
+    });
+
   const server = await startHttpServer({
     db,
     bus,
@@ -1574,6 +1809,17 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       remove: (site, user) => vaultDelete(vaultDir(), site, user),
     },
     cfg: surfCfg,
+
+    // 仪表盘（D2，2026-10-22）：`/d/<slug>` 读容器 home 里的 `dashboards/<slug>.html`。
+    // 刻意用箭头包一层而不是直接传引用：readHomeFileForShot 在本文件后面才定义
+    // （const 有 TDZ），这里只需要「调用时已存在」。
+    // 为什么不直接挂宿主目录：dashboards 是 agent 用 fs.write 写的容器内文件，
+    // 宿主没有它的路径；容器 home 的唯一读入口就是 exec 的 fs.read。
+    readHomeFile: (dotId: string, path: string) => readHomeFileForShot(dotId, path),
+    dotId: 'dot1',
+    // D1/D3：同一份取数闭包同时供 HTTP（`dotd brief` / `dotd connections`）与飞书推送。
+    brief: briefOf,
+    connections: connectionsOf,
     webRoot: cfg.webRoot,
     // §5.7 求救自检要真值：顺序/兜底文件直接从 router 的 alerts 配置取，
     // 不让 /api/channels 与 `dotd sos-test` 拿编译期默认值猜（2026-10-17）。
@@ -1709,6 +1955,106 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
         })
       : null;
 
+// ⑧c 每日简报（D1 的发送侧，2026-10-22）
+//
+// 三个关键决定：
+//   ① 判据「今天发过没有」查的是 `surf_outbound_log` 里 kind='brief' 的成功记录，
+//      不是内存变量 —— daemon 重启不该让主人收第二份。
+//   ② 迟到 `window_min`（默认 180 分钟）之外放弃：中午重启补发的「早间简报」
+//      里日程已经过时，是噪音。
+//   ③ 文案与 `dotd brief`、`/api/brief` 共用同一个闭包（briefOf），
+//      不会出现「手机看到的和命令行看到的不是一份」。
+const briefPush = startDailyBriefPush({
+  cfg: surfCfg.brief,
+  now: () => Date.now(),
+  lastSentDay: () => {
+    try {
+      const row = db
+        .prepare("SELECT at FROM surf_outbound_log WHERE kind = 'brief' AND ok = 1 ORDER BY id DESC LIMIT 1")
+        .get() as { at?: string } | undefined;
+      if (row?.at === undefined) return null;
+      const t = Date.parse(row.at);
+      return Number.isFinite(t) ? briefDayKey(t) : null;
+    } catch {
+      return null;
+    }
+  },
+  record: (r) =>
+    recordOutbound(db, {
+      kind: 'brief',
+      dedupKey: `brief:${briefDayKey(Date.parse(r.at))}:${r.chatId}`,
+      chatId: r.chatId,
+      ok: r.ok,
+      error: r.error,
+      textPreview: r.text.slice(0, 200),
+      at: r.at,
+    }),
+  buildText: (nowMs) => briefOf(nowMs).text,
+  targets: () => (surfCfg.brief.chatId !== null ? [surfCfg.brief.chatId] : ownerChats),
+  sendText: (chatId, text) => feishuGw.sendText(chatId, text),
+  log,
+});
+log(
+  surfCfg.brief.enabled
+    ? `[brief] 每日简报已启用：每天 ${surfCfg.brief.time}（迟到 ${surfCfg.brief.windowMin} 分钟后放弃）`
+    : '[brief] 每日简报未启用（surfaces.brief.enabled=false）',
+);
+
+// ⑧cc 连接看门狗（U3「持续在线」那一半，2026-10-22）
+//
+// 简报是「到点说一次」，看门狗是「有变化才说」。两者的取数闭包是同一个
+// （connectionsOf），所以主人收到的消息与 `dotd connections` 看到的不会互相矛盾。
+//
+// 状态落 surf_kv（迁移 190）：重启后不该把已经说过的话再说一遍。
+const connWatch = startConnectionWatch({
+  cfg: surfCfg.connWatch,
+  now: () => Date.now(),
+  rows: () => connectionsOf(),
+  loadState: () => {
+    try {
+      const row = db
+        .prepare('SELECT value FROM surf_kv WHERE key = ?')
+        .get('connwatch:dot1') as { value?: string } | undefined;
+      if (row?.value === undefined) return {};
+      const parsed: unknown = JSON.parse(row.value);
+      return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, string>)
+        : {};
+    } catch {
+      return {};
+    }
+  },
+  saveState: (state) => {
+    try {
+      db.prepare('INSERT INTO surf_kv (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+        .run('connwatch:dot1', JSON.stringify(state), Date.now());
+    } catch (cause) {
+      log(`[connwatch] 状态落库失败（下轮会重复报一次）：${String(cause)}`);
+    }
+  },
+  targets: () => ownerChats,
+  sendText: (chatId, text) => feishuGw.sendText(chatId, text),
+  record: (r) =>
+    recordOutbound(db, {
+      kind: 'connwatch',
+      dedupKey: `connwatch:${r.at}:${r.chatId}`,
+      chatId: r.chatId,
+      ok: r.ok,
+      error: r.error,
+      textPreview: r.text.slice(0, 200),
+      at: r.at,
+    }),
+  log,
+});
+log(
+  surfCfg.connWatch.enabled
+    ? `[connwatch] 连接看门狗已启用：每 ${surfCfg.connWatch.intervalMin} 分钟检查一次` +
+      (surfCfg.connWatch.quietHours !== null
+        ? `（安静时段 ${surfCfg.connWatch.quietHours.start}-${surfCfg.connWatch.quietHours.end} 只记不推）`
+        : '')
+    : '[connwatch] 连接看门狗未启用（surfaces.conn_watch.enabled=false）',
+);
+
   // ⑧d 过程可视化（T5，2026-10-20）
   //
   // 一个跑 10 分钟的任务，主人在飞书那边原本**什么都看不到** ——
@@ -1732,6 +2078,26 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     cfg: surfCfg.progress,
     log,
   });
+
+  // ⑧e 「在做」表情标识（2026-10-22）
+  //
+  // 主人原话：「不需要输出过程，给我答案就行，**或者给我一个助手在做的标识就行了**」。
+  // 播报的问题不是措辞而是形态——它是消息，23 条就把答案冲没了。
+  // 这里改成在**主人那条消息**上挂一个表情：零新增消息、零未读、会话列表干净。
+  //
+  // 与 ⑧d 相互独立：播报关着（默认）也能只开这个。
+  const progressReaction =
+    feishuGw !== NULL_FEISHU_GATEWAY
+      ? startProgressReaction({
+          db,
+          bus: { on: (t, h) => bus.on(t, h) },
+          port: {
+            addReaction: (mid: string, emoji: string) => feishuGw.addReaction(mid, emoji),
+            removeReaction: (mid: string, rid: string) => feishuGw.removeReaction(mid, rid),
+          },
+          log,
+        })
+      : null;
 
   // ⑨ Runner 常驻协程（CP §12：pop 循环；AbortSignal 让位）
   // `bus` = roadmap P0-2 的会话增量通道：Runner 每步把模型正文增量推到 `chat.delta`。
@@ -1895,6 +2261,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     await Promise.race([runnerLoop.catch(() => {}), grace]);
     // ②b 出站订阅此刻才解订：在跑任务若正好在宽限内 finish，回复仍发得出去
     stopFeishuOutbound?.();
+    // ②c 两个定时推送器跟着停：它们的 tick 会发消息，宽限期过后不该再触发
+    briefPush.stop();
+    connWatch.stop();
     // ③ 关 HTTP（SSE 长连接会拖住 close；补一次强关）
     await new Promise<void>((done) => {
       server.close(() => done());

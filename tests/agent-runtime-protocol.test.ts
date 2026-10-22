@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   CAPABILITIES,
@@ -117,11 +117,15 @@ test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sid
     'mail.account.add', 'mail.account.list', 'mail.account.remove',
     'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send',
     // 日历写 3 件套（2026-10-21，task-1）：同样只在 daemon 里跑，不进容器
-    'calendar.add', 'calendar.edit', 'calendar.delete',
+    'calendar.add', 'calendar.edit', 'calendar.delete', 'calendar.list', 'calendar.conflicts', 'calendar.day', 'calendar.rest',
     'github.notifications', 'github.issues', 'github.pulls', 'rss.read',
     'vault.sites',
     // W2（2026-10-21）：浏览器三件套在宿主上跑 agent-browser CLI，不进容器
     'web.snapshot', 'web.read', 'web.act',
+    // 2026-10-22：搜索走宿主上的 argo CLI，容器里没有 argo，不进容器
+    'search.web', 'search.fetch',
+    // 2026-10-22：memory.search 直接读宿主的 mem_messages（FTS5），容器里没有库，不进容器
+    'memory.search',
   ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),
@@ -430,7 +434,7 @@ test('能力目录: 容器内工具与契约词表一致（宿主侧工具不在
 
 test('能力目录: mode 归属 = fs.* 为 sync，其余 async（EX §5.2 判据句）', () => {
   const sync = CAPABILITIES.filter((c) => c.mode === 'sync').map((c) => c.name);
-  assert.deepEqual(sync, ['fs.read', 'fs.write', 'fs.list', 'fs.stat', 'fs.remove', 'tool.list', 'tool.create', 'tool.invoke']);
+  assert.deepEqual(sync, ['fs.read', 'fs.write', 'fs.list', 'fs.grep', 'fs.stat', 'fs.remove', 'tool.list', 'tool.create', 'tool.invoke']);
   for (const c of CAPABILITIES) {
     // sync 判据（2026-10-19 更新）：fs.*（纯本地文件操作）与 tool.*（本地工具存取/子进程，
     // 不走跨机排队）都是 sync；其余 shell/browser/net 是 async（可能长跑、要占 job 槽位）。
@@ -448,6 +452,7 @@ test('能力目录: sideEffect 档位（契约 J2：未声明按 unknown）', ()
     'fs.read': 'safe',
     'fs.write': 'replayable',
     'fs.list': 'safe',
+    'fs.grep': 'safe',
     'fs.stat': 'safe',
     'fs.remove': 'unknown',
     'shell.run': 'unknown',
@@ -535,6 +540,13 @@ function makeHome(): Tmp {
       rmSync(home, { recursive: true, force: true });
     },
   };
+}
+
+/** 在临时 home 里写一个文件（自动建父目录，如 notes/2026-10-20.md）。 */
+function writeHome(home: string, rel: string, content: string): void {
+  const abs = join(home, rel);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, content, 'utf8');
 }
 
 test('fs 护栏: HOME_ROOT 恒 /dot/home（容器内事实源）', () => {
@@ -784,3 +796,165 @@ test('shell env: 白名单 + HOME 覆写 + 剥光 DOTD_*（契约 T5 不注模�
 });
 
 void _driftProof;
+
+// ═══════════════════════════════════════════════════════════════════
+// fs.grep（2026-10-22 新增）
+//
+// 加它的动机不是"功能补齐"，是**上下文记忆**：
+// 在此之前模型的长期记忆只有"被塞进上下文"一条路，而那条路会被 token 预算
+// 截断、会被摘要失真污染。没有按内容检索，模型想问"我们之前定过什么"只能
+// 猜路径一个个 fs.read —— 实际行为是直接答"我没有上下文"。
+// Letta 实测（benchmarking-ai-agent-memory）：只给文件系统工具让 agent 自己
+// grep，LoCoMo 74.0%，高于专用记忆工具 Mem0 的 68.5%；结论是"会不会用检索
+// 工具比检索机制本身更重要"。所以这些用例盯的是**行为**，不是部署形态。
+// ═══════════════════════════════════════════════════════════════════
+
+test('fs.grep: 按内容搜到文件路径 + 行号 + 原文', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'MEMORY.md', '# MEMORY\n- 暗号是 blue-lantern\n- 主人在做 dotd\n');
+    writeHome(t.home, 'notes/2026-10-20.md', '今天讨论了烧烤地点\n约在怀柔白河湾\n');
+
+    const r = fs.grep('g1', { path: '.', pattern: '暗号' });
+    assert.equal(r.status, 'ok');
+    const out = r.result as { matches: Array<{ path: string; line: number; text: string }>; truncated: boolean };
+    assert.equal(out.matches.length, 1, '应命中 1 行');
+    assert.equal(out.matches[0]!.path, 'MEMORY.md');
+    assert.equal(out.matches[0]!.line, 2, '行号要准（1-based）');
+    assert.ok(out.matches[0]!.text.includes('blue-lantern'), '原文要带回来');
+    assert.equal(out.truncated, false);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: 递归子目录，跨文件命中', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'MEMORY.md', '无关内容\n');
+    writeHome(t.home, 'notes/a.md', '烧烤方案 A\n');
+    writeHome(t.home, 'notes/deep/b.md', '烧烤方案 B\n');
+
+    const r = fs.grep('g2', { path: '.', pattern: '烧烤' });
+    const out = r.result as { matches: Array<{ path: string }> };
+    const paths = out.matches.map((m) => m.path).sort();
+    assert.deepEqual(paths, ['notes/a.md', 'notes/deep/b.md'], '子目录也要搜到');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: 默认字面量匹配 —— . 和 * 不当通配符', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'a.md', 'sk-abc123\nskXabc123\n');
+    // 字面量 "sk-" 只该命中第一行；若误当正则，"." 会通配到 skX 那行
+    const r = fs.grep('g3', { path: '.', pattern: 'sk.abc' });
+    const out = r.result as { matches: unknown[] };
+    assert.equal(out.matches.length, 0, '字面量含 . 时不应把 . 当通配符');
+
+    const r2 = fs.grep('g4', { path: '.', pattern: 'sk-abc' });
+    assert.equal((r2.result as { matches: unknown[] }).matches.length, 1);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: regex=true 才按正则；非法正则报 bad_args 而不是静默降级', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'a.md', 'item-111\nitem-222\nnope\n');
+    const r = fs.grep('g5', { path: '.', pattern: 'item-\\d+', regex: true });
+    assert.equal((r.result as { matches: unknown[] }).matches.length, 2, '正则应命中 2 行');
+
+    const bad = fs.grep('g6', { path: '.', pattern: 'item-(', regex: true });
+    assert.equal(bad.error?.code, ERROR_CODES.bad_args, '非法正则要显式报错，不能悄悄当字面量');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: maxResults 生效并标 truncated + hint（防一次打爆上下文）', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    const lines = Array.from({ length: 30 }, (_, i) => `命中行 ${i}`).join('\n');
+    writeHome(t.home, 'big.md', `${lines}\n`);
+
+    const r = fs.grep('g7', { path: '.', pattern: '命中行', maxResults: 5 });
+    const out = r.result as { matches: unknown[]; truncated: boolean; hint?: string };
+    assert.equal(out.matches.length, 5, '要尊重 maxResults');
+    assert.equal(out.truncated, true, '截断了必须标记，否则模型以为搜完了');
+    assert.ok(typeof out.hint === 'string' && out.hint.length > 0, '要给收窄建议');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: 二进制与超大文件跳过但不报错', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'text.md', '找得到这段话\n');
+    // 含 NUL 的二进制
+    writeFileSync(join(t.home, 'bin.dat'), Buffer.from([0x00, 0x01, 0x02, 0x4e, 0x55, 0x4c]));
+    const r = fs.grep('g8', { path: '.', pattern: '找得到' });
+    assert.equal(r.status, 'ok', '二进制存在不该让整次搜索失败');
+    assert.equal((r.result as { matches: unknown[] }).matches.length, 1);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: 沙箱不越界（与其它 fs.* 同口径）', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    const r = fs.grep('g9', { path: '/etc', pattern: 'root' });
+    assert.equal(r.error?.code, 'path_outside_home', '不能借 grep 读宿主机');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: 归档目录垫底 —— 当前文件优先于历史备份', () => {
+  // 真实踩到的坑（2026-10-22）：搜 "MEMORY" 时前 5 条全是
+  // .archive/*__MEMORY.md 的历史快照，当前 MEMORY.md 一条都进不了结果，
+  // 模型想问"现在记着什么"却只拿到旧备份 —— 比没有检索更糟。
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'MEMORY.md', '关键约定：暗号 blue-lantern\n');
+    for (let i = 0; i < 5; i += 1) {
+      writeHome(t.home, `.archive/2026-10-1${i}__MEMORY.md`, '关键约定：旧暗号 green\n');
+    }
+    writeHome(t.home, 'backup/MEMORY.md', '关键约定：旧暗号 red\n');
+
+    const r = fs.grep('p1', { path: '.', pattern: '关键约定', maxResults: 3 });
+    const out = r.result as { matches: Array<{ path: string }>; truncated: boolean };
+    assert.equal(out.matches[0]!.path, 'MEMORY.md', '当前 MEMORY.md 必须排第一');
+    // 归档虽垫底，但仍应被搜到（不能直接丢弃：模型可能就是来找旧版本的）
+    const all = fs.grep('p2', { path: '.', pattern: '关键约定', maxResults: 50 });
+    const paths = (all.result as { matches: Array<{ path: string }> }).matches.map((m) => m.path);
+    assert.ok(paths.some((p) => p.startsWith('.archive/')), '归档要能搜到，只是排在后面');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('fs.grep: 同层时浅路径优先', () => {
+  const t = makeHome();
+  try {
+    const fs = new FsTools({ homeRoot: t.home });
+    writeHome(t.home, 'notes/deep/x.md', '目标关键词\n');
+    writeHome(t.home, 'top.md', '目标关键词\n');
+    const r = fs.grep('p3', { path: '.', pattern: '目标关键词', maxResults: 1 });
+    assert.equal((r.result as { matches: Array<{ path: string }> }).matches[0]!.path, 'top.md');
+  } finally {
+    t.cleanup();
+  }
+});

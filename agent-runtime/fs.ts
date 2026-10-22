@@ -146,6 +146,16 @@ export interface FsToolsDeps {
 const MAX_ENTRIES = 2000;
 
 /**
+ * fs.grep 的递归深度上限（2026-10-22）。
+ *
+ * 3 层：dot/home 的结构是 `notes/日期-主题.md`、`projects/x/y.md` 这种浅布局，
+ * 3 层足够覆盖；再深说明是 node_modules 一类的东西，扫它既慢又没意义。
+ * 与 fs.list 的 FS_LIST_MAX_DEPTH 分开：list 是看目录结构（4 层），
+ * grep 是找内容（3 层就够，且要扫全部文件，成本高得多）。
+ */
+const FS_GREP_MAX_DEPTH = 3;
+
+/**
  * 覆盖前归档（§3.4 .archive/：硬限 32MB、按时间 FIFO）。
  * 2026-10-18 事故催生：模型把 MEMORY.md 写成空串，一千多字记忆瞬间归零。
  * 防清空只挡"整篇写空"，挡不住"写成别的内容"；留旧版本才是最省的兜底。
@@ -380,6 +390,157 @@ export class FsTools {
    * fs.list（EX §7）：目录枚举，深度 ≤4。
    * args: {path, depth?}
    */
+  /**
+   * fs.grep —— 在 home 里按内容搜索（2026-10-22 新增）。
+   *
+   * **为什么必须有它**：模型的"长期记忆"只有两条路 —— ①被动塞进上下文（会被预算
+   * 截断，且依赖摘要不失真）②自己去翻。在此之前 dotd 只有 fs.list/read/stat，
+   * 没有按**内容**检索的能力：模型想问"我们之前定过什么"，只能靠猜路径一个个 read。
+   *
+   * Letta 的实测结论支持这条路：把对话历史放进文件、只给 agent 文件系统工具
+   * （search_files/grep），LoCoMo 得 74.0%，高于 Mem0 专用的记忆工具 68.5%
+   * （https://www.letta.com/blog/benchmarking-ai-agent-memory/）。
+   * 结论是"agent 会不会用检索工具，比检索机制本身更重要"。
+   *
+   * 设计取舍：
+   *  - **只搜文本**：二进制跳过（不返回乱码），单文件 >4MB 跳过（与 fs.read 同口径）。
+   *  - **只搜 home**：走与其它 fs.* 相同的沙箱 resolve，不越界。
+   *  - **必须给上限**：命中可能上万条，全部回传会把上下文一次打爆 ——
+   *    `maxResults` 默认 40、硬顶 200；`truncated` 标记是否截断，让模型知道要收窄。
+   *  - **regex 可选**：默认按字面量搜（子串），`regex=true` 才当正则用；
+   *    非法正则 → bad_args，不静默退化成字面量（那种"静默"会让模型以为搜到了没找到）。
+   */
+  grep(callId: string, args: Record<string, unknown>): ToolResult {
+    let safe: SafePath;
+    try {
+      safe = this.resolve(args.path);
+    } catch (e) {
+      return pathError(callId, e);
+    }
+    const pattern = args.pattern;
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      return errorResult(callId, ERROR_CODES.bad_args, 'pattern 必须是非空字符串', false);
+    }
+    // 默认不区分大小写：人找东西的默认预期（要精确匹配传 ignoreCase:false）
+    const ignoreCase = args.ignoreCase !== false;
+    const useRegex = args.regex === true;
+    let re: RegExp;
+    try {
+      // 字面量转义：默认按子串搜，"C++" / "a.b" 这类不该被当成正则
+      const flags = ignoreCase ? 'gi' : 'g';
+      re = useRegex
+        ? new RegExp(pattern, flags)
+        : new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+    } catch (e) {
+      return errorResult(callId, ERROR_CODES.bad_args, `正则无效：${String(e)}`, false);
+    }
+
+    const maxResultsRaw = args.maxResults ?? 40;
+    const maxResults =
+      typeof maxResultsRaw === 'number' && Number.isInteger(maxResultsRaw) && maxResultsRaw > 0
+        ? Math.min(maxResultsRaw, 200)
+        : 40;
+
+    if (!existsSync(safe.abs)) {
+      return errorResult(callId, ERROR_CODES.not_a_file, `不存在：${safe.rel}`, false);
+    }
+
+    const matches: Array<{ path: string; line: number; text: string }> = [];
+    let truncated = false;
+    let scanned = 0;
+
+    // 待扫文件队列：path 可能是目录（递归）也可能是单个文件
+    const files: string[] = [];
+    const collect = (abs: string, rel: string, depth: number): void => {
+      let st;
+      try {
+        st = lstatSync(abs);
+      } catch {
+        return;
+      }
+      if (st.isFile()) {
+        if (st.size <= FS_READ_MAX_BYTES) files.push(abs);
+        return;
+      }
+      if (!st.isDirectory()) return;
+      if (rel === '') {
+        // 目录根：跳过 .archive 等隐藏目录（纵深防御，与 list 一致）
+      }
+      if (depth <= 0) return;
+      for (const name of this.readdir(abs).sort()) {
+        if (name === HIDDEN_PREFIX) continue;
+        collect(join(abs, name), rel === '' ? name : `${rel}/${name}`, depth - 1);
+      }
+    };
+    collect(safe.abs, safe.rel === '.' ? '' : safe.rel, FS_GREP_MAX_DEPTH);
+
+    // 命中顺序 = 模型先看到什么，所以它是个产品决定，不是无关细节。
+    //
+    // 实测（2026-10-22，真实 home）搜 "MEMORY" 时，前 5 条全是
+    // `.archive/*__MEMORY.md` 的历史快照，当前 MEMORY.md 一条都挤不进来，
+    // truncated=true —— 模型想问"现在记着什么"，拿到的却是几份旧备份，
+    // 反而更没上下文。归档目录必须垫底。
+    //
+    // 两条判据：① 归档/备份类目录整个垫底；② 其余按路径深度浅的优先
+    // （home 根的 MEMORY.md 比 deep/nested/xxx.md 更可能是要找的）。
+    const ARCHIVE_DIRS = ['archive', 'backup', 'backups', 'trash', 'tmp', 'temp', 'node_modules'];
+    const isArchived = (abs: string): boolean => {
+      const rel = toRel(abs, safe.abs).replace(/\\/g, '/');
+      return rel.split('/').some((seg) => seg.startsWith('.') || ARCHIVE_DIRS.includes(seg));
+    };
+    const depthOf = (abs: string): number => toRel(abs, safe.abs).split('/').length;
+    files.sort((x, y) => {
+      const ax = isArchived(x) ? 1 : 0;
+      const ay = isArchived(y) ? 1 : 0;
+      if (ax !== ay) return ax - ay;
+      return depthOf(x) - depthOf(y);
+    });
+
+    for (const abs of files) {
+      if (matches.length >= maxResults) { truncated = true; break; }
+      scanned += 1;
+      const buf = this.readFile(abs);
+      // 二进制跳过：含 NUL 字节即判定为非文本（与 git 的判据一致）
+      if (buf.includes(0)) continue;
+      const text = buf.toString('utf8');
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length; i += 1) {
+        if (matches.length >= maxResults) { truncated = true; break; }
+        const line = lines[i] as string;
+        re.lastIndex = 0;
+        if (re.test(line)) {
+          // 相对路径：用 safe.rel 作前缀，避免再引 homeRoot
+          const relPrefix = safe.rel === '.' ? '' : safe.rel.replace(/\/+$/, '');
+          const absNorm = abs.replace(/\\/g, '/');
+          const baseNorm = safe.abs.replace(/\\/g, '/').replace(/\/+$/, '');
+          const relPath =
+            absNorm === baseNorm
+              ? (relPrefix === '' ? absNorm.slice(absNorm.lastIndexOf('/') + 1) : relPrefix)
+              : relPrefix === ''
+                ? absNorm.slice(baseNorm.length + 1)
+                : `${relPrefix}/${absNorm.slice(baseNorm.length + 1)}`;
+          matches.push({
+            path: relPath,
+            line: i + 1,
+            // 单行超过 240 字截断：一行几万字的 minified 内容不该占满上下文
+            text: line.length > 240 ? `${line.slice(0, 240)}…` : line,
+          });
+        }
+      }
+    }
+
+    return okResult(callId, {
+      pattern,
+      regex: useRegex,
+      ignoreCase,
+      scanned_files: scanned,
+      matches,
+      truncated,
+      // 显式告诉模型"还有更多"时该怎么办，省一轮试错
+      ...(truncated ? { hint: `只回了前 ${maxResults} 条，实际更多。收窄 path 或改写 pattern 再搜。` } : {}),
+    });
+  }
+
   list(callId: string, args: Record<string, unknown>): ToolResult {
     let safe: SafePath;
     try {

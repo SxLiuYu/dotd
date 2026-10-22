@@ -1,6 +1,6 @@
 {
   "name": "dotd-agent-runtime",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "description": "dotd 容器内 agent-runtime（EX §5.2 端点表，监听 0.0.0.0:9223）。镜像构建见 dotd/exec-image/。",
   "type": "module",

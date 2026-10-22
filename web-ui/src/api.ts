@@ -186,8 +186,21 @@ export const api = {
 
   breaker: () => request<{ snapshot: unknown }>('GET', '/api/breaker'),
 
-  send: (text: string, dotId?: string) =>
-    request<{ taskId: string; threadId: string; status: string }>('POST', '/api/messages', { text, dotId }),
+  // 2026-10-22：必须能带 threadId。
+  //
+  // 现场：web 侧 1237 个 external_ref=NULL 的孤立线程，每个会话只有 1-2 条消息，
+  // 于是"多轮对话接不上"——主人问"我刚才让你记的暗号"，模型看到的是空会话。
+  // 根因就在这里：ChatView 把返回的 threadId 存进了 state，但 send() 从来没把它
+  // 传回去，后端每轮都走 openThread 新建。
+  // 服务端 http.ts 早已支持（带已知 threadId 就复用，未知则 404），缺的是客户端这一行。
+  send: (text: string, opts: { dotId?: string; threadId?: string | null } = {}) =>
+    request<{ taskId: string; threadId: string; status: string }>('POST', '/api/messages', {
+      text,
+      ...(opts.dotId !== undefined ? { dotId: opts.dotId } : {}),
+      ...(typeof opts.threadId === 'string' && opts.threadId.length > 0
+        ? { threadId: opts.threadId }
+        : {}),
+    }),
 
   conversations: (threadId: string) =>
     request<{ threadId: string; messages: Array<{ seq: number; role: string; kind: string; content: string; createdAt: number }> }>(

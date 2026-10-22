@@ -260,7 +260,7 @@ export interface ExecServiceDeps {
  * 所以容器返回的能力目录里天然没有它们 —— getCapabilities 必须把它们合并进去，
  * 否则模型根本看不见（2026-10-18 实测：主人让设提醒，模型答"schedule.create 不在列表里"）。
  */
-const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read', 'vault.sites', 'web.snapshot', 'web.read', 'web.act']);
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'calendar.list', 'calendar.conflicts', 'calendar.day', 'calendar.rest', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read', 'vault.sites', 'web.snapshot', 'web.read', 'web.act', 'search.web', 'search.fetch', 'memory.search']);
 
 /**
  * A1（2026-10-21）：`args.identity` 是给**宿主侧** browser.* 读的，不是给容器读的。

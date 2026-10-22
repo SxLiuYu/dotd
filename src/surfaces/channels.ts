@@ -462,6 +462,60 @@ export class FeishuGateway {
   }
 
   /**
+   * 给一条消息加 emoji reaction（2026-10-22）。
+   *
+   * 用途见 progress-reaction.ts：用"主人那条消息上的一个表情"代替
+   * "每 3 步发一条播报消息"。零新增消息、零未读。
+   *
+   * 返回 reaction_id —— 撤的时候**必须**用它（飞书的 DELETE 路由是
+   * /messages/:message_id/reactions/:reaction_id），而它只在添加成功时出现一次。
+   *
+   * 失败返回 null 而不是抛：这是装饰，不是功能（同 sendImage 的失败纪律）。
+   */
+  async addReaction(messageId: string, emojiType: string): Promise<string | null> {
+    try {
+      const token = await this.accessToken();
+      const res = await fetch(
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ reaction_type: { emoji_type: emojiType } }),
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const json = (await res.json()) as { code?: number; msg?: string; data?: { reaction_id?: string } };
+      if (json.code !== 0) return null;
+      const rid = json.data?.reaction_id;
+      return typeof rid === 'string' && rid.length > 0 ? rid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 撤掉自己加的 reaction（DELETE /messages/:mid/reactions/:rid）。失败返回 false，不抛。 */
+  async removeReaction(messageId: string, reactionId: string): Promise<boolean> {
+    try {
+      const token = await this.accessToken();
+      const res = await fetch(
+        `${this.deps.apiBase ?? 'https://open.feishu.cn'}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(reactionId)}`,
+        {
+          method: 'DELETE',
+          headers: { authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const json = (await res.json()) as { code?: number };
+      return json.code === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * §5.5 指令通道：飞书事件订阅是**推送**（webhook POST 到我们的 URL），不像 TG 长轮询。
    * 所以入站由 http.ts 的 `/api/hooks/feishu` 端点接收，本类只负责出站。
    */

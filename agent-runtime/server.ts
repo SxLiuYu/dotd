@@ -58,7 +58,17 @@ import {
 } from './net.ts';
 
 /** agent-runtime 版本（参与镜像 tag 计算；增删工具必须 bump，EX S2）。 */
-export const RUNTIME_VERSION = '0.1.0';
+/**
+ * 容器运行时版本。**改容器内工具集就必须升它**（§3.2）。
+ *
+ * 它参与镜像 tag（`dotd/exec:{base}-{ver}`）：版本不变 → tag 不变 →
+ * ImageManager 认为"已构建"，新代码永远进不了容器。这一条踩过：
+ * 2026-10-22 加 fs.grep 时忘了升，容器里 grep 不到 `fs.grep`，
+ * 而宿主侧测试全绿（测试直接用源码，不经过镜像）。
+ *
+ * 0.1.0 → 0.2.0：新增 fs.grep（按内容检索 home）。
+ */
+export const RUNTIME_VERSION = '0.2.1';
 
 /**
  * 已结束 job 的保留条数。宿主在读到终态后还可能再轮询一次 GET /jobs/{id}，
@@ -573,6 +583,8 @@ export class AgentRuntime {
         return this.fs.write(call.call_id, call.args);
       case 'fs.list':
         return this.fs.list(call.call_id, call.args);
+      case 'fs.grep':
+        return this.fs.grep(call.call_id, call.args);
       case 'fs.stat':
         return this.fs.stat(call.call_id, call.args);
       case 'tool.list':

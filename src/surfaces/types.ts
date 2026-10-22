@@ -99,6 +99,24 @@ export interface UiConfig {
  * 这个是"往飞书推不推、多频繁"。两者受众不同（浏览器 vs 手机），
  * 开关也该分开 —— 你可能想看流的输出但不希望手机响。
  */
+/**
+ * 每日简报（D1，2026-10-22 对标 Claude Duet 的「每日简报」）。
+ *
+ * 默认**关**：一个会每天主动发消息的功能，不该在升级后自己开始说话。
+ * 打开后按 `time`（本地时区）发一条，`window_min` 之外不再补发 ——
+ * daemon 中午重启不该让主人收到一份早间简报。
+ */
+export interface BriefSurfaceConfig {
+  enabled: boolean;
+  /** 'HH:MM'（本地时区）。 */
+  time: string;
+  /** 发到哪个会话；null = 全部主人会话（与审批卡片同口径）。 */
+  chatId: string | null;
+  /** 迟到多少分钟后放弃本次（默认 180）。 */
+  windowMin: number;
+  /** 正文上限，超过按段裁剪（默认 1200，见 BRIEF_MAX_CHARS）。 */
+  maxChars: number;
+}
 export interface ProgressSurfaceConfig {
   enabled: boolean;
   everyNSteps: number;
@@ -115,6 +133,20 @@ export interface SurfacesConfig {
   feishu: FeishuConfig;
   ui: UiConfig;
   progress: ProgressSurfaceConfig;
+  brief: BriefSurfaceConfig;
+  connWatch: ConnWatchSurfaceConfig;
+}
+
+/**
+ * 连接看门狗（U3「持续在线」那一半）。与 `crontabs.quiet_hours` 同语义：
+ * 安静时段内只落状态、不推送 —— 坏消息也不该吵醒人，可以等到早上。
+ */
+export interface ConnWatchSurfaceConfig {
+  enabled: boolean;
+  /** 每多少分钟检查一次（默认 15）。 */
+  intervalMin: number;
+  /** 安静时段；null = 不设。 */
+  quietHours: { start: string; end: string } | null;
 }
 
 // ── §5.1 入站 ────────────────────────────────────────────────────────

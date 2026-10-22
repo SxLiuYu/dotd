@@ -429,8 +429,11 @@ describe('静态守卫：出网默认关闭这件事写在代码里，不是靠�
     assert.match(get.failures, /net_tools_disabled/, 'net.get 的失败清单必须含关闭码');
     assert.match(post.failures, /net_post_disabled/, 'net.post 的失败清单必须含只读码');
     assert.doesNotMatch(get.failures, /not_implemented/, '阶段二占位码说明必须清理');
-    assert.match(NET_SEARCH_GUIDE, /没有内置搜索工具/);
-    assert.match(NET_SEARCH_GUIDE, /shell curl/);
+    // 2026-10-22：搜索改走 argo（search.web），指南不再说"没有内置搜索工具"。
+    // 护栏保留的是两条实质约束：①要搜就用 search.web；②不许用 shell curl 绕出网治理。
+    assert.match(NET_SEARCH_GUIDE, /search\.web/, '指南必须指向 search.web');
+    assert.match(NET_SEARCH_GUIDE, /shell\.?run[^\n]*curl|用 shell\.run 去 curl/, '必须禁止用 shell curl 绕出网治理');
+    assert.doesNotMatch(NET_SEARCH_GUIDE, /没有内置搜索工具/, '旧前提已失效，不得残留');
   });
 });
 

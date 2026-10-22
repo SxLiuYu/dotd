@@ -166,7 +166,19 @@ export class Fleet {
            WHERE dot_id = ?`,
         )
         .run(
-          o.runtimeVer ?? existing.runtime_ver,
+          // 2026-10-22 修：runtime_ver 必须跟着配置走，不能沿用库里的旧值。
+          //
+          // 原写法 `o.runtimeVer ?? existing.runtime_ver`，而 ensureDot 的调用方都不传
+          // runtimeVer，于是**升级后再也不会更新**：镜像 tag 由 cfg.runtimeVer 决定
+          // （dotd/exec:slim-<ver>），库里的版本却永远停在首次 create 的值。
+          //
+          // 后果是自锁死循环（实测踩到）：每次 boot 都判「容器镜像 ≠ 期望镜像」→ 重建 →
+          // 重建后镜像已经是新的，但库里的旧版本号没变，下次 boot 又判漂移 → 重建。
+          // 累计 >3 次/24h 触发 recreate 上限，dot 转 quarantined，容器在跑但所有
+          // fs.* 全返回 container_not_ready —— 模型一个工具都用不了。
+          //
+          // 现在：显式传了就用传的，否则对齐当前配置。配置才是唯一真相源。
+          o.runtimeVer ?? cfg.runtimeVer,
           JSON.stringify({ ...parseLimits(existing.limits_json), ...limits }),
           o.idleTimeoutS ?? existing.idle_timeout_s,
           o.deepStopAfterS ?? existing.deep_stop_after_s,

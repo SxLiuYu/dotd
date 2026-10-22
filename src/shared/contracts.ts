@@ -736,6 +736,11 @@ export type ToolName =
   | 'fs.read'
   | 'fs.write'
   | 'fs.list'
+  // 2026-10-22：按内容搜 home 下的文件（grep）。它与 memory.search 分工不同——
+  // 前者搜文件、后者搜对话历史；缺了它模型被问"我们之前定过什么"只能猜路径。
+  // agent-runtime/protocol.ts 与 src/exec/protocol.ts 的 CAPABILITY_CATALOG 早已有它，
+  // 本处漏加 → 两侧 ToolName 不再同形（tests/agent-runtime-protocol.test.ts:87 编译期就炸）。
+  | 'fs.grep'
   | 'fs.stat'
   | 'fs.remove'
   | 'shell.run'

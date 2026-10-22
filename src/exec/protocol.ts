@@ -134,10 +134,65 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     sideEffect: 'safe',
   },
   {
+    // fs.grep（2026-10-22）：按**内容**在 home 里搜索。
+    //
+    // 为什么它不是"锦上添花"：在此之前模型的长期记忆只有"被塞进上下文"一条路，
+    // 而那条路会被 token 预算截断、会被摘要失真污染（见 MemoryService 里
+    // 摘要自污染那个修复）。没有 grep，模型想问"我们之前定过什么"就只能猜路径
+    // 一个个 fs.read —— 实际上它什么都不会做，直接答"我没有上下文"。
+    //
+    // Letta 的实测：只给文件系统工具（grep/搜索）让 agent 自己翻，LoCoMo 74.0%，
+    // 高于专用记忆工具 Mem0 的 68.5%。结论是"会不会用检索工具比检索机制更重要"。
+    name: 'fs.grep',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        path: str('搜索起点（绝对路径；目录则递归，文件则只搜它）'),
+        pattern: str('要找的文本（默认按字面量子串匹配）'),
+        regex: { type: 'boolean', description: 'true 时把 pattern 当正则（默认 false=字面量）' },
+        ignoreCase: { type: 'boolean', description: '默认 true 不区分大小写' },
+        maxResults: { type: 'integer', minimum: 1, maximum: 200, description: '命中上限，默认 40' },
+      },
+      ['path', 'pattern'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
     name: 'fs.stat',
     mode: 'sync',
     max_deadline_ms: 60_000,
     args_schema: obj({ path: str('绝对路径') }, ['path']),
+    sideEffect: 'safe',
+  },
+  {
+    /**
+     * 按内容搜**对话历史**（不是文件）。
+     *
+     * 与 fs.grep 的分工要说清，否则模型会拿错工具：
+     *   - fs.grep      → 搜 /dot/home 下的文件（MEMORY.md、notes/*.md）
+     *   - memory.search → 搜 mem_messages 里的每一条对话（含已被摘要挤出上下文的部分）
+     *
+     * 为什么必须有：MEM 侧的 searchMessages()（FTS5 + 中文 bigram + bm25）早就实现了，
+     * 但一直**没有工具暴露给模型** —— 能力在、入口不在。实测的后果就是模型被问
+     * "我们之前定过什么"时只能答"我没有上下文"：它手上只有文件工具，而 11423 条
+     * 历史消息全在数据库里，它够不着。
+     *
+     * Letta 的结论（benchmarking-ai-agent-memory）：文件系统工具让 agent 自己检索
+     * 达 LoCoMo 74.0% > 专用记忆工具 Mem0 68.5%，"会不会用检索工具比检索机制本身更重要"。
+     * 那句话的前提是**检索工具真的在手边**。
+     */
+    name: 'memory.search',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        query: str('要找回的内容，自然语言或关键词都行（中文按 bigram 切）'),
+        sinceDays: { type: 'integer', minimum: 1, maximum: 3650, description: '只看最近 N 天，缺省全部' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, description: '返回条数，缺省 8' },
+      },
+      ['query'],
+    ),
     sideEffect: 'safe',
   },
   {
@@ -449,6 +504,41 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     sideEffect: 'unknown',
   },
   {
+    /**
+     * 宿主侧工具：列已有日程（2026-10-22 补登能力目录）。
+     *
+     * 为什么必须补：实现早在 daemon.ts:1279 注册、tools.yml 也登记了 read 档，
+     * 但 CAPABILITY_CATALOG 里没有它 —— getCapabilities 只合并**本目录里**属于
+     * HOST_SIDE_TOOLS 的条目，于是模型永远看不见它。
+     * 这不是「工具不存在」，是「做完了但没接上线」，
+     * 与 ExecService.ts:258 注释里记录的 2026-10-18 那个 schedule.create 事故同型。
+     */
+    name: 'calendar.list',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        window_days: { type: 'integer', minimum: 1, description: '可选。往后看几天（默认 7，上限 365）' },
+        source: str('可选。只看某个来源（local / 某个订阅文件名）；不给则全部')
+      },
+      [],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 宿主侧工具：查未来 N 天有没有时间冲突（约时间前先问，避免撞车）。 */
+    name: 'calendar.conflicts',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        window_days: { type: 'integer', minimum: 1, description: '可选。往后看几天（默认 7，上限 365）' },
+      },
+      [],
+    ),
+    sideEffect: 'safe',
+  },
+  {
     /** 宿主侧工具：往本地日历加一条事件（写 <dataDir>/calendar/local.ics；订阅 .ics 只读）。 */
     name: 'calendar.add',
     mode: 'sync',
@@ -497,6 +587,41 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
       ['id'],
     ),
     sideEffect: 'replayable',
+  },
+  {
+    /**
+     * 宿主侧：某天上班还是休息（含法定节假日 / 调休补班 / 周几）。
+     * 数据源是公开节假日表，不依赖主人维护日历源 —— 这是日常最常问的那类问题。
+     */
+    name: 'calendar.day',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        date: str('日期 YYYY-MM-DD；省略 = 今天'),
+      },
+      [],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /**
+     * 宿主侧：找出下一个休息窗口（连休几天），并附该窗口天气。
+     * 只给事实（哪天休、几天、天气数值），"去哪玩"交给模型结合记忆说，不硬编码景点。
+     */
+    name: 'calendar.rest',
+    mode: 'sync',
+    max_deadline_ms: 90_000,
+    args_schema: obj(
+      {
+        withinDays: { type: 'integer', minimum: 1, maximum: 400, description: '可选。只看未来多少天内，默认 60' },
+        lookBackDays: { type: 'integer', minimum: 0, maximum: 400, description: '可选。往回看多少天（问"今年国庆哪天补班"这类已公布的安排时用），默认 0' },
+        lat: { type: 'number', description: '可选。纬度（省略则按北京，并在返回里标记为假设）' },
+        lon: { type: 'number', description: '可选。经度' },
+      },
+      [],
+    ),
+    sideEffect: 'safe',
   },
   {
     /** 宿主侧：列当前 GitHub 通知（mention / review_requested 等，需配 token）。 */
@@ -589,6 +714,35 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     mode: 'async',
     max_deadline_ms: 120_000,
     args_schema: obj({ url: str('要读取的页面 URL，http(s)') }, ['url']),
+    sideEffect: 'safe',
+  },
+  // ── 2026-10-22：宿主侧搜索（argo CLI）──
+  //
+  // 加这两个工具的直接理由：实测本机直连只到 baidu/bing/zhihu/github，
+  // jd/taobao/tmall/amazon 直连与代理都不通。模型拿 net.get / web.read 去查
+  // "京东上某物多少钱"，怎么降级都拿不到——不是工具坏了，是这条路本身不通。
+  // argo 走它自己的 272 个源，不受本机出口限制。
+  {
+    /** 联网搜索（多源融合），返回标题/URL/摘要清单。 */
+    name: 'search.web',
+    mode: 'async',
+    max_deadline_ms: 120_000,
+    args_schema: obj(
+      {
+        query: str('搜索词，自然语言即可'),
+        limit: { type: 'integer', minimum: 1, maximum: 20, description: '返回条数，缺省 5' },
+        time_range: str('时间过滤，如 "d"/"w"/"m"（可选）'),
+      },
+      ['query'],
+    ),
+    sideEffect: 'safe',
+  },
+  {
+    /** 抓取单页正文（argo 多级降级：HTTP → TLS 指纹 → 浏览器）。 */
+    name: 'search.fetch',
+    mode: 'async',
+    max_deadline_ms: 120_000,
+    args_schema: obj({ url: str('要抓取的页面 URL，http(s)') }, ['url']),
     sideEffect: 'safe',
   },
   {

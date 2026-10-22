@@ -346,6 +346,27 @@ const feishuSchema = z.object({
   mirror_web_to_feishu: z.boolean().default(false),
 });
 
+/**
+ * 每日简报（D1）。`time` 只做形状校验（HH:MM 允许一位小时，与安静时段同口径），
+ * 真正的"到点了吗"由 `daily-brief.ts` 的 `shouldSendBrief` 判 —— 那里也有单测。
+ */
+const briefSchema = z.object({
+  enabled: z.boolean().default(false),
+  time: z.string().default('08:30'),
+  chat_id: z.string().optional(),
+  window_min: z.coerce.number().int().positive().default(180),
+  max_chars: z.coerce.number().int().positive().max(4000).default(1200),
+});
+
+/**
+ * 连接看门狗（U3 的「持续在线」那一半）。interval_min 与 quiet_hours 同 crontabs 语义：
+ * quiet_hours 空串 = 不设安静时段；字符串解析成 {start,end} 由 parseSurfacesSection 做。
+ */
+const connWatchSchema = z.object({
+  enabled: z.boolean().default(false),
+  interval_min: z.coerce.number().int().positive().max(1440).default(15),
+  quiet_hours: z.string().optional(),
+});
 const surfacesSchema = z.object({
   http: httpSchema,
   hooks: z.array(hookSchema).default([]),
@@ -362,12 +383,28 @@ const surfacesSchema = z.object({
   }),
   ui: uiSchema.default({ stream_deltas: true }),
   progress: progressSchema.default({ enabled: false, every_n_steps: 3, min_interval_ms: 90_000 }),
+  brief: briefSchema.default({ enabled: false, time: '08:30', window_min: 180, max_chars: 1200 }),
+  conn_watch: connWatchSchema.default({ enabled: false, interval_min: 15 }),
 });
 
 /**
  * 从整个 config.yml 的解析结果中取 `surfaces:` 节并校验。
  * 段缺失/非法即拒启动（fail-closed）：http 段缺失时无法确定监听端口与 token。
  */
+/**
+ * 解析 quiet_hours 字符串（`HH:MM-HH:MM`，本地时区）成结构化边界。
+ *
+ * 与 `src/control-plane/scheduler.ts` 的 `inQuietHours()` 同一个形状：
+ * 写错就当作「没设安静时段」（返回 null）—— 宁可多报一句，也不要因为一个格式笔误
+ * 让所有连接故障被静音。跨午夜（start > end）由 `inQuietHours()` 处理。
+ */
+export function parseQuietHours(raw: string | undefined): { start: string; end: string } | null {
+  if (raw === undefined) return null;
+  const m = /^(\d{1,2}:\d{2})-(\d{1,2}:\d{2})$/.exec(raw.trim());
+  if (m === null) return null;
+  return { start: m[1] ?? '', end: m[2] ?? '' };
+}
+
 export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
   const raw = root['surfaces'];
   if (raw === undefined || raw === null) {
@@ -425,6 +462,18 @@ export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
       enabled: s.progress.enabled,
       everyNSteps: s.progress.every_n_steps,
       minIntervalMs: s.progress.min_interval_ms,
+    },
+    brief: {
+      enabled: s.brief.enabled,
+      time: s.brief.time,
+      chatId: s.brief.chat_id !== undefined && s.brief.chat_id !== '' ? s.brief.chat_id : null,
+      windowMin: s.brief.window_min,
+      maxChars: s.brief.max_chars,
+    },
+    connWatch: {
+      enabled: s.conn_watch.enabled,
+      intervalMin: s.conn_watch.interval_min,
+      quietHours: parseQuietHours(s.conn_watch.quiet_hours),
     },
   };
 }

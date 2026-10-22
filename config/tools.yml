@@ -37,6 +37,16 @@ tools:
   - name: fs.stat
     tier: read
     # EX §7：mtime/size
+  - name: fs.grep
+    tier: read
+    # 2026-10-22 补登：能力表/工具目录/容器实现三处都有它，唯独治理白名单漏了，
+    # 而 gate.ts:327 是「未登记 ⇒ deny」——模型看得见工具名、却每次都拿到 deny。
+    # 只读检索 /dot/home 下文件内容（回路径+行号），无副作用 ⇒ read。
+  - name: memory.search
+    tier: read
+    # 2026-10-22 补登，原因同上：宿主侧 daemon.ts:1692 已注册实现，白名单没登记。
+    # 查 mem_messages（含已被挤出上下文的对话），与 fs.grep 查文件分工不同。
+    # 只读本地库 ⇒ read。
   - name: shell.run
     tier: write_file                        # 容器内 shell（EX §7：bash -c，cwd=/dot/home，超时必填）
     upgrade:                                # 命中即提档（解析规则见 GOV §3.1）
@@ -186,6 +196,12 @@ tools:
     tier: write_file
   - name: calendar.delete
     tier: write_file
+  # 2026-10-22：节假日/调休查询与休息窗口推荐。纯只读 GET（公开节假日表 + open-meteo 天气），
+  # 不碰主人的日历文件，也不需要凭据 ⇒ read 档，不弹审批。
+  - name: calendar.day
+    tier: read
+  - name: calendar.rest
+    tier: read
   # 连接器第一批（2026-10-21，task-2 接线）：全是只读 GET，tier: read。
   # GitHub 未配 token 时 issues/pulls 仍可用（公开仓，60 请求/时限速）；notifications 需要 token。
   - name: github.notifications
@@ -207,4 +223,10 @@ tools:
   - name: web.read
     tier: read
   - name: web.act
+    tier: read
+  # 2026-10-22：宿主侧搜索（argo CLI）。只读网络，不弹审批：
+  # 参数只影响 query/url，可执行文件与子命令名在代码里写死。
+  - name: search.web
+    tier: read
+  - name: search.fetch
     tier: read

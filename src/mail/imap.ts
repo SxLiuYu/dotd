@@ -303,15 +303,25 @@ function parseSummaries(lines: string[]): MailSummary[] {
     if (!/^\*\s+\d+\s+FETCH/i.test(line)) continue;
     const uid = /\bUID\s+(\d+)/i.exec(line)?.[1] ?? '';
     if (!uid) continue;
-    // header 块在 literal 里，我们已经在 cmd 里拼回 line 了
-    const hdrStart = line.indexOf('\r\n\r\n');
-    const head = hdrStart >= 0 ? line.slice(0, hdrStart) : line;
+    // header 块在 IMAP literal 里：`... BODY[...] {258}Date: ...\r\n...`。
+    // 取信头**必须从 literal 起点开始**，否则 `{258}` 前缀会挡在 `Date:` 前面，
+    // 让 `^Date:` 匹配不到（实测 date 恒为 null，就是这里）。
+    // literal 起点 = `{数字}` 之后；没有 literal（部分服务器内联）则退回整段。
+    const lit = /\{(\d+)\}\r?\n?/.exec(line);
+    const bodyStart = lit !== null ? lit.index + lit[0].length : 0;
+    const afterLit = line.slice(bodyStart);
+    // 信头与正文之间是空行；列表只取 HEADER.FIELDS，通常没有正文，
+    // 所以末尾的 \r\n\r\n 也当作结束标记。
+    const hdrEnd = afterLit.indexOf('\r\n\r\n');
+    const head = hdrEnd >= 0 ? afterLit.slice(0, hdrEnd) : afterLit;
     out.push({
       uid,
       messageId: headerValue(head, 'Message-ID'),
-      from: headerValue(head, 'From'),
+      // from/subject 必须解 RFC2047：中文发件人名与主题在 IMAP 里是 =?utf-8?B?...?=，
+      // 不解就会把编码串原样给模型/主人（实测 OPPO 营销信主题整条不可读）。
+      from: decodeRfc2047(headerValue(head, 'From') ?? ''),
       to: headerValue(head, 'To'),
-      subject: headerValue(head, 'Subject'),
+      subject: decodeRfc2047(headerValue(head, 'Subject') ?? ''),
       date: headerValue(head, 'Date'),
     });
   }

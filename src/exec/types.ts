@@ -195,7 +195,14 @@ export const DEFAULT_EXEC_CONFIG: ExecConfig = {
   dockerApiMax: '1.52',
   dockerSocketPath: '/var/run/docker.sock',
   baseImageTag: 'slim',
-  runtimeVer: '0.1.0',
+  // 容器运行时版本 —— **参与镜像 tag**（`dotd/exec:slim-{ver}`）。
+  //
+  // 改容器内工具集必须同时升这里和 agent-runtime/server.ts 的 RUNTIME_VERSION，
+  // 否则 tag 不变 → ImageManager 认为镜像已就绪 → 新工具永远进不了容器。
+  // 2026-10-22 加 fs.grep 时两个都忘了升，现象很有迷惑性：
+  // 宿主侧单测全绿（直接跑源码，不过镜像），容器里 `grep fs.grep` 却是 0 命中。
+  // 0.1.0 → 0.2.0：fs.grep 进容器工具集。
+  runtimeVer: '0.2.1',
   networkName: 'dotd',
   runtimePort: 9223,
   syncDeadlineMs: 60_000,

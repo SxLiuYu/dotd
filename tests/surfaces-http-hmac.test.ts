@@ -57,6 +57,8 @@ function makeConfig(overrides: Partial<SurfacesConfig['http']> = {}): SurfacesCo
     feishu: { appId: '', appSecret: '', verificationToken: '', encryptKey: '', editThrottleMs: 1500 },
     ui: { streamDeltas: true },
     progress: { enabled: false, everyNSteps: 3, minIntervalMs: 90_000 },
+    brief: { enabled: false, time: '08:30', chatId: null, windowMin: 180, maxChars: 1200 },
+    connWatch: { enabled: false, intervalMin: 15, quietHours: null },
   };
 }
 

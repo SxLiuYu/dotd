@@ -69,6 +69,15 @@ import { createHeartbeatAdmin } from './heartbeat-tick.ts';
 import { buildTaskView, type CallLogRow } from './task-view.ts';
 import { PLAN_MARKER, plansFromMessages } from '../runner/plan.ts';
 import { serveStatic } from './web.ts';
+import type { DailyBrief } from './daily-brief.ts';
+import type { ConnectionRow } from './connections.ts';
+import { connectionSummary, renderConnections } from './connections.ts';
+import {
+  dashboardCsp,
+  dashboardHomePath,
+  parseDashboardSlug,
+  validateDashboardHtml,
+} from './dashboard.ts';
 import { resolve } from 'node:path';
 
 // ── 常量（§5.2 逐字） ────────────────────────────────────────────────
@@ -108,6 +117,8 @@ export type Route =
   | 'hook_ingest'
   | 'task_by_id'
   | 'activity'
+  | 'brief'
+  | 'connections'
   | 'logs'
   | 'memory_archive'
   | 'memory_restore'
@@ -136,6 +147,11 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   // 冒烟脚本与 CLI `/status`（surfaces.md:273）共用这一个端点（跨模块对接缺口，
   // 由装配期冒烟发现；数据全部取自已有属主投影，不新增事实源）。
   if (m === 'GET' && p === '/api/status') return { route: 'status', params: {} };
+  // D1/D3（2026-10-22，对标 Claude Duet）：每日简报 / 已连接应用总览。
+  // 两个都是**只读聚合**，数据全部来自本机库与日历目录；不含任何凭证
+  //（邮箱只到地址与主机名，模型端点只到 base_url 与模型名）。
+  if (m === 'GET' && p === '/api/brief') return { route: 'brief', params: {} };
+  if (m === 'GET' && p === '/api/connections') return { route: 'connections', params: {} };
   if (m === 'GET' && p === '/api/whoami') return { route: 'whoami', params: {} };
   if (m === 'POST' && p === '/api/messages') return { route: 'messages', params: {} };
   if (m === 'GET' && p === '/api/queue') return { route: 'queue', params: {} };
@@ -503,7 +519,21 @@ export interface HttpDeps {
   alertsRoute?: () => { order: readonly string[]; outboxPath: string };
   /** Web UI 静态根（绝对路径；缺省 repo 根 web-ui/dist）。 */
   webRoot?: string;
-  now?(): Date;
+
+  /**
+   * 仪表盘（D2）：从容器 home 读文件。daemon 装配时传 exec 侧的 fs.read(base64) 实现。
+   * 缺省 = `/d/<slug>` 一律 503 —— 没装这条腿时宁可明说，也别回一个空页面。
+   */
+  readHomeFile?: (dotId: string, path: string) => Promise<Buffer | null>;
+  /** 仪表盘所属 dot。阶段一恒 dot1（多 Dot 是阶段三）。 */
+  dotId?: string;
+  /**
+   * 每日简报（D1）：daemon 装配好的取数+渲染闭包（`insight.ts` 的 `buildBrief`）。
+   * 缺省 = `/api/brief` 回 503 —— 没装这条腿时明说，别回一句「今天没事」。
+   */
+  brief?: (nowMs?: number) => DailyBrief;
+  /** 已连接应用总览（D3）：同上，`insight.ts` 的 `buildConnectionsView`。 */
+  connections?: () => ConnectionRow[];  now?(): Date;
   /**
    * 列出 .archive/ 里的记忆备份（按时间倒序）。
    * 2026-10-18：归档能力做完后补的"入口"——之前只能手动 docker exec cp 恢复。
@@ -586,6 +616,70 @@ export function createHttpServer(deps: HttpDeps): Server {
     res.end(text);
   };
 
+  /**
+   * 仪表盘（D2）：`/d/<slug>` —— 把容器 home 里的 `dashboards/<slug>.html` 原样托管。
+   *
+   * 为什么这条路由**不走 /api 前缀、也不要 token**：它是给主人在手机浏览器里
+   * 直接点开的页面，与 web-ui 静态资源同级。写权限仍然只在 agent → 治理那条链上
+   * （模型只能通过 fs.write 写文件），所以「能看」不等于「能改」。
+   *
+   * 三处刻意从严：
+   *   ① slug 白名单（`parseDashboardSlug`），路径穿越在进入 fs 之前就被拒；
+   *   ② 只发 `text/html` + 严格 CSP（`dashboardCsp`），模型写的页面不许在主人的
+   *      同源里跑脚本 —— localStorage 里躺着 master token；
+   *   ③ 内容不符（空/非 HTML/超 512KB）回 422 并说明原因，不硬发。
+   */
+  async function serveDashboard(req: IncomingMessage, res: ServerResponse, rawSlug: string): Promise<void> {
+    const parsed = parseDashboardSlug(decodeURIComponent(rawSlug));
+    if (!parsed.ok) {
+      json(res, 404, { error: 'dashboard', message: parsed.reason === 'empty' ? '没给页面名' : '页面名不合法（只允许小写字母/数字/中划线）' });
+      return;
+    }
+    const read = deps.readHomeFile;
+    if (read === undefined) {
+      json(res, 503, { error: 'dashboard', message: 'daemon 没装配仪表盘读取能力（readHomeFile 未传）' });
+      return;
+    }
+    let buf: Buffer | null = null;
+    try {
+      buf = await read(deps.dotId ?? 'dot1', dashboardHomePath(parsed.slug));
+    } catch (cause) {
+      json(res, 503, { error: 'dashboard', message: '读页面失败：' + String(cause) });
+      return;
+    }
+    if (buf === null) {
+      json(res, 404, {
+        error: 'dashboard',
+        message: '没有这个仪表盘。让它做一份：一句话说清要看什么，它会写到 ' + dashboardHomePath(parsed.slug),
+      });
+      return;
+    }
+    const html = buf.toString('utf8');
+    const check = validateDashboardHtml(html);
+    if (!check.ok) {
+      json(res, 422, {
+        error: 'dashboard_invalid',
+        reason: check.reason,
+        message:
+          check.reason === 'too_large'
+            ? '页面太大（上限 512KB），别把原始数据整份贴进 HTML'
+            : check.reason === 'not_html'
+              ? '这个文件不是 HTML（开头既没有 <!doctype html> 也没有 <html>）'
+              : '文件是空的',
+      });
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      // 页面可能随时被定时任务重写，缓存一份旧的就是给人看错数据
+      'cache-control': 'no-store',
+      'content-security-policy': dashboardCsp(),
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'content-length': String(buf.length),
+    });
+    res.end(req.method === 'HEAD' ? undefined : buf);
+  }
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     const pathname = url.pathname;
@@ -620,6 +714,12 @@ export function createHttpServer(deps: HttpDeps): Server {
       return;
     }
 
+    // 仪表盘（D2）：`GET /d/<slug>`。放在 matchRoute 之前 —— 它不属于 API 路由表，
+    // 也不是 SPA 静态资源（那些应以 index.html 兜底，而这里必须 404/422 说人话）。
+    if ((method === 'GET' || method === 'HEAD') && (pathname === '/d' || pathname.startsWith('/d/'))) {
+      await serveDashboard(req, res, pathname === '/d' ? '' : pathname.slice(3));
+      return;
+    }
     const match = matchRoute(method, pathname);
     if (match === null) {
       // 非 /api、非 /hooks 的 GET/HEAD → 静态托管（SPA）
@@ -1074,6 +1174,39 @@ export function createHttpServer(deps: HttpDeps): Server {
         return;
       }
 
+      // D1（2026-10-22）：每日简报。同一份数据既供 `dotd brief`，也供飞书每天那条推送
+      //（推送侧用同一个 provider，见 daemon 的 briefTimer）—— 口径只有一处。
+      case 'brief': {
+        const provider = deps.brief;
+        if (provider === undefined) {
+          json(res, 503, { error: 'brief', message: 'daemon 没装配简报能力（insightDeps 未传）' });
+          return;
+        }
+        try {
+          const nowMs = now().getTime();
+          json(res, 200, provider(nowMs));
+        } catch (cause) {
+          json(res, 500, { error: 'brief', message: `生成简报失败：${String(cause)}` });
+        }
+        return;
+      }
+
+      // D3（2026-10-22）：已连接应用总览。只读；行里不含任何凭证（见 connections.ts 的约束）。
+      case 'connections': {
+        const provider = deps.connections;
+        if (provider === undefined) {
+          json(res, 503, { error: 'connections', message: 'daemon 没装配连接总览能力（insightDeps 未传）' });
+          return;
+        }
+        try {
+          const rows = provider();
+          const summary = connectionSummary(rows);
+          json(res, 200, { rows, summary, text: renderConnections(rows) });
+        } catch (cause) {
+          json(res, 500, { error: 'connections', message: `生成连接总览失败：${String(cause)}` });
+        }
+        return;
+      }
       case 'task_by_id': {
         const id = match.params.id!;
         const task = deps.cp.getTask(id);

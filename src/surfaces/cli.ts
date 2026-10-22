@@ -638,6 +638,48 @@ export function buildCli(opts: CliOptions = {}): Command {
     });
 
   program
+    .command('brief')
+    .description('今天的简报（GET /api/brief：日程 / 等你批的事 / 近 24 小时结果 / 定时任务）')
+    .action(async () => {
+      const o = merged();
+      const r = await api<{
+        text: string;
+        sections: Array<{ id: string; title: string; lines: string[] }>;
+        omittedSections: string[];
+        enabled?: boolean;
+      }>('GET', '/api/brief', undefined, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      // 正文由 daemon 侧渲染（与飞书推送同一份），CLI 只加一行指路。
+      // 开关已经打开时不能再劝人「去打开」——那句提示在启用后是假的（2026-10-22 实测）。
+      const briefOn = r.body.enabled === true;
+      const tail = briefOn
+        ? '\n\n（每天自动推送：已启用）'
+        : '\n\n（想每天自动收到：在 ~/.dotd/config.yml 打开 surfaces.brief.enabled）';
+      emit(o, r.body.text + tail);
+    });
+
+  program
+    .command('connections')
+    .description('已连接应用总览（GET /api/connections：邮箱 / 日历 / 连接器 / MCP / 模型端点 / 通知）')
+    .action(async () => {
+      const o = merged();
+      const r = await api<{
+        rows: unknown[];
+        summary: { total: number; connected: number; issues: number };
+        text: string;
+      }>('GET', '/api/connections', undefined, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      emit(o, r.body.text);
+    });
+  program
     .command('cancel <taskId>')
     .description('取消任务（cp.cancel(id, "user")）')
     .action(async (taskId: string) => {

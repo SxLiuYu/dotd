@@ -27,6 +27,7 @@ export type ToolName =
   | 'fs.read'
   | 'fs.write'
   | 'fs.list'
+  | 'fs.grep'
   | 'fs.stat'
   | 'fs.remove'
   | 'shell.run'
@@ -45,6 +46,7 @@ export const TOOL_NAMES: readonly ToolName[] = [
   'fs.read',
   'fs.write',
   'fs.list',
+  'fs.grep',
   'fs.stat',
   'fs.remove',
   'shell.run',
@@ -200,6 +202,26 @@ export const CAPABILITIES: readonly Capability[] = [
       type: 'object',
       required: ['path'],
       properties: { path: { type: 'string', minLength: 1 }, depth: { type: 'integer', minimum: 1, maximum: FS_LIST_MAX_DEPTH } },
+      additionalProperties: false,
+    },
+    sideEffect: 'safe',
+  },
+  {
+    // fs.grep（2026-10-22）：按内容搜索 home。模型主动找回过去的唯一手段，
+    // 见宿主 src/memory/MemoryService.ts 的摘要修复与 Letta 的 LoCoMo 结论。
+    name: 'fs.grep',
+    mode: 'sync',
+    max_deadline_ms: SYNC_MAX_DEADLINE_MS,
+    args_schema: {
+      type: 'object',
+      required: ['path', 'pattern'],
+      properties: {
+        path: { type: 'string', minLength: 1 },
+        pattern: { type: 'string', minLength: 1 },
+        regex: { type: 'boolean' },
+        ignoreCase: { type: 'boolean' },
+        maxResults: { type: 'integer', minimum: 1, maximum: 200 },
+      },
       additionalProperties: false,
     },
     sideEffect: 'safe',

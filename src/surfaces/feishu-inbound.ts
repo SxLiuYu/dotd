@@ -582,12 +582,23 @@ export async function handleFeishuCallback(
         externalRef: `feishu:${decision.chatId}`,
       });
       await deps.mem.appendMessage(threadId, { role: 'user', kind: 'text', content: goalText });
+      // 带上飞书消息 id（2026-10-22）：任务跑起来后要在**主人那条消息**上挂一个
+      // "在做"表情（见 progress-reaction.ts）。飞书撤 reaction 需要 message_id，
+      // 而它只在入站时出现一次 —— 不落到任务上就永远拿不回来。
+      //
+      // 走 payloadJson 而不是新增列：tasks.payload_json 本来就存在且飞书入站一直没用，
+      // 省一次 schema 迁移（user_version 不必动）。
+      const fuMsgId =
+        typeof ((decision.raw.payload as Record<string, unknown> | null)?.['message'] as Record<string, unknown> | undefined)?.['message_id'] === 'string'
+          ? (((decision.raw.payload as Record<string, unknown>)['message'] as Record<string, unknown>)['message_id'] as string)
+          : '';
       const task = deps.cp.submit({
         title: decision.text.slice(0, 60),
         goal: goalText,
         priority: 1,
         dotId: decision.raw.dotId,
         threadId,
+        ...(fuMsgId.length > 0 ? { payloadJson: JSON.stringify({ feishuMessageId: fuMsgId }) } : {}),
       });
       deps.bus.publish('chat.final', {
         kind: 'chat.final',

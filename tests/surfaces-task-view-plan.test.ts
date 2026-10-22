@@ -1,4 +1,4 @@
-﻿/**
+/**
  * tests/surfaces-task-view-plan.test.ts —— P2-2 可观测性：`dotd task <id> --verbose` 里的计划。
  *
  * 证明② 的"最后一公里"：计划不只是内存里的一份字符串，而是能从
@@ -41,6 +41,8 @@ function makeConfig(overrides: Partial<SurfacesConfig['http']> = {}): SurfacesCo
     feishu: { appId: '', appSecret: '', verificationToken: '', encryptKey: '', editThrottleMs: 1500 },
     ui: { streamDeltas: true },
     progress: { enabled: false, everyNSteps: 3, minIntervalMs: 90_000 },
+    brief: { enabled: false, time: '08:30', chatId: null, windowMin: 180, maxChars: 1200 },
+    connWatch: { enabled: false, intervalMin: 15, quietHours: null },
   };
 }
 

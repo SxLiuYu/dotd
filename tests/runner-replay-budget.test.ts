@@ -44,9 +44,20 @@ test('会话重放不得直接使用 session.budgetTokens（那是任务预算�
 });
 
 test('REPLAY_BUDGET_TOKENS 常量存在且是个合理的小值', () => {
-  const m = /const REPLAY_BUDGET_TOKENS = ([\d_]+);/.exec(src);
-  assert.ok(m !== null, '应有 REPLAY_BUDGET_TOKENS 常量定义');
+  // 2026-10-22：常量改为由 replayBudgetTokens() 计算（环境变量
+  // DOTD_REPLAY_BUDGET_TOKENS 可覆盖），所以这里匹配的是**默认值**常量。
+  // 断言意图不变：那个默认值必须是个经过考虑的小值，不能是"不限"。
+  const m = /const DEFAULT_REPLAY_BUDGET_TOKENS = ([\d_]+);/.exec(src);
+  assert.ok(m !== null, '应有 DEFAULT_REPLAY_BUDGET_TOKENS 默认值定义');
   const v = Number(m![1]!.replace(/_/g, ''));
   assert.ok(v > 0, '预算必须为正');
-  assert.ok(v <= 20000, `重放预算不应超过 20000 tokens（实际 ${v}）——否则起不到限制作用`);
+  // 2026-10-22：8000 → 24000。
+  //
+  // 8000 是当初修「整条线程无限重放」（28k prompt 里 19878 是历史、其中 460 条
+  // 是作废工具输出）时定的。但收紧到 8k 有个反向代价：聊久一点，最近 8k 之外的
+  // 一切模型都看不见，而摘要一旦失真（同期修的 bug）就等于彻底没有记忆。
+  // 24k 仍远小于 200k 上下文，限制作用还在，但不再让"聊了多久"决定"还记得多少"。
+  // 硬顶 40000：再往上就该怀疑是不是在拿回放当检索用了（该用 fs.grep）。
+  assert.ok(v <= 40000, `重放预算不应超过 40000 tokens（实际 ${v}）——否则起不到限制作用`);
+  assert.ok(v >= 8000, `重放预算不应小于 8000 tokens（实际 ${v}）——否则长会话会失去记忆`);
 });

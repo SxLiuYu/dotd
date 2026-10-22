@@ -67,6 +67,7 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
       'fs.read',
       'fs.write',
       'fs.list',
+      'fs.grep',
       'fs.remove',
       'fs.stat',
       'shell.run',
@@ -91,9 +92,13 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
   'mail.search',
   'mail.draft',
   'mail.send',
+  'calendar.list',
+  'calendar.conflicts',
   'calendar.add',
   'calendar.edit',
   'calendar.delete',
+  'calendar.day',
+  'calendar.rest',
   'github.notifications',
   'github.issues',
   'github.pulls',
@@ -103,6 +108,11 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
   'web.snapshot',
   'web.read',
   'web.act',
+  // 2026-10-22：搜对话历史（FTS5），与 fs.grep 分工：这个搜对话，那个搜文件
+  'memory.search',
+  // 2026-10-22：搜索走 argo，两个宿主侧工具
+  'search.web',
+  'search.fetch',
     ],
   );
 });
@@ -277,7 +287,16 @@ test('system prompt：是导出常量、有长度预算、内容不是空话', (
   // 实测改动前 prompt 已 4163（余量 37），一行 ~110 字符必超，按任务批复抬到 4400。
   // 4600 → 4700（2026-10-21，W2）：web.* 三件套进目录，引导段逐名覆盖 + 讲清
   // read/snapshot→act 的选择逻辑；压到 4604 仍差 4 字符，再压就要删信息了。
-  assert.ok(SYSTEM_PROMPT_BUDGET <= 4700, '总长上限 < 4700 字符');
+  // 4700 保持不动（2026-10-22）：search.* 两件套进目录，靠精简 NET_SEARCH_GUIDE
+  // 与 shell.run 文档段腾出空间（实测 4698，压到 4604 的老余量已用完）。
+  // 4700 → 4900（2026-10-22）：fs.grep 进目录。
+  // 它比前几批工具更"非加不可"：文件系统检索是模型唯一的主动找回过去的手段。
+  // Letta 实测（benchmarking-ai-agent-memory）只给文件系统工具、让 agent 自己
+  // grep，LoCoMo 74.0% > 专用记忆工具 Mem0 68.5%，结论是"会不会用检索工具
+  // 比检索机制本身更重要"——所以"想不起就去 fs.grep 搜"这句指令就是那把工具
+  // 的发现路径，省掉它等于没加。抬线前已按老规矩压了 7 处文案到 4726，
+  // 再压就要删 mail.* / browser.* 的全名（测试逐字要求），那是真信息损失。
+  assert.ok(SYSTEM_PROMPT_BUDGET <= 4900, '总长上限 < 4900 字符');
 
   // 必备的四块：身份/环境、工作纪律、记忆、对主人表达。
   for (const must of ['Dot', '/dot/home', 'MEMORY.md', 'notes/', 'manuals/', '结论先行', '中文']) {
@@ -461,10 +480,23 @@ test('运行时：查 model 请求 messages —— [0] 是 system prompt，末�
   assert.equal(head.role, 'system');
   assert.equal(head.content, composeSystemPrompt(), 'messages[0] 必须是运行手册全文');
   // ② 文件记忆排在它后面，且不覆盖 prompt
-  const memoryMsg = req0.messages[1] as ChatMessage;
-  assert.equal(memoryMsg.role, 'system');
-  assert.ok(memoryMsg.content.includes('# MEMORY.md'));
+  //
+  // 2026-10-22 起 prompt 之后先插一条 `sys:now`（当前时间），所以记忆不再是
+  // messages[1]。这里改成**按内容定位**：真正的不变量是"记忆在 prompt 之后、
+  // 且不与 prompt 相同"，而不是它恰好占第 2 个位置。
+  const systemMsgs = req0.messages.filter((m) => m.role === 'system') as ChatMessage[];
+  const memoryMsg = systemMsgs.find((m) => m.content.includes('# MEMORY.md'));
+  assert.ok(memoryMsg !== undefined, '必须有 MEMORY.md 快照');
   assert.notEqual(memoryMsg.content, composeSystemPrompt());
+  // ②b 当前时间行：模型靠它判断"今天/明天"，不能靠 shell.run date 去猜
+  const nowMsg = systemMsgs.find((m) => m.content.includes('现在是 '));
+  assert.ok(nowMsg !== undefined, '必须有 sys:now 当前时间行');
+  assert.ok(/现在是 \d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(nowMsg.content), 'sys:now 必须是 ISO 风格时间');
+  // ②c 时间行必须在 prompt 之后、记忆之前（先有手册，再有"现在几点"）
+  assert.ok(
+    req0.messages.indexOf(nowMsg as ChatMessage) < req0.messages.indexOf(memoryMsg as ChatMessage),
+    'sys:now 应在记忆快照之前',
+  );
   // ③ 目标在最后一条 user
   const last = req0.messages[req0.messages.length - 1]!;
   assert.equal(last.role, 'user');

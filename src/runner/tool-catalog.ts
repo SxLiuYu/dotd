@@ -131,6 +131,25 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     failures: 'not_a_directory（路径是文件或不存在）、too_deep（depth>4）、路径类错误同 fs.read。',
   },
   {
+    name: 'fs.grep',
+    description:
+      '在 home 里按**内容**搜索，返回命中的文件路径、行号、那一行原文。' +
+      '**"我们之前聊过/定过什么"、"上次那个报错是什么"、"我之前让你记的暗号"这类问题先用它搜，别直接说没有上下文。' +
+      'MEMORY.md、notes/*.md 里记着过去的事，搜关键词就能捞回来。' +
+      '默认字面量匹配（不经正则）、不区分大小写；要正则传 regex:true。最多回 40 条（可调，硬顶 200），超了 truncated=true。',
+    params: {
+      path: '搜索起点，home 内相对路径；给目录就递归（最多 3 层），给文件就只搜它。不知道在哪就写 .（整个家目录）。',
+      pattern: '要找的文本，例如「暗号」「烧烤」「sk-」；默认按字面量子串匹配，不会把 . 或 * 当通配符。',
+      regex: '布尔，true 时把 pattern 当正则表达式用；缺省 false。',
+      ignoreCase: '布尔，缺省 true 不区分大小写；要精确大小写传 false。',
+      maxResults: '整数 1–200，命中上限，缺省 40。命中太多说明关键词太宽，收窄它。',
+    },
+    returns:
+      '返回值是 JSON：pattern、regex、ignoreCase、scanned_files（扫了几个文件）、matches[]（每项 path / line 行号 / text 那一行，超 240 字截断）、truncated。truncated=true 时另有 hint 提示怎么收窄。',
+    failures:
+      'bad_args（pattern 为空或正则无效）、not_a_file（path 不存在）、too_deep（超过 3 层）、路径类错误同 fs.read。二进制文件与 >4MB 的文件自动跳过，不算失败。',
+  },
+  {
     name: 'fs.remove',
     description:
       '删除 home 里的一个文件或空目录。**删除前会自动把旧内容存进 .archive/ 一次**，删错了能捞回来。' +
@@ -483,6 +502,35 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
           '草稿不存在或已发送；SMTP 认证失败（授权码不对/端口错）——如实转述 error，别假装发出去了。',
       },
       {
+        name: 'calendar.list',
+        description:
+          '列主人已有的日程（本地 + 订阅来的 .ics 合并看）。' +
+          '主人问"我这周有什么安排/明天忙不忙/最近有什么会"时先调它，别凭记忆答。' +
+          '也能用来确认某条事件的 uid 和来源（source=local 才改得动/删得掉）。',
+        params: {
+          window_days: '可选。往后看几天，默认 7，上限 365。问"这周"给 7，问"这个月"给 30。',
+          source: '可选。只看某个来源：local（本地自己加的）或某个订阅文件名；不给则全部。',
+        },
+        returns:
+          '返回 JSON：events（每条含 uid/summary/startMs/endMs/allDay/location/source）、count、text（已排好版的人话，可直接转告主人）。',
+        failures:
+          '读不到日历目录时返回空表而不是报错（主人本来就没有日历也算正常）。',
+      },
+      {
+        name: 'calendar.conflicts',
+        description:
+          '查未来 N 天有没有时间重叠（两场安排撞在一起）。' +
+          '**约时间之前先调它** —— 主人说"下周三下午三点和产品评审"时，先确认那个时段没别的安排，' +
+          '撞了就如实说撞了并给出替代时间，别默默加进去。',
+        params: {
+          window_days: '可选。往后看几天，默认 7，上限 365。',
+        },
+        returns:
+          '返回 JSON：conflicts（每对重叠事件）、count、text（人话描述，可直接转告）。count=0 表示这段时间没有冲突。',
+        failures:
+          '日历为空时 count=0，属正常，不代表调用失败。',
+      },
+      {
         name: 'calendar.add',
         description:
           '往主人的**本地日历**加一条日程（订阅来的 .ics 日历只读，加不进去）。' +
@@ -537,6 +585,43 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
         failures: 'BAD_ARG（缺 id）；写文件失败时返回系统错误原文。',
       },
   {
+    name: 'calendar.day',
+    description:
+      '查某一天到底上不上班。不依赖主人维护日历 —— 数据来自公开节假日表（含调休）。' +
+      '主人问"明天上班吗""这周六要补班吗""国庆放几天""下周一是不是节假日"时用它。' +
+      '返回里 answer 直接是「要上班/不用上班」，rest 是布尔同义值；' +
+      'makeupWorkday=true 表示这是调休补班的工作日（周末但得上班），要主动提醒。' +
+      'holidayName 源没给时是 null，那就只说"休息/上班"，别编节日名。' +
+      '只查**单日**用；问一段区间、补班安排、放假天数时改用 calendar.rest，别一天一天连着调。',
+    params: {
+      date: 'YYYY-MM-DD。省略则按今天。查"明天"要自己算出日期再传，别传"明天"两个字。',
+    },
+    returns:
+      'date / weekday 周几 / rest 是否休息 / answer「要上班|不用上班」/ legalHoliday 是否法定节假日 / weekend 是否周末 / makeupWorkday 是否补班 / holidayName 节日名（可能 null）。',
+    failures:
+      'HOLIDAY_SOURCE_DOWN：所有源都失败时返回，retryable=true，可以稍后重试（不要换个工具重试同一件事）。BAD_ARG：date 格式不是 YYYY-MM-DD，retryable=false。',
+  },
+  {
+    name: 'calendar.rest',
+    description:
+      '找出接下来哪几天连着休息，并附上那段窗口的天气。专答"什么时候适合出去玩/这个月还有没有长假"。' +
+      '返回 windows 是连休窗口（days 是天数，needsMakeup 提示那阵子要不要补班），' +
+      'weather 是第一个窗口的逐日天气（goodForOuting 已按降水/雷暴判过）。' +
+      '**它只给事实，不给景点**：具体去哪由你结合主人偏好（记忆里有没有提过想去哪、怕不怕冷、带不带娃）自己说。' +
+      '主人没说在哪个城市时，天气是按北京取的，必须在回复里讲明这是假设。' +
+      '问补班、放假这类问题**直接用它一次拿全**（makeupDays/holidayRuns），不要逐日调 calendar.day 试探。',
+    params: {
+      withinDays: '只看未来多少天内的窗口，默认 60，上限 400。问"下个月"就传 31。',
+      lookBackDays: '往回看多少天，默认 0。问"国庆哪天补班""今年放过哪几个假"这类**已公布**安排时传 60 以上，否则扫不到过去的日子。',
+      lat: '纬度。和 lon 一起给才生效；主人说了城市就查坐标传进来，别省。',
+      lon: '经度。和 lat 成对出现，只给一个不起作用。',
+    },
+    returns:
+      'windows[{start,end,days,holidays[],needsMakeup}] 未来连休窗口 / makeupDays[{date,weekday,forHoliday}] 补班日 / holidayRuns[{name,start,end,days}] 法定假期段 / weather[{date,tMax,tMin,desc,goodForOuting}] / assumedBeijing / note。',
+    failures:
+      'HOLIDAY_SOURCE_DOWN：节假日源全挂，retryable=true。天气单独失败时 weather 是空数组但 windows 仍然有效 —— 可以只报窗口、说天气没取到，不要当作整体失败。',
+  },
+  {
     name: 'github.notifications',
     description:
       '列出当前配置的 GitHub 账号的未读/最新通知：谁在哪个仓库 mention 了你、请你 review、' +
@@ -552,6 +637,7 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       'timeout / network：15s 超时或网络不通 —— 稍后重试；' +
       'http_401 / http_403：token 无效或配额耗尽（对照 rateLeft）—— 别原样重发。',
   },
+
   {
     name: 'github.issues',   // github.pulls 同形，把 issue 换成 PR
     description:
@@ -662,6 +748,60 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
     failures:
       'web_tool_error：ref 失效或元素不可见 —— 重新 web.snapshot 再试；' +
       'action 不合法：只支持上面列的那几个。',
+  },
+  {
+    name: 'memory.search',
+    description:
+      '按内容搜**过去所有对话**，返回命中片段 + 时间 + 是谁说的。' +
+      '**想不起"我们之前说过什么"就先搜它**——暗号、定过的方案、上次的报错原文、' +
+      '主人提过的偏好，全在库里。' +
+      '与 fs.grep 分工：fs.grep 搜 /dot/home 的文件（MEMORY.md、notes），' +
+      'memory.search 搜对话本身（包括已被挤出上下文的几百条历史）。' +
+      '**别直接说"我没有上下文"**——那是没搜就下结论。',
+    params: {
+      query: '要找回的内容。关键词比整句好使，中文按词切（"暗号"而不是"你还记得我上次说的那个暗号吗"）',
+      sinceDays: '只看最近 N 天，缺省搜全部历史',
+      limit: '回几条，缺省 8，最多 50',
+    },
+    returns:
+      '{ output }：命中条数 + 每条的时间/角色/片段（片段是命中词前后各留一段上下文，' +
+      '不是整条消息）。搜到之后如果要在文件里落地，再用 fs.read/fs.write。',
+    failures:
+      'search_failed：库读不了（少见）—— 换 fs.grep 搜 notes/ 兜底；' +
+      '结果为空：换关键词、放宽 sinceDays，或该事确实没发生过（那就直说不知道，别编）。',
+  },
+  {
+    name: 'search.web',
+    description:
+      '联网搜索，一次问多个源，返回标题 + 链接 + 摘要。' +
+      '**查价格、查新闻、查任何"网上有什么说法"首选它**：它走 argo 自己的多源通道，' +
+      '京东/淘宝/中关村在线这些直连打不开的站点它也能拿到摘要。' +
+      '比 web.snapshot 省事——不用先猜网址，直接得到若干候选链接再决定读哪篇。',
+    params: {
+      query: '搜索词，自然语言即可（"罗技 MX Master 3S 多少钱" 这种问句也行）',
+      limit: '要几条，缺省 5，最多 20',
+      time_range: '可选时间过滤：d=一天内、w=一周内、m=一月内',
+    },
+    returns:
+      '{ output }：编号清单，每条含标题、URL、摘要（摘要里常直接带价格和日期）。' +
+      '按编号挑一条，再用 search.fetch 读全文或 web.snapshot 打开它。',
+    failures:
+      'search_tool_error：argo 超时或该源全挂 —— 换个更短的 query 重试；' +
+      '结果为空：换成英文关键词或去掉过细的限定词。',
+  },
+  {
+    name: 'search.fetch',
+    description:
+      '把一个 URL 的正文抓成纯文本（不是浏览器，是服务端抓取 + 正文提取）。' +
+      '拿到 search.web 给的链接后，用它读内容最省上下文。' +
+      '对需要登录或重 JS 渲染的页面它可能返回空，那时改用 web.snapshot。',
+    params: {
+      url: '要抓的页面地址，必须 http(s)',
+    },
+    returns: '{ output }：该页正文文本（已去掉导航栏/广告等噪声，过长会截断）。',
+    failures:
+      'search_tool_error：抓取失败或页面是空响应 —— JS 重的站改走 web.snapshot；' +
+      '非 http(s)：只支持 http/https。',
   },
 ];
 
@@ -774,19 +914,18 @@ const KNOWN_PARAM_WORDS = new Set([
  * - 因此：搜索能力表达为 **net.get + 本手册**。主人若能提供自己的搜索端点（自建 SearxNG、
  *   公司内网检索、已付费的 API），模型直接 `net.get <那个端点>?...` 即可，不需要我们内置。
  */
-export const NET_SEARCH_GUIDE = `联网查资料的判据（没有内置搜索工具，用 net.get 自己拼 URL）：
-- 先问自己：这件事**必须**用今天的实时信息吗？代码/文档/本机文件里已有的，别联网。
-  联网会把主人问的问题发给外部服务——这是隐私代价，能省就省。
-- 出网默认关闭。若 net.get 返回 net_tools_disabled，说明主人没开；**不要**改用 shell curl 绕过去
-  （那是同一个出网行为，绕过治理），直接告诉主人"需要联网的话请设 DOTD_NET_TOOLS=get"。
-- 开了以后，优先直连**权威数据源**，而不是搜索引擎：
-  · 官方 API 的 JSON（如 https://api.github.com/repos/<owner>/<repo>/issues?state=open）
-  · 官方文档、RSS/Atom 订阅、sitemap、公开数据集
-  这些结果结构稳定、可解析、不会突然变成广告页。
-- 确实需要"搜索"时：主人若在 config 里给了搜索端点就用它；没有的话，**不要**去抓 google/bing
-  的网页（实测会被重定向到地区版、返回与查询无关的内容，还可能触发验证码），
-  而是直连你知道站点的 URL，或如实告诉主人"我查不到，需要你给一个搜索服务"。
-- 抓回来的 HTML 很长时：只读你需要的片段（fs.write 存档后 shell.run grep），别把整页塞进推理。`;
+export const NET_SEARCH_GUIDE = `联网查资料的判据（**首选 search.web**，2026-10-22 起走 argo）：
+- 先问自己：必须用今天的实时信息吗？本机文件/文档里有的，别联网——联网会把主人的
+  问题发给外部服务，能省就省。
+- **要搜就用 search.web**：查价格、新闻、口碑、评价，第一反应都是它，别自己拼 URL。
+  搜到编号后 → search.fetch 读正文（省上下文），JS 重的站改 web.snapshot。
+  别去抓 google/bing 的搜索页：实测会跳地区版、返回与查询无关的结果、还可能弹验证码。
+- **不必**用它的场合：已知确切 URL 的权威源——官方 API 的 JSON、官方文档、
+  RSS/Atom、sitemap。这些用 net.get 直连更准，结构也稳定。
+- search.web 与 net.get 是两条路：net.get 受 DOTD_NET_TOOLS 管，search.web **不吃**
+  这个开关。所以 net.get 报 net_tools_disabled 不代表不能联网——先试 search.web。
+  **不要**用 shell.run 去 curl（容器本就不通外网，是死路）。
+- 抓回的 HTML 很长时只读需要的片段（存档后 shell.run grep），别整页塞进推理。`;
 
 /**
  * 工具清单里发给模型的整体引导段（放在 system prompt 之后、工具定义之前使用，
@@ -794,22 +933,21 @@ export const NET_SEARCH_GUIDE = `联网查资料的判据（没有内置搜索�
  */
 export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额外接了自己的工具，见各自说明）：
 1. 看盘：fs.list（目录）→ fs.stat（在不在/多大）→ fs.read（读文本）。这是绝大多数任务的第一步。
-2. 写盘：fs.write（覆盖整篇；改文件前必须先 fs.read 原文再整篇写回）。
-   删除：fs.remove（先归档再删，可恢复；目录只删空的）。
-3. 命令：shell.run（grep/截取/处理大文件；有超时、不能联网、危险命令要审批）。
-   **读文档也用 shell.run**（不要用 fs.read——它只能读纯文本，二进制会被破坏）：
-   · PDF：\`pdftotext 文件.pdf -\` 直接打出文本；\`pdfinfo 文件.pdf\` 看页数/元信息
-   · Word(.docx) / Excel(.xlsx)：本质是 zip+xml，用 python3 解（zipfile 读内部 xml，正则或 ElementTree 取文本）
+   **想不起过去的事就搜**：对话本身用 memory.search（暗号/旧方案/上次报错，含已被挤出上下文的历史），文件用 fs.grep（MEMORY.md、notes/*.md，回路径+行号）。别直接说没上下文。
+2. 写盘：fs.write（整篇覆盖；改文件先 fs.read 原文再写回）。删：fs.remove（先归档，可恢复；只删空目录）。
+3. 命令：shell.run（截取/处理大文件；有超时、不能联网、危险命令要审批）。
+   **读文档也用 shell.run**（fs.read 只读纯文本，二进制会坏）：
+   · PDF：\`pdftotext 文件.pdf -\`；\`pdfinfo\` 看页数
+   · Word/Excel：zip+xml，python3 解（zipfile 读 xml）
    · 纯文本/代码/日志：fs.read 就够
-4. 网页（**不弹审批**）：读正文用 web.read（JS 页面也读得到；net.get 只有空壳）。
-       操作页面用 web.snapshot 取「元素+@eN 引用」→ web.act 用 @eN 点/填，做完自动回新清单。
-       老名字 browser.open/browser.snapshot/browser.act/browser.close/browser.screenshot 同一条引擎，照样能用。
-5. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 有副作用，谨慎。**出网默认关闭**。
-6. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
-   7. 邮件：mail.account.list 看接了哪些 → mail.list / mail.search / mail.read 收、搜、读 → mail.draft 起稿 → mail.send 真发（dangerous，必过主人审批）；接入 mail.account.add，移除 mail.account.remove。
-   8. 日历：calendar.add 记 → calendar.edit 改 → calendar.delete 删（写本地日历；订阅 .ics 只读）。约时间前先 calendar.conflicts 查冲突。
-   9. 连接器：github.notifications（GitHub 通知）/ github.issues / github.pulls（仓库 issue/PR 清单）/ rss.read（抓 RSS/Atom 源）。都是只读；没配 DOTD_GITHUB_TOKEN 时 GitHub 只能查公开仓。/ vault.sites（保险库条目名清单，配合 $vault:site:user 占位符用）。
-   10. 造工具：tool.create / tool.list / tool.invoke。
+4. 搜索（**不弹审批**）：search.web 查「标题+URL+摘要」，查价/新闻/口碑首选；读某条正文用 search.fetch。
+5. 网页（**不弹审批**）：读正文 web.read（JS 站也行）；操作走 web.snapshot 取 @eN → web.act 用 @eN 点/填。老名 browser.open、browser.snapshot、browser.act、browser.close、browser.screenshot 同样管用。
+6. 接口：net.get / net.post。能直接拿数据就别开浏览器；net.post 有副作用，谨慎。**出网默认关闭**。
+7. 定时：schedule.create（建）、schedule.list（看）、schedule.remove（停用；不是硬删，可恢复）。cron 是 5 段（分 时 日 月 周）。
+   8. 邮件：mail.account.list 看接了哪些 → mail.list、mail.search、mail.read 收搜读 → mail.draft 起稿 → mail.send 真发（dangerous，必审批）；接入 mail.account.add，移除 mail.account.remove。
+   9. 日历：calendar.list 看已有安排（本地+订阅），calendar.add、calendar.edit、calendar.delete 管本地日程，约前先查 calendar.conflicts。上班/调休问 calendar.day；「周末/假期哪天能出去玩、天气、几号放假」问 calendar.rest（连休窗口+逐日天气+补班日）。**别用 shell.run 去 date 或猜日期**，calendar.* 直接答。
+   10. 连接器：github.notifications（GitHub 通知）/ github.issues / github.pulls（仓库 issue/PR 清单）/ rss.read（抓 RSS/Atom 源）。都是只读；没配 DOTD_GITHUB_TOKEN 时 GitHub 只能查公开仓。/ vault.sites（保险库条目名清单，配合 $vault:site:user 占位符用）。
+   11. 造工具：tool.create / tool.list / tool.invoke。
       **写脚本前先看有没有「你已有的自造工具」**：对口就 tool.invoke，别重写。
       没对口但以后会重复 → tool.create 造一个。
 通用约定：
