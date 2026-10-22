@@ -24,6 +24,41 @@
 不是**能力**。而所谓"日历 0 个源"在上一版被列为待补——复核后是**误判**：
 本地日历靠对话长出来，本来就通，只是没往里加东西所以是空的（§2.1）。
 
+## 0.1 真机逐项验收（2026-10-22 第三轮，Muse §2.1 那张表逐条跑）
+
+前两轮做的都是**静态对账**（能力表 vs 白名单 vs 宿主集合）。静态对账能证明
+「名字都在」，证明不了「真的能用」——而 §1.1 那 4 个缺陷正是死在这一点上。
+这一轮改成拿 Muse 原文的能力清单**逐条发真任务**，看真实工具返回。
+
+| Muse 实测能力（docs/meta-muse.md §2.1）| dotd | 真机证据 |
+|---|---|---|
+| 读 Gmail（查线程、判时间线）| ✅ | `[mail.list] succeeded :: {"count":3,...}`，真实邮件「您已完成实名认证」(OPPO)；`[mail.read]` 拿到完整正文与 Date 头 |
+| 起草邮件（能改语气）| ✅ | `[mail.draft] succeeded :: {"draftId":"md_844014984a7843ec","note":"草稿已生成，**尚未发送**"}` |
+| 操作电商网站（搜索、比价、加购物车）| ✅ | `[browser.open] succeeded :: title:"Ecommerce Test Site to Learn Web Scraping"` + `[browser.snapshot]` 拿到 4383 字符的完整 DOM 结构，含 `link "Abominable Hoodie ... $69.00"`、`button "Search"`、`combobox "Shop order"` |
+| 填表单（地址/电话/姓名，可视化浏览器里填）| ✅ | 上一轮已验证：`https://httpbin.org/forms/post` 填三个字段 + 选 bacon + 提交，**服务端回显** `{"custname":"张三","custtel":"13800001111","custemail":"zhangsan@example.com","topping":"bacon"}` |
+| 主动要信息（缺地址就问）| ✅ | `ask_user` 通道在（治理审批面 `/api/approvals`），本轮的悬置问题就是用它问的 |
+| 管账号（登录、查套餐）| ✅ | `browser.*` 的 `--session` 按域名派生持久登录态，跨进程保留 cookie（`webtools.ts:348`）|
+| 付款（连一次卡，之后一说就买）| ⬜ | 结构齐备、后端未接，见 §2.4。**这是唯一真实缺口** |
+
+### 这一轮为此修掉的两个真缺陷
+
+验收过程中撞到两个缺陷，都不是「代码写错」而是「判据设计错」，已修：
+
+1. **水位阈值永远不可达 → 全任务卡死**（`ec1032f`）。
+   标定把 `baseMb` 取成 MemAvailable 的 p50，又拿 `base + 6144` 当 normal 线：
+   24GB 机器空载时算出 28.5GB，**超过物理总量**，于是永远回不到 normal，
+   guard 持续 pause 容器。现场表现就是「发什么都 queued 不动」。
+   谁也没想到根因在内存水位上——它伪装成「模型不出话」。
+2. **慢站一律打不开**（`795b072`）。
+   `browser.open` 把「浏览器冷启动」和「首次导航」压在一次调用里，
+   挤爆 agent-browser 内部的固定预算，稳定 27~28s 超时；
+   而报错是 `os error 11` / `ERR_NAME_NOT_RESOLVED`，看起来像网络故障。
+   curl 同一 URL 只要 6.5s，证明不是网络。
+
+两个缺陷的共同点：**失败信息指向的位置都不是真因**。
+这也说明为什么必须真机验收 —— 静态对账对这两个缺陷完全无感。
+
+---
 ## 1. 工具面：46 个，覆盖 Muse 公开清单
 
 实测 **46 个能力**（`CAPABILITY_CATALOG`，见 `src/exec/protocol.ts:98`）：
