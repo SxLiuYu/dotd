@@ -1025,6 +1025,27 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ⑥ EX（fleet 的唯一开关是 DOTD_FLEET，经 execConfigFromEnv 落到 ExecConfig.fleet；
   //     未设时 DEFAULT_EXEC_CONFIG.fleet='stub'。真 fleet 要求 daemon 跑在 WSL 里：
   //     dockerSocketPath 硬编码 /var/run/docker.sock，HttpRuntime 又走容器 IP:9223。）
+  // **stub 模式必须在启动时喊出来**（2026-10-22 真机血案）。
+  //
+  // 现场：`DOTD_FLEET` 没设 → fleet='stub'（types.ts:192 的默认值）→ ExecService
+  // 用的是 StubRuntime，一套**内存**文件系统。它把 fs.write 答得头头是道：
+  //
+  //   {"path":"/dot/home/notes/x.md","size":1545}
+  //
+  // 文件在真实容器里根本不存在，重启即蒸发。而进程照常服务、API 照常 200、
+  // 日志里只有业务日志 —— **没有任何一处提示「你现在跑的是假的」**。
+  //
+  // 代价是：一整轮「真机验收」全部作废。笔记、日历、mail 的读写证据全是内存里的
+  // 回显，和真实容器没有半点关系。这类事故不是靠更仔细就能避免的 ——
+  // 默认值本身就是陷阱，必须在启动时把它变成**看得见**的事实。
+  const execCfgNow = execConfigFromEnv();
+  if (execCfgNow.fleet === 'stub') {
+    log(
+      '[exec] ⚠️  fleet=stub：容器是**内存模拟**，fs/shell 的写入**不会落到任何真实文件系统**，重启即蒸发。' +
+        ' 真机验收必须 DOTD_FLEET=docker 启动（默认就是 stub，别拿它当验收环境）。',
+    );
+  }
+
   const exec = new ExecServiceImpl({
     db,
     bus,

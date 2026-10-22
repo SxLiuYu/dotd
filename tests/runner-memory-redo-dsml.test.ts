@@ -265,7 +265,25 @@ test('补写轮：提示词说「用 fs.write 写」，请求体就必须真的�
     assert.equal(redoToolChoice, 'auto', '给了工具就必须允许调用（tool_choice:auto），不能又设成 none');
 
     // 反向：白名单之外的一个都不能给。补写轮跑在任务收口后，不该再有任何副作用机会。
-    for (const forbidden of ['shell.run', 'net.get']) {
+    // **读类工具也不该给**（2026-10-22 真机第三修）。
+  //
+  // 原来给的是四个文件工具，想着「写之前先看看目录结构是合理的」。
+  // 真机抓到的补写轮是：`fs.read MEMORY.md` + `fs.list .` —— 一个 fs.write 都没有。
+  // 工具清单的形状本身就在暗示任务是什么，摆四个调查类工具它就去做调查了。
+  // 这一轮的任务是唯一的：把已经想清楚的经验写下来。
+  for (const forbidden of ['fs.read', 'fs.list', 'fs.stat']) {
+    assert.ok(
+      !redoToolNames.includes(forbidden),
+      `补写轮不该给 ${forbidden} —— 给了它就读文件去了，不会写。实际给了：${redoToolNames.join(',')}`,
+    );
+  }
+  assert.deepEqual(
+    redoToolNames.filter((n) => n.startsWith('fs.')),
+    ['fs.write'],
+    `补写轮的文件类工具应当只有 fs.write，实际：${redoToolNames.join(',')}`,
+  );
+
+  for (const forbidden of ['shell.run', 'net.get']) {
       assert.ok(!redoToolNames.includes(forbidden), `补写轮不该给 ${forbidden}，实际给了：${redoToolNames.join(',')}`);
     }
   } finally {

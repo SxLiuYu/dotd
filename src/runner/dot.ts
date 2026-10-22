@@ -1912,7 +1912,22 @@ export class DotRunner {
    * 另建一份就会像 §1.1 记的那些缺陷一样，两边迟早漂移。
    */
   private async redoToolSpecs(task: Task): Promise<Array<{ name: string; description?: string; parameters?: object }>> {
-    const ALLOWED = new Set(['fs.write', 'fs.read', 'fs.list', 'fs.stat']);
+    // **只给 fs.write，不给读类工具**（2026-10-22 真机第三修，同一现场）。
+    //
+    // 原来给的是 ['fs.write','fs.read','fs.list','fs.stat'] —— 心想「写之前先看看
+    // 目录结构是合理的」。结果真机抓到的补写轮是这样：
+    //
+    //   [39] fs.read MEMORY.md   failed
+    //   [40] fs.list .           succeeded
+    //
+    // 一个 fs.write 都没发。给它读的能力，它就去读；读完了觉得「材料还不够」，
+    // 这一轮就到 maxTokens 了。**工具清单的形状本身就在暗示任务是什么** ——
+    // 摆了四个调查类工具，它就去做调查了。
+    //
+    // 这一轮的任务是**唯一的**：把已经想清楚的经验写下来。要读什么，主循环里
+    // 早就读过了；真需要看目录，模型也可以直接写它要写的那个路径。
+    // 所以只给一个 fs.write，任务形状就无从歧义。
+    const ALLOWED = new Set(['fs.write']);
     try {
       const all = await this.toolSpecs(task);
       return all.filter((s) => ALLOWED.has(s.name));
