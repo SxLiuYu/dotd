@@ -15,7 +15,7 @@
  * 具体指令经注入的 execPorts 下发，未注入时只记资源事件。
  */
 
-import { freemem } from 'node:os';
+import { freemem, totalmem } from 'node:os';
 import type { DatabaseSync } from 'node:sqlite';
 import type { ControlPlaneConfig, ResourceEventLevel, ResourceEventRow } from './types.ts';
 import type { Queue } from './queue.ts';
@@ -48,6 +48,11 @@ export interface GuardDeps {
   exec?: ExecPorts;
   /** 宿主内存读数（WSL 内核视角；测试可注入假值）。缺省 = /proc/meminfo 语义的 freemem。 */
   readMem?(): { availableMb: number };
+  /**
+   * 物理内存总量（MB），用于给阈值做上限夹取。缺省 = os.totalmem()。
+   * 测试注入假值时一并注入总量，否则阈值夹取会用宿主机真实总量，造成跨机不确定。
+   */
+  readTotalMb?(): number;
   /** 环境变量表（缺省 process.env）；DOTD_GUARD_BASE_MB 钉基线用。 */
   env?: NodeJS.ProcessEnv;
 }
@@ -199,17 +204,63 @@ export class Guard {
     void this.applyContainerPolicy(next);
   }
 
-  /** 四档阈值：标定后用相对基线，未标定用兜底固定值。 */
+  /**
+   * 四档阈值：标定后用相对基线，未标定用兜底固定值。
+   *
+   * ⚠️ 2026-10-22 真机缺陷（阈值 > 物理总量 ⇒ 档位永远不可达）：
+   * 标定把 `baseMb` 取成 **MemAvailable 的 p50**（系统空闲时约等于总内存），
+   * 这里又用 `base + dotdReserveMb` 当 normal 线，于是：
+   *   24GB 机器、空载 MemAvailable≈22.4GB → normal 线 28.5GB > 总量 24GB。
+   * 「回到 normal」物理上不可能，guard 永久停在 throttled：
+   * 停 pop + pause 容器 → 任务全部卡死（现场 queue {queued:1, running:0}）。
+   * 而且这个错误**机器越空闲越严重**（可用量越大、门槛越高），自我否定。
+   *
+   * 修法：算完相对阈值后，按物理总量做上限夹取 —— 保证每一档在物理上都可达，
+   * 并留出 `dotdReserveMb` 的余量给 daemon 自己。夹取是纯防御：正常机器
+   * （baseMb 明显小于总量）不会触发，行为零变化。
+   *
+   * 为什么不改 baseMb 的语义（改成「基线占用」= 总量-可用）：
+   * 那会改动 §6.3 的全部判定口径与既有测试基线，风险远大于收益；
+   * 夹取只补一处上限，语义不动、既有行为不动。
+   */
   private thresholds(): { normalMb: number; guardedMb: number; throttledMb: number } {
     if (this.baseMb === null) {
       return { ...this.cfg.fallbackThresholds };
     }
     const base = this.baseMb;
-    return {
+    const raw = {
       normalMb: base + this.cfg.dotdReserveMb,
       guardedMb: base + 3 * 1024,
       throttledMb: base,
     };
+    return this.clampThresholdsToPhysical(raw);
+  }
+
+  /**
+   * 把三条水位线夹取到物理内存可达范围内（见 thresholds() 的缺陷说明）。
+   *
+   * 上限取 `总量 - dotdReserveMb`：normal 线不该要求「全部物理内存都空着」，
+   * 否则 daemon 自己一跑就又掉档，来回翻烧饼。下限取 0（内存极小的机器也不能出负数）。
+   */
+  private clampThresholdsToPhysical(t: {
+    normalMb: number;
+    guardedMb: number;
+    throttledMb: number;
+  }): { normalMb: number; guardedMb: number; throttledMb: number } {
+    const totalMb = this.readTotalMb();
+    if (!Number.isFinite(totalMb) || totalMb <= 0) return t;
+    const ceiling = Math.max(1, totalMb - this.cfg.dotdReserveMb);
+    const clamp = (v: number): number => Math.max(0, Math.min(v, ceiling));
+    return {
+      normalMb: clamp(t.normalMb),
+      guardedMb: clamp(t.guardedMb),
+      throttledMb: clamp(t.throttledMb),
+    };
+  }
+
+  private readTotalMb(): number {
+    if (this.deps.readTotalMb !== undefined) return this.deps.readTotalMb();
+    return Math.round(totalmem() / 1024 / 1024);
   }
 
   // ── 容器指令（CP §6.3 表；实施归 EX，契约 J5）────────────────────────
