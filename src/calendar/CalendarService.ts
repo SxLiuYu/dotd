@@ -126,11 +126,19 @@ export function listEvents(
     const localErrors: string[] = [];
     const localEvents = readLocalEvents(cfg, localErrors);
     for (const e of localErrors) errors.push(e);
-    if (localEvents.length > 0) {
-      sources.push({ name: 'local', path: localPath, eventCount: localEvents.length, errors: [] });
-      for (const e of localEvents) all.push({ ...e, source: 'local' });
-    } else if (sourceFilter === 'local') {
-      // 明确点名要看本地日历而文件还没有：如实说，别让主人以为"日程是空的"。
+    // **空日历也要登记成「一个源」**（2026-10-22 真机）。
+    //
+    // 原来只在有事件时才 push。于是空日历 + 无订阅 = `sources: []`。
+    // 模型看到这个返回，判断成了「我没有连接日历的权限，只有读写本地文件的能力」——
+    // 它明明刚调过 calendar.list，却因为这份返回**看不出日历是可用的**而自我否定，
+    // 转而给主人生成 .ics 文件。
+    //
+    // 空不等于不可用。源在册就是可用，`eventCount: 0` 已经说明它空着。
+    sources.push({ name: 'local', path: localPath, eventCount: localEvents.length, errors: [] });
+    for (const e of localEvents) all.push({ ...e, source: 'local' });
+    if (localEvents.length === 0 && sourceFilter === 'local') {
+      // 点名要看本地日历而它空着：补一句怎么才会长出来。
+      // （不点名时不加 error：空日历不是错误，不该污染 errors。）
       errors.push('local：本地日历还没有任何事件（' + localPath + ' 在首次 calendar.add 后自动创建）');
     }
   }
@@ -472,6 +480,17 @@ export function renderList(r: ListResult): string {
   const lines: string[] = [];
   if (r.events.length === 0) {
     lines.push('未来 ' + r.windowDays + ' 天没有日程。');
+    // **说清「哪些源在册」**（2026-10-22 真机）。
+    //
+    // 原来这一行说完就没了。模型读到「没有日程」，再一看没有 Google/Outlook 订阅，
+    // 就答「我没有连接日历的权限」——可它手上明明有 calendar.add，
+    // 返回里也明明有 local 这个源。
+    //
+    // 「没有日程」和「没有日历」是两件事。空着要说清是**哪个**日历空着。
+    const names = r.sources.map((s) => s.name);
+    if (names.length > 0) {
+      lines.push('（在册的日历：' + names.join('、') + '；其中 local 是可写入的本地日历）');
+    }
   } else {
     lines.push('未来 ' + r.windowDays + ' 天有 ' + r.events.length + ' 个日程：');
     lines.push('');

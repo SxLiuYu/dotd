@@ -161,7 +161,7 @@ test('补写轮：正文里的 DSML 调用必须被捞回并真的派发', async
   }
 });
 test('补写轮：提示词说「用 fs.write 写」，请求体就必须真的给 fs.write', async () => {
-  // 2026-10-22 真机缺陷：MEMORY_REDO_PROMPT 明说「如果有：用 fs.write 把它写进 notes/」，
+  // 2026-10-22 真机缺陷：memoryRedoPrompt 明说「如果有：用 fs.write 把它写进 notes/」，
   // 请求体却刻意**不带 tools**（old :2767 注释写着「不给它别的动作面」）。
   // 结果是自相矛盾：
   //   提示词：「用 fs.write 写进去」

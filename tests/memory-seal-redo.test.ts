@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { makeTempDataDir, makeStubTransport, sweepTempPaths } from './helpers.ts';
 import type { TempDataDir } from './helpers.ts';
 import { createControlPlane } from '../src/control-plane/index.ts';
-import { DotRunner, MEMORY_REDO_PROMPT } from '../src/runner/dot.ts';
+import { DotRunner, memoryRedoPrompt } from '../src/runner/dot.ts';
 import type { RunnerOptions } from '../src/runner/dot.ts';
 import { MemoryServiceImpl } from '../src/memory/MemoryService.ts';
 import { ExecServiceImpl } from '../src/exec/ExecService.ts';
@@ -191,7 +191,7 @@ async function makeRig(opts: {
   initGovernance(tmp.db, catalog, govDeps, govOpts as never);
 
   // ── 模型：一个小路由器，把"补写轮"与"主循环轮"区分开 ──
-  // 判据 = 请求里第一条 message 的 content 是否就是 MEMORY_REDO_PROMPT（补写轮的请求体
+  // 判据 = 请求里第一条 message 的 content 是否就是 memoryRedoPrompt（补写轮的请求体
   // 第一句就是我们写死的 system 文案）。这样断言"补写轮真的发了一次请求"不依赖调用次数。
   const mainTransport = makeStubTransport(opts.main as never);
   const requests: RouteRequest[] = [];
@@ -199,7 +199,7 @@ async function makeRig(opts: {
     async complete(req: RouteRequest): Promise<RouteResult> {
       requests.push(req);
       const first = req.messages[0];
-      const isRedo = first !== undefined && first.role === 'system' && first.content === MEMORY_REDO_PROMPT;
+      const isRedo = first !== undefined && first.role === 'system' && isRedoSystemContent(first.content);
       if (isRedo) {
         const r = opts.redo ?? { content: 'SKIP' };
         return {
@@ -309,9 +309,19 @@ const MAIN_NO_WRITE: StubResp[] = [
   { content: '读了一下资料' },
 ];
 
+/**
+ * 「这一条是不是补写轮」的判据。
+ *
+ * 原来直接比 `isRedoSystemContent(first.content)`。现在那是个函数（末句后面还要
+ * 接本任务的调用账，见 memoryRedoPrompt 的注释），所以改成比**句首那句**——
+ * 它是写死的常量，调用账只会出现在它后面。
+ */
+function isRedoSystemContent(content: string): boolean {
+  return content.startsWith('任务已经结束。现在做最后一件收尾动作');
+}
 function isRedoRequest(r: RouteRequest): boolean {
   const first = r.messages[0];
-  return first !== undefined && first.role === 'system' && first.content === MEMORY_REDO_PROMPT;
+  return first !== undefined && first.role === 'system' && isRedoSystemContent(first.content);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -330,7 +340,7 @@ test('① done + 未写记忆 → 补写轮真的发生了（额外一次模型�
   const prompt = redo[0]!.messages.map((m) => m.content).join('\n');
   assert.ok(prompt.includes('SKIP'), 'prompt 必须告诉模型"没有可沉淀的回 SKIP"');
   assert.ok(prompt.includes('notes/'), 'prompt 必须指明往哪写');
-  assert.ok(prompt.includes(MEMORY_REDO_PROMPT), 'system 段就是导出的常量（可测试）');
+  assert.ok(isRedoSystemContent(prompt), 'system 段就是那句写死的提醒（可测试）');
 });
 
 test('①b 顺序正确：补写轮发生在 cp.finish() **之前**（任务此刻仍是 running）', async () => {
@@ -529,7 +539,7 @@ test('⑤-b 显式传 memoryRedo:true → 补写轮真的发生（防"生产上�
   assert.equal(rig.requests.length, 2, '主循环 1 次 + 补写轮 1 次');
   // 且这一轮的 prompt 就是导出的提醒文案（不是别的什么请求）
   const redo = rig.requests.find(isRedoRequest)!;
-  assert.equal(redo.messages[0]!.content, MEMORY_REDO_PROMPT);
+  assert.ok(isRedoSystemContent(redo.messages[0]!.content), '就是补写轮那条 system');
 });
 
 test('⑤-c 生产装配（src/daemon.ts）确实显式传了 memoryRedo:true', async () => {
@@ -561,4 +571,39 @@ test('⑤-c 生产装配（src/daemon.ts）确实显式传了 memoryRedo:true', 
     /this\.memoryRedoEnabled = opts\.memoryRedo \?\? true/,
     '不得改回默认 true：那会给所有人的每个任务悄悄多加一轮 LLM 调用',
   );
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 补写轮也要摆事实：工具少 ≠ 能力少
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 2026-10-22 真机，第 6 轮。
+ *
+ * 主人说「用 calendar.add 加一条日程」，模型第 4/6/8 步**连续三次** calendar.add
+ * 成功，第 9 步还正确答「已经在日历里了，没重复添加」。
+ *
+ * 然后补写轮只留下 fs.write 一个工具，它答：
+ *
+ *   「我这个环境里没有 calendar.add 工具（当前可用工具只有文件读写和 shell），
+ *     所以这条日程我实际上并没有创建」
+ *
+ * ——刚刚用它干成了事，却在收尾轮把它否掉。
+ *
+ * 这跟 89 步那次是同一个病：**工具清单的形状被读成了能力清单**。
+ * 收口注记已经会摆事实了（usedToolsLine），补写轮还没摆。这条把它钉住。
+ */
+test('补写轮的提示词必须摆出「你刚才调过什么」', () => {
+  const p = memoryRedoPrompt('你在本任务里实际调用过这些工具：calendar.add ×3、fs.read ×1。');
+  assert.ok(
+    p.includes('calendar.add ×3'),
+    '调用账要原样出现在提示词里，否则模型会把「这轮只给了 fs.write」读成「我从来没调过日历工具」',
+  );
+  assert.ok(p.includes('SKIP'), '原有约束不能被这条挤掉');
+  assert.ok(p.includes('notes/'), '原有约束不能被这条挤掉');
+});
+
+test('调用账为空时也要给一句，不能留白', () => {
+  const p = memoryRedoPrompt('（还没有成功派发过工具）');
+  assert.ok(p.includes('（还没有成功派发过工具）'), '空也要有明确说法');
 });

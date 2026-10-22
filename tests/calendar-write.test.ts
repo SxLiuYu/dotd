@@ -256,3 +256,52 @@ test('非法输入一律 ok:false 且不写文件；订阅 .ics 在写路径上�
     t.cleanup();
   }
 });
+
+/**
+ * 空日历必须仍然登记成「一个可用的源」（2026-10-22 真机，第 6 轮）。
+ *
+ * 现场：主人说「帮我把季度复盘会加到日历里」，模型调 calendar.list 拿到
+ *
+ *   {"events":[],"sources":[],"windowDays":30,"errors":[],"text":"未来 30 天没有日程。"}
+ *
+ * 然后它答：
+ *
+ *   「我这个环境里没有连接日历的权限（只有读写本地文件的能力），
+ *     所以没法直接把日程写进你的日历。我帮你生成一个 .ics 文件…」
+ *
+ * ——它**刚调过 calendar.list**，`calendar.add` 也在白名单里，却因为这份返回
+ * 里 `sources` 是空数组而认定日历不可用，转而让主人自己去导文件。
+ *
+ * 根因：老代码只在 `localEvents.length > 0` 时才 push 源。空日历 + 没有订阅
+ * = `sources: []`。可 `sources: []` 读起来只有一个意思：**一个源都没有**。
+ *
+ * > 空不等于不可用。源在册就是可用，`eventCount: 0` 已经说明它空着。
+ */
+test('空本地日历也要出现在 sources 里：空 ≠ 不可用', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cal-empty-'));
+  try {
+    const cfg = { dir };
+    const r = listEvents(cfg, Date.now(), 30);
+
+    assert.equal(r.events.length, 0, '没有事件是对的');
+    assert.equal(r.sources.length, 1, '但必须有一个源，否则模型会以为日历没配');
+    assert.equal(r.sources[0]?.name, 'local');
+    assert.equal(r.sources[0]?.eventCount, 0, 'eventCount: 0 才是「空」的正确表达');
+    assert.equal(r.errors.length, 0, '空日历不是错误，不该写进 errors');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('点名要看 local 而它空着时，要说明怎么才会长出来', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cal-empty2-'));
+  try {
+    const cfg = { dir };
+    const r = listEvents(cfg, Date.now(), 30, 'local');
+    assert.equal(r.sources.length, 1);
+    assert.equal(r.errors.length, 1, '点名了就该给一句下一步，而不是沉默');
+    assert.match(r.errors[0] ?? '', /calendar\.add/, '要告诉主人写入动作是哪个');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

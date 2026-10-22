@@ -3005,7 +3005,12 @@ export class DotRunner {
     let seq = -1;
     let callId = '';
     try {
-      const begin = this.cp.journal.beginLlm(task.id, epoch, digestOf(MEMORY_REDO_PROMPT));
+      // **把本任务的调用账现算出来**：补写轮只留下 fs.write，模型会把
+      // 「这一轮没给日历工具」读成「我从来没有日历工具」，进而否定自己刚做成的事
+      // （2026-10-22 真机：三调 calendar.add 成功后，收尾轮答「环境里没有这个工具」）。
+      // 事实清单是唯一有效的解药——讲道理不管用，§0.1.5 已经证过。
+      const usedTools = this.usedToolsLine(task.id);
+      const begin = this.cp.journal.beginLlm(task.id, epoch, digestOf(memoryRedoPrompt(usedTools)));
       seq = begin.seq;
       callId = begin.callId;
       // **工具集：只给写记忆需要的几个**（2026-10-22 真机修）。
@@ -3027,7 +3032,7 @@ export class DotRunner {
         track: 'primary',
         tools: await this.redoToolSpecs(task),
         messages: [
-          { role: 'system', content: MEMORY_REDO_PROMPT },
+          { role: 'system', content: memoryRedoPrompt(usedTools) },
           {
             role: 'user',
             content:
@@ -3202,12 +3207,29 @@ const START_MAX_BACKOFF_MS = 60_000;
  * 内容就**只回 SKIP**（Runner 靠这个字面量判定"模型拒绝补写"，并据此记 missed 而不是
  * 再猜它写了没写——猜会退化成又一种"假提醒"）。
  */
-export const MEMORY_REDO_PROMPT = [
-  '任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。',
-  '如果有：用 fs.write 把它写进 notes/（过程与结论）或 manuals/（可复用的操作手册），',
-  '写法要能让以后的自己直接照着做；没有值得沉淀的内容时，只回复一个词：SKIP。',
-  '不要重复任务已经完成的内容，也不要执行任何与写记忆无关的动作。',
-].join('\n');
+export function memoryRedoPrompt(toolsUsed: string): string {
+  return [
+    // **先说清「你刚才调过什么」**（2026-10-22 真机，第 6 轮）。
+    //
+    // 现场：主人说「用 calendar.add 加一条日程」，模型第 4/6/8 步**连续三次**
+    // calendar.add 成功，第 9 步也正确答「已经在日历里了，没重复添加」。
+    // 然后补写轮只留下 fs.write 一个工具，它答：
+    //
+    //   「我这个环境里没有 calendar.add 工具（当前可用工具只有文件读写和 shell），
+    //     所以这条日程我实际上并没有创建」
+    //
+    // 它刚刚用那个工具干成了事，却在收尾轮把它否掉。这是 §0.1.5 那个病的
+    // 另一半：收口注记已经会摆事实了，**补写轮还没摆**。
+    //
+    // 工具清单的形状在暗示任务（见 redoToolSpecs 注释），但工具少不等于能力少；
+    // 不把账摆出来，模型会把「这轮没给」读成「我从来没有」。
+    '任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。',
+    toolsUsed,
+    '如果有：用 fs.write 把它写进 notes/（过程与结论）或 manuals/（可复用的操作手册），',
+    '写法要能让以后的自己直接照着做；没有值得沉淀的内容时，只回复一个词：SKIP。',
+    '不要重复任务已经完成的内容，也不要执行任何与写记忆无关的动作。',
+  ].join('\n');
+}
 
 // ── 流式增量上总线（roadmap P0-2）────────────────────────────────────────────
 
