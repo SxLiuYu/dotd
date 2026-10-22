@@ -330,6 +330,28 @@ export function normalizeResultForRepeatForTest(value: unknown): string {
   return normalizeResultForRepeat(value);
 }
 
+/**
+ * 把「按 (工具,参数) 记的调用账」压成 `web.act ×9、browser.open ×1`（2026-10-22）。
+ *
+ */
+export function usedToolsSummary(
+  bucket: ReadonlyMap<string, { count: number }> | undefined,
+): string {
+  if (bucket === undefined || bucket.size === 0) return '（还没有成功派发过工具）';
+  const tally = new Map<string, number>();
+  for (const [key, rec] of bucket) {
+    // key 形如 `web.act::[...]`，工具名在 `::` 之前。
+    // indexOf 找不到时是 -1，slice(0, -1) 会**悄悄切掉一个字符** —— 宁可显示原名也别截错。
+    const sep = key.indexOf('::');
+    const name = sep < 0 ? key : key.slice(0, sep);
+    tally.set(name, (tally.get(name) ?? 0) + rec.count);
+  }
+  return [...tally.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, n]) => `${name} ×${n}`)
+    .join('、');
+}
+
 export function repeatSignatureForTest(argumentsJson: string): string {
   return repeatSignature(argumentsJson);
 }
@@ -365,18 +387,6 @@ function repeatSignature(argumentsJson: string): string {
     const entries = Object.entries(obj as Record<string, unknown>)
       .filter(([k]) => !IGNORED.has(k))
       .map(([k, v]) => {
-        // **ref 编号必须归一化**（2026-10-22 真机，填表任务 64 步）。
-        //
-        // browser/web 的 `@e83` 是「第几号快照里的第几个元素」的**位置编号**，
-        // 每拍一次快照整体上移。现场模型把同样三个字段填了 5 遍：
-        //   @e18/@e19/@e20 → @e34/@e35/@e36 → @e51/... → @e67/... → @e83/...
-        // 每一轮 args 里的 ref 都不同 ⇒ 每轮一个新 key ⇒ rec.count 永远累积不起来。
-        //
-        // 这与第五轮 deny 账本同源：**模型改一个无关参数就换了一个账本**。
-        // ref 和 timeout_ms、path 前缀一样，是「换个说法指同一个东西」。
-        if (k === 'ref' && typeof v === 'string') {
-          return [k, v.replace(/\d+/g, '#')] as [string, unknown];
-        }
         // **路径参数也要归一化**（2026-10-18 实测）：g1.txt 与 /dot/home/g1.txt 指向同一文件，
         // 但原样比较是两个不同签名 → 护栏数不到重复。实测就是这样让同文件被写了 8 次。
         if (k === 'path' && typeof v === 'string') {
@@ -1437,11 +1447,32 @@ export class DotRunner {
             // 而真相是：前几轮的 browser.snapshot 结果就在上文，商品名和价格都在里面。
             // 收口轮之所以摘掉工具（:1505），是物理上不让它再重复，不是它没有能力。
             // 所以这里必须显式告诉它：材料在上文，从那里取，别再调工具。
+            // **把「你这个任务确实用过哪些工具」摆出来**（2026-10-22 真机第二轮）。
+            //
+            // 上一版只写了「材料在上文」「别再说没有工具」，真机仍然答：
+            //   「我只有文件读写工具，没有浏览器控制能力，也没有任何执行记录」
+            // 而它第 35 步刚拿到 `— 当前页面 — https://httpbin.org/post`。
+            //
+            // 光劝不管用——得给它**具体证据**：这些工具名、这些次数，就是它自己调过的。
+            // 数据现成：repeatGuard 里按 taskId 记着每个 (工具,参数) 的调用次数。
+            `你在本任务里实际调用过这些工具：${this.usedToolsLine(session.id)}。` +
             '你已经反复调用同一个工具，且每次都返回一样的结果——这一步已经做完了。' +
               '注意：**前几轮的工具返回结果就在上面的对话里**，你要的答案通常已经在其中，' +
               '不要再说「我没有某个工具」，也不要再调用任何工具。' +
               '现在请直接从上文的工具结果中提取信息，给出最终结论；' +
-              '如果确实拿不到，就说明你已经查到了什么、还差什么。',
+              '如果确实拿不到，就说明你已经查到了什么、还差什么。' +
+              // **还要提醒它「可能早就成功了」**（2026-10-22 真机，填表任务）。
+              //
+              // 现场：模型在 httpbin 表单页点提交 → 页面跳到 /post（POST 结果页）。
+              // 它反复重填同一个表单，收口时答：
+              //   「我这边没有可用的浏览器或网络请求工具，所以没法真的打开那个页面」
+              // ——而上一轮的工具返回里明明白白写着 `— 当前页面 — https://httpbin.org/post`。
+              //
+              // 「没有工具」是它的归因；真相是**它早就做成了，只是没认出成功的样子**。
+              // 所以收口注记要正面点出这个可能，否则它会把自己的成功判成失败。
+              '另外一种很常见的情况：**你其实已经做成了，只是没认出成功的标志**' +
+              '（比如页面跳到结果页、返回里出现回显数据、命令退出码 0）。' +
+              '如果是这样，请直接说明「已完成」并给出你看到的证据，不要声称自己没做到。',
           );
           break;
         }
@@ -2101,6 +2132,18 @@ export class DotRunner {
    * 不会撞这条判据；撞到的是**完全相同的 工具+参数**，那种情况第 3 次基本不可能是必要的。
    * 但保守起见，先软后硬，给模型一次自我纠正的机会。
    */
+  /**
+   * 「这个任务实际用过哪些工具」，形如 `web.act ×9、browser.open ×1`（2026-10-22）。
+   *
+   * 为什么需要它：收口轮会摘掉工具清单（:1505 的物理强制），模型于是把自己读成
+   * 「没有任何工具」——真机原话「我只有文件读写工具，没有浏览器控制能力」。
+   * 而证据一直在：它自己调过 web.act 九次、最后一次还拿到了结果页 URL。
+   *
+   * 讲道理没用（上一版注记劝过，模型照旧否认），**摆事实才行**。
+   */
+  private usedToolsLine(taskId: string): string {
+    return usedToolsSummary(this.repeatGuard.get(taskId));
+  }
   private checkRepeat(
     call: { id: string; name: string; arguments: string },
     ctx: RunContext,

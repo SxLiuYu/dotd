@@ -384,3 +384,32 @@ test('会话继承：anon 显式无痕不被记进继承表', async () => {
     assert.doesNotMatch(snap.output ?? '', /--session/, 'anon 之后不该继承出登录态 session');
   });
 });
+
+
+test('agent-browser 退出码 0 但输出 ✗ 时，必须判失败（2026-10-22 真机）', async () => {
+  // 现场：填表任务点 `button[type="submit"]`，agent-browser 输出
+  //   `✗ Element not found: button[type="submit"]. Verify the selector…`
+  // 而**退出码是 0**。老代码只看 code，于是回一句 `✓ Done`。
+  // 模型以为点了 5 次提交，其实一次都没点中，最后判定「我没有浏览器能力」——
+  // 前 28 步全白做。
+  //
+  // 同一份输出还曾被 friendlyFailure 判成「agent-browser 不可用：请确认已安装」，
+  // 因为老正则 `/ENOENT|not found/i` 把 `Element not found` 也吞了。
+  await withBin('echo "✗ Element not found: button"', async (m) => {
+    const r = await m.webAct({ action: 'click', ref: '@e1' });
+    assert.equal(r.ok, false, '退出码 0 但输出 ✗ 的调用不能报成功');
+    assert.match(r.error ?? '', /没找到这个元素/, '要说清是页面元素没了，不是环境没装');
+    assert.doesNotMatch(r.error ?? '', /请确认已安装/, '不能把元素不存在误报成没装');
+  });
+});
+
+test('元素不存在时不要谎报「agent-browser 没装」', async () => {
+  // 真机第二次踩：点 submit 报「请确认已安装」，紧接着 browser.open 又成功。
+  // 环境明明是好的，一句假话就足以让模型放弃整个任务。
+  await withBin('echo "✗ Element not found: button[type=submit]"', async (m) => {
+    const r = await m.webAct({ action: 'fill', ref: '@e9', text: 'x' });
+    assert.equal(r.ok, false);
+    assert.doesNotMatch(r.error ?? '', /npm i -g agent-browser/);
+    assert.match(r.error ?? '', /web\.snapshot|重新取/, '要给出可执行的下一步');
+  });
+});

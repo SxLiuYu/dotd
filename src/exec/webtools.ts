@@ -158,14 +158,60 @@ function identityOf(args: Record<string, unknown>, taskKey?: string): unknown {
 
 /** agent-browser 没装好时给一条能自己修的话，而不是干巴巴的 ENOENT。 */
 function friendlyFailure(stderr: string, code: number): string {
-  if (/ENOENT|not found/i.test(stderr)) {
+  // **`not found` 不等于「没装」**（2026-10-22 真机，提交那一步炸了）。
+  //
+  // agent-browser 找不到元素时输出：
+  //   `✗ Element not found: button[type="submit"]. Verify the selector…`
+  // 老正则 `/ENOENT|not found/i` 把它判成「agent-browser 不可用：请确认已安装」，
+  // 于是模型以为环境坏了、放弃任务——而真相只是选择器没匹配上。
+  //
+  // 真机现场：点 submit 报「请确认已安装」，紧接着 browser.open 又成功。
+  // 这一句假话直接毁掉了整个填表任务（前 28 步全白做）。
+  if (/ENOENT/i.test(stderr)) {
     return `${BIN} 不可用：请确认已安装（npm i -g agent-browser && agent-browser install --with-deps）`;
+  }
+  // 元素没找到：这是**页面的问题**，不是环境的问题，必须说清楚。
+  if (/Element not found/i.test(stderr)) {
+    return (
+      '没找到这个元素——页面结构和快照时不一样了。' +
+      '先用 web.snapshot 重新取一份（ref 会变），再用新的 ref 操作；' +
+      '也可以用 browser.snapshot 看完整结构确认选择器。'
+    );
   }
   if (/Chrome not found|executable-path/i.test(stderr)) {
     return 'agent-browser 找不到 Chrome：运行 agent-browser install 下载（首次约 190MB）';
   }
   const first = stderr.trim().split('\n').slice(0, 6).join('\n');
   return first === '' ? `agent-browser 退出码 ${code}` : first;
+}
+
+/**
+ * 这次调用算不算失败（2026-10-22 真机）。
+ *
+ * **agent-browser 出事时退出码常常还是 0**，失败只写在 stdout 开头：
+ *   ✗ Element not found: button["type=submit"]. Verify the selector…
+ * 老代码一律只看 `code !== 0`，于是把失败当成功，回一句 `✓ Done`。
+ *
+ * 真机代价：填表任务点了 5 次"提交"其实一次都没点中，
+ * 模型最后判定「我没有浏览器能力」，前 28 步全白做。
+ */
+/**
+ * 每个浏览器 session 上一次见到的 URL（2026-10-22）。
+ *
+ * 用来判断「刚才这个动作把页面带走了吗」—— 地址变了就是动作生效的最硬证据。
+ * 按 session 分开记：同一任务可能有匿名页和登录页两个上下文。
+ */
+const lastUrlBySession = new Map<string, string>();
+function isFailure(r: { code: number; stdout: string; stderr: string }): boolean {
+  if (r.code !== 0) return true;
+  const said = r.stdout.trim();
+  return said.startsWith('✗') || /Element not found/i.test(said);
+}
+
+/** 把一次失败的调用转成人话错误。 */
+function failureOf(r: { code: number; stdout: string; stderr: string }): WebResult {
+  const raw = r.stderr.trim() === '' ? r.stdout : r.stderr;
+  return { ok: false, error: friendlyFailure(raw, r.code) };
 }
 
 /**
@@ -184,15 +230,13 @@ export async function webSnapshot(args: Record<string, unknown>): Promise<WebRes
     const url = safeUrl(rawUrl);
     if (url === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
     const opened = await run(['open', url], session);
-    if (opened.code !== 0) {
-      return { ok: false, error: friendlyFailure(opened.stderr, opened.code) };
-    }
+    if (isFailure(opened)) return failureOf(opened);
+    // 记下起点，这样紧接着的 web.act 才能判断「页面有没有被带走」。
+    lastUrlBySession.set(session ?? '', url);
   }
 
   const snap = await run(interactive ? ['snapshot', '-i'] : ['snapshot'], session);
-  if (snap.code !== 0) {
-    return { ok: false, error: friendlyFailure(snap.stderr, snap.code) };
-  }
+  if (isFailure(snap)) return failureOf(snap);
   const out = clip(snap.stdout.trim());
   if (out === '' || out === '(empty page)') {
     return {
@@ -214,14 +258,30 @@ export async function webSnapshot(args: Record<string, unknown>): Promise<WebRes
  */
 export async function webRead(args: Record<string, unknown>): Promise<WebResult> {
   const rawUrl = typeof args['url'] === 'string' ? args['url'] : '';
-  if (rawUrl === '') return { ok: false, error: '缺少 url 参数' };
-  const url = safeUrl(rawUrl);
-  if (url === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
+  const session = sessionOf(args['identity']);
 
-  const r = await run(['read', url], sessionOf(args['identity']));
-  if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+  // **没有 url 时读「当前页」，不要重新发 GET**（2026-10-22 真机）。
+  //
+  // 现场：模型在 httpbin 表单页点了提交 → 跳到 /post（POST 的结果页）。
+  // 它想确认结果，于是调 web.read({url:'https://httpbin.org/post'})，
+  // 而老的 webRead 一律 `agent-browser read <url>` —— 那是一次**新的 GET**，
+  // httpbin 的 /post 只收 POST ⇒ 405。
+  // 模型拿到「✗ Read failed with HTTP 405」，判定提交失败，重新打开表单又填一遍。
+  //
+  // 页面本来就在浏览器里渲染着（且带着 POST 的响应），直接读当前页就对了。
+  // 只有显式给了 url 才导航——那时调用方确实想换页。
+  let url = '';
+  if (rawUrl !== '') {
+    const safe = safeUrl(rawUrl);
+    if (safe === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
+    url = safe;
+  }
+
+  const r = url === '' ? await run(['read'], session) : await run(['read', url], session);
+  if (isFailure(r)) return failureOf(r);
   const out = clip(r.stdout.trim());
-  if (out === '') return { ok: true, output: `（${url} 没有可读正文——可能是空页面或需要登录）` };
+  const where = url === '' ? '当前页' : url;
+  if (out === '') return { ok: true, output: `（${where} 没有可读正文——可能是空页面或需要登录）` };
   return { ok: true, output: out };
 }
 
@@ -256,14 +316,62 @@ export async function webAct(args: Record<string, unknown>): Promise<WebResult> 
 
   const session = sessionOf(args['identity']);
   const r = await run(argv, session);
-  if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+  if (isFailure(r)) return failureOf(r);
 
-  // 操作后页面可能变了：顺手回一份新快照，省掉模型再调一次。
-  // 失败不影响动作本身的结果（有些动作本来就会跳转走）。
+  // **失败不能只看退出码**（2026-10-22 真机，实测）。
+  //
+  // agent-browser 找不到元素时：退出码 **0**，失败写在 stdout 里：
+  //   `✗ Element not found: button[type="submit"]. …`
+  // 于是老代码把它当成功，回一句 `✓ Done` —— 模型以为点了，其实没点。
+  // 填表任务因此反复"提交"却原地不动，最后判定自己没能力。
+  //
+  // 判据：输出以 `✗` 开头（agent-browser 的失败记号），或者带上 Element not found。
+  const said = r.stdout.trim();
+  if (said.startsWith('✗') || /Element not found/i.test(said)) {
+    return { ok: false, error: friendlyFailure(said, 0) };
+  }
+
+  // **先取 URL，再取快照**（2026-10-22 真机，顺序踩过坑）。
+  //
+  // 现场：点提交后返回里同时出现
+  //   `— 操作后的可交互元素 —` 还是**提交前的表单**
+  //   `— 当前页面 — https://httpbin.org/post`（已经跳走了）
+  // 一份自相矛盾的材料。模型据此认为「还没提交」，重新打开表单又填一遍。
+  //
+  // 原因很简单：click 触发的跳转还没生效，`snapshot` 就先跑了；等 `get url` 时
+  // 页面才跳完。**先查 URL 后取快照**，两者才都反映跳转之后的状态。
+  const before = lastUrlBySession.get(session ?? '');
+  const urlAfter = await run(['get', 'url'], session);
   const after = await run(['snapshot', '-i'], session);
   const tail = after.code === 0 ? clip(after.stdout.trim()) : '';
+  const nowUrl = urlAfter.code === 0 ? urlAfter.stdout.trim() : '';
+
+  // **必须报出当前 URL**（2026-10-22 真机：填表任务提交成功后模型看不见）。
+  //
+  // 现场：模型 click 了 "Submit order"，httpbin 跳到了 JSON 结果页。
+  // 那里的快照只剩一个 `checkbox "Pretty-print"` —— 正确、但**看不出是结果页**。
+  // 于是模型以为没提交成功，重新 open 表单、又填了一遍，跑 64 步。
+  // 而表单其实早就提交了，服务端也回显了。
+  //
+  // 只要把「现在在哪个 URL」说清楚，`/post` 这个跳转就是铁证。
+  // 这和 §0.1 那次「收口轮说不清你有什么」是同一类：模型不是不会做，是看不见现状。
+  // **明说「跳转了」**，不要只丢一个 URL 让模型自己体会。
+  //
+  // 真机：只给 URL 时模型照样不认;它要的是一句「这一步成功了」。
+  // 地址变了 = 动作生效了，这是最硬的证据。
+  const moved = nowUrl !== '' && before !== undefined && before !== nowUrl;
+  const where =
+    nowUrl === ''
+      ? ''
+      : `\n\n— 当前页面 —\n${nowUrl}` +
+        (moved
+          ? `\n（操作前是 ${before}，**页面已经跳转**——这说明动作生效了，` +
+            '不要重复提交同一步，直接看下面的内容判断结果。）'
+          : '');
+  if (nowUrl !== '') lastUrlBySession.set(session ?? '', nowUrl);
   const head = r.stdout.trim() === '' ? `已执行 ${action}` : clip(r.stdout.trim());
-  return { ok: true, output: tail === '' ? head : `${head}\n\n— 操作后的可交互元素 —\n${tail}` };
+  const body = tail === '' ? head : `${head}\n\n— 操作后的可交互元素 —\n${tail}`;
+  return { ok: true, output: body + where };
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -371,9 +479,9 @@ export async function legacyBrowser(
     // 代价是多一次子进程调用（约几十毫秒）；收益是所有慢站都能打开。
     // 已起过的 session 上是幂等的（open 无 URL 只是确保浏览器在跑）。
     const boot = await run(['open'], session);
-    if (boot.code !== 0) return { ok: false, error: friendlyFailure(boot.stderr, boot.code) };
+    if (isFailure(boot)) return failureOf(boot);
     const r = await run(['open', url], session);
-    if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+    if (isFailure(r)) return failureOf(r);
     // 老的 browser.open 返回 {url,title}；这里给同样的信息，历史调用方不用改。
     const title = r.stdout.trim().split('\n')[0]?.replace(/^[\s✓]+/, '') ?? '';
     return {
@@ -398,7 +506,7 @@ export async function legacyBrowser(
       // 拿不到卷路径不阻断截图：退回 agent-browser 自己的临时目录，
       // 并在返回里说清"这张图不会被自动推送"，别让人以为推送坏了。
       const r = await run(['screenshot'], session);
-      if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+      if (isFailure(r)) return failureOf(r);
       return {
         ok: true,
         output: `${r.stdout.trim()}\n（提示：没能定位容器 home 卷，此图不会随回复自动推送）`,
@@ -407,7 +515,7 @@ export async function legacyBrowser(
     const name = `shot-${Date.now().toString(36)}.png`;
     const abs = `${home}/screenshots/${name}`;
     const r = await run(['screenshot', abs], session);
-    if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+    if (isFailure(r)) return failureOf(r);
     // 与容器版同形：{path: '/dot/home/screenshots/...'}，screenshot-push 靠这个字段取值
     const homePath = `${SCREENSHOT_DIR_IN_HOME}/${name}`;
     const size = await statSize(abs);
@@ -421,7 +529,7 @@ export async function legacyBrowser(
     const r = await run(['close'], session);
     // 页面关了，继承就没意义了；不清会让下一次 snapshot 指向一个已销毁的 session
     if (taskKey !== undefined) lastIdentityByTask.delete(taskKey);
-    if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+    if (isFailure(r)) return failureOf(r);
     return { ok: true, output: '已关闭' };
   }
 
@@ -447,6 +555,6 @@ export async function legacyBrowser(
   }
 
   const r = await run(argv, session);
-  if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
+  if (isFailure(r)) return failureOf(r);
   return { ok: true, output: r.stdout.trim() === '' ? `已执行 ${action}` : clip(r.stdout.trim()) };
 }

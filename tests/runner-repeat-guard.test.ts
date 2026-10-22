@@ -129,45 +129,79 @@ test("判据是「结果没变化」而非单纯次数：结果一致的重复�
     '必须有这条判据的说明（否则后来人会把次数当唯一判据又踩一遍）',
   );
 });
-test('填表：同一批元素在不同快照里的 ref 编号不同，不算「换了动作」', async () => {
-  // 2026-10-22 真机，真实 docker + 真实浏览器，填 httpbin 表单跑了 64 步。
+test('ref 编号**不能**归一化：它不是"换个说法"，是"哪个元素"', async () => {
+  // 2026-10-22 真机踩过的坑，写下来防止再犯。
   //
-  // 模型把**同样三个字段填了 5 遍**，args 长这样：
-  //   {"action":"fill","ref":"@e18","text":"张三"}
-  //   {"action":"fill","ref":"@e34","text":"张三"}
-  //   {"action":"fill","ref":"@e51","text":"张三"}
-  //   {"action":"fill","ref":"@e67","text":"张三"}
-  //   {"action":"fill","ref":"@e83","text":"张三"}
+  // 填表任务跑了 64 步，模型把同样三个字段填了 5 遍。args 里 ref 每轮都变
+  // （@e18 → @e34 → @e51 → @e67 → @e83），看起来完全符合「模型换个说法换本账」
+  // 那个模式，于是我把 ref 也归一化了（\\d+ → #）。
   //
-  // 同一个输入框，每次快照后编号整体上移。按 (工具, 原始参数) 记账，
-  // 每一轮都是**新 key**，rec.count 永远到不了阈值，护栏全程沉默。
+  // **单元测试全绿，真机立刻错**。因为 ref 不是措辞，是**元素身份**：
+  //   {"action":"check","ref":"@e104"}   → radio "Large"
+  //   {"action":"check","ref":"@e105"}   → checkbox "Bacon"
+  // 归一化之后这两条签名相同 ⇒ 「勾选 Large 再勾选 Bacon」被当成同一个动作重复，
+  // 护栏会在第 3 次误报"你在原地打转"，把正常的表单填写打断。
   //
-  // 这与第五轮 deny 账本（参数里塞 description 换措辞）是同一种病：
-  // **模型改一个与语义无关的参数，就换了一本账**。
-  // 修法也一样：把「换个说法指同一个东西」的参数归一化掉。
+  // 正确归因：ref 之所以每轮都变，是因为**模型每次重新快照后拿到新编号**，
+  // 而它之所以反复重新快照，是因为提交成功后看不见「页面已经跳走了」——
+  // 那是 web.act 不报当前 URL 的缺陷，不是签名的问题。修错了层级。
+  //
+  // > 判据只能抹掉"换了说法指同一个东西"的差异。
+  // > 抹掉"指不同东西"的差异，就会把正常操作判成打转。
   const { repeatSignatureForTest } = await import('../src/runner/dot.ts');
   const sig = (json: string): string => repeatSignatureForTest(json);
-  const at = (ref: string): string => `{"action":"fill","ref":"${ref}","text":"张三"}`;
 
-  const shapes = ['@e18', '@e34', '@e51', '@e67', '@e83'];
-  const first = sig(at(shapes[0]!));
-  for (const r of shapes.slice(1)) {
-    assert.equal(
-      sig(at(r)),
-      first,
-      `ref ${r} 与 ${shapes[0]} 指向同一个输入框，签名必须相同（否则护栏数不到重复）`,
-    );
-  }
-
-  // 但不能抹过头：动作或内容不同，必须仍然是不同签名
   assert.notEqual(
-    sig('{"action":"fill","ref":"@e18","text":"李四"}'),
-    first,
-    '填的内容不同 → 必须是不同签名',
+    sig('{"action":"check","ref":"@e104"}'),
+    sig('{"action":"check","ref":"@e105"}'),
+    '勾选 Large 与勾选 Bacon 是**不同元素**，签名必须不同（否则正常填表被误判成打转）',
   );
   assert.notEqual(
-    sig('{"action":"click","ref":"@e18"}'),
-    sig(at('@e18')),
-    '动作不同 → 必须是不同签名',
+    sig('{"action":"fill","ref":"@e18","text":"张三"}'),
+    sig('{"action":"fill","ref":"@e34","text":"张三"}'),
+    'ref 不同就是不同元素，签名必须不同',
   );
+  // 仍然必须归一化的是这些「换个说法指同一个东西」的参数
+  assert.equal(
+    sig('{"path":"g1.txt"}'),
+    sig('{"path":"/dot/home/g1.txt"}'),
+    'path 的同义前缀仍须归一化（2026-10-18 的原缺陷）',
+  );
+  assert.equal(
+    sig('{"command":"ls","timeout_ms":5000}'),
+    sig('{"command":"ls","timeout_ms":9000}'),
+    'timeout 仍须忽略（不影响"做了什么"）',
+  );
+});
+
+test('收口注记要摆出「实际调用过哪些工具」——空口劝没用，得给事实', async () => {
+  // 2026-10-22 真机两轮，同一个病：
+  //
+  // 第 35 步 web.act 返回里明明写着 `— 当前页面 — https://httpbin.org/post`（提交成功）,
+  // 但模型在收口轮（工具清单被摘掉）答：
+  //   「我只有文件读写工具，没有浏览器控制能力，也没有任何执行记录」
+  //
+  // 第一版注记只是劝：『材料在上文』『别再说没有工具』——真机无效，模型照旧否认。
+  // 第二版才想到：repeatGuard 里本来就记着它调过什么，**摆出来**即可。
+  //
+  // > 模型不是不肯承认，是手上真没有一份「我做过什么」的清单。给它清单。
+  const { usedToolsSummary } = await import('../src/runner/dot.ts');
+
+  const bucket = new Map<string, { count: number }>([
+    ['web.act::[["action","fill"]]', { count: 6 }],
+    ['web.act::[["action","click"]]', { count: 3 }],
+    ['browser.open::[["url","https://httpbin.org/forms/post"]]', { count: 1 }],
+  ]);
+  const line = usedToolsSummary(bucket);
+  assert.match(line, /web\.act ×9/, '同类工具要合并计数：6+3=9');
+  assert.match(line, /browser\.open ×1/);
+  assert.ok(line.indexOf('web.act') < line.indexOf('browser.open'), '按次数从多到少排');
+
+  // 空账：不能吐出空串（否则注记里会出现「实际调用过这些工具：。」）
+  assert.match(usedToolsSummary(new Map()), /还没有/);
+  assert.match(usedToolsSummary(undefined), /还没有/);
+
+  // 没有 `::` 的脏键：必须原样显示，不能 slice(0,-1) 悄悄截掉一个字符
+  const dirty = new Map<string, { count: number }>([['web.act', { count: 2 }]]);
+  assert.equal(usedToolsSummary(dirty), 'web.act ×2');
 });
