@@ -1565,16 +1565,32 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
 
   // A2-C 收尾（2026-10-21）：GitHub token 从保险库注入（site='github.com', user='token'）。
   // 没配就维持 public-only 降级模式，不报错不挡启动。
-  try {
-    if (process.env.DOTD_GITHUB_TOKEN === undefined && process.env.DOTD_MAIL_KEY !== undefined) {
+  // 2026-10-22 实测缺陷：这里的 catch 以前是空的，把「保险库里有条目但解不开」
+  // （`Unsupported state or unable to authenticate data`，通常是换过 DOTD_MAIL_KEY 后
+  // 老条目没重录）和「压根没配」混为一谈——两者都静默降级成 public-only。
+  // 后果：连接器面板显示 `public_only`，看起来像「没配 token」，于是去查环境变量，
+  // 查到的是空，更确信没配。真实原因是**有密文但密钥不对**，排查方向完全被带偏。
+  //
+  // 现在把两种情况分开说：没配保持安静（这是合法默认），解不开必须喊出来。
+  // 仍然不挡启动：安全组件的容错边界是「不因为少一个 token 就不服务」。
+  if (process.env.DOTD_GITHUB_TOKEN === undefined && process.env.DOTD_MAIL_KEY !== undefined) {
+    try {
       const gh = vaultGet(vaultDir(), process.env.DOTD_MAIL_KEY, 'github.com', 'token');
       if (gh !== null && gh.length > 0) {
         process.env.DOTD_GITHUB_TOKEN = gh;
         log('[vault] GitHub token 已从保险库注入（连接器完整模式）');
+      } else {
+        log('[vault] 保险库里没有 github.com/token，GitHub 连接器保持 public-only（未配置，非故障）');
       }
+    } catch (e) {
+      // 到这里说明条目存在但解不开：密钥换过 / vault.json 被替换 / 条目损坏。
+      // 只报站点与错误类型，**不打印密文或密钥**。
+      const why = e instanceof Error ? e.message : String(e);
+      log(
+        `[vault] GitHub token 解密失败（github.com/token 条目存在但与当前 DOTD_MAIL_KEY 不匹配）：${why}。` +
+          'GitHub 连接器降级为 public-only —— 重录一次即可：dotd vault put github.com token',
+      );
     }
-  } catch {
-    // 保险库不可用不挡启动
   }
 
   const bootReport = await exec.boot(cfg.dotIds);
