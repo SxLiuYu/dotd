@@ -129,3 +129,45 @@ test("判据是「结果没变化」而非单纯次数：结果一致的重复�
     '必须有这条判据的说明（否则后来人会把次数当唯一判据又踩一遍）',
   );
 });
+test('填表：同一批元素在不同快照里的 ref 编号不同，不算「换了动作」', async () => {
+  // 2026-10-22 真机，真实 docker + 真实浏览器，填 httpbin 表单跑了 64 步。
+  //
+  // 模型把**同样三个字段填了 5 遍**，args 长这样：
+  //   {"action":"fill","ref":"@e18","text":"张三"}
+  //   {"action":"fill","ref":"@e34","text":"张三"}
+  //   {"action":"fill","ref":"@e51","text":"张三"}
+  //   {"action":"fill","ref":"@e67","text":"张三"}
+  //   {"action":"fill","ref":"@e83","text":"张三"}
+  //
+  // 同一个输入框，每次快照后编号整体上移。按 (工具, 原始参数) 记账，
+  // 每一轮都是**新 key**，rec.count 永远到不了阈值，护栏全程沉默。
+  //
+  // 这与第五轮 deny 账本（参数里塞 description 换措辞）是同一种病：
+  // **模型改一个与语义无关的参数，就换了一本账**。
+  // 修法也一样：把「换个说法指同一个东西」的参数归一化掉。
+  const { repeatSignatureForTest } = await import('../src/runner/dot.ts');
+  const sig = (json: string): string => repeatSignatureForTest(json);
+  const at = (ref: string): string => `{"action":"fill","ref":"${ref}","text":"张三"}`;
+
+  const shapes = ['@e18', '@e34', '@e51', '@e67', '@e83'];
+  const first = sig(at(shapes[0]!));
+  for (const r of shapes.slice(1)) {
+    assert.equal(
+      sig(at(r)),
+      first,
+      `ref ${r} 与 ${shapes[0]} 指向同一个输入框，签名必须相同（否则护栏数不到重复）`,
+    );
+  }
+
+  // 但不能抹过头：动作或内容不同，必须仍然是不同签名
+  assert.notEqual(
+    sig('{"action":"fill","ref":"@e18","text":"李四"}'),
+    first,
+    '填的内容不同 → 必须是不同签名',
+  );
+  assert.notEqual(
+    sig('{"action":"click","ref":"@e18"}'),
+    sig(at('@e18')),
+    '动作不同 → 必须是不同签名',
+  );
+});

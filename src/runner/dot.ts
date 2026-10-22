@@ -365,6 +365,18 @@ function repeatSignature(argumentsJson: string): string {
     const entries = Object.entries(obj as Record<string, unknown>)
       .filter(([k]) => !IGNORED.has(k))
       .map(([k, v]) => {
+        // **ref 编号必须归一化**（2026-10-22 真机，填表任务 64 步）。
+        //
+        // browser/web 的 `@e83` 是「第几号快照里的第几个元素」的**位置编号**，
+        // 每拍一次快照整体上移。现场模型把同样三个字段填了 5 遍：
+        //   @e18/@e19/@e20 → @e34/@e35/@e36 → @e51/... → @e67/... → @e83/...
+        // 每一轮 args 里的 ref 都不同 ⇒ 每轮一个新 key ⇒ rec.count 永远累积不起来。
+        //
+        // 这与第五轮 deny 账本同源：**模型改一个无关参数就换了一个账本**。
+        // ref 和 timeout_ms、path 前缀一样，是「换个说法指同一个东西」。
+        if (k === 'ref' && typeof v === 'string') {
+          return [k, v.replace(/\d+/g, '#')] as [string, unknown];
+        }
         // **路径参数也要归一化**（2026-10-18 实测）：g1.txt 与 /dot/home/g1.txt 指向同一文件，
         // 但原样比较是两个不同签名 → 护栏数不到重复。实测就是这样让同文件被写了 8 次。
         if (k === 'path' && typeof v === 'string') {
