@@ -27,6 +27,7 @@
 | Web 控制台 | ✅ 有 | 6 视图 + daemon serve，见 §6 |
 | 多端 App | ❌ 无原生工程 | 见 §7 |
 | 外部账号集成 | ⚠️ 通用替代已有，OAuth 未做 | 见 §8 |
+| **付款 / 下单** | ❌ **不支持（决定，不是待办）** | dotd 零支付通道；`shop.checkout` 不是可调用工具。见 §7.6 |
 
 ---
 
@@ -71,7 +72,7 @@ calendar-criteria.sh    49 通过 / 0 失败   ← 修了 3 条假红判据
 | DB 字段 | `crontabs.proactive` / `quiet_hours` / `throttle_hours` / `last_push_at`（`170_proactive.sql:45`） |
 | 判定 | `src/surfaces/proactive.ts` 的 `shouldPush()`：开关 → 安静时段 → 节流 |
 | 接线 | `control-plane/index.ts:204,247` |
-| 当前值 | **「早间日程提醒」已 `proactive=1`（throttle=20h）**，其余 4 条仍 0 |
+| 当前值 | **2026-10-22 实测：现存 4 条全部 `enabled=1` 且 `proactive=1`**（其中「早间日程提醒」throttle=20h）。2026-10-21 那版写的是「1 条开、其余 4 条 0」，已被本轮改动超过：proactive 陆续打开，且 A5 按 id 删掉两条（重复的「早间喝水提醒」`proactive=0` 与测试残留「一次性验证」`enabled=0`）。**这行数字必然再变，以上面那条 SQL 当场查为准** |
 | 消费端 | `feishu-outbound.ts` 的 `shouldAnnounce()`（2026-10-21 补，此前判定无人读） |
 
 ```bash
@@ -179,8 +180,65 @@ daemon 已在 `http.ts:424` serve `web-ui/dist`。HTTP API 共 27 个端点。
 | 7.3 | Muse Charm 硬件 / 眼镜 | 无此形态 |
 | 7.4 | 打电话 | Muse 自己也没有 |
 | 7.5 | 「人格/情绪」 | 不是改代码能实现的东西。persona 在 `system-prompt.ts` 可调，但那不等于「做到」 |
+| 7.6 | **付款 / 下单（Stripe 一类支付通道）** | **本轮定为「不支持」**，不是待办。理由与边界见 §7.6 与 §8 |
 
-**7.1 是「不该做」，7.5 是「做不到」**，两者不同，别再混。
+**7.1 是「不该做」，7.5 是「做不到」，7.6 是「决定不做」**，三者不同，别再混。
+
+### 7.6 付款能力边界（2026-10-22 定案，任务 B4）
+
+**结论：dotd 不支持付款，也不把「接 Stripe」留作待办。** 这是一个决定，不是进度落后。
+
+理由两条：
+
+1. **真钱风险最高**：一旦接通，「说一句就下单」这类体验的错误成本是真金白银，且扣款不可撤销；
+   本轮没有任何机制能在扣款之前替主人兜住判断错误。
+2. **没有支付通道**：实跑 `grep -rni stripe src/` → **0 命中**（2026-10-22）。接 Stripe 需要商户资质与
+   API key，是「另一个项目」的工程量，不是补几行代码。
+
+**关于 `shop.checkout` 的真实语义（别照工具名猜，也别照旧文档猜）**：
+
+它**不是一个可以调用的工具**。2026-10-22 实测三件事：
+
+- `grep -rni shop src/` → **0 命中**：运行代码里没有这个名字，模型的工具列表里不会出现它，
+  因此也谈不上「被主人误认为能付钱」的技术入口。
+- `config/tools.yml:122-126`：整段以 `#` **注释掉**的**形状模板**，注释头原话（:120）是
+  「阶段二接入支付/下单类工具时按此形状补条目（含 spendParams.required）」。其档位写的是
+  **`spend`**，不是 `dangerous`。同文件 :119 还写着「阶段一工具词表（§9.1/M5）**无 spend 档工具**；
+  购物走 `browser.act` 由 review 承接」。
+- `tests/runner-main.test.ts:86`、`tests/governance-state-machine.test.ts:53`：**测试夹具里的假工具名**，
+  用来验证「spend 档一律开人工审批单」这条策略（`governance-state-machine.test.ts:47` 的测试名），
+  不代表存在支付能力。
+
+实测档位现状（可复现）：
+
+- active 的 `tier: spend` 条目：**0 个**（`grep -nE "^[[:space:]]*tier: spend" config/tools.yml` 无输出）。
+- active 的 `tier: dangerous` 条目只有 5 个，都不是付款：`fs.remove` / `mcp.call` / `tool.create` /
+  `tool.invoke` / `mail.send`。
+
+所以「dotd 有个 `shop.checkout` 工具挂在 dangerous 档 ⇒ 主人以为能付钱」这条推断**不成立**：
+该名字既不在工具白名单（未注释部分）里，也不是 dangerous 档，模型根本看不到它。
+真正会让人误会的是 §8 旧行只写了「零实现」而没写「不支持」——读的人把它当成「还没做、以后会做」。
+本节把它改成一个明确的**决定**。
+
+**「购物」在 dotd 里现在到底是什么**：走 `browser.act` / `web.act` 在页面上点击与填表
+（`config/tools.yml:204` 原话：「危险动作由 spend 档把关」——而 spend 档当前为空）。
+即 dotd **能**把商品查到结算页、把要买的东西和价格报给主人，**不能**完成最后一步付款。
+
+**这条边界写在哪、靠什么守住**（三处一致）：
+
+1. 本节 + §8 表格行：文档层面的结论。
+2. `src/runner/system-prompt.ts`「# 干活的节奏」段（2026-10-22 新增一行）：让模型自己知道不能付款、
+   别去页面上凑支付流程、别答「我来下单」。
+3. 判据：**没有** `scripts/regress/` 判据守着这条边界。实跑核对（2026-10-22）：
+   `grep -rni stripe scripts/regress/` → 0 命中；`grep -rn '付款\|下单\|支付\|扣款' scripts/regress/` → 0 命中；
+   `grep -rni shop scripts/regress/` → 2 命中，但**与付款无关** —— 都只是 `progress-criteria.sh:146,168`
+   里当作进度推送样例的假想域名 `shop.example.com`（测的是「browser.open 的标题+域名怎么翻成人话」）。
+   `tests/` 里也没有断言这条新提示词行（`grep -rn 你不能付款 tests/ scripts/` → 0 命中）。
+   结论：这条边界靠**文档 + 系统提示词**守住，不是靠代码拦住一个并不存在的付款调用；
+   `SYSTEM_PROMPT_BUDGET` 那条测试（`tests/runner-tool-catalog.test.ts:267`）只保证提示词不超长，
+   **不保证**付款边界这句话还在。（`docs/goal-2026-10-22.md` 不在 cleanup 的写权限范围内
+   —— 见该文件 §2 任务表里 B4 一行写的授权范围。这条「边界靠文档+提示词而非代码守住」的结论
+   已随任务 B4 回报 lead，由其写进交付段。）
 
 ---
 
@@ -190,7 +248,7 @@ daemon 已在 `http.ts:424` serve `web-ui/dist`。HTTP API 共 27 个端点。
 |---|---|---|
 | Gmail | `mail.*` 是**通用 IMAP/SMTP**，不绑服务商 | 开 Gmail 应用专用密码即可用，无需 OAuth 审核 |
 | Google Calendar | `calendar.*` 读订阅 .ics（只读）+ 写本地 .ics | 日历客户端导出 .ics 放 `<dataDir>/calendar/` |
-| Stripe 付款 | **零实现**（`grep stripe src/` 无结果） | 要接就得处理真钱，风险最高 |
+| **付款 / Stripe** | **不支持（2026-10-22 定案，非待办）**：`grep -rni stripe src/` → 0 命中；`shop.checkout` 只是 `config/tools.yml:122` 里**被注释掉的模板**与测试夹具名，**不是可调用工具**（详见 §7.6） | 不接。要买东西由主人自己付：dotd 可查到结算页并报价，最后一步不代付 |
 | 更多 SaaS | `mcp.call` 通用通道 | 逐个加 MCP server |
 
 **没有 OAuth 是有意的**：`CalendarService.ts:10` 写明「不直接连 Google/Outlook —— 那需要 OAuth、审核、token 过期」。
@@ -654,5 +712,12 @@ rules.yml 条目 {"tool":"shop.buy","amountAtLeast":50000} 试图把 approve 放
 - 「接截图是小工量」—— 看了依赖链，没写
 - 「IMAP + .ics 覆盖 80%」—— 取决于你要「能用」还是「像原生客户端」
 - 「原生 App 不该做」—— 产品判断，不是技术限制
+- 「付款定为不支持是对的选择」—— 产品/风险判断（真钱 + 无支付通道），见 §7.6；
+  技术上能不能接是另一回事，本轮**没做**也**不打算做**
+
+**2026-10-22 补充实测**：`grep -rni stripe src/` → 0；`grep -rni shop src/` → 0；
+`config/tools.yml` 里 active 的 `tier: spend` 条目 **0 个**，active `dangerous` 只有
+`fs.remove` / `mcp.call` / `tool.create` / `tool.invoke` / `mail.send` 五个。
+（`shop.checkout` 只存在于 :122-126 的**注释模板**与两个测试夹具里。）
 
 **未验**：真人收到卡片/进度的观感、跨网络稳定性、Muse 的记忆/并行/重试机制（见 `meta-muse.md` §8）。

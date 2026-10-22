@@ -23,12 +23,14 @@ dotd 已经和 Meta Muse 对齐到可用状态：**41 个工具**、六步验收
 | 截图从没随进度发出去过 | **已修** —— 三个叠加缺陷，见 §9ter |
 | 长文折叠反而变长（601→655 字） | **已修** —— 见 §9ter |
 | 判据把通过条数钉死 | **已修** —— 见 §4.3 |
-| 主动推送只有 1/5 在跑 | **已开 4/6** —— 见 §7.5 |
+| 主动推送只有 1/5 在跑 | **已开，现存 4 条全部 proactive=1**（A5 删掉 2 条脏数据后是 4/4）—— 见 §7.5 |
 
 **当前没有已知的坏功能。** 遗留的都是数据和配置选择，不是代码缺陷：
 - 126 条历史审批停在 `executing`（方案见 [approvals-stuck-executing.md](approvals-stuck-executing.md)，**未执行**）
-- 两条重复的「喝水提醒」crontab（见 §7.5）
-- 一条测试残留的「一次性验证」crontab（凌晨 3 点跑，建议删）
+- ~~两条重复的「喝水提醒」crontab~~ / ~~一条测试残留的「一次性验证」crontab~~ ——
+  **2026-10-22 A5 已按 id 删除**（`ct_01M5FB2JA88NYBGXQ7TPHHBYHR`、`ct_01M59KEYJXWESPABJVJAJ2NSD6`），
+  备份 `/root/.dotd/backups/dotd-crontab-cleanup-20261022-072351.db`、回滚 SQL
+  `/root/.dotd/backups/a5-rollback-restore-two-crontabs.sql`，见 §7.5。剩 4 条。
 
 ---
 
@@ -266,18 +268,19 @@ node --import tsx --test $(cat <该块的文件列表>)
 
 | 项目 | 状态 |
 |---|---|
-| HEAD | 写这份时是 `7a5e5b1`（会变，以 `git log` 为准） |
-| 工作区 | 干净 |
+| HEAD | **别在这行记 commit 号**（写死必然过期，本轮结束还会变）。当场查：`git -C D:\toagi\dotd log --oneline -1` |
+| 工作区 | **当场查**：`git -C D:\toagi\dotd status --porcelain`（空 = 干净）。本轮多人并行改文件，这里必然是动的，别记「干净」 |
 | `npx tsc --noEmit` | 0 错误 |
 | 全量回归 | **1630 条 / 1629 通过 / 0 失败 / 1 跳过**（2026-10-21，EXIT=0） |
 | 功能判据 | **5 个全绿 157 条**（mail 41 / card 21 / proactive 19 / progress 27 / calendar 49） |
 | 工具数 | **41**（`config/tools.yml`，别再写 38） |
 | slim 改造 | **已提交**（`8937390`），镜像 `dotd/exec:slim-probe` 563MB 已建但**未切到现网** |
-| 现网跑的镜像 | **还是旧的** `dotd/exec:1.49.1-0.1.0`（3.55GB） |
-| 容器 | `dotd-dot-dot1`，Up 8 小时 |
-| daemon | 在跑，HTTP 200 |
+| 现网跑的镜像 | **不是当前 tag 指向的那个**。2026-10-22 实测：容器 image id = `fb98ec90ef9e`，而 `docker images` 里它是 `<none>`（**悬空**）；当前 tag `dotd/exec:1.49.1-0.1.0` 指向 `15fbed5219f3`（3.55GB），`dotd/exec:slim-probe` = `11399003b38a`（563MB，未上线）。当场查：`docker inspect --format "{{.Image}}" dotd-dot-dot1` 与 `docker images --no-trunc --format "{{.ID}} {{.Repository}}:{{.Tag}} {{.Size}}"` |
+| 容器 | 名字 `dotd-dot-dot1`。**运行时长别写死**（必然过期）。当场查：`docker ps --format "{{.Names}} {{.Image}} {{.Status}}"` |
+| 现网容器里还有 playwright 吗 | 有 —— 这是「现网仍是旧基座」最直接的证据。当场查：`docker exec dotd-dot-dot1 sh -c "du -sh /ms-playwright; node -v"`（2026-10-22 实测 1.4G + node **v22.12.0**；slim 基座是 node:24，故 v22 即旧基座） |
+| daemon | 在跑。**当场查**：`pgrep -af src/daemon.ts`（HTTP 是否应答用 §3 那条 curl，别看这行） |
 | 邮箱账号 | **2 个**，11 封缓存 |
-| crontab | **6 条**（4 条启用且主动推送，1 条关着，1 条重复待处理） |
+| crontab | **4 条，全部 enabled=1 且 proactive=1**（2026-10-22 A5 删掉 2 条：重复的「早间喝水提醒」proactive=0、测试残留「一次性验证」enabled=0）。当场查：`node --import tsx src/surfaces/cli.ts hb list` |
 | 暂停的任务 | `tk_mvf3rc3gxyradt`、`tk_mvgow7taoew2sg`、`tk_mvgp03asc3qtkv` |
 | 审批终态分布 | `executing` 126 / `expired` 9 / **`executed` 1** —— 只有 1 条走到了终态 |
 | 审批卡片点击 | **已修**（四个缺陷叠加，见 §9bis） |
@@ -306,7 +309,7 @@ console.log(db.prepare("select ...").all());
 
 表：`events, crontabs, task_results, steps, event_decisions, breaker_state,
 breaker_sample, breaker_event, router_state, pool_probe_result, recon_candidate,
-model_call_log, gov_seq, approval, mail_accounts, mail_drafts, mail_messages`
+model_call_log, gov_seq, approvals, mail_accounts, mail_drafts, mail_messages`
 
 `steps` 列：`task_id, seq, kind, status, call_id, tool_name, args_json,
 result_json, side_effect, run_epoch, approval_id, started_at, finished_at`
@@ -356,13 +359,24 @@ docker exec dotd-dot-dot1 sh -c 'command -v pdftotext git python3'
 
 见 [backlog.md](backlog.md)，其中比较值得做的（都已现场核实过）：
 
-- **`scripts/soak.sh` 的注释和线上 crontab 对不上**：脚本第 15-16 行注释写的是
-  `0 */6 * * * soak.sh probe`，线上实际是 `15 */6 * * *`。注释还据此论证"sample
-  在 :00/:30、probe 在 :00，每 6 小时必然撞一次"——**前提已经不成立**，那段
-  推导要重写。（改的是注释，别顺手去改 crontab，那是故意错开的。）
+- ~~**`scripts/soak.sh` 的注释和线上 crontab 对不上**~~ —— **2026-10-22 已改（任务 A3）**。
+  注释里的时刻已与线上一致，"每 6 小时必然撞一次"那段推导已重写成"现在错开 15 分钟、
+  不再必然相撞，保险降级为兜边"。**只动了注释**：`install_cron` 分支里 probe 那行代码
+  仍写 `0 */6`（本轮不许动代码，也别据此重装 cron —— 那 15 分钟是主人故意错开的）。
+  证据：`bash -n scripts/soak.sh` rc=0，且"去掉整行注释后的可执行体"与 git HEAD **逐字节相同**。
 - 容器隔离（quarantine）后没有自动恢复
-- `FEISHU_OWNER_CHAT_ID` 看着被污染：长度 **71**，正常应该是 `oc_` + 32 位 = 35。
-  已核实确实 71。（打印长度是安全的，别打印值。）
+- ~~`FEISHU_OWNER_CHAT_ID` 看着被污染：长度 **71**~~ —— **这条是误报，2026-10-22 实测推翻**。
+  长度确实是 71，但 71 = **两个合法 id 用逗号连接**（35 + 1 + 35），两段**各自**都通过
+  `^oc_[A-Za-z0-9]{32}$`。而且入站侧**本来就支持多会话**：`src/surfaces/feishu-inbound.ts:164`
+  和 `:214` 都是 `cfg.ownerChatId.split(",").map(trim).filter(...)` 建一个 owner Set。
+  所以这不是配置被写坏。当场复现（只报长度和是否匹配，**别打印值**）：
+  `V=$(tr "\0" "\n" < /proc/<daemon pid>/environ | sed -n "s/^FEISHU_OWNER_CHAT_ID=//p"); echo ${#V}; echo "$V" | tr , "\n" | while read s; do echo "${#s} $(echo "$s" | grep -qE "^oc_[A-Za-z0-9]{32}$" && echo VALID || echo BAD)"; done`
+- **但这里确实有一个真缺陷，性质完全不同**：不是配置脏，是**投递代码只取第一个会话**。
+  审批卡片与系统通知硬编码 `.split(",")...[0]`，第二个主人会话**永远收不到审批**。
+  实读位置（2026-10-22 当场核对行号）：`src/daemon.ts:948`（审批卡片）、
+  `src/daemon.ts:1678`（fallbackChatId）、`src/daemon.ts:924`（`feishuChatId`，同样是 `[0]`；
+  工作目表 F5 只列了前两处，924 是本轮补读的第三处）。
+  **状态：本轮修复中**（任务 B1，channels 负责）。既别写成「配置被污染」，也别写成「没问题」。
 
 > 一条更正记录：我一度以为 `: > "$RESULTS"` 截断写是个待修 bug，实际它在
 > `scripts/acceptance.sh:103`，而且那段上下有 20 行注释专门解释**为什么必须**
@@ -386,7 +400,11 @@ executed       1     << 只有 1 条走到了终态
 建议把「执行结果已落库的」回填成 `executed`、其余标 `expired`。
 **未执行**，改数据前要备份。
 
-### 7.5 主动推送：已经开了 4/6，但有 3 个配置问题要你定
+### 7.5 主动推送：三个配置问题里两个已处理（2026-10-22 A5），只剩节流语义
+
+下面这张 6 行的表是 **2026-10-21 的旧快照**，保留是为了说明当时判据；
+**现在只剩 4 条**（2026-10-22 A5 按 id 删掉了标 `<<` 的那两条）。当场查最新状态：
+`node --import tsx src/surfaces/cli.ts hb list`。
 
 2026-10-21 实测状态：
 
@@ -413,16 +431,21 @@ tk_ev_23  早间天气提醒   task_reply ok=1  oc_e764f9021f3db527f36dff984ff06
 把 `next_fire` 改成 +60s 时，它把当天已经错过的时点补上了，
 所以「组会提醒」在晚上 21:47 说「下午3点了」是**正确的**，不是 bug。
 
-三个待你决定的配置问题：
+三个配置问题的现状：
 
-1. **两条喝水提醒重复**：`早上喝水提醒`（已开）和 `早间喝水提醒`（`proactive=0`）
-   内容几乎一样、都是 7:00。开第二条会一天提醒两次喝水。**建议删一条**。
-2. **`一次性验证` 是测试残留**：prompt 是「只回复 ONCE-OK」，`0 3 * * *`，
-   每天凌晨 3 点跑一次没意义。**建议删**。
-3. **`throttle_hours=6` 会挡掉 9:00 的日程提醒**：天气 8:30 推完，
-   6 小时内不再推 —— 日程 9:00 那条会被节流（同一条 crontab 的 `last_push_at`
-   是各自的，所以实际上不互相影响，但**同一条**在 6 小时内不会重复推）。
-   如果想让日程提醒必到，把它的 `throttle_hours` 调小。
+1. **两条喝水提醒重复** —— **已处理（2026-10-22 A5）**：按 id 删掉
+   `ct_01M5FB2JA88NYBGXQ7TPHHBYHR`（「早间喝水提醒」，`proactive=0`），
+   留下主人已开的那条 `ct_mvej42ui7m49u3vi`（「早上喝水提醒」）。
+2. **`一次性验证` 是测试残留** —— **已处理（同上）**：删掉
+   `ct_01M59KEYJXWESPABJVJAJ2NSD6`（`enabled=0`、prompt「只回复 ONCE-OK」）。
+3. **`throttle_hours=6` 会不会挡掉 9:00 的日程提醒 —— 不会，这不是缺陷**，本条如实保留原结论：
+   节流读的是**每行自己的** `last_push_at`（`src/surfaces/proactive.ts:107-109` 用
+   `input.throttleHours` 与 `input.lastPushAt` 比较；`src/control-plane/index.ts:206-207`
+   逐行传 `ct.throttle_hours` / `ct.last_push_at`，`:219` 也只 `UPDATE ... WHERE id=?`）。
+   所以天气推完不会让日程推不出去；被节流的是**同一条**在窗口内重复推。
+   实测也支持这个读法：2026-10-22 四条的 `last_push_at` 各不相同
+   （日程那条至今是 `NULL`，`throttle_hours=20`）。
+   —— 结论：原描述里"会被节流"那半句是夸大的，**去掉**；保留"同一条 6 小时内不重复推"这个真实行为。
 
 > 有个更重要的结论要说清楚：**「消息精简」不会误杀主动推送**。
 > 我用 47 条真实定时任务回复实测，`isLowValueReply` 判为无信息量的是 **0 条**；
@@ -643,11 +666,21 @@ assert.ok(call.text.length < 700, '整体不回到千字级');
 ## 10. 验收相关
 
 ```bash
-bash scripts/verify-goal.sh        # 只读，退出码即结论
-bash scripts/regress/web-tools-criteria.sh    # 浏览器判据 18 条
+bash scripts/verify-goal.sh                   # 只读，退出码即结论
+bash scripts/regress/web-tools-criteria.sh    # 浏览器判据（条数看它自己打印的「合计 N 通过 / 0 失败」）
 bash scripts/regress/mail-criteria.sh
 bash scripts/regress/calendar-criteria.sh
 ```
+
+**判据条数别在文档里记死**。2026-10-22 实跑 `web-tools-criteria.sh` 两次，脚本自己的
+计数器（`scripts/regress/web-tools-criteria.sh:75` 的 `合计 $PASS 通过 / $FAIL 失败`）
+都打印 **18 通过 / 0 失败**。
+
+> 一条更正记录（本轮踩到的计数陷阱）：工作目表把 web 判据写成 **19**，来源是
+> `grep -c PASS` —— 但**最后那行汇总横幅 `PASS: web-tools-criteria 全过（18/18）` 自己也含
+> "PASS"**，于是 18 条判据 + 1 行横幅 = 19。按缩进只数判据行（`grep -cE '^  PASS '`）= **18**。
+> 所以文档**保持 18**，没有按工作目表改成 19；这条已回报 lead。
+> 教训：数判据要用脚本内部计数器或锚定行首缩进，别裸 `grep -c PASS`。
 
 六步验收结论在 [ACCEPTANCE.md](ACCEPTANCE.md)，Muse 对齐细节在
 [muse-tasks.md](muse-tasks.md)。
