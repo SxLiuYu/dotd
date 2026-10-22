@@ -2,7 +2,24 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- F6（2026-10-22）：控制台要能在手机上读写，故 viewport 保持可缩放（scaleability
+         是无障碍要求，不为了「像原生 App」关掉）；viewport-fit=cover 配合 CSS 的
+         env(safe-area-inset-*) 绕开刘海/圆角/Home 条。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- token 会出现在 /api/stream 的 ?token= 里（EventSource 设不了请求头，§4.5 妥协）。
+         no-referrer 保证这个 URL 不会经 Referer 头带给任何第三方资源。 -->
+    <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#0f1115" />
+    <meta name="color-scheme" content="dark" />
+    <!-- PWA 最小集：manifest + 图标。iOS「添加到主屏幕」靠 apple-touch-icon + 下面这条
+         独立全屏声明，不依赖 service worker。 -->
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="dotd" />
     <title>dotd · 自主 Dot 控制台</title>
   </head>
   <body>

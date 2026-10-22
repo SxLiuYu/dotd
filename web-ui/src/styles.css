@@ -28,6 +28,9 @@ body {
   display: grid;
   grid-template-columns: 200px 1fr;
   min-height: 100vh;
+  /* F6 手机：移动端浏览器地址栏会让 100vh > 实际可见高度（内容被顶出一屏），
+     dvh 跟手。写两行是刻意的渐进增强：不支持 dvh 的内核直接忽略第二行。 */
+  min-height: 100dvh;
 }
 
 .sidebar {
@@ -190,8 +193,10 @@ textarea {
 
 .gate {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
+  padding: 20px;
 }
 
 .gate form {
@@ -241,6 +246,7 @@ textarea {
   flex-direction: column;
   gap: 10px;
   height: calc(100vh - 300px);
+  height: calc(100dvh - 300px);
   min-height: 260px;
   overflow-y: auto;
   padding: 4px;
@@ -574,7 +580,10 @@ button.more {
   border: 1px solid var(--line);
   border-radius: 8px;
   height: calc(100vh - 220px);
+  height: calc(100dvh - 220px);
   overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-text-size-adjust: 100%;
   padding: 8px 10px;
   font-size: 12px;
 }
@@ -610,4 +619,193 @@ button.more {
 
 .filter {
   max-width: 220px;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   F6（2026-10-22）响应式断点 —— 让六视图在 390px 宽（iPhone 14 逻辑宽度）
+   可读可写。约束与取舍：
+   - 只加 CSS，不改组件结构、不引 UI 框架（任务书明确要求）；
+   - 侧栏不做「汉堡菜单 + 遮罩层」那套：那需要 App.tsx 加状态。改成**横向
+     可滑的顶部标签条**，零 JS 就能在手机上点导航，代价是丢掉竖向层级感；
+   - 断点取 720px：手机横屏和小平板都落在这条线以下，桌面（≥1024px）完全
+     不受影响 —— 本轮不动桌面布局是刻意的，主人的主力屏幕已经调好了。
+   ══════════════════════════════════════════════════════════════════════ */
+
+@media (max-width: 720px) {
+  /* 外壳：两列栅格 → 单列；侧栏变顶部横向标签条 */
+  .app {
+    grid-template-columns: 1fr;
+    /* 刘海 / Home 条 / 圆角：viewport-fit=cover 之后必须自己留白 */
+    padding-top: env(safe-area-inset-top);
+  }
+
+  .sidebar {
+    order: -1;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    /* 横向滚动导航；overscroll-behavior 防「划到头之后整页跟着抖」 */
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .sidebar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .brand {
+    padding: 0 6px 0 0;
+    font-size: 16px;
+    flex: none;
+  }
+
+  .nav-item {
+    flex: none;
+    /* iOS 上 < 16px 的输入框会触发聚焦放大；按钮则是 44px 最小可点区 */
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    padding: 8px 12px;
+    white-space: nowrap;
+  }
+
+  .sidebar-foot {
+    margin-top: 0;
+    margin-left: auto;
+    padding: 0;
+    flex: none;
+  }
+
+  .sidebar-foot button {
+    min-height: 44px;
+  }
+
+  .content {
+    padding: 14px 14px calc(20px + env(safe-area-inset-bottom));
+  }
+
+  /* 顶栏：状态串很长（service · dotId · 队列三项 · bus_seq），窄屏折行会把
+     内容往下顶一屏；改成允许换行 + 缩字号，并隐藏次要的「数据源见提示」
+     （hover/tooltip 在触屏上本来也点不出来）。 */
+  .topbar {
+    gap: 6px;
+    font-size: 12px;
+    padding-bottom: 10px;
+    margin-bottom: 12px;
+  }
+
+  .topbar .src-hint {
+    display: none;
+  }
+
+  /* 表单与按钮：触摸友好 */
+  button,
+  input,
+  textarea,
+  select {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  /* 打字区不该因为一行中文就顶到 44px 那么高，但 iOS 缩放阈值是字号不是高度，
+     字号已 16px，故这里只降回视觉合适的高度即可。 */
+  .chat-input {
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .chat-input button {
+    height: auto;
+    padding: 0 16px;
+  }
+
+  /* 气泡：72% 上限在窄屏会把内容挤成竖条，改为占满 */
+  .bubble {
+    max-width: 100%;
+  }
+
+  /* 聊天流高度：顶栏/标签条/输入区在窄屏占得更多，按可视区算 */
+  .chat-list {
+    height: calc(100dvh - 260px);
+    min-height: 200px;
+  }
+
+  /* 队列：卡片列 minmax(220px) 在 360px 屏上会挤出「一列半」，直接单列 */
+  .queue-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  /* 表格类视图（活动 / 事件 / 模型）：窄屏横向滚动而不是压扁列宽。
+     用 display:block 让表格自身成为滚动容器 —— 表格默认不认 overflow。 */
+  .activity-table,
+  .events-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+
+  .activity-filters {
+    gap: 10px;
+  }
+
+  .stat-row {
+    gap: 14px;
+  }
+
+  /* 日志：topic 列 190px 固定宽 + 时间戳 52px 在 390px 屏上只剩 100px 给正文，
+     等于读不到内容。改为堆叠两行：头一行 topic，第二行数据。 */
+  .log-line {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .log-line .seq,
+  .log-line .topic {
+    min-width: 0;
+    text-align: left;
+  }
+
+  .log-box {
+    height: calc(100dvh - 210px);
+    font-size: 11px;
+  }
+
+  .filter {
+    max-width: none;
+  }
+
+  /* 审批视图是手机上的第一刚需：把决定按钮做成一行两个、明显可点 */
+  .approval-list .card {
+    padding: 12px;
+  }
+
+  .approval-list .card footer {
+    gap: 8px;
+  }
+
+  .approval-list .card footer button {
+    flex: 1 1 auto;
+    min-width: 84px;
+    text-align: center;
+  }
+}
+
+/* 更窄（≤390px 的常见机型）时再收一档内边距，避免 14px 双边吃掉 8% 宽度 */
+@media (max-width: 390px) {
+  .content {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .view-head {
+    gap: 8px;
+    margin-bottom: 12px;
+  }
 }

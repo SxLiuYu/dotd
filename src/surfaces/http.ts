@@ -1,8 +1,12 @@
 /**
  * src/surfaces/http.ts —— HTTP 路由表 + 鉴权 + HMAC（surfaces.md §5.2；契约 H2/S-2/S-4）。
  *
- * 全 daemon **唯一监听** `127.0.0.1:7788`（契约 H2：CP 的 8642 作废，CP REST 子集由
+ * 全 daemon **唯一监听**，默认 `127.0.0.1:7788`（契约 H2：CP 的 8642 作废，CP REST 子集由
  * 本路由器进程内转调 CP 函数）。鉴权/CORS/SSE/CLI base URL 四件事单点在此。
+ *
+ * F6（2026-10-22）：host 变成可配置（`surfaces.http.host` / 环境变量 `DOTD_HTTP_HOST`），
+ * 但**代码默认值仍是回环**（`DEFAULT_HTTP_HOST`，判据 scripts/regress/web-console-criteria.sh
+ * 钉住它）。扩到非回环只收紧、绝不放宽这里的判定 —— 见下面「暴露面」段的三条处置。
  *
  * §5.2 鉴权（逐字落地）：
  * - `Bearer master_token`：全部读写；
@@ -57,6 +61,7 @@ import { createSchedule, listSchedules, removeSchedule } from '../control-plane/
 import { CronExpressionParser } from 'cron-parser';
 import type { HookConfig, SurfacesConfig } from './types.ts';
 import { createIngress, ingest, MAX_BODY_BYTES, normalizeHook, originAllowed } from './ingress.ts';
+import { DEFAULT_HTTP_HOST, isLoopbackBindHost } from './config.ts';
 import { handleFeishuCallback, maybeDecryptFeishuBody } from './feishu-inbound.ts';
 import { listOutbound } from './feishu-outbound.ts';
 import { SseBus, parseStreamQuery } from './sse.ts';
@@ -335,6 +340,14 @@ export function authenticate(
   return { kind: 'none', token: null, error: 'invalid' };
 }
 
+/** 取 Authorization: Bearer 的 token 原文（不校验，没有返回 null）。 */
+function bearerFromHeaders(headers: IncomingMessage['headers']): string | null {
+  const raw = Array.isArray(headers['authorization']) ? headers['authorization'][0] : headers['authorization'];
+  if (raw === undefined || raw.length === 0) return null;
+  const m = /^Bearer\s+(.+)$/i.exec(raw.trim());
+  return m === null ? null : m[1]!.trim();
+}
+
 function safeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(a, 'utf8');
   const bb = Buffer.from(b, 'utf8');
@@ -344,6 +357,96 @@ function safeEqualStr(a: string, b: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ── 暴露面（F6：可配置 bind ⇒ 鉴权边界只能收紧，不能放宽）────────────────
+//
+// 把监听地址从回环扩到局域网，**改变的是「谁能连上这个端口」**，一个请求字节都没变。
+// 于是三条原本靠「只有本机能连」兜住的假设同时失效，本段逐条处置：
+//
+//   ① Origin 白名单空 = 全部放行（ingress.ts 的 originAllowed：allow.length === 0
+//      直接 return true）。回环监听时这不叫漏洞（能连上的只有本机进程）；扩到局域网
+//      后它等于「任何局域网网页把浏览器指到本机，就能带着用户 Origin 打 /api」。
+//      → 处置见 originAllowedForBind()：非回环 + 空/通配白名单 ⇒ 一律拒绝带
+//        Origin/Referer 的请求，主人必须显式写下自己要用的来源。
+//
+//   ② /api/stream 的 token 走 ?token=（EventSource 不能设请求头，§4.5 明文妥协）。
+//      URL 会被浏览器写进**历史记录**、被上游**代理/网关日志**整条记走、还可能通过
+//      Referer 带出去。回环时这些落点都在本机同一人手里，风险≈0；扩到局域网后它们
+//      变成「共享设备 / 中间代理看得到你的 master token」。
+//      → 本轮处置：监听时打警告（不删功能：删了手机控制台就用不了，代价更大）+
+//        前端 meta referrer=no-referrer（web-ui/index.html，堵住 Referer 这条），
+//        并把「上 HTTPS / 反代」列为未解决风险如实上报。
+//
+//   ③ 保险库写路径。daemon.ts:1553 注释写着「secret 只走本机回环 + master token」，
+//      但**代码从来没验过回环**。扩面后这条注释第一次变成实际承诺。
+//      → 处置见 requireLoopbackPeer 判定：非回环监听时，带 secret 过线的
+//        POST/DELETE /api/vault/entries 只对回环对端开放（403 并如实说明原因）。
+
+/**
+ * 对端地址是否本机回环。
+ *
+ * 只看 socket 的 remoteAddress，不信任何转发头：`X-Forwarded-For` 是客户端可编的，
+ * 拿它判回环等于把门钥匙交给门外的人。**反代场景因此不在本轮支持范围内**
+ * （见交付报告的残留风险）：套一层 nginx 后所有对端都是代理，判定恒真。
+ */
+export function isLoopbackPeer(req: IncomingMessage): boolean {
+  const raw = (req.socket?.remoteAddress ?? '').toLowerCase();
+  if (raw.length === 0) return false;
+  const addr = raw.replace(/^\[/, '').replace(/\]$/, '');
+  if (addr.startsWith('127.')) return true;
+  if (addr === '::1' || addr === '::ffff:127.0.0.1') return true;
+  // Unix socket / 命名管道（没有 IP 字面量）= 本机进程，算回环。
+  if (!/[:.]/.test(addr)) return true;
+  return false;
+}
+
+/**
+ * Origin 白名单是不是「没写字 / 写了通配」。
+ *
+ * 空数组 = originAllowed 直接放行全部；含 `*` 是主人的「通配」意图（现 matcher 其实
+ * 不认它，会让浏览器全 403 —— 属于配置写错）。两种都要在非回环监听时按「未显式授权」
+ * 处理，这样「扩面 + 忘了配白名单」不会等于「扩面 + 没有 Origin 闸」。
+ */
+export function originsAreLenient(allowed: readonly string[]): boolean {
+  return allowed.length === 0 || allowed.some((o) => o.trim().length === 0 || o.includes('*'));
+}
+
+/**
+ * Origin 闸（§5.2 防 DNS rebinding）在「本次监听的暴露面」下的实际判定。
+ * @param bindLoopback 绑的是回环（只有本机可达）还是可路由地址（局域网可达）。
+ */
+export function originAllowedForBind(
+  headers: { origin?: string; referer?: string },
+  allowed: readonly string[],
+  bindLoopback: boolean,
+): boolean {
+  if (bindLoopback) return originAllowed(headers, allowed);
+  if (originsAreLenient(allowed)) {
+    // 未显式授权 ⇒ 带 Origin/Referer 的一律拒；无来源客户端（curl / CLI / hooks）不受影响。
+    const fromBrowser = (headers.origin?.length ?? 0) > 0 || (headers.referer?.length ?? 0) > 0;
+    return !fromBrowser;
+  }
+  return originAllowed(headers, allowed);
+}
+
+/**
+ * 需要「回环对端」才放行的路由：secret 明文过线的那两条写路径。
+ * 回环监听时恒不触发（不改既有行为）；扩到局域网后才生效 ⇒ 只收紧、不放宽。
+ */
+export function routeRequiresLoopbackPeer(route: Route): boolean {
+  return route === 'vault_put' || route === 'vault_delete';
+}
+
+/** 暴露面的启动期一句话结论（daemon 日志与判据都读它）。 */
+export function describeBind(cfg: SurfacesConfig): string {
+  const loopback = isLoopbackBindHost(cfg.http.host);
+  const lenient = originsAreLenient(cfg.http.allowedOrigins);
+  return [
+    `监听 ${cfg.http.host}:${cfg.http.port}`,
+    loopback ? '回环（仅本机可达）' : '非回环（同局域网可达）',
+    lenient ? 'Origin 白名单未显式授权' : `Origin 白名单 ${cfg.http.allowedOrigins.length} 条`,
+  ].join(' · ');
 }
 
 // ── HTTP 服务 ────────────────────────────────────────────────────────
@@ -431,6 +534,9 @@ function requiresMaster(route: Route): boolean {
 export function createHttpServer(deps: HttpDeps): Server {
   const now = deps.now ?? (() => new Date());
   const nonces = new NonceCache();
+  // F6：本次监听是否只有本机能连。决定 Origin 闸的松紧与保险库写路径的可见性，
+  // 只用来**收紧**（true 时行为与扩面改造前逐字一致）。
+  const bindLoopback = isLoopbackBindHost(deps.cfg.http.host);
   const ingress = createIngress({
     db: deps.db,
     bus: deps.bus,
@@ -501,9 +607,16 @@ export function createHttpServer(deps: HttpDeps): Server {
     }
 
     // Origin/Referer 白名单（§5.2：防 DNS rebinding；对全部 /api 生效）
-    if (pathname.startsWith('/api/') && !originAllowed(req.headers, deps.cfg.http.allowedOrigins)) {
+    // F6：非回环监听时，白名单为空/含通配 = 未显式授权 ⇒ 带浏览器来源的请求一律拒
+    //（见文件头「暴露面」段第①条）。
+    if (pathname.startsWith('/api/') && !originAllowedForBind(req.headers, deps.cfg.http.allowedOrigins, bindLoopback)) {
       ingress.rejects.record({ source: 'http', actor: null, reason: 'origin', detail: `Origin ${String(req.headers.origin ?? '')}` });
-      json(res, 403, { error: 'origin', message: 'Origin/Referer 不在白名单' });
+      json(res, 403, {
+        error: 'origin',
+        message: bindLoopback
+          ? 'Origin/Referer 不在白名单'
+          : 'Origin/Referer 不在白名单（daemon 正监听非回环地址：必须在 surfaces.http.allowed_origins 显式写出你的来源，空/通配不放行）',
+      });
       return;
     }
 
@@ -539,17 +652,51 @@ export function createHttpServer(deps: HttpDeps): Server {
       // EventSource 不能设请求头 → token 走 ?token=（§4.5 明文妥协）。
       // §5.2「鉴权：Bearer master_token」：缺 token 与错 token 一律 401——
       //   readonly token 只走 Authorization 头，不在这里放行。
-      const q = url.searchParams.get('token');
-      if (q === null) {
-        ingress.rejects.record({ source: 'http', actor: null, reason: 'auth', detail: 'stream 缺少 token 查询参数' });
-        json(res, 401, { error: 'auth', message: 'SSE 订阅需 ?token=<master_token>' });
+      // F6：?token= 把 master token 写进 URL，于是浏览器历史、上游代理访问日志、
+      //   Referer 都可能留下它。回环监听时无所谓（落点都在本机同一人手里），
+      //   扩到局域网后它是真实泄露面。这里**接受 Authorization 头**作为首选通道
+      //   （fetch/自建 EventSource 替代者能带），头缺失或不对才回落到 query。
+      //   只加通道、不放宽判定：仍是「必须等于 master_token」，readonly 依旧不行。
+      const fromHeader = bearerFromHeaders(req.headers);
+      const fromQuery = url.searchParams.get('token');
+      const isMaster =
+        (fromHeader !== null && safeEqualStr(fromHeader, deps.cfg.http.masterToken)) ||
+        (fromQuery !== null && safeEqualStr(fromQuery, deps.cfg.http.masterToken));
+      // 非回环 + 仍在用 ?token= ⇒ 说一句（一次进程一条，不刷屏）：功能不挡，但要把
+      // 「token 已进 URL」这件事摆到明面上，别让主人以为头通道自动生效了。
+      if (!bindLoopback && fromQuery !== null && safeEqualStr(fromQuery, deps.cfg.http.masterToken)) {
+        warnExposureOnce(
+          'stream-query-token',
+          `SSE 正用 ?token=<master_token> 订阅（token 出现在 URL 里，会进浏览器历史与任何中间代理日志）。` +
+            ` 当前监听 ${deps.cfg.http.host}:${deps.cfg.http.port} 是非回环地址；` +
+            ` 自带 Authorization 头也能订阅（本端口已支持），建议前端改用头通道。`,
+        );
+      }
+      if (!isMaster) {
+        const detail = fromHeader === null && fromQuery === null ? 'stream 缺少 token' : 'stream token 非法';
+        ingress.rejects.record({ source: 'http', actor: null, reason: 'auth', detail });
+        json(res, 401, {
+          error: 'auth',
+          message: fromHeader === null && fromQuery === null
+            ? 'SSE 订阅需 Authorization: Bearer <master_token>（或 ?token=<master_token>）'
+            : '非法的 token',
+        });
         return;
       }
-      if (!safeEqualStr(q, deps.cfg.http.masterToken)) {
-        ingress.rejects.record({ source: 'http', actor: null, reason: 'auth', detail: 'stream token 非法' });
-        json(res, 401, { error: 'auth', message: '非法的 token 查询参数' });
-        return;
-      }
+    }
+
+    // F6：保险库写路径 —— daemon.ts:1553 注释承诺「secret 只走本机回环 + master token」，
+    // 但代码此前从未验回环。监听一旦扩到局域网，这条承诺第一次需要被执行：
+    // 带 secret 明文过线的两条写路径只对本机回环对端开放（读路径不受影响）。
+    if (!bindLoopback && routeRequiresLoopbackPeer(match.route) && !isLoopbackPeer(req)) {
+      const peer = req.socket?.remoteAddress ?? '?';
+      ingress.rejects.record({ source: 'http', actor: 'master', reason: 'auth', detail: `vault 写路径来自非回环对端 ${peer}` });
+      json(res, 403, {
+        error: 'loopback_required',
+        message: '保险库写操作（新增/删除 secret）只在回环对端开放；daemon 当前监听非回环地址。' +
+          '请在该机器本机执行 dotd vault add/rm，或把 surfaces.http.host 收回 127.0.0.1。',
+      });
+      return;
     }
 
     switch (match.route) {
@@ -1461,7 +1608,9 @@ export function createHttpServer(deps: HttpDeps): Server {
     const { topics, dotId, lastEventId } = parseStreamQuery(url.search, headerStr(req, 'last-event-id'));
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache, no-transform',
+      // no-store：这条流里是任务内容/审批事件，中间代理（哪怕局域网里的缓存网关）
+      // 不该留档；no-transform 防 gzip 代理把 SSE 帧攒着不发。
+      'cache-control': 'no-cache, no-transform, no-store',
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
@@ -1495,13 +1644,41 @@ function headerStr(req: IncomingMessage, name: string): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
 
-/** 装配层入口：listen 到 cfg.http.host:port（契约 H2 唯一监听 127.0.0.1:7788）。 */
+// ── 暴露面告警的进程内去重 ────────────────────────────────────────────
+//
+// 同一次启动里 assertHttpConfig（配置自检）和 startHttpServer（真正 listen）都会看
+// 一眼 bind。不去重就在日志里刷两遍同样的「⚠ 已暴露到局域网」，而日志噪音正是
+// 让人后来直接跳过的东西。key = host:port，因此测试用不同端口天然不受影响。
+const exposureWarned = new Set<string>();
+
+function warnExposureOnce(key: string, message: string): void {
+  if (exposureWarned.has(key)) return;
+  exposureWarned.add(key);
+  process.emitWarning(message);
+}
+
+/** 装配层入口：listen 到 cfg.http.host:port（契约 H2 默认 127.0.0.1:7788；F6 起可配置）。 */
 export function startHttpServer(deps: HttpDeps): Promise<Server> {
   const server = createHttpServer(deps);
   return new Promise((resolvePromise, reject) => {
     server.once('error', reject);
     server.listen(deps.cfg.http.port, deps.cfg.http.host, () => {
       server.removeListener('error', reject);
+      // F6：真正绑下去了，才算「暴露」成立 —— 非回环必须在这里说清楚，
+      // 让主人/日志知道端口已不在本机命名空间内（详见文件头「暴露面」段）。
+      const host = deps.cfg.http.host;
+      if (!isLoopbackBindHost(host)) {
+        warnExposureOnce(
+          `listen:${host}:${deps.cfg.http.port}`,
+          [
+            `HTTP 已监听非回环地址 ${host}:${deps.cfg.http.port} —— 同一网络内的其他机器现在都能连这个端口。`,
+            `  · 该端口用 ${DEFAULT_HTTP_HOST} 之外的地址暴露后，master token 就是局域网级别的凭据；`,
+            `  · SSE 仍兼容 ?token=<master_token>，token 会进 URL（浏览器历史/代理日志/Referer），非回环下请优先用 Authorization 头；`,
+            `  · 保险库写操作（vault add/rm）已改为仅回环对端可调用；`,
+            `  · 若要收回：把 surfaces.http.host 改回 ${DEFAULT_HTTP_HOST} 并重启 daemon。`,
+          ].join('\n'),
+        );
+      }
       resolvePromise(server);
     });
   });
@@ -1516,4 +1693,64 @@ export function assertHttpConfig(cfg: SurfacesConfig): void {
   if (cfg.http.masterToken.length === 0) {
     throw new ConfigError('surfaces.http.master_token 为空（fail-closed）', null);
   }
+
+  // ── F6：非回环监听的显式告警 + Origin 白名单不许「没写/通配」──────────────
+  //
+  // 为什么默认值必须是回环、而扩大它必须付出「额外写明」的代价：见 config.ts
+  // DEFAULT_HTTP_HOST 的注释。这里守的是**非回环那一侧**的门槛。
+  const loopback = isLoopbackBindHost(cfg.http.host);
+  if (!loopback) {
+    // ① Origin 白名单：空数组在 originAllowed 里 = 放行任何来源；含 `*` 是主人的
+    //    通配意图。两者在回环下都无伤大雅（能连上的只有本机），在非回环下等于
+    //    「扩面 + DNS rebinding 防护形同不存在」。fail-closed 拒启动，让主人补
+    //    一行明确来源，而不是默默把 /api 摊给整个二层网络。
+    if (originsAreLenient(cfg.http.allowedOrigins)) {
+      throw new ConfigError(
+        [
+          `surfaces.http.host = ${cfg.http.host} 是非回环地址，但 allowed_origins 没写清（空或含 *）。`,
+          '非回环监听必须显式列出要放行的来源，例如：',
+          `  allowed_origins: ["http://${cfg.http.host}:${cfg.http.port}"]`,
+          `（回环监听没有这个要求：把 host 改回 ${DEFAULT_HTTP_HOST} 即可照常启动。）`,
+        ].join('\n'),
+        null,
+      );
+    }
+    // ② 白名单写了、但一条都不指向这个 bind 地址 ⇒ 浏览器打开控制台会全 403
+    //    （Origin 是 http://<bind>:port，白名单里只有 localhost 时匹配不上）。
+    //    不拒启动（主人可能就是要挡住浏览器、只留 CLI），但要告警：这是最容易
+    //    被当成「鉴权坏了」去乱改 token 的场景，先把真相写在日志里。
+    const covers = cfg.http.allowedOrigins.some((o) => originHostMatches(o, cfg.http.host));
+    if (!covers) {
+      // 同 host:port 只说一次：这不是错误，刷两遍只会让人整段跳过。
+      warnExposureOnce(
+        `origins:${cfg.http.host}:${cfg.http.port}`,
+        [
+          `HTTP 监听非回环 ${cfg.http.host}:${cfg.http.port}，但 allowed_origins 里没有一条指向它：`,
+          `  已配置 ${JSON.stringify(cfg.http.allowedOrigins)}`,
+          `  浏览器按 http://${cfg.http.host}:${cfg.http.port} 访问时 Origin 匹配不上，/api 会全部 403。`,
+          '  要网页可用，请把它加进 allowed_origins；只要 CLI/API 可用则忽略本条。',
+        ].join('\n'),
+      );
+    }
+    warnExposureOnce(
+      `assert:${cfg.http.host}:${cfg.http.port}`,
+      `HTTP 配置为监听非回环地址 ${cfg.http.host}:${cfg.http.port}（默认 ${DEFAULT_HTTP_HOST}）：端口对整个局域网可达，` +
+        '请确认这是主人的本意。风险与缓解见 src/surfaces/http.ts 文件头「暴露面」段。',
+    );
+  }
+}
+
+/** 来源 URL 的 host 是否就是监听地址（用于「白名单里有没有一条真的对得上」的判断）。 */
+function originHostMatches(origin: string, bindHost: string): boolean {
+  let hostname = '';
+  try {
+    hostname = new URL(origin.trim()).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  const b = bindHost.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  if (hostname === b) return true;
+  // ::1 与 localhost / 127.0.0.1 之间互认（浏览器可能写其中任一种）
+  if (isLoopbackBindHost(b) && isLoopbackBindHost(hostname)) return true;
+  return false;
 }
