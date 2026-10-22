@@ -216,3 +216,116 @@ test('被拒调用：参数每次微调也必须被拦住（治理只看工具�
     tmp.cleanup();
   }
 });
+test('参数完全一样、结果每轮都不同，也必须被护栏收口（易变输出不该成为免死牌）', async () => {
+  // 2026-10-22 真机缺陷（95 步仍 running，真实 docker fleet 下抓到的）：
+  //
+  //   模型反复发同一条命令：
+  //     {"cmd":"echo DOTD-REAL-$(date +%s); uname -a","timeout_ms":15000}
+  //   命令里的 $(date +%s) 每轮求值都不同 → 结果串永不相等。
+  //
+  //   护栏因此判「结果在变，说明有进展」，一路给「【必须收尾】」提示却**永不升级到 stop**。
+  //   现场 25 次 shell.run、95 步、任务进了 awaiting_approval 才被人工打断。
+  //
+  // 这与 2026-10-22 的 browser ref 漂移同源（stabilizeVolatileText 那次的教训），
+  // 但那次的修法只覆盖 `[ref=eN]`。时间戳类输出同样易变，而且更常见 ——
+  // 任何带 date / 随机 id / 耗时的命令都会命中。
+  //
+  // 判据不能是「结果变了就是有进展」：**同一个调用反复做，结果怎么变都不算进展**。
+  // 次数本身就是证据，不该被易变输出抵消掉。
+  const tmp = makeTempDataDir();
+  try {
+    let stepCount = 0;
+    const notes: string[] = [];
+    let llmRounds = 0;
+    const task = { id: 'tk_volatile_loop', dotId: 'dot1', runEpoch: 1, threadId: 'thr_v', title: 't', goal: 'g', budgetTokens: 10_000_000, resumeFromSeq: null };
+
+    const routerStub = {
+      async complete(req: RouteRequest): Promise<RouteResult> {
+        if ((req.tools ?? []).length === 0) {
+          return { response: { content: '收尾：以现有信息为准。', toolCalls: [] },
+            meta: { endpointId: 'stub', model: 'stub', tier: 1, degraded: false, tried: [] },
+            usage: { promptTokens: 1, completionTokens: 1 } } as unknown as RouteResult;
+        }
+        llmRounds += 1;
+        // 参数每轮**完全一样**（真机现场就是这一条命令）
+        return { response: { content: '', toolCalls: [{ id: `c${llmRounds}`, name: 'shell.run', arguments: '{"cmd":"echo tick-$(date +%s); uname -a","timeout_ms":15000}' }] },
+          meta: { endpointId: 'stub', model: 'stub', tier: 1, degraded: false, tried: [] },
+          usage: { promptTokens: 1, completionTokens: 1 } } as unknown as RouteResult;
+      },
+    };
+
+    const cp = {
+      pop: () => null,
+      getTask: () => ({ ...task, status: 'running' }),
+      bindSession: () => {},
+      finish: () => {},
+      failTask: () => {},
+      pauseByReason: () => {},
+      setAwaitingApproval: () => {},
+      heartbeat: () => ({ aborted: false, overBudget: false }),
+      journal: {
+        beginLlm: () => { llmRounds += 0; return { seq: ++stepCount, callId: `llm_${stepCount}` }; },
+        endLlm: () => {},
+        beginTool: () => ({ seq: ++stepCount, callId: `tool_${stepCount}` }),
+        endTool: () => {},
+        skipStep: () => {},
+        markPending: () => {},
+        resumeStep: () => ({ callId: '' }),
+        tail: () => [],
+        getStepByCallId: () => null,
+      },
+    } as unknown as ControlPlane;
+
+    let toolRuns = 0;
+    const runner = new DotRunner(
+      {
+        cp,
+        router: routerStub as unknown as ConstructorParameters<typeof DotRunner>[0]['router'],
+        exec: {
+          // 每次返回**不同的** stdout —— 模拟 $(date +%s) 求值
+          runTool: async (c: { call_id: string }) => {
+            toolRuns += 1;
+            return { call_id: c.call_id, status: 'ok', result: { exit_code: 0, stdout: `tick-${String(1792697858 + toolRuns * 7)}\nLinux dot-dot1`, signal: null } };
+          },
+          getCapabilities: async () => [
+            { name: 'shell.run', mode: 'sync', max_deadline_ms: 60000, args_schema: {}, sideEffect: 'unknown' },
+          ],
+          reconcileCall: async () => 'unknown',
+          getCallResult: async () => null,
+          cancelTool: async () => {},
+        } as unknown as ConstructorParameters<typeof DotRunner>[0]['exec'],
+        memory: {
+          openThread: async () => 'thr_v',
+          appendMessage: async () => ({ id: 'm', seq: 1 }),
+          appendSystemMessage: async () => ({ id: 'm', seq: 1 }),
+          buildContextBundle: async () => ({ memoryMd: '', manualExcerpts: [], summary: null }),
+          buildSessionReplay: async () => [],
+          beforeWrite: async () => ({ ok: true }),
+          sealTask: async () => {},
+          needsMemoryRedo: async () => false,
+        } as unknown as MemoryServiceApi,
+        governance: {
+          evaluate: async () => ({ kind: 'allow' as const }),
+          claim: async () => ({ ok: true }),
+          forceApproval: async () => ({ approvalId: 0 }),
+        } as unknown as GovernanceApi,
+      },
+      { idlePollMs: 5, log: (m: string) => notes.push(m) },
+    );
+
+    const out = await (runner as unknown as { runTask: (t: unknown) => Promise<{ status: string }> }).runTask(task);
+
+    assert.equal(out.status, 'done', `应被收口成 done，实际 ${out.status}`);
+    assert.ok(
+      llmRounds <= 6,
+      `同参数、易变输出的重复应在 6 轮内收口，实际 ${String(llmRounds)} 轮（真机曾烧到 95 步不收口）。` +
+        `日志：${notes.slice(-4).join(' | ')}`,
+    );
+    assert.ok(
+      notes.some((n) => n.includes('原地打转') || n.includes('护栏')),
+      `应留下护栏介入的日志，实际：${notes.slice(-4).join(' | ')}`,
+    );
+  } finally {
+    tmp.cleanup();
+  }
+});

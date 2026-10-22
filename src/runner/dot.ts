@@ -441,8 +441,38 @@ function normalizeResultForRepeat(value: unknown): string {
  * （商品名/价格/元素角色都原样保留）。
  */
 function stabilizeVolatileText(v: unknown): unknown {
-  if (typeof v !== 'string') return v;
-  return v.replace(/ref=e\d+/g, 'ref=e#');
+  if (typeof v !== 'string') {
+    // shell.run 的 stdout 常在**对象里**，不只在顶层字符串上；递归进去抹。
+    if (Array.isArray(v)) return v.map(stabilizeVolatileText);
+    if (v !== null && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, x] of Object.entries(v as Record<string, unknown>)) out[k] = stabilizeVolatileText(x);
+      return out;
+    }
+    return v;
+  }
+  return (
+    v
+      // browser.snapshot 的 `[ref=e374]` / `[level=1, ref=e374]`：会话内单调递增。
+      .replace(/ref=e\d+/g, 'ref=e#')
+      // **时间戳/序号类易变输出**（2026-10-22 真机，95 步不收口）。
+      //
+      // 现场命令是 `echo DOTD-REAL-$(date +%s); uname -a`：命令本身完全没变，
+      // 但 $(date +%s) 每轮求值都不同，于是 stdout 永不相等 → sameResultCount
+      // 恒为 1 → 护栏判「结果在变，说明有进展」，一路沉默到 95 步。
+      //
+      // 这类输出和 ref 编号是同一个性质：**每次都不一样，但不代表进展**。
+      // 逐个命令去猜不现实（date / $RANDOM / pid / 耗时 / 自增 id 无穷无尽），
+      // 所以在文本层把「看起来像时间戳/大整数」的片段统一抹平。
+      // 只抹**长数字串**（>= 8 位），普通的小数字（行数、退出码、价格）原样保留 ——
+      // 判据要窄，宁可漏抹也不能把「真的换了结果」误判成「没变」。
+      .replace(/\b\d{10,}\b/g, 'N#')
+      // ISO 时间戳（2026-10-22T19:38:59.165Z）同样每轮都变。
+      .replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?/g, 'T#')
+      // 常见的时间形式 19:38:59 / 2026-10-22 19:38:59
+      .replace(/\b\d{2}:\d{2}:\d{2}\b/g, 'C#')
+      .replace(/\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}\b/g, 'D#')
+  );
 }
 
 /**
@@ -2145,12 +2175,51 @@ export class DotRunner {
     if (rewriteNote !== null) return rewriteNote;
 
     const sameResult = rec.sameResultCount ?? 0;
+    // **结果变了不等于有进展**（2026-10-22 真机缺陷，95 步不收口）。
+    //
+    // 现场：模型反复发同一条命令，命令里带 `$(date +%s)`
+    //
+    //   {"cmd":"echo DOTD-REAL-$(date +%s); uname -a","timeout_ms":15000}
+    //
+    // 每轮求值都不同 → 结果串永不相等 → sameResultCount 恒为 1 →
+    // 下面那句「【必须收尾】」每轮都发，却**永远升级不到 stop**（升级要求 >= 3）。
+    // 于是它一边被提醒一边继续发，25 次 shell.run、95 步、进了 awaiting_approval。
+    //
+    // 这与 2026-10-22 的 browser ref 漂移同源，但那次的 stabilizeVolatileText
+    // 只覆盖 `[ref=eN]`。时间戳/随机 id/耗时这类易变输出更常见 —— 任何带
+    // `date`、`$RANDOM`、pid、时长的命令都会命中。逐个模式去抹是抹不完的。
+    //
+    // 所以判据换掉：**同一个调用反复做，结果怎么变都不算进展**。
+    // `rec.count` 是这份账本里唯一不会被易变输出影响的事实，次数够了就必须收口。
+    // 下面的阈值沿用既有语义（soft=2 / hard=4），只是不再被 sameResult 短路掉。
+    // **「结果有没有变」这个判据必须先判对**（2026-10-22 真机缺陷，95 步不收口）。
+    //
+    // 现场：模型反复发同一条命令，命令里带 `$(date +%s)`
+    //
+    //   {"cmd":"echo DOTD-REAL-$(date +%s); uname -a","timeout_ms":15000}
+    //
+    // 每轮求值都不同 → 结果串永不相等 → sameResultCount 恒为 1 →
+    // 下面那句「【必须收尾】」每轮都发，却**永远升级不到 stop**（升级要求 >= 3）。
+    // 一边被提醒一边继续发，25 次 shell.run、95 步、进了 awaiting_approval。
+    //
+    // 注意 sameResultCount 的真实语义（与旧注释相反，旧注释误导过一次）：
+    //   1        = 结果每轮都在变（从没重复过）
+    //   >= 2     = 至少重复过一次（第 2 次起）
+    // 所以「每次都返回一样的结果」这句话只有 >= 2 才说得出；对 == 1 说这句是假话。
     if (sameResult >= 3) return 'stop';
     if (sameResult >= 1) {
+      // **别对 sameResult===1 说「每次都返回一样的结果」**（那是在说假话）。
+      // 1 的真实含义是「结果每轮都在变，从没重复过」。旧文案两种情形共用一句，
+      // 于是模型被反复告知「结果没变」而它明明看到变了 —— 提示因此失去可信度，
+      // 它继续发同一条命令也就变得合理了。
+      const why =
+        sameResult >= 2
+          ? `而且**每次都返回一样的结果**：${rec.last}。`
+          : '虽然每次输出略有不同，但**动作完全一样**，说明这一步没有推进。';
       return {
         note:
           `【必须收尾】${call.name} 用完全相同的参数已经调用 ${rec.count} 次，` +
-          `而且**每次都返回一样的结果**：${rec.last}。` +
+          why +
           `重复不会产生新信息，现在立刻停止调用工具，直接给出最终结论。`,
       };
     }
