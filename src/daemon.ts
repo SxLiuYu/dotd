@@ -40,7 +40,7 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { openDb, resolveDbPath } from '../db/conn.ts';
 import { MailService } from './mail/MailService.ts';
-import { CardRegistry, pushApprovalCard, resolveApprovalCard } from './surfaces/feishu-approval.ts';
+import { CardRegistry, parseOwnerChatIds, resolveApprovalCards } from './surfaces/feishu-approval.ts';
 import { startProgressPush } from './surfaces/progress-push.ts';
 import {
   addLocalEvent,
@@ -763,10 +763,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 170）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 185）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 170 });
+    const res = migrate(db, { expectedVersion: 185 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -921,7 +921,11 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     filePath: join(cfg.dataDir, 'notifications.log'),
     defaultChatId: surfCfg.telegram.ownerChatId ?? surfCfg.telegram.allowlist[0],
     // owner_chat_id 允许逗号分隔多会话（入站闸门放行全部）；出站通知发第一个。
-    feishuChatId: surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0],
+    // 求救通道是**单会话语义**：channels.ts 的 feishuChatId?: string 会被原样塞进
+    // 飞书 API 的 chat_id，传 'oc_a,oc_b' 直接 400 → 求救静默降级到 OUTBOX.md，
+    // 比「只发第一个」更糟。所以这里显式取主会话（不再是手切字符串）。
+    // 要让求救也广播，得先把 channels.ts 的接口改成 chatIds: string[] + 逐会话发。
+    feishuChatId: parseOwnerChatIds(surfCfg.feishu.ownerChatId)[0],
   });
   // 飞书可用性预热：拿到 token 即置位。否则 daemon 刚起来时 available('feishu') 恒 false
   // （只在 sendText 成功后才置位），第一封求救——常是重启后两轨齐挂那一刻——会白白
@@ -944,14 +948,21 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   //   能发卡片就发卡片（带按钮），发不出去才退回纯文本。
   // 去重交给它的 claimAndSend（同一 approvalId 只发一次）。
   const cardRegistry = new CardRegistry();
-  const ownerChatForApproval =
-    surfCfg.feishu.ownerChatId?.split(',').map((x) => x.trim()).filter((x) => x.length > 0)[0] ?? '';
+  // B1（F5）：owner_chat_id 允许逗号分隔多会话，入站闸门放行全部，
+  // **出站也要投全部** —— 原来这里取 [0]，第二个会话永远收不到审批卡片，
+  // 任务卡在 awaiting_approval 直到 24h 过期。切换点收敛到 parseOwnerChatIds。
+  const ownerChats = parseOwnerChatIds(surfCfg.feishu.ownerChatId);
+  // 单会话消费方（进度推送 9.1、求救通道）仍取第一个：那是高频播报/兜底，
+  // 广播会变成打扰；真要多会话得先改各自的接口，见 docs backlog。
+  const ownerChatForApproval = ownerChats[0] ?? '';
   const approvalCardSender =
-    feishuGw !== NULL_FEISHU_GATEWAY && ownerChatForApproval !== ''
+    feishuGw !== NULL_FEISHU_GATEWAY && ownerChats.length > 0
       ? {
-          chatId: ownerChatForApproval,
-          send: async (view: import('./shared/contracts.ts').ApprovalView) => {
-            const r = await feishuGw.sendCard(ownerChatForApproval, buildApprovalCard(view));
+          chatIds: ownerChats,
+          // 循环由 feishu-outbound.ts 的 claimAndSend 驱动（发送/审计/去重一处），
+          // 这里只负责「往指定会话发一张」并把 messageId 记进 registry。
+          send: async (view: import('./shared/contracts.ts').ApprovalView, chatId: string) => {
+            const r = await feishuGw.sendCard(chatId, buildApprovalCard(view));
             if (r.ok && r.messageId !== undefined) cardRegistry.set(view.id, r.messageId);
             return r;
           },
@@ -1612,15 +1623,25 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
             },
             resolveCard: async (cardMessageId, approvalId) => {
               // 改卡片：把按钮换成结论，避免主人重复点。失败不影响裁决。
-              // 复用 feishu-approval.ts 已有的 resolveApprovalCard（含"找不到就不改"）。
-              const mid = cardMessageId.length > 0 ? cardMessageId : cardRegistry.get(approvalId);
-              if (typeof mid !== 'string' || mid.length === 0) return;
-              await resolveApprovalCard(
+              // B1（F5）：广播之后一个 approvalId 在 N 个会话里有 N 张卡片。
+              // **必须遍历全部** —— 只改被点的那一张 = 另一端挂着可点按钮的旧卡片，
+              // 主人换个会话又点一次；裁决先到先得不会重复执行，但审计里会堆
+              // 「迟到裁决」噪音，而且主人会怀疑「我到底批了没有」。
+              // 并入 cardMessageId：registry 是内存态，daemon 重启后为空，
+              // 这时入站带来的那一张仍要改。
+              const mids = Array.from(
+                new Set([
+                  ...(cardMessageId.length > 0 ? [cardMessageId] : []),
+                  ...cardRegistry.getMany(approvalId),
+                ]),
+              );
+              if (mids.length === 0) return;
+              await resolveApprovalCards(
                 {
                   sender: feishuGw,
-                  chatId: ownerChatForApproval,
+                  chatIds: ownerChats,
                   log,
-                  // 同步查最新状态：resolveApprovalCard 的 getApprovalView 是同步签名，
+                  // 同步查最新状态：resolveApprovalCards 的 getApprovalView 是同步签名，
                   // 而 govGetApproval 返回 Promise。这里只要 status/verdict 用于改卡片文案。
                   getApprovalView: (id) => {
                     const row = db
@@ -1630,7 +1651,7 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
                     return { id: row.id, seq: row.seq, status: row.status } as unknown as ApprovalView;
                   },
                 },
-                mid,
+                mids,
                 approvalId,
                 '飞书',
               );
@@ -1673,9 +1694,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           mirrorWebToFeishu: surfCfg.feishu.mirrorWebToFeishu ?? false,
           // T3：能发卡片就发卡片，发不出去才退回纯文本（避免重复推送）
           ...(approvalCardSender !== undefined ? { approvalCards: approvalCardSender } : {}),
-          // 系统级通知（如 dot 被隔离）发到主人默认会话的第一个 chat
-          fallbackChatId:
-            surfCfg.feishu.ownerChatId?.split(',').map((s) => s.trim()).filter((s) => s.length > 0)[0] ?? null,
+          // 系统级通知（如 dot 被隔离）：没有来源会话，兜底给主人 = **全部会话**（B1/F5）。
+          // 只投第一个时，第二个会话的主人看到的只有「任务莫名其妙挂了」。
+          fallbackChatIds: ownerChats,
           // A3：截图随单推送 —— 文本回复发出成功后触发（见 screenshot-push.ts）。
           // 读图走容器 fs.read(base64)；发图走 FeishuGateway.sendImage。
           // 9.1（2026-10-21）：这两个能力现在也供进度推送复用（见 readHomeFileForShot 注释）。

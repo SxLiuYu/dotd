@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
+import { latestMigrationVersion } from '../db/migrate.ts';
 import { makeTempDataDir, type TempDataDir } from './helpers.ts';
 
 let tmp: TempDataDir;
@@ -208,14 +209,16 @@ test('关停：shutdown 幂等 + shutdown_marker + OUTBOX 留痕', async (t) => 
   assert.ok(outbox.includes('优雅退出'), `OUTBOX 无优雅退出留痕：${outbox.slice(0, 200)}`);
 });
 
-test('装配：库里迁移到位（user_version=170）', async (t) => {
+test('装配：库里迁移到位（user_version = db/migrations 最大 NNN）', async (t) => {
   const { daemon, close } = await boot();
 
   const row = tmp.db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
   // PRAGMA 查询在 node:sqlite 下返回行对象
   const v = row === undefined ? (tmp.db.prepare('PRAGMA user_version').get() as unknown as { user_version: number }).user_version : row.user_version;
-  // 必须等于 db/migrations/ 里最大的 NNN。新增迁移包时同步改这里和 src/daemon.ts
-  // 的 expectedVersion——两处漏一处，这个测试就是唯一会响的警报。
-  assert.equal(v, 170);
+  // 必须等于 db/migrations/ 里最大的 NNN。这里**故意不写死数字**（2026-10-22 去钉）：
+  // 以前是 assert.equal(v, 170)，于是每加一个迁移包都要来改这个字面量，漏改就红一片，
+  // 而红的原因是"数字没抄上"而不是"迁移没跑"。改成读目录算出来的期望值后，
+  // 它仍然能在"src/daemon.ts 的 expectedVersion 落后于迁移目录"时响 —— 那才是真问题。
+  assert.equal(v, latestMigrationVersion(), `user_version 应等于最大迁移号 ${latestMigrationVersion()}`);
   void close;
 });
