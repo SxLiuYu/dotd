@@ -352,6 +352,26 @@ export async function legacyBrowser(
     if (rawUrl === '') return { ok: false, error: 'browser.open 需要 url' };
     const url = safeUrl(rawUrl);
     if (url === null) return { ok: false, error: `只支持 http(s) URL，收到：${rawUrl}` };
+    // 2026-10-22 真机缺陷：**冷启动 + 首次导航叠在一起会超时**，慢站一律打不开。
+    //
+    // 现场：https://www.scrapingcourse.com/ecommerce/ 用 curl 只要 6.5s（HTTP 200），
+    // 但 browser.open 稳定在 27~28s 报
+    //   `Operation timed out. The page may still be loading or the element may not exist.`
+    // 紧接着 browser.snapshot 返回 `(no interactive elements)` / `(empty page)` ——
+    // 看起来像「网站有问题」或「网络不通」，实测两者都不是。
+    //
+    // 手动拆开就成功（同一 URL、同一 session）：
+    //   open about:blank   → ✓ launched browser（把冷启动这一步单独吃掉）
+    //   open <url>         → ✓ Ecommerce Test Site to Learn Web Scraping
+    // 说明超时的不是网络，是 agent-browser 内部对**单次 open 动作**的固定预算
+    // （实测卡在 27~28s，且 AGENT_BROWSER_DEFAULT_TIMEOUT 设成 3s 也不影响快站，
+    //  设成 120s 也不放宽慢站 —— 即该变量在本版本被忽略，别指望它）。
+    //
+    // 修法：**先无 URL 起一次浏览器把冷启动分离出去**，再导航。
+    // 代价是多一次子进程调用（约几十毫秒）；收益是所有慢站都能打开。
+    // 已起过的 session 上是幂等的（open 无 URL 只是确保浏览器在跑）。
+    const boot = await run(['open'], session);
+    if (boot.code !== 0) return { ok: false, error: friendlyFailure(boot.stderr, boot.code) };
     const r = await run(['open', url], session);
     if (r.code !== 0) return { ok: false, error: friendlyFailure(r.stderr, r.code) };
     // 老的 browser.open 返回 {url,title}；这里给同样的信息，历史调用方不用改。
