@@ -141,6 +141,32 @@ export async function pushTaskScreenshots(
     }
     try {
       const res = await deps.sendImage(chatId, png);
+      // 2026-10-23：随单截图也要落台账。
+      //
+      // 原来只写日志，而日志每次重启被截断（wsl-daemon.sh 用 `: > "$LOG"`）。
+      // 结果「任务结束时到底补发过几张图」事后查不到 —— 主人问「怎么这么多消息」时，
+      // 图片那部分完全是黑箱：progress_image 记的是**进度推送**发的图，不是这里发的。
+      //
+      // kind 用 task_image 与 progress_image 区分：一个跟着结论走，一个跟着过程走。
+      // 混在一起统计就分不清「过程里看到了什么」和「结论配了哪张图」。
+      try {
+        deps.db
+          .prepare(
+            `INSERT INTO surf_outbound_log (kind, dedup_key, chat_id, ok, error, text_preview, at)
+             VALUES ('task_image', ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            `taskimg:${taskId}:${path}`,
+            chatId,
+            res.ok ? 1 : 0,
+            res.ok ? null : (res.error ?? null),
+            `随单截图 ${path}`.slice(0, 200),
+            new Date().toISOString(),
+          );
+      } catch (cause) {
+        // 台账写失败不能影响发图本身：图比记录重要（与 progress-push 同策）。
+        deps.log(`[screenshot-push] 写台账失败 ${path}：${String(cause)}`);
+      }
       if (res.ok) {
         sent += 1;
       } else {

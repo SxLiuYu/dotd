@@ -261,3 +261,42 @@ test('跨模块去重看 ok=1：发失败过的图仍要重试', async () => {
   assert.equal(sends.length, 1, '失败过的不算已发过，应重试');
   assert.equal(n, 1);
 });
+
+test('随单截图落台账 task_image：成功记 ok=1（2026-10-23 补）', async () => {
+  // 为什么必须记：原来只写日志，而日志每次重启被截断（wsl-daemon.sh 用 `: > "$LOG"`）。
+  // 主人问「怎么这么多消息」时，图片那部分是黑箱 —— progress_image 记的是
+  // **进度推送**发的图，不是随单补发的图，两者混在同一个 kind 里就分不清了。
+  const db = makeDb();
+  db.prepare('INSERT INTO tasks (id, dot_id) VALUES (?, ?)').run('tk_1', 'dot1');
+  const p1 = '/dot/home/screenshots/a.png';
+  insertShot(db, 'tk_1', 4, JSON.stringify({ output: JSON.stringify({ path: p1 }) }));
+  const deps = makeDeps(db, { files: new Map([[p1, Buffer.from('aaa')]]) });
+  const n = await pushTaskScreenshots('tk_1', 'oc_1', deps);
+  assert.equal(n, 1);
+  const rows = db
+    .prepare("SELECT kind, dedup_key, chat_id, ok FROM surf_outbound_log WHERE kind = 'task_image'")
+    .all() as Array<{ kind: string; dedup_key: string; chat_id: string; ok: number }>;
+  assert.equal(rows.length, 1, '发出去一张就该有一条 task_image 台账');
+  assert.equal(rows[0]!.dedup_key, `taskimg:tk_1:${p1}`);
+  assert.equal(rows[0]!.chat_id, 'oc_1');
+  assert.equal(rows[0]!.ok, 1);
+});
+
+test('随单截图落台账：发送失败记 ok=0 并带 error（不许静默吞掉）', async () => {
+  const db = makeDb();
+  db.prepare('INSERT INTO tasks (id, dot_id) VALUES (?, ?)').run('tk_1', 'dot1');
+  const p1 = '/dot/home/screenshots/b.png';
+  insertShot(db, 'tk_1', 5, JSON.stringify({ output: JSON.stringify({ path: p1 }) }));
+  const deps = makeDeps(db, {
+    files: new Map([[p1, Buffer.from('bbb')]]),
+    sendResults: [{ ok: false, error: 'rate limited' }],
+  });
+  const n = await pushTaskScreenshots('tk_1', 'oc_1', deps);
+  assert.equal(n, 0, '发失败不计入成功数');
+  const row = db
+    .prepare("SELECT ok, error FROM surf_outbound_log WHERE kind = 'task_image'")
+    .get() as { ok: number; error: string | null } | undefined;
+  assert.ok(row !== undefined, '失败也要留一条，否则「发没发过」无从回答');
+  assert.equal(row!.ok, 0);
+  assert.equal(row!.error, 'rate limited');
+});
