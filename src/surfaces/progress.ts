@@ -153,8 +153,18 @@ export function decideProgress(
 ): ProgressDecision {
   if (!cfg.enabled) return { push: false, reason: 'disabled' };
 
-  // 需要人介入 → 必推，不看节流。理由：这种消息漏掉的代价远大于多推一条。
+  // 需要人介入 → 越过步数节流，但**不越过时间节流**。
+  //
+  // 2026-10-23 修（主人原话「飞书消息又变多了」）。原来是「必推，不看节流」，
+  // 理由写的是「这种消息漏掉的代价远大于多推一条」—— 那句话本身没错，
+  // 错在它假设 attention 是稀有的。实测 tk_mvk7ok90toir14：失败 3 次、
+  // attention 却推了 9 条，因为「最近 5 步有 failed」在随后每一步都成立。
+  // 一个 92 步的任务从 13 条降到 3 条，失败信息一条不少。
+  //
+  // 保留"越过步数"：失败不该等到再走 3 步才说。
   if (input.needsAttention) {
+    const sinceLast = input.lastPushAt === null ? Infinity : input.now - input.lastPushAt;
+    if (sinceLast < cfg.minIntervalMs) return { push: false, reason: 'too_soon' };
     return { push: true, text: renderProgress(input, true), reason: 'attention' };
   }
 

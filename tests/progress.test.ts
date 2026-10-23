@@ -101,7 +101,7 @@ const mk = (over: Partial<ProgressInput> = {}): ProgressInput => ({
 // ── 6. 需要人介入必须突破节流 ──────────────────────────────────
 {
   const d = decideProgress(
-    mk({ needsAttention: true, lastPushAt: NOW - 1_000, lastPushStep: 5, stepCount: 5 }),
+    mk({ needsAttention: true, lastPushAt: NOW - 200_000, lastPushStep: 5, stepCount: 5 }),
     ON,
   );
   ok('需要关注时立刻推', d.push === true && d.reason === 'attention');
@@ -109,6 +109,21 @@ const mk = (over: Partial<ProgressInput> = {}): ProgressInput => ({
     ok('  文案说"需要你看一下"', d.text.includes('需要你看一下'));
     ok('  文案指出详情在哪', d.text.includes('/tasks'));
   }
+
+  // 2026-10-23（主人原话「飞书消息又变多了」）：attention 越过**步数**节流，
+  // 但不再越过**时间**节流。原来「必推，不看节流」导致一次失败连推三条：
+  // 实测 tk_mvk7ok90toir14，92 步任务发了 13 条进度，其中 9 条是 attention，
+  // 而真实失败只有 3 次。
+  const tooSoon = decideProgress(
+    mk({ needsAttention: true, lastPushAt: NOW - 1_000, lastPushStep: 5, stepCount: 5 }),
+    ON,
+  );
+  ok('需要关注但刚推过 → 等一会儿再说', tooSoon.push === false && tooSoon.reason === 'too_soon');
+  const firstEver = decideProgress(
+    mk({ needsAttention: true, lastPushAt: null, lastPushStep: null, stepCount: 5 }),
+    ON,
+  );
+  ok('从没推过时失败照旧立刻说', firstEver.push === true && firstEver.reason === 'attention');
 
   // 连默认关都要让位于"需要人"吗？—— 不。开关是主人的最终决定。
   const off = decideProgress(mk({ needsAttention: true }), DEFAULT_PROGRESS);

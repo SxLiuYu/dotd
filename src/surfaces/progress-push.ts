@@ -50,6 +50,8 @@ interface TaskProgressState {
   lastSeenCallId: string | null;
   /** 上一次随进度发出去的截图路径（没发过 = null）。用于去重，见 decideScreen。 */
   lastImagePath: string | null;
+  /** 上次因为失败推过一条的步序号（attention 边沿判据，2026-10-23）。 */
+  lastAttentionSeq: number | null;
 }
 
 /**
@@ -244,6 +246,7 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
       lastPushStep: null,
       lastSeenCallId: null,
       lastImagePath: null,
+      lastAttentionSeq: null,
     };
 
     // 同一 callId 重投直接忽略（总线不保证不重投）
@@ -253,7 +256,7 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     // 从库里读真实步数与最近几步 —— 不靠内存计数，
     // 因为审批续跑会让 step 序列跳号，内存计数会漂。
     let stepCount = 0;
-    let recent: Array<{ kind: 'llm' | 'tool'; toolName: string | null; status: string }> = [];
+    let recent: Array<{ seq: number; kind: 'llm' | 'tool'; toolName: string | null; status: string }> = [];
     let title = '';
     let screen: string | null = null;
     /** 本次可附的截图路径（最近一条成功的 browser.screenshot）。 */
@@ -265,15 +268,16 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
       stepCount = row?.c ?? 0;
       const rows = deps.db
         .prepare(
-          'SELECT kind, tool_name AS toolName, status, result_json AS resultJson FROM steps WHERE task_id=? ORDER BY seq DESC LIMIT 5',
+          'SELECT seq, kind, tool_name AS toolName, status, result_json AS resultJson FROM steps WHERE task_id=? ORDER BY seq DESC LIMIT 5',
         )
         .all(taskId) as Array<{
+        seq: number;
         kind: 'llm' | 'tool';
         toolName: string | null;
         status: string;
         resultJson: string | null;
       }>;
-      recent = rows.map((r) => ({ kind: r.kind, toolName: r.toolName, status: r.status }));
+      recent = rows.map((r) => ({ seq: r.seq, kind: r.kind, toolName: r.toolName, status: r.status }));
       // 9.1：找最近一张真截图（browser.screenshot 落盘 PNG）。
       // 只取一张 —— 进度是"现在看到什么"，不是相册。
       if (deps.image !== undefined) {
@@ -309,7 +313,22 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     }
 
     // 失败的一步 = 需要人看一眼
-    const needsAttention =
+    // 失败的一步 = 需要人看一眼 —— 但**一次失败只报一次**（2026-10-23）。
+    //
+    // 原来写的是 `recent.some(r => r.status === failed)`，即「最近 5 步里有失败」。
+    // 那是**状态**，不是**事件**：第 79 步失败后，第 80、81、82 步的 recent 里
+    // 都还带着那条 failed，而 attention 分支当时不受任何节流约束。
+    // 实测 tk_mvk7ok90toir14：失败 3 次 → attention 消息 9 条（13 条里占 9 条）。
+    //
+    // 改法：取「最靠后的那条失败」的 seq，跟上次报过的比 —— 只有新的才报。
+    const failedSeqs = recent
+      .filter((r) => r.status === 'failed' || r.status === 'interrupted')
+      .map((r) => r.seq);
+    const latestFailSeq = failedSeqs.length > 0 ? Math.max(...failedSeqs) : null;
+    const isNewFailure =
+      latestFailSeq !== null && latestFailSeq !== st.lastAttentionSeq;
+    const needsAttention = p.status === 'error' || isNewFailure;
+    if (isNewFailure && latestFailSeq !== null) st.lastAttentionSeq = latestFailSeq;
       p.status === 'error' || recent.some((r) => r.status === 'failed' || r.status === 'interrupted');
 
     // 2026-10-21（主人选方案 1）：这一步是不是刚出了**新手**截图？
@@ -367,6 +386,32 @@ export function startProgressPush(deps: ProgressPushDeps): () => void {
     state.set(taskId, st);
 
     const r = await deps.sender!.send(deps.chatId!, decision.text);
+    // 2026-10-23：进度**文字**也要落台账。
+    //
+    // 原来只有图片落台账（kind=progress_image），文字只写日志；而日志每次重启被
+    // 截断（wsl-daemon.sh 用 `: > "$LOG"`）。于是主人问「飞书怎么这么多消息」时，
+    // 查 surf_outbound_log 只有 task_reply/approval_card —— 看上去像别处在发，
+    // 实际是这个通道发了没记账。这次梳理就被这个坑耽误了半小时。
+    //
+    // kind 用 progress_text 不复用 task_reply：两者语义不同（过程 vs 结论），
+    // 混一起就分不清「说了多少句」和「答了多少题」。
+    try {
+      deps.db
+        .prepare(
+          `INSERT INTO surf_outbound_log (kind, dedup_key, chat_id, ok, error, text_preview, at)
+           VALUES ('progress_text', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `progress:${taskId}:${stepCount}:${decision.reason}`,
+          deps.chatId!,
+          r.ok ? 1 : 0,
+          r.ok ? null : (r.error ?? null),
+          decision.text.slice(0, 200),
+          new Date().toISOString(),
+        );
+    } catch (cause) {
+      deps.log(`[progress] 写进度台账失败（${taskId}）：${String(cause)}`);
+    }
     if (r.ok) {
       deps.log(`[progress] ${taskId} 推了进度（${decision.reason}，${stepCount} 步）`);
     } else {
