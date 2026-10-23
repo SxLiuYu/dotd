@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { makeTempDataDir } from './helpers.ts';
-import { createSchedule, listSchedules, removeSchedule } from '../src/control-plane/schedules.ts';
+import { createSchedule, listSchedules, removeSchedule, renderScheduleRemoved } from '../src/control-plane/schedules.ts';
 
 // 测试用的 cron 计算：只认标准 5 段，支持步进（星号斜杠 N）与固定分钟。
 function fakeCronNext(cron: string, from: number): number {
@@ -147,4 +147,46 @@ test('停用后不再出现在默认列表里，但仍可带 includeDisabled 查
   } finally {
     tmp.cleanup();
   }
+});
+
+
+// ── 停用提醒后必须说「办成了」（2026-10-23）─────────────────────────
+//
+// 真机现场（任务 tk_mvk9u8cpahns35，主人原话「15点的组会提醒取消」）：
+// 第 5 步 schedule.remove 就成功了，第 8 步 schedule.list 也只剩 3 条，
+// 但模型不认账，之后连着调 `bash crontab -l` / `systemctl` 三次，
+// 全被 deny（工具未登记），打转护栏强制收口，最后回主人的是：
+//   「我这边没有可以操作提醒的工具…我没法直接帮你取消这个提醒」
+// 事办成了，话说反了。根因是返回值只有一个裸布尔 removed:true，
+// 没有一句「已经办成了」的话——模型从一个布尔字段推不出成功。
+
+test('停用后的回话要说清「办成了」，不能只给一个布尔值', () => {
+  const t = renderScheduleRemoved('组会提醒', 'ct_01M59JVMHXG1XSPASS0G1DNPEE');
+  assert.ok(t.includes('已停用'), '必须有一句「已停用」：' + t);
+  assert.ok(t.includes('组会提醒'), '要带标题，ULID 对人/对模型都不构成确认：' + t);
+});
+
+test('必须说清是停用不是删除（否则主人以为数据没了）', () => {
+  const t = renderScheduleRemoved('组会提醒', 'ct_x');
+  assert.ok(t.includes('停用') && !/已删除/.test(t), '不能写成已删除：' + t);
+  assert.ok(t.includes('恢复'), '要说能恢复：' + t);
+});
+
+test('要主动堵住「再去系统 cron 里查一遍」这条岔路', () => {
+  // 这正是不堵就发生的事：模型跑去 crontab/systemctl 找，
+  // 一无所获，然后把「查不到」读成「没办成」。
+  const t = renderScheduleRemoved('组会提醒', 'ct_x');
+  assert.ok(/cron|systemd/.test(t), '要明确提到不必查系统 cron/systemd：' + t);
+  assert.ok(/不用再|不必/.test(t), '要明确说不用再确认：' + t);
+});
+
+test('没有标题时退回用 id，不能渲染出「「」」这种空壳', () => {
+  const t = renderScheduleRemoved('', 'ct_fallback');
+  assert.ok(t.includes('ct_fallback'), '空标题要退回 id：' + t);
+  assert.ok(!t.includes('「」'), '不能出现空的引号：' + t);
+});
+
+test('空白标题同样退回 id（trim 后为空）', () => {
+  const t = renderScheduleRemoved('   ', 'ct_ws');
+  assert.ok(t.includes('ct_ws'), '空白标题要退回 id：' + t);
 });

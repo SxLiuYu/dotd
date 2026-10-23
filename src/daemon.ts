@@ -102,7 +102,7 @@ import { loadMcpServers } from './exec/mcp-config.ts';
 import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
-import { createSchedule, listSchedules, removeSchedule } from './control-plane/schedules.ts';
+import { createSchedule, listSchedules, removeSchedule, renderScheduleRemoved } from './control-plane/schedules.ts';
 import type { ExecToolCall, ExecToolResult } from './shared/contracts.ts';
 import { CronExpressionParser } from 'cron-parser';
 import { createMemoryService } from './memory/MemoryService.ts';
@@ -1110,9 +1110,38 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     if (id.length === 0) {
       return { ok: false, code: 'schedule_invalid', message: '要停用哪一条？给我 id（可用 schedule.list 查）' };
     }
+    // 先记下标题再停用：removeSchedule 只回 {ok}，而「已停用哪一条」这句话
+    // 必须带标题模型才能对上号（id 是 ULID，对人不构成确认）。
+    const before = listSchedules(db).find((x) => x.id === id);
     const r = removeSchedule(db, id);
     if (!r.ok) return { ok: false, code: 'schedule_not_found', message: r.error ?? '没找到这条定时任务' };
-    return { ok: true, value: { id, removed: true, note: '已停用（不是硬删，能在管理界面恢复）' } };
+    // **必须带回 text**（2026-10-23，真机）。
+    //
+    // 现场：主人说「15点的组会提醒取消」，模型第 5 步就调了 schedule.remove，
+    // 返回 {id, removed:true}，第 8/14 步 schedule.list 也确实只剩 3 条 ——
+    // **事情早就办成了**。但模型跑完第 18 步仍不确认，第 21 步起改调 `bash`
+    // 去看 crontab，连吃三次 `deny:工具未登记`，打转护栏触发强制收口，
+    // 最后答出「我这边没有可以操作提醒的工具…我没法直接帮你取消」。
+    //
+    // 根因之一是这条返回只有一个 removed 布尔值，没有一句「办成了」的话。
+    // 同一批 host tool 里的 calendar.add / calendar.update / calendar.remove
+    // 都带 text（「已加日程…」「已改日程…」「已删除该日程。」）—— 唯独停用
+    // 提醒没有。模型要从裸布尔字段推断成功，推断失败就去找别的路了。
+    //
+    // 措辞讲究：这条是**停用**不是删除（enabled=0，管理界面能恢复），
+    // 所以不能写「已删除」。最后一句还得堵住「再去系统里查一遍」这个岔路：
+    // 提醒本来就存在本机表里，不在 crontab / systemd 里，去那儿查必然一无所获，
+    // 而一无所获又会被误读成「没做成」。
+    return {
+      ok: true,
+      value: {
+        id,
+        removed: true,
+        title: before?.title ?? '',
+        note: '已停用（不是硬删，能在管理界面恢复）',
+        text: renderScheduleRemoved(before?.title ?? '', id),
+      },
+    };
   });
 
   exec.registerHostTool('schedule.list', async () => {

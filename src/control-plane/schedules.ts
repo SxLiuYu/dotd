@@ -182,6 +182,40 @@ export function listSchedules(
 }
 
 /** 停用一条定时任务（不硬删，保留历史可查）。 */
+/**
+ * 停用一条提醒后给模型看的话（2026-10-23）。
+ *
+ * 为什么这句话要单独一个函数、还要能被单测：它是「模型知不知道自己办成了」的
+ * 唯一依据。真机现场（任务 tk_mvk9u8cpahns35，主人原话「15点的组会提醒取消」）：
+ *
+ *   第 5 步  schedule.remove  → {"id":...,"removed":true}        ← 办成了
+ *   第 8 步  schedule.list    → 只剩 3 条                          ← 复核也对
+ *   第 18 步（又查了两轮 list / calendar.list，仍不确认）
+ *   第 21 步  bash crontab -l → deny:工具未登记
+ *   第 22 步  bash crontab -l → deny:工具未登记
+ *   第 24 步  bash systemctl  → deny:工具未登记  → 打转护栏强制收口
+ *   第 25 步  答：「我这边没有可以操作提醒的工具…我没法直接帮你取消」
+ *
+ * 事办成了，回话却是「我做不到」—— 因为返回值只有一个裸布尔 `removed:true`，
+ * 没有一句人能读懂的成功宣告。同批的 calendar.add / calendar.update /
+ * calendar.remove 都有 text（「已加日程…」「已删除该日程。」），只有这里漏了。
+ *
+ * 三件事必须同时说到，少一件模型就会接着乱找：
+ *   ① 办成了什么（带标题，不是 ULID）；
+ *   ② 是停用不是删除（enabled=0，可恢复）—— 说成「已删除」会误导主人；
+ *   ③ 别去系统里再查一遍 —— 这条从来不在 crontab / systemd 里，
+ *      去那儿查必然空手而归，而空手而归又被它读成「没做成」。
+ */
+export function renderScheduleRemoved(title: string, id: string): string {
+  const name = title.trim() !== '' ? title.trim() : id;
+  return (
+    `已停用提醒「${name}」，它以后不会再触发。` +
+    '（这是停用不是删除：记录还在，管理界面能恢复。）' +
+    '这件事到此为止，不用再去别处确认，也不必查系统 cron / systemd ——' +
+    '这个提醒由本机日程表管理，从来就不在系统 cron 里。'
+  );
+}
+
 export function removeSchedule(db: DatabaseSync, id: string): { ok: boolean; error?: string } {
   // 只更新"启用中"的行：对一条已经停用的再停用，应当报"没有"而不是假装成功
   // （2026-10-18 单测抓到：原写法对已停用的行也会 changes=1）。
