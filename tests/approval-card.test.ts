@@ -12,7 +12,7 @@
  *   snapshot 会在我改文案时假红，而文案改成什么样都行。
  *   这里断言的是**语义**：有没有这个信息、解析对不对。
  */
-import { buildApprovalCard, parseCardAction, buildResolvedCard } from '../src/surfaces/feishu-card.ts';
+import { buildApprovalCard, parseCardAction, buildResolvedCard, toDecideCall } from '../src/surfaces/feishu-card.ts';
 import { classifyFeishuInbound } from '../src/surfaces/feishu-inbound.ts';
 import type { ApprovalView } from '../src/shared/contracts.ts';
 
@@ -184,6 +184,90 @@ const cardText = (c: Record<string, unknown>): string => JSON.stringify(c);
   ok('没参数时不编造收件人', !t.includes('收件人'));
   ok('没风险时不编造风险段', !t.includes('**风险**'));
   ok('工具名取不到也有兜底', t.includes('未知操作') || t.includes('mail.send'));
+}
+
+console.log('');
+console.log('  F. question 单：选项必须变成可点的按钮，且答案能解析回来（2026-10-23）');
+
+{
+  // 现场（approvals#150）：卡片只发了「同意/拒绝」两个按钮，主人点了同意，
+  // 审批 approved、任务续跑，但 `ask` 收到 `{answered:false}` —— 因为
+  // 按钮 value 里根本没有答案位，主人也没法在一张只有两个按钮的卡上「选」。
+  const v = makeView({
+    kind: 'question',
+    tier: null,
+    summary: 'ask 要删哪一条？',
+    reason: '要删哪一条？（日历删除没有回收站，先确认一下）',
+    subject: {
+      kind: 'question',
+      prompt: '要删哪一条？（日历删除没有回收站，先确认一下）',
+      options: ['周会试跑 10-27 10:00', '诊断跑 10-28 09:00', '全部删掉'],
+    },
+  });
+  const card = buildApprovalCard(v) as { elements: Array<Record<string, unknown>> };
+  const actions = card.elements.filter((e) => e.tag === 'action');
+  const buttons = actions.flatMap((a) => (a.actions ?? []) as Array<Record<string, unknown>>);
+  ok('卡片上有按钮', buttons.length >= 3, String(buttons.length));
+  const labels = buttons.map((b) => String((b.text as { content?: string }).content ?? ''));
+  ok('每个选项各一个按钮',
+     labels.includes('周会试跑 10-27 10:00') && labels.includes('诊断跑 10-28 09:00'),
+     JSON.stringify(labels));
+  const withAnswer = buttons.filter((b) => String(b.value).includes('answer'));
+  ok('选项按钮的 value 带 answer', withAnswer.length === 3, String(withAnswer.length));
+
+  // 解析回来：这是「主人到底答了什么」的唯一来源
+  const parsed = parseCardAction(buttons[0]?.value);
+  ok('解析出 approvalId', parsed?.approvalId === 42, String(parsed?.approvalId));
+  ok('解析出 verdict=approve', parsed?.verdict === 'approve', String(parsed?.verdict));
+  ok('解析出答案原文', parsed?.answer === '周会试跑 10-27 10:00', String(parsed?.answer));
+}
+
+{
+  // 没给选项时也要有能点的按钮，否则主人只能打字（且没有 answer 字段）
+  const v = makeView({
+    kind: 'question',
+    tier: null,
+    subject: { kind: 'question', prompt: '随便说点什么' },
+  });
+  const card = buildApprovalCard(v) as { elements: Array<Record<string, unknown>> };
+  const buttons = card.elements
+    .filter((e) => e.tag === 'action')
+    .flatMap((a) => (a.actions ?? []) as Array<Record<string, unknown>>);
+  ok('无选项时仍有按钮', buttons.length > 0, String(buttons.length));
+  ok('无选项按钮不带 answer（不能凭空造答案）',
+     buttons.every((b) => !String(b.value).includes('answer')));
+}
+
+{
+  // tool_call 单不受影响：仍是同意/拒绝两个按钮，且不带 answer
+  const card = buildApprovalCard(makeView()) as { elements: Array<Record<string, unknown>> };
+  const buttons = card.elements
+    .filter((e) => e.tag === 'action')
+    .flatMap((a) => (a.actions ?? []) as Array<Record<string, unknown>>);
+  ok('tool_call 卡片仍是 2 个按钮', buttons.length === 2, String(buttons.length));
+  ok('tool_call 按钮不带 answer', buttons.every((b) => !String(b.value).includes('answer')));
+}
+
+console.log('');
+console.log('  G. toDecideCall：卡片点击 → GOV decide() 实参（answer 必须变成 note）');
+
+{
+  // 这一组存在的理由：映射原来只写在 daemon.ts 的装配闭包里，而装配闭包
+  // 在测试里永远被假的 decide 顶替 —— 实测把 note 透传删掉，用例照旧全绿。
+  // 抽成纯函数之后，删掉 note 这一条立刻变红（见下方注释里的验伪记录）。
+  const a = toDecideCall({ kind: 'approval', approvalId: 1, verdict: 'approve', answer: '周会试跑 10-27 10:00' });
+  ok('approve → approve_once', a.verdict === 'approve_once', a.verdict);
+  ok('answer 变成 note（这是 ask 的全部语义）', a.note === '周会试跑 10-27 10:00', String(a.note));
+
+  const b = toDecideCall({ kind: 'approval', approvalId: 2, verdict: 'reject' });
+  ok('reject → reject', b.verdict === 'reject', b.verdict);
+  ok('没有 answer 时 note 是 undefined（不能塞空串）', b.note === undefined, String(b.note));
+
+  const c = toDecideCall({ kind: 'approval', approvalId: 3, verdict: 'approve', answer: '   ' });
+  ok('空白 answer 按没答处理', c.note === undefined, JSON.stringify(c.note));
+
+  const d = toDecideCall({ kind: 'approval', approvalId: 4, verdict: 'approve', answer: '  全部删掉  ' });
+  ok('answer 两端空白去掉', d.note === '全部删掉', JSON.stringify(d.note));
 }
 
 console.log('\n  合计 ' + pass + ' 通过 / ' + fail + ' 失败\n');

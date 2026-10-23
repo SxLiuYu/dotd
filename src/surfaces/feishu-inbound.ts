@@ -79,6 +79,8 @@ export type FeishuInboundDecision =
       eventId: string;
       approvalId: number;
       verdict: 'approve' | 'reject';
+      /** question 单的答案（主人点的那个选项）。tool_call 单没有这个字段。 */
+      answer?: string;
       /** 卡片的 message_id，落定后要拿它改卡片 */
       cardMessageId: string;
       chatId: string;
@@ -172,6 +174,7 @@ export function classifyFeishuInbound(
       eventId,
       approvalId: parsed.approvalId,
       verdict: parsed.verdict,
+      ...(parsed.answer !== undefined ? { answer: parsed.answer } : {}),
       cardMessageId,
       chatId,
       operatorId,
@@ -444,6 +447,8 @@ export interface FeishuInboundDeps {
       approvalId: number,
       verdict: 'approve' | 'reject',
       operatorId: string,
+      /** 主人给的答案／补充说明（GOV §3.4：随审批单回到执行方）。 */
+      note?: string,
     ): Promise<{ ok: boolean; status?: string; reason?: string }>;
     /** 落定后改卡片（去掉按钮）。失败不影响裁决本身。 */
     resolveCard?(cardMessageId: string, approvalId: number): Promise<void>;
@@ -520,7 +525,7 @@ export async function handleFeishuCallback(
         // 装配层没接审批能力 —— 如实忽略，不假装点了。
         return { httpStatus: 200, body: { ignored: true, reason: 'approval_not_wired' } };
       }
-      const r = await deps.approval.decide(decision.approvalId, decision.verdict, decision.operatorId);
+      const r = await deps.approval.decide(decision.approvalId, decision.verdict, decision.operatorId, decision.answer);
       if (!r.ok) {
         return { httpStatus: 200, body: { ignored: true, reason: r.reason ?? 'decide_failed' } };
       }

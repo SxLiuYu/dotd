@@ -25,6 +25,17 @@ export interface CardAction {
   kind: 'approval';
   approvalId: number;
   verdict: 'approve' | 'reject';
+  /**
+   * 主人选的答案（只有 question 类审批才有）。
+   *
+   * 为什么必须走 value 而不是让主人打字：`ask` 的全部语义就是「主人的回答」，
+   * 而批准一张 question 单时如果 note 为空，gate.decide() 会把 final_params_json
+   * 原样回传，claim() 带回来的 ownerNote 就是 undefined —— 实测 daemon.ts 的 ask
+   * 处理器于是返回 `{answered:false, text:'主人没有回答这个问题…'}`。
+   * 结果是主人明明点了同意，模型却被告知没人回答（2026-10-23 现场：
+   * 任务 tk_mvk9uj7vedr2fx 的 #150 就是这么废掉的，模型只好自己编一条日程）。
+   */
+  answer?: string;
 }
 
 /**
@@ -34,7 +45,78 @@ export interface CardAction {
  * 所以卡片里必须有：谁要干什么（tool）、花多少钱/发给谁（关键参数）、
  * 风险是什么（riskBrief）、以及"不点是会怎样的"（超时策略）。
  */
+/**
+ * question 类审批（`ask`）：把每个选项做成一个按钮，答案随回调带回。
+ *
+ * 与 tool_call 分支的区别不是样式，是**语义**：tool_call 问「准不准做」，
+ * question 问「选哪个」。前者『同意』就够了，后者不带回答案等于没回答。
+ */
+function buildQuestionCard(v: ApprovalView): Record<string, unknown> {
+  const subj = v.subject;
+  const prompt = subj !== undefined && subj.kind === 'question' ? subj.prompt : v.reason;
+  const options = subj !== undefined && subj.kind === 'question' ? (subj.options ?? []) : [];
+  const elements: unknown[] = [
+    { tag: 'div', text: { tag: 'lark_md', content: '**要问你**\n' + prompt.slice(0, 600) } },
+  ];
+  if (options.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({ tag: 'div', text: { tag: 'lark_md', content: '**点一个回答**（点完就带回去了）' } });
+    // 每个选项一个按钮。飞书 action 块横向排布，超过 4 个会换行，可接受。
+    elements.push({
+      tag: 'action',
+      actions: options.slice(0, 10).map((opt, idx) => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: opt.slice(0, 40) },
+        type: idx === 0 ? 'primary' : 'default',
+        value: JSON.stringify({
+          kind: 'approval',
+          approvalId: v.id,
+          verdict: 'approve',
+          answer: opt,
+        } satisfies CardAction),
+      })),
+    });
+  }
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content:
+        '想答别的就回「回答 ' + String(v.id) + ' 你的答案」。⏱ 若 ' + formatDeadline(v.expiresAt) + ' 内没有回应，按没回答处理。',
+    },
+  });
+  // 没有选项时也必须有一个可点的按钮，否则主人只能打字
+  if (options.length === 0) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '知道了' },
+          type: 'primary',
+          value: JSON.stringify({ kind: 'approval', approvalId: v.id, verdict: 'approve' } satisfies CardAction),
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '拒绝' },
+          type: 'danger',
+          value: JSON.stringify({ kind: 'approval', approvalId: v.id, verdict: 'reject' } satisfies CardAction),
+        },
+      ],
+    });
+  }
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: { template: 'blue', title: { tag: 'plain_text', content: '问你一件事 · 审批 #' + v.id } },
+    elements,
+  };
+}
+
 export function buildApprovalCard(v: ApprovalView): Record<string, unknown> {
+  // question 是**问答题**，不是许可题：单独渲染，否则选项无处可点。
+  if (v.kind === 'question') return buildQuestionCard(v);
+
   const risk = extractRisk(v);
   const keyParams = extractKeyParams(v);
   const toolName = extractToolName(v);
@@ -257,6 +339,33 @@ function formatDeadline(iso: string | null | undefined): string {
 }
 
 /**
+ * 卡片点击 → GOV decide() 的实参。
+ *
+ * 为什么要单独一个函数：这段映射原来**只**写在 daemon.ts 的装配闭包里，
+ * 而装配闭包在测试里永远被假的 decide 顶替 —— 于是「answer 有没有被搬过去」
+ * 这件事没有任何护栏。实测验伪：把 `note ?? undefined` 从 daemon 里删掉，
+ * 全部用例照旧全绿（测试注入的假 decide 自己很乖）。
+ * 抽到这里之后，映射本身可被单测钉死，装配层只剩「调用它」这一句。
+ *
+ * 三条语义：
+ * 1. 卡片只有「一次」和「拒绝」两个语义 ⇒ approve 一律 approve_once，
+ *    不擅自替主人"记住"（记住是主人的决定，不该由一次点击代劳）；
+ * 2. 通道声明为 'web'（卡片是 web 形态的交互，与 /api/approvals 同权）；
+ * 3. **answer 必须原样变成 note** —— 对 question 单这不是补充说明，
+ *    而是回答本身；丢了它，gate 会原样回传参数，claim() 拿不到 ownerNote，
+ *    `ask` 只能报「主人没有回答」。
+ */
+export function toDecideCall(action: CardAction): {
+  verdict: 'approve_once' | 'reject';
+  note: string | undefined;
+} {
+  const verdict = action.verdict === 'approve' ? 'approve_once' : 'reject';
+  // 空串按「没答」处理：绝不能把空话当成主人的话塞进 ownerNote。
+  const note = action.answer !== undefined && action.answer.trim() !== '' ? action.answer.trim() : undefined;
+  return { verdict, note };
+}
+
+/**
  * 解析飞书回调里的按钮 value。
  * 返回 null 表示"这不是审批按钮"（可能是别的卡片），调用方要当普通事件处理。
  */
@@ -284,7 +393,14 @@ export function parseCardAction(raw: unknown): CardAction | null {
   if (!Number.isInteger(id) || id <= 0) return null;
   const verdict = o.verdict === 'approve' ? 'approve' : o.verdict === 'reject' ? 'reject' : null;
   if (verdict === null) return null;
-  return { kind: 'approval', approvalId: id, verdict };
+  // question 单的答案是随按钮回来的额外字段。空串按「没答」处理，不塞空话。
+  const answerRaw = typeof o.answer === 'string' ? o.answer.trim() : '';
+  return {
+    kind: 'approval',
+    approvalId: id,
+    verdict,
+    ...(answerRaw !== '' ? { answer: answerRaw.slice(0, 500) } : {}),
+  };
 }
 
 /**

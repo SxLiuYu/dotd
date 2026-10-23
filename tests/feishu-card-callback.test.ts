@@ -169,5 +169,71 @@ console.log('  E. decide 失败要如实说，不能报成功');
 }
 
 console.log('');
+console.log('');
+console.log('  F. question 单选：选项必须随回调变成 note（2026-10-23）');
+
+{
+  // 现场：主人点了卡片上的选项按钮，审批落成 approved、任务也续跑了，
+  // 但 `ask` 拿到的是 `{answered:false, text:'主人没有回答这个问题…'}`，
+  // 模型于是自己编了一条日程出来（tk_mvk9uj7vedr2fx，approvals#150）。
+  //
+  // 根因是这条链上「主人的答案」根本没被搬运：
+  //   buildApprovalCard 的按钮 value 只有 {approvalId, verdict} —— 没有答案位；
+  //   parseCardAction 也就不可能返回答案；
+  //   daemon 那条 decide 闭包只接收三个参数，note 永远是 undefined；
+  //   gate.decide() 见 note 为空就原样回传 params_json；
+  //   claim() 带回来的 ownerNote 不存在 → ask 判定「没人回答」。
+  // 对 tool_call 单只是少一句补充，对 question 单就是回答丢了。
+  const db = mkDb();
+  const calls: Array<{ verdict: string; note?: string }> = [];
+  const r = await handleFeishuCallback(
+    {
+      schema: '2.0',
+      header: { event_id: 'ev_ans', event_type: 'card.action.trigger' },
+      event: {
+        operator: { open_id: 'ou_owner' },
+        action: {
+          value: { kind: 'approval', approvalId: 150, verdict: 'approve', answer: '周会试跑 10-27 10:00' },
+        },
+        context: { open_message_id: 'om_card_1' },
+      },
+    },
+    {
+      db,
+      cfg: CFG as never,
+      trustedTransport: true,
+      approval: {
+        decide: async (_id: number, verdict: 'approve' | 'reject', _op: string, note?: string) => {
+          calls.push({ verdict, ...(note !== undefined ? { note } : {}) });
+          return { ok: true, status: 'approved' };
+        },
+      },
+    } as never,
+  );
+  ok('答案作为 note 传到 decide（不是丢掉）', calls[0]?.note === '周会试跑 10-27 10:00',
+     JSON.stringify(calls[0]));
+  ok('verdict 仍是 approve', calls[0]?.verdict === 'approve', String(calls[0]?.verdict));
+  ok('返回 decided:true', (r.body as { decided?: boolean }).decided === true, JSON.stringify(r.body));
+}
+
+{
+  // 没有 answer 字段的普通 tool_call 卡片：note 必须是 undefined，
+  // 不能变成空串塞进 params_json（那会让 gate 认为主人留了话）。
+  const db = mkDb();
+  let got: string | undefined | null = null;
+  await handleFeishuCallback(cardFrame({ approvalId: 12, verdict: 'approve', eventId: 'ev_noans' }), {
+    db,
+    cfg: CFG as never,
+    trustedTransport: true,
+    approval: {
+      decide: async (_id: number, _v: 'approve' | 'reject', _o: string, note?: string) => {
+        got = note;
+        return { ok: true, status: 'approved' };
+      },
+    },
+  } as never);
+  ok('普通审批卡片不带 note（保持旧行为）', got === undefined, String(got));
+}
+
 console.log('  合计 ' + pass + ' 通过 / ' + fail + ' 失败');
 process.exit(fail === 0 ? 0 : 1);

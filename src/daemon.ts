@@ -53,7 +53,7 @@ import {
   renderList,
   type LocalEventInput,
 } from './calendar/CalendarService.ts';
-import { buildApprovalCard } from './surfaces/feishu-card.ts';
+import { buildApprovalCard, toDecideCall } from './surfaces/feishu-card.ts';
 import { migrate } from '../db/migrate.ts';
 
 import { EventBus } from './shared/bus.ts';
@@ -1316,6 +1316,36 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     return { ok: true, value: { ...r, text: renderConflicts(r) } };
   });
 
+  // 主动向主人提问（2026-10-22 第 7 轮补，docs/gap-vs-muse-dots.md §2.5）。
+  //
+  // 关键点：**这个 handler 正常根本跑不到「没人回答」的情形**。
+  // gate.ts 在裁决阶段就签发 question 单并把任务挂起（setAwaitingApproval），
+  // 主人答完 `/answer N <文本>` 才恢复，届时 decide() 把回答并进
+  // final_params_json.ownerNote，claim() 带回来 —— 所以 args.ownerNote 就是答案。
+  //
+  // 留一条"没拿到回答"的分支不是冗余：审批过期（TTL 24h）或被 revoke 时，
+  // 链路上可能在无 note 的情况下继续。那时候必须**明说没拿到**，
+  // 而不是返回一个空字符串让模型自己脑补（§0.4 那个病的形状）。
+  exec.registerHostTool('ask', async (args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    const question = typeof a.question === 'string' ? a.question : '';
+    const answer = typeof a.ownerNote === 'string' ? a.ownerNote.trim() : '';
+    if (answer === '') {
+      return {
+        ok: true,
+        value: {
+          question,
+          answered: false,
+          text: `主人没有回答这个问题（${question}）。不要自己编一个答案，也不要假装知道；如实在回复里说明缺这条信息。`,
+        },
+      };
+    }
+    return {
+      ok: true,
+      value: { question, answered: true, answer, text: `主人的回答：${answer}` },
+    };
+  });
+
   exec.registerHostTool('calendar.add', async (args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     const input: LocalEventInput = {
@@ -1897,9 +1927,27 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
           // 按钮，所以 'approve' 一律映射成 'approve_once'（不擅自"记住"，
           // 记住是主人的决定，不该由一次点击替他做）。
           approval: {
-            decide: async (approvalId, verdict, operatorId) => {
-              const v = verdict === 'approve' ? 'approve_once' : 'reject';
-              const r = await govDecide(approvalId, 'web', v, operatorId);
+            // 2026-10-23：**必须把 answer 当成 note 传下去**。
+            //
+            // 现场：主人点了卡片上的选项按钮，审批落成 approved，任务也续跑了，
+            // 但 `ask` 拿到的还是 `{answered:false}` —— 因为这条 decide 只传了
+            // verdict，note 是 undefined，final_params_json 于是原样回传，
+            // claim() 带回来的 ownerNote 不存在。
+            // 对 tool_call 单这只是少一句补充，对 question 单就是**回答丢了**：
+            // 模型被告知「主人没有回答」，只好自己编（实测它编了一条日程出来）。
+            //
+            // answer 只在 question 卡片上出现；tool_call 卡片没有这个字段，
+            // 传下去就是 undefined，与旧行为逐字相同。
+            decide: async (approvalId: number, verdict: 'approve' | 'reject', operatorId: string, note?: string) => {
+              // 映射收在 feishu-card.toDecideCall()（可单测）：answer → note。
+              // 映射收在 feishu-card.toDecideCall()（可单测）：answer → note。
+              const call = toDecideCall({
+                kind: 'approval',
+                approvalId,
+                verdict,
+                ...(note !== undefined ? { answer: note } : {}),
+              });
+              const r = await govDecide(approvalId, 'web', call.verdict, operatorId, call.note);
               return r.ok
                 ? { ok: true, ...(r.finalStatus !== undefined ? { status: r.finalStatus } : {}) }
                 : { ok: false, ...(r.reason !== undefined ? { reason: r.reason } : {}) };
