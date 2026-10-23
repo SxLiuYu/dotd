@@ -49,10 +49,21 @@ const mk = (over: Partial<ProgressInput> = {}): ProgressInput => ({
 
 // ── 2. 首次推送 ────────────────────────────────────────────────
 {
-  const d = decideProgress(mk({ lastPushAt: null, lastPushStep: null, stepCount: 1 }), ON);
+  const d = decideProgress(mk({ lastPushAt: null, lastPushStep: null, stepCount: 3 }), ON);
   ok('第一次会推', d.push === true && d.reason === 'start');
   if (d.push) ok('  文案带任务标题', d.text.includes('整理上周的销售数据'));
 
+  // 2026-10-23：开始的那条别在第 1 步就说。
+  // 实测（台账 2026-10-23 01:00:02）主人刚发完消息 1 秒就收到
+  //   **正在做**：早间日程提醒 / 现在：在思考 / 已经 1 步
+  // —— 他自己知道自己发了。而且这条一推就占住 90 秒时间窗，
+  // 反而把第 1 分钟里的真实进展挤掉。门槛与 everyNSteps 对齐。
+  const at1 = decideProgress(mk({ lastPushAt: null, lastPushStep: null, stepCount: 1 }), ON);
+  ok('第 1 步不说话（「在思考」没信息量）', at1.push === false && at1.reason === 'nothing_to_say');
+  const at2 = decideProgress(mk({ lastPushAt: null, lastPushStep: null, stepCount: 2 }), ON);
+  ok('第 2 步也还早', at2.push === false && at2.reason === 'nothing_to_say');
+  const at3 = decideProgress(mk({ lastPushAt: null, lastPushStep: null, stepCount: 3 }), ON);
+  ok('走到第 3 步才说第一句', at3.push === true && at3.reason === 'start');
   const d0 = decideProgress(mk({ lastPushAt: null, lastPushStep: null, stepCount: 0 }), ON);
   ok('还没走步时不推', d0.push === false && d0.reason === 'nothing_to_say');
 }

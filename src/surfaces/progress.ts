@@ -168,9 +168,16 @@ export function decideProgress(
     return { push: true, text: renderProgress(input, true), reason: 'attention' };
   }
 
-  // 一次都没推过 → 这是"开始了"，值得说一句。
+  // 一次都没推过 → 这是「开始了」，值得说一句 —— 但别在第 1 步就说。
+  //
+  // 2026-10-23 修。实测台账（2026-10-23 01:00:02）：
+  //   **正在做**：早间日程提醒 / 现在：在思考 / 已经 1 步
+  // 主人刚在飞书里发完消息，1 秒后就收到「在思考」—— 他自己知道自己发了。
+  // 这条消息零信息量，还顺手占掉 90 秒的时间窗（lastPushAt 一写就生效），
+  // 把第 1 分钟里真正的进展挤掉。所以门槛与 everyNSteps 对齐：
+  // 走到第 everyNSteps 步才说第一句，那时任务已经有形状了。
   if (input.lastPushAt === null) {
-    if (input.stepCount === 0) return { push: false, reason: 'nothing_to_say' };
+    if (input.stepCount < cfg.everyNSteps) return { push: false, reason: 'nothing_to_say' };
     return { push: true, text: renderProgress(input, false), reason: 'start' };
   }
 

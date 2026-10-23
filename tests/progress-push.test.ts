@@ -108,32 +108,42 @@ test('一个失败只推一次，不是推一片（边沿而非电平）', async
     now: () => clock,
   });
 
-  // 先推一条 start（第 1 步），把 lastPushAt 定下来
+  // 新门槛（2026-10-23）：走到第 everyNSteps 步才说第一句，「在思考」那种不算数。
+  // 前两步必须完全安静 —— 这也是主人的噪音源之一。
   addStep(1, 'succeeded');
   await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c1', status: 'ok' });
-  const afterStart = sent.length;
-  assert.equal(afterStart, 1, '第一步该推一条 start');
-
-  // 第 2 步失败 → 该推一条 attention
+  assert.equal(sent.length, 0, '第 1 步不该说话');
   clock += 1000;
-  addStep(2, 'failed', 'shell.run');
-  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c2', status: 'error' });
+  addStep(2, 'succeeded');
+  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c2', status: 'ok' });
+  assert.equal(sent.length, 0, '第 2 步也不该说话');
+
+  // 第 3 步 → 首推（start），lastPushAt 定下来
+  clock += 1000;
+  addStep(3, 'succeeded');
+  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c3', status: 'ok' });
+  assert.equal(sent.length, 1, '走到第 3 步该推一条 start');
+
+  // 第 4 步失败 → 该推一条 attention
+  clock += 1000;
+  addStep(4, 'failed', 'shell.run');
+  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c4', status: 'error' });
   assert.equal(sent.length, 2, '新失败该推一条 attention');
 
-  // 第 3、4 步成功，但 recent 里仍能看到 seq=2 的 failed。
+  // 第 5、6 步成功，但 recent 里仍能看到 seq=4 的 failed。
   // 这就是现场那个「连推」的条件 —— 现在必须安静。
   clock += 1000;
-  addStep(3, 'succeeded', 'fs.read');
-  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c3', status: 'ok' });
+  addStep(5, 'succeeded', 'fs.read');
+  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c5', status: 'ok' });
   clock += 1000;
-  addStep(4, 'succeeded', 'fs.read');
-  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c4', status: 'ok' });
+  addStep(6, 'succeeded', 'fs.read');
+  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c6', status: 'ok' });
   assert.equal(sent.length, 2, '同一个失败不该被报第二遍、第三遍');
 
   // 新的一次失败 → 又是一个新事件，该说
   clock += 1000;
-  addStep(5, 'failed', 'shell.run');
-  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c5', status: 'error' });
+  addStep(7, 'failed', 'shell.run');
+  await bus.emit('exec.call.finished', { taskId: 'tk_t', callId: 'c7', status: 'error' });
   assert.equal(sent.length, 3, '换了新失败 seq 要再说一次');
 });
 
@@ -148,7 +158,7 @@ test('同一个失败只报一次，即使中间隔了很多步', async () => {
     bus,
     sender: { send: async (_c, t) => { sent.push(t); return { ok: true }; } },
     chatId: 'oc_test',
-    cfg: { enabled: true, everyNSteps: 3, minIntervalMs: 1 },
+    cfg: { enabled: true, everyNSteps: 1, minIntervalMs: 1 },
     log: () => undefined,
     now: () => clock,
   });
