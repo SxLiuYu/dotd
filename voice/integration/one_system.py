@@ -181,10 +181,12 @@ def resolve_http_port(paths: Paths, env: Optional[dict[str, str]] = None) -> int
                 return int(http["port"])
     except Exception:
         pass
-    # 无 PyYAML 时的窄回退：只找 surfaces.http 段
-    m = re.search(r"(?ms)^surfaces\s*:\s*(.*?)(?=^\S|\Z)", text)
+    # 无 PyYAML 时的窄回退：只找 surfaces.http 段。
+    # 注意 `[^\n]*\n` 而不是 `\s*`：后者会把下一行的缩进一起吃掉，
+    # 导致 `^\s+http` 永远匹配不上（CI 没装 PyYAML 时暴露）。
+    m = re.search(r"(?ms)^surfaces\s*:[^\n]*\n(.*?)(?=^\S|\Z)", text)
     if m is not None:
-        hm = re.search(r"(?ms)^\s+http\s*:\s*(.*?)(?=^\s{0,2}\w+\s*:|\Z)", m.group(1))
+        hm = re.search(r"(?ms)^\s*http\s*:[^\n]*\n(.*?)(?=^\s{0,2}\w+\s*:|\Z)", m.group(1))
         if hm is not None:
             pm = re.search(r"(?m)^\s+port\s*:\s*(\d+)", hm.group(1))
             if pm is not None:

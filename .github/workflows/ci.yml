@@ -28,6 +28,14 @@ jobs:
       - name: Install Node deps
         run: npm ci --no-audit --no-fund
 
+      # web-ui/dist 是构建产物（.gitignore），但 one-system 的 --check / 代理壳
+      # 会断言控制台已构建，所以 CI 必须先构建它。
+      - name: Install web-ui deps
+        run: npm --prefix web-ui ci --no-audit --no-fund
+
+      - name: Build web console
+        run: npm run build:web
+
       - name: Install Python deps (integration layer)
         run: python -m pip install --disable-pip-version-check -r voice/requirements-integration.txt
 

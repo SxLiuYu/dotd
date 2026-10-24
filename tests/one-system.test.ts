@@ -62,19 +62,6 @@ function makeHome(): string {
   return dir;
 }
 
-async function waitHttp(url: string, timeoutMs = 15_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url);
-      if (res.status > 0) return;
-    } catch {
-      /* retry */
-    }
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  throw new Error(`等待 ${url} 超时`);
-}
 
 interface FakeDotd {
   server: Server;
@@ -142,30 +129,62 @@ test('--check：临时 home → 配置、token、端口、控制台都解析出�
 test('代理壳：/health 聚合、/console/api 注入 token、query token 被剥掉', { skip, timeout: 60_000 }, async () => {
   const home = makeHome();
   const fake = await startFakeDotd();
-  const port = await freePort();
-  const child: ChildProcess = spawn(
-    PY!,
-    [
-      '-m',
-      'voice.integration.one_system',
-      '--proxy-only',
-      '--port',
-      String(port),
-      '--dotd-port',
-      String(fake.port),
-      '--token',
-      'test-token',
-    ],
-    {
-      cwd: REPO,
-      env: { ...process.env, CHARLIE_HOME: home },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  );
+  // freePort() 只保证「此刻」空闲；并行测试可能在我们 spawn 前抢走同一端口，
+  // 结果 curl 打到别人的 404 上。启动失败就换端口重试。
+  let child: ChildProcess | null = null;
+  let port = 0;
   let stderr = '';
-  child.stderr?.on('data', (b: Buffer) => (stderr += b.toString('utf8')));
+  let lastError = '';
+  for (let attempt = 0; attempt < 4; attempt++) {
+    port = await freePort();
+    stderr = '';
+    const candidate = spawn(
+      PY!,
+      [
+        '-m',
+        'voice.integration.one_system',
+        '--proxy-only',
+        '--port',
+        String(port),
+        '--dotd-port',
+        String(fake.port),
+        '--token',
+        'test-token',
+      ],
+      {
+        cwd: REPO,
+        env: { ...process.env, CHARLIE_HOME: home },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    candidate.stderr?.on('data', (b: Buffer) => (stderr += b.toString('utf8')));
+    const deadline = Date.now() + 8000;
+    let ready = false;
+    while (Date.now() < deadline && candidate.exitCode === null) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/health`, {
+          signal: AbortSignal.timeout(1000),
+        });
+        lastError = `health=${res.status}`;
+        if (res.status === 200) {
+          ready = true;
+          break;
+        }
+      } catch {
+        /* 还没起来 */
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    if (ready) {
+      child = candidate;
+      break;
+    }
+    candidate.kill();
+    await new Promise((r) => setTimeout(r, 200));
+    lastError += `; exit=${candidate.exitCode}; stderr=${stderr.slice(-300)}`;
+  }
+  assert.ok(child !== null, `代理壳没有就绪：${lastError}`);
   try {
-    await waitHttp(`http://127.0.0.1:${port}/health`);
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(health.status, 200);
     const h = (await health.json()) as Record<string, unknown>;
@@ -192,7 +211,7 @@ test('代理壳：/health 聚合、/console/api 注入 token、query token 被�
     assert.match(page.headers.get('content-type') ?? '', /text\/html/);
     assert.match(await page.text(), /<div id="root">|<script/);
   } finally {
-    child.kill();
+    child?.kill();
     await new Promise((r) => setTimeout(r, 300));
     await fake.close();
     rmSync(home, { recursive: true, force: true });

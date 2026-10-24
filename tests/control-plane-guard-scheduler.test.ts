@@ -51,6 +51,8 @@ interface Fixture {
 function fixture(
   opts: {
     memMb?: number;
+    /** 物理内存总量（MB）。默认 64GB，避免 CI 小内存机器触发阈值夹取。 */
+    totalMb?: number;
     cfg?: Record<string, number>;
     rules?: EventRule[];
     lowBrain?: LowBrain;
@@ -59,6 +61,7 @@ function fixture(
   const tmp = makeTempDataDir();
   tmps.push(tmp);
   const cfg = { ...DEFAULT_CP_CONFIG, ...opts.cfg };
+  const totalMb = opts.totalMb ?? 65_536;
   const events: Array<{ kind: string; detail: string }> = [];
   const fired: Array<{ ctId: string; missed: number }> = [];
   const record = (kind: string, level: 'normal' | 'guarded' | 'throttled' | 'halted', detail: string): void => {
@@ -97,6 +100,9 @@ function fixture(
     knownDotIds: () => ['dot1'],
     exec,
     readMem: () => ({ availableMb: memMb }),
+    // 阈值会按物理总量夹取；不注入的话 CI 小内存机器上 normal 线会被压到
+    // 10GB 左右，base+4GB 的用例就变成 normal 了。
+    readTotalMb: () => totalMb,
   });
   const scheduler = new Scheduler({
     db: tmp.db,
@@ -623,10 +629,15 @@ test('CP §8-S8：路由从降级态恢复 → paused(circuit_open) 批量回 qu
     // 路由恢复：TOTAL_OUTAGE → NORMAL（降级态 → 可用态）
     tmp.bus.publish('router.mode_changed', { from: 'TOTAL_OUTAGE', to: 'NORMAL' });
     const after = tmp.db
-      .prepare(`SELECT id, status, stop_reason AS sr FROM tasks WHERE id IN (?,?,?) ORDER BY id`)
+      .prepare(`SELECT id, status, stop_reason AS sr FROM tasks WHERE id IN (?,?,?)`)
       .all(t1.id, t2.id, t3.id) as Array<{ id: string; status: string; sr: string | null }>;
+    // 按提交顺序断言，不按 id 排序：id 的字典序不保证等于创建顺序。
+    const byId = new Map(after.map((r) => [r.id, r]));
     assert.deepEqual(
-      after.map((r) => [r.status, r.sr]),
+      [t1, t2, t3].map((t) => {
+        const row = byId.get(t.id)!;
+        return [row.status, row.sr];
+      }),
       [
         ['queued', null],
         ['queued', null],

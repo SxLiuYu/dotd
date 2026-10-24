@@ -366,6 +366,8 @@ test('偏好：设备写、管理面读；跨设备互不可见；可删除', as
 test('主动推送：dotd 说该不该说（开关/安静时段/同文去重/每日上限/节流）', async (t) => {
   t.after(sweepTempPaths);
   resetPushEnv();
+  // 测试不假设跑在哪个时区/几点：先显式关掉安静时段，后面单独把窗口设成全天。
+  process.env.DOTD_VOICE_QUIET_HOURS = '';
   const h = await startServer();
   try {
     const dev = await createDevice(h, '客厅');
@@ -416,7 +418,9 @@ test('主动推送：dotd 说该不该说（开关/安静时段/同文去重/每
     const quiet = await decide('evening', '今天辛苦了');
     assert.equal(quiet.allow, false);
     assert.equal(quiet.reason, 'quiet_hours');
-    delete process.env.DOTD_VOICE_QUIET_HOURS;
+    // 恢复成「关闭」而不是删掉：删掉会回到默认 23:00-07:30，
+    // CI 在 UTC 凌晨跑时后续断言会被安静时段误伤。
+    process.env.DOTD_VOICE_QUIET_HOURS = '';
 
     // 拒绝也留痕，管理面能回放。
     const audit = await jsonOf<{
@@ -453,7 +457,7 @@ test('主动推送：被拒绝的决策不推进节流账本（安静时段结�
     process.env.DOTD_VOICE_QUIET_HOURS = '00:00-23:59';
     const quiet = await decide('decision', '日历上 10 点有个会');
     assert.equal(quiet.reason, 'quiet_hours');
-    delete process.env.DOTD_VOICE_QUIET_HOURS;
+    process.env.DOTD_VOICE_QUIET_HOURS = '';
 
     const after = await decide('decision', '日历上 10 点有个会');
     assert.equal(after.allow, true, '安静时段拒绝不该把 last_push_at 推进');
