@@ -1,0 +1,21 @@
+# 真音频验收依赖（可选，不进 CI 门禁）
+# 用法：pip install -r voice/requirements-real-audio.txt
+# 然后按 docs/acceptance/voice-real-audio/REPORT.md 设置 OPUS_LIB / SENSE_VOICE_MODEL。
+
+# Charlie 的 Opus 编解码绑定；还需要系统里有 libopus（Windows 可复用 PyAV 自带的那份）
+opuslib>=3.0
+# 音频重采样/解码（自带 FFmpeg 与 libopus 动态库）
+av>=12.0
+# TTS（免费，无需 key）
+edge-tts>=6.1
+# 给 Charlie 的 mp3→opus 提供 ffmpeg 可执行文件
+imageio-ffmpeg>=0.5
+# 对照 ASR（SenseVoice 不可用时的回退）
+faster-whisper>=1.0
+# Charlie 默认本地 ASR；模型需另下（见验收报告）
+sherpa-onnx>=1.10
+# 声学闭环录音（Windows/Linux 均可；PortAudio 随 wheel 提供）
+sounddevice>=0.4
+scipy>=1.11
+# 仅 Windows：解除扬声器静音/设置音量
+pycaw>=20240210; sys_platform == "win32"

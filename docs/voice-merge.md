@@ -22,8 +22,9 @@
 | 单一主动推送决策 | ✅ 阶段 5（2026-10-24） | `POST /api/device/proactive/decide` + `voice/integration/push_gate.py`；允许/拒绝都写 `device_push_log` |
 | 一个安装包 / 一个入口 | ✅ 阶段 5（2026-10-24） | `npm run setup:all`（Node + Python venv + 体检）、`npm run up`（再启动）；`scripts/setup-all.mjs` |
 
-**没有做的，不写成做了。** 真机音频链路、真 ASR 准确率、真 Opus 编解码仍未验证；
-真模型首条延迟未达方案目标（见 §7）。
+**没有做的，不写成做了。** 真音频闭环（TTS → 扬声器 → 空气 → 麦克风 → Opus →
+SenseVoice）已在 2026-10-24 跑通，识别原文一致；ESP32 硬件、真人/远场/噪声语音
+仍未验证。真模型首条延迟未达方案目标（见 §7）。
 
 ### 1.1 阶段 1 的证据（一套壳）
 
@@ -90,7 +91,8 @@
 （`chat.chat.delta`），解析时只取 kind 部分，且 `taskId` 在内层 `payload` 里——
 这两点都曾让 `firstDeltaMs` 恒为空，已修。
 
-**未验**：真 ESP32/麦克风音频链路（本机无硬件、无 ffmpeg）。
+**未验**：真 ESP32 硬件（本机没有设备）。**已验**：扬声器→空气→麦克风→Opus→
+SenseVoice 的声学闭环（2026-10-24，见 `docs/acceptance/voice-real-audio/`）。
 
 ### 1.3 阶段 3/4 的证据
 
@@ -262,14 +264,17 @@ npm run setup:all:check   # 只体检（CI 用）
 | 类型检查 | `npx tsc --noEmit -p .` | 0 错误 |
 | 体检 | `npm run voice:check` | 必需 6 项全过；ffmpeg 标 skip（本机未装） |
 | 真模型延迟 | `node scripts/fake-device.mjs --runs 5` | 首条 P50 **4.80 s** / 端到端 P50 **10.98 s** / P95 **23.46 s**；**未达 2.5 s 目标** |
+| 真音频闭环 | `DOTD_REAL_AUDIO=1 DOTD_REAL_MIC=1 python -m unittest voice.integration.test_real_audio` | **2 / 2**：TTS → 扬声器 → 空气 → 麦克风 → Opus → SenseVoice，识别原文一致 |
 | 安装入口 | `npm run setup:all` | Node + `.venv` + 依赖 + 体检全过 |
 
-**未验**：真麦克风/ESP32 的端到端语音、真 ASR 准确率、真 Opus 编解码、真红外控空调。
+**未验**：ESP32 硬件、真人/远场/噪声语音、云 ASR/TTS 厂商（无 key）、真红外控空调。
 真模型延迟报告：`docs/acceptance/voice-real-latency/REPORT.md`；
-音频自测边界：`docs/acceptance/voice-audio-sim/REPORT.md`。
+音频自测边界：`docs/acceptance/voice-audio-sim/REPORT.md`；
+真音频证据：`docs/acceptance/voice-real-audio/REPORT.md`。
 
 Charlie FastAPI 全量启动已在容器里跑通（2026-10-23）：`/health` 返回
 `voice:"ok"` + `kernel:"ok"`，`dotd` 作为子进程由 `one_system.py` 管理，设备自动注册，
 设备面一轮有凭证（`docs/acceptance/voice-docker/`）。但容器只装了
 `requirements-core.txt`：VAD 退化成 RMS 端点、TTS 因无 key 报 `no TTS available`
-（日志里明写，不影响文本链路）。真机音频链路仍然未验。
+（日志里明写，不影响文本链路）。真 ESP32 硬件仍未验；本机声学闭环已验
+（`docs/acceptance/voice-real-audio/`）。

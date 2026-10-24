@@ -18,8 +18,9 @@ npm run up            # 启动 Charlie，它会托管 dotd
 - 30 分钟上手：[`docs/voice-quickstart.md`](docs/voice-quickstart.md)
 - 安全边界与漏洞报告：[`SECURITY.md`](SECURITY.md)
 - 怎么贡献：[`CONTRIBUTING.md`](CONTRIBUTING.md)
-- **诚实状态**：真机音频（麦克风/ASR 准确率/Opus）尚未验证；真模型首条延迟
-  P50 4.8 s，未达方案目标（证据在 `docs/acceptance/`，不写成达标）。
+- **诚实状态**：真音频链路已用「Edge/SAPI TTS → 扬声器 → 空气 → 麦克风 → Opus →
+  SenseVoice」跑通，识别与原文一致；ESP32 硬件、真人/远场/噪声语音仍未验。
+  真模型首条延迟 P50 4.8 s，未达方案目标（证据在 `docs/acceptance/`，不写成达标）。
 
 **英文版见 [README.en.md](README.en.md)。** 细节以本文件为准。
 
@@ -515,9 +516,11 @@ dotd 的立身之本是**完全自托管，唯一允许的外部依赖是可换 
 - 真模型延迟实测：首条增量 P50 **4.80 s**、端到端 P50 **10.98 s**、P95 **23.46 s**
   （见 [`docs/acceptance/voice-real-latency/REPORT.md`](docs/acceptance/voice-real-latency/REPORT.md)）；
   方案 §7.1 的「简单问答 < 2.5 s」**未达标**，瓶颈在模型网关 TTFT，不在 dotd 调度。
-- 音频链路：无硬件条件下用合成 PCM 跑通 WS → VAD → ASR/大脑接缝 → TTS 回发
+- 音频链路：合成 PCM 跑通 WS → VAD → ASR/大脑接缝 → TTS 回发
   （[`docs/acceptance/voice-audio-sim/REPORT.md`](docs/acceptance/voice-audio-sim/REPORT.md)）；
-  真麦克风/真 ASR 准确率/真 Opus 编解码仍未验证。
+  真音频闭环（TTS → 扬声器 → 空气 → 麦克风 → Opus → SenseVoice）已验证，
+  识别原文一致（[`docs/acceptance/voice-real-audio/REPORT.md`](docs/acceptance/voice-real-audio/REPORT.md)）。
+  ESP32 硬件、真人/远场语音仍未验。
 - 一个安装入口：`npm run setup:all`（Node + Python + 体检）、`npm run up`（再加启动）。
 
 ### 那套 11 工具契约为什么存在

@@ -474,7 +474,7 @@ quickstart 的配网步骤只到「照着做」这一层，没有计时证据。
 | 一个入口 | `scripts/setup-all.mjs`：`npm run setup:all` / `npm run up` / `npm run setup:all:check` | 本机实跑：Node + `.venv` + 依赖 + 体检全过 |
 | 许可证 | `voice/LICENSE`（MIT）+ 根 `LICENSE`（Apache-2.0）+ `THIRD_PARTY.md` | `voice/NOTICE` 记归属与双许可 |
 | 真模型延迟 | `node scripts/fake-device.mjs --runs 5` | 首条 P50 4.80s / 端到端 P50 10.98s / P95 23.46s —— **未达 §7.1 的 2.5s**，瓶颈是网关 TTFT |
-| 音频链路 | 合成 PCM 走真 WS：VAD → ASR 接缝 → 大脑接缝 → TTS 回发 | `voice/integration/test_audio_chain.py` 2/2；真麦克风/真 Opus 仍未验 |
+| 音频链路 | 合成 PCM 走真 WS；另加真实 TTS/扬声器/麦克风/Opus/SenseVoice 闭环 | `test_audio_chain.py` 2/2；`test_real_audio.py` 2/2（识别原文一致，见 `docs/acceptance/voice-real-audio/`）；ESP32 硬件仍未验 |
 
 新增的失败语义（写进实现，不是口头约定）：
 
