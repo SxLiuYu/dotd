@@ -1,0 +1,20 @@
+{"model": "deepseek-v4.1-flash", "ms": 1493, "ok": true, "txt": "urgent"}
+{"model": "deepseek-v4.1-flash", "ms": 1326, "ok": true, "txt": "urgent"}
+{"model": "deepseek-v4.1-flash", "ms": 1462, "ok": true, "txt": "urgent"}
+{"model": "deepseek-v4.1-flash", "ms": 1688, "ok": true, "txt": "urgent"}
+{"model": "deepseek-v4.1-flash", "ms": 1273, "ok": true, "txt": "urgent"}
+{"model": "DeepSeek-Flash", "ms": 1839, "ok": true, "txt": "urgent"}
+{"model": "DeepSeek-Flash", "ms": 1827, "ok": true, "txt": "urgent"}
+{"model": "DeepSeek-Flash", "ms": 7172, "ok": true, "txt": "urgent"}
+{"model": "DeepSeek-Flash", "ms": 2440, "ok": true, "txt": "urgent"}
+{"model": "DeepSeek-Flash", "ms": 32085, "ok": true, "txt": "urgent"}
+{"model": "Qwen3.8-Flash", "ms": 1898, "ok": true, "txt": "urgent"}
+{"model": "Qwen3.8-Flash", "ms": 45028, "ok": false, "err": "TimeoutError: timed out"}
+{"model": "Qwen3.8-Flash", "ms": 32280, "ok": true, "txt": "urgent"}
+{"model": "Qwen3.8-Flash", "ms": 2186, "ok": true, "txt": "urgent"}
+{"model": "Qwen3.8-Flash", "ms": 1242, "ok": true, "txt": "urgent"}
+{"model": "GLM-5.3-Flash", "ms": 1920, "ok": true, "txt": "urgent"}
+{"model": "GLM-5.3-Flash", "ms": 1498, "ok": true, "txt": "urgent"}
+{"model": "GLM-5.3-Flash", "ms": 6893, "ok": true, "txt": "urgent"}
+{"model": "GLM-5.3-Flash", "ms": 31966, "ok": true, "txt": "urgent"}
+{"model": "GLM-5.3-Flash", "ms": 1399, "ok": true, "txt": "urgent"}

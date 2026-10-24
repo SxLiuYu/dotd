@@ -31,6 +31,12 @@ from pathlib import Path
 CHARLIE = Path(__file__).resolve().parents[1] / "charlie"
 sys.path.insert(0, str(CHARLIE))
 
+# opuslib 是 ctypes 绑定，找不到 libopus 时抛的是 Exception（不是 ImportError），
+# 上游的 except ImportError 兜不住 → import app.xiaozhi_codec 直接炸。先补库路径。
+from voice.integration.opus_runtime import ensure_opus_library  # noqa: E402
+
+ensure_opus_library()
+
 # ── 假 Charlie 模块：必须在 import app.xiaozhi_ws 之前注入 ─────────────
 
 _fake_voice_agent = types.ModuleType("voice_agent")

@@ -1,0 +1,20 @@
+{"model": "deepseek-v4.1-flash", "ok": true, "t1_ms": 1657, "t2_ms": 1242, "total": 2899, "grounded": true, "final": "**notes/probe.md 的内容：** 明天九点开会。\n\n**今天还没做完的待办：**\n1. 交周报（未完成）\n2. 回邮件（未完成）"}
+{"model": "deepseek-v4.1-flash", "ok": true, "t1_ms": 1567, "t2_ms": 1815, "total": 3383, "grounded": true, "final": "**notes/probe.md** 内容只有一句：明天九点开会。\n\n**未完成的待办**（2 项）：\n1. 交周报\n2. 回邮件\n\n需要我帮你把「明天九点开会"}
+{"model": "deepseek-v4.1-flash", "ok": true, "t1_ms": 1918, "t2_ms": 2042, "total": 3960, "grounded": true, "final": "两件事都查好了：\n\n**notes/probe.md 内容：** 就一行——「明天九点开会。」\n\n**今天的待办（都还没完成）：**\n1. 交周报\n2. 回邮件"}
+{"model": "deepseek-v4.1-flash", "ok": true, "t1_ms": 2044, "t2_ms": 1884, "total": 3929, "grounded": true, "final": "**notes/probe.md 的内容：** “probe 文件内容：明天九点开会。”\n\n**今天还没做完的待办：**\n1. 交周报\n2. 回邮件\n\n两项都标"}
+{"model": "DeepSeek-Flash", "ok": true, "t1_ms": 2156, "t2_ms": 2458, "total": 4614, "grounded": true, "final": "**notes/probe.md 内容**\n\n```\nprobe 文件内容：明天九点开会。\n```\n\n即一条提醒：明天九点开会。\n\n**今天未完成的待办（2 项"}
+{"model": "DeepSeek-Flash", "ok": false, "total": 46894, "err": "TimeoutError: timed out"}
+{"model": "DeepSeek-Flash", "ok": true, "t1_ms": 3940, "t2_ms": 3227, "total": 7168, "grounded": true, "final": "**notes/probe.md 内容**\n> 明天九点开会。\n\n**今天未完成的待办（2 项）**\n1. 交周报\n2. 回邮件\n\n一点提示：笔记里写的是「明天"}
+{"model": "DeepSeek-Flash", "ok": true, "t1_ms": 3426, "t2_ms": 2921, "total": 6348, "grounded": true, "final": "**notes/probe.md 内容**\n\n> 明天九点开会。\n\n（就这一行，记录的是明天的会议安排，不是今天的待办。）\n\n**今天未完成的待办**\n\n1. "}
+{"model": "GLM-5.3-Flash", "ok": false, "total": 45023, "err": "TimeoutError: timed out"}
+{"model": "GLM-5.3-Flash", "ok": true, "t1_ms": 1822, "t2_ms": 2877, "total": 4700, "grounded": true, "final": "`notes/probe.md` 的内容：\n\n> probe 文件内容：明天九点开会。\n\n今天的待办（均未完成）：\n\n1. 交周报\n2. 回邮件\n\n另外提醒一下"}
+{"model": "GLM-5.3-Flash", "ok": true, "t1_ms": 2354, "t2_ms": 3073, "total": 5428, "grounded": true, "final": "**notes/probe.md 内容**\n\n> probe 文件内容：明天九点开会。\n\n（只有一行，记录了一个明天 9:00 的会议）\n\n**今天未完成的待办"}
+{"model": "GLM-5.3-Flash", "ok": false, "total": 45029, "err": "TimeoutError: timed out"}
+{"model": "Qwen3.8-Flash", "ok": false, "total": 45027, "err": "TimeoutError: timed out"}
+{"model": "Qwen3.8-Flash", "ok": true, "t1_ms": 31608, "t2_ms": 6836, "total": 38444, "grounded": true, "final": "**notes/probe.md 内容**\n\n```\nprobe 文件内容：明天九点开会。\n```\n\n就一行：提到明天九点有个会（注意是明天，不是今天的待办）。"}
+{"model": "Qwen3.8-Flash", "ok": false, "total": 45020, "err": "TimeoutError: timed out"}
+{"model": "Qwen3.8-Flash", "ok": true, "t1_ms": 1622, "t2_ms": 2636, "total": 4259, "grounded": true, "final": "`notes/probe.md` 的内容：\n\n> probe 文件内容：明天九点开会。\n\n今天还没做完的待办：\n\n1. 交周报（未完成）\n2. 回邮件（未完成）"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "t1_ms": 15601, "t2_ms": 2912, "total": 18513, "grounded": true, "final": "**notes/probe.md 内容：** 明天九点开会。\n\n**未完成的待办：**\n1. 交周报\n2. 回邮件\n\n另外提醒一下：笔记里提到明天九点有会议，可"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "t1_ms": 2301, "t2_ms": 7443, "total": 9745, "grounded": true, "final": "**notes/probe.md 内容：**「明天九点开会。」\n\n**今天尚未完成的待办：**\n1. 交周报\n2. 回邮件\n\n另外，笔记还提醒你明天九点要开会。"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "t1_ms": 2012, "t2_ms": 6119, "total": 8131, "grounded": false, "final": "**notes/probe.md 的内容：**\n\n> probe 文件内容"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "t1_ms": 2804, "t2_ms": 20349, "total": 23154, "grounded": true, "final": "**notes/probe.md** 的内容（原文照录）：\n\n> probe 文件内容：明天九点开会。\n\n提醒一下：这段文字本身带着「probe 文件内容：」这"}

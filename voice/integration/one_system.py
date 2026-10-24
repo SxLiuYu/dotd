@@ -752,6 +752,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # 现在才 import Charlie：它依赖 cwd/sys.path 和上面的环境变量
     sys.path.insert(0, str(CHARLIE_DIR))
     os.chdir(CHARLIE_DIR)
+
+    # 必须在 import Charlie 之前：opuslib 找不到 libopus 时抛的是 Exception
+    # （不是 ImportError），上游的 except ImportError 兜不住，进程会在 import
+    # 阶段直接死掉。这里先把 PyAV 自带的 libopus 接上（见 opus_runtime 注释）。
+    from voice.integration.opus_runtime import ensure_opus_library
+
+    ensure_opus_library()
+
     import voice_server  # noqa: E402
 
     install_one_system(voice_server.app, sup, token, dotd_port)

@@ -110,5 +110,7 @@ DOTD_REAL_AUDIO=1 DOTD_REAL_MIC=1 ...同上...
 3. **云 ASR/TTS 厂商**（百度 / StepFun / Finna / Audio8）：本机没有对应 key 或
    本地服务（Audio8 `127.0.0.1:8024` 未启动），未测。
 4. **端到端 2.5 s 目标**：本次只测音频段。音频段热路径约
-   `SenseVoice 0.3 s + Edge TTS TTFB 1.1 s + Opus 0.1–0.4 s`；
-   之前的真模型报告里 LLM TTFT P50 是 **4.8 s**，瓶颈仍在模型网关，不在音频。
+   `SenseVoice 0.3 s + Edge TTS TTFB 1.1 s + Opus 0.1–0.4 s`。
+   当时 LLM TTFT P50 是 **4.8 s**，瓶颈在模型网关、不在音频。
+   **2026-10-24 已把 primary/light 换成 `deepseek-v4.1-flash`**，同日真 daemon
+   端到端首条 P50 降到 **2.02 s**（见 `docs/acceptance/model-latency/REPORT.md`）。

@@ -1,0 +1,33 @@
+{"model": "deepseek-v4.1-flash", "ok": true, "ttft": 1849, "ttft_any": 1849, "total": 2462, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4.1-flash", "ok": true, "ttft": 1219, "ttft_any": 1219, "total": 1703, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4.1-flash", "ok": true, "ttft": 1349, "ttft_any": 1349, "total": 1769, "tool": false, "finish": "stop"}
+{"model": "DeepSeek-Flash", "ok": false, "ttft": null, "total": 45015, "err": "TimeoutError: timed out"}
+{"model": "DeepSeek-Flash", "ok": true, "ttft": 1160, "ttft_any": 690, "total": 1354, "tool": true, "finish": "tool_calls"}
+{"model": "DeepSeek-Flash", "ok": true, "ttft": 3464, "ttft_any": 698, "total": 4328, "tool": false, "finish": "stop"}
+{"model": "Qwen3.8-Flash", "ok": true, "ttft": 7482, "ttft_any": 982, "total": 8429, "tool": false, "finish": "stop"}
+{"model": "Qwen3.8-Flash", "ok": false, "ttft": null, "total": 45012, "err": "TimeoutError: timed out"}
+{"model": "Qwen3.8-Flash", "ok": true, "ttft": 5884, "ttft_any": 746, "total": 6290, "tool": false, "finish": "stop"}
+{"model": "GLM-5.3-Flash", "ok": true, "ttft": 3779, "ttft_any": 535, "total": 4394, "tool": false, "finish": "stop"}
+{"model": "GLM-5.3-Flash", "ok": false, "ttft": null, "total": 45008, "err": "TimeoutError: timed out"}
+{"model": "GLM-5.3-Flash", "ok": true, "ttft": 3052, "ttft_any": 687, "total": 3766, "tool": false, "finish": "stop"}
+{"model": "glm-5.3", "ok": true, "ttft": 3863, "ttft_any": 3863, "total": 4375, "tool": false, "finish": "stop"}
+{"model": "glm-5.3", "ok": true, "ttft": 4162, "ttft_any": 4162, "total": 4613, "tool": false, "finish": "stop"}
+{"model": "glm-5.3", "ok": true, "ttft": 3110, "ttft_any": 3110, "total": 3110, "tool": true, "finish": "tool_calls"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "ttft": 2052, "ttft_any": 1376, "total": 3351, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "ttft": 1659, "ttft_any": 1196, "total": 2094, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "ttft": 1997, "ttft_any": 1774, "total": 2389, "tool": false, "finish": "stop"}
+{"model": "hy3", "ok": true, "ttft": 3189, "ttft_any": 1306, "total": 3726, "tool": false, "finish": "stop"}
+{"model": "hy3", "ok": true, "ttft": 1895, "ttft_any": 1417, "total": 2372, "tool": false, "finish": "stop"}
+{"model": "hy3", "ok": true, "ttft": 1708, "ttft_any": 1708, "total": 2417, "tool": false, "finish": "stop"}
+{"model": "space-bunny", "ok": true, "ttft": 2906, "ttft_any": 1710, "total": 3367, "tool": true, "finish": "tool_calls"}
+{"model": "space-bunny", "ok": true, "ttft": 2272, "ttft_any": 1430, "total": 2704, "tool": true, "finish": "tool_calls"}
+{"model": "space-bunny", "ok": true, "ttft": 2384, "ttft_any": 1401, "total": 2877, "tool": true, "finish": "tool_calls"}
+{"model": "minimax-m3.1-flash", "ok": true, "ttft": 34948, "ttft_any": 34051, "total": 35702, "tool": false, "finish": "stop"}
+{"model": "minimax-m3.1-flash", "ok": false, "ttft": null, "total": 45016, "err": "TimeoutError: timed out"}
+{"model": "minimax-m3.1-flash", "ok": true, "ttft": 4246, "ttft_any": 774, "total": 5209, "tool": false, "finish": "stop"}
+{"model": "step-5-preview", "ok": true, "ttft": 5159, "ttft_any": 2102, "total": 5818, "tool": false, "finish": "stop"}
+{"model": "step-5-preview", "ok": true, "ttft": 4700, "ttft_any": 2131, "total": 5580, "tool": false, "finish": "stop"}
+{"model": "step-5-preview", "ok": true, "ttft": 4259, "ttft_any": 2587, "total": 5057, "tool": false, "finish": "stop"}
+{"model": "auto", "ok": true, "ttft": 1607, "ttft_any": 994, "total": 1817, "tool": false, "finish": "stop"}
+{"model": "auto", "ok": true, "ttft": 2637, "ttft_any": 918, "total": 2672, "tool": true, "finish": "tool_calls"}
+{"model": "auto", "ok": true, "ttft": 2486, "ttft_any": 1379, "total": 2499, "tool": true, "finish": "tool_calls"}

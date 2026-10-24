@@ -1,0 +1,12 @@
+{"model": "deepseek-v4.1-flash", "rounds": 2, "total": 5206, "ok": true, "final": "读完了，情况如下。\n\n**notes 目录内容**\n- 该目录下只有一个文件 `a.md`，其中只有一行：“明天九点开会。”\n\n**未完成的"}
+{"model": "deepseek-v4.1-flash", "rounds": 4, "total": 7466, "ok": true, "final": "notes 下的 4 个路径都读过了（a.md、b.md、c.md，以及目录本身）。\n\n**未完成的待办（根据 task_list 工具的结"}
+{"model": "deepseek-v4.1-flash", "rounds": 4, "total": 8152, "ok": true, "final": "我已经把能读到的 notes 文件都读完了，不过有一个限制需要先说明：我没有列出目录的工具，只能按路径读取文件。我读的路径是 `notes`"}
+{"model": "DeepSeek-Flash", "rounds": 0, "ok": false, "total": 45019, "err": "TimeoutError: timed out"}
+{"model": "DeepSeek-Flash", "rounds": 4, "total": 46809, "ok": true, "final": "看完了 `notes` 下的 3 个文件（a.md、b.md、c.md）。\n\n## 文件内容\n| 文件 | 内容 |\n|---|---|\n|"}
+{"model": "DeepSeek-Flash", "rounds": 0, "ok": false, "total": 45023, "err": "TimeoutError: timed out"}
+{"model": "GLM-5.3-Flash", "rounds": 4, "ok": false, "total": 59807, "err": "TimeoutError: timed out"}
+{"model": "GLM-5.3-Flash", "rounds": 2, "total": 11480, "ok": true, "final": "看过了：`notes` 目录下只有一个文件 `a.md`，没有其他笔记文件。\n\n**文件内容**\n- `notes/a.md`：明天九点开会"}
+{"model": "GLM-5.3-Flash", "rounds": 1, "ok": false, "total": 48660, "err": "TimeoutError: timed out"}
+{"model": "deepseek-v4-1-flash-1017", "rounds": 5, "total": 20056, "ok": false, "final": ""}
+{"model": "deepseek-v4-1-flash-1017", "rounds": 4, "total": 65274, "ok": false, "final": ""}
+{"model": "deepseek-v4-1-flash-1017", "rounds": 1, "total": 8815, "ok": false, "final": "我先看看待办列表，并尝试读取 notes"}

@@ -32,28 +32,46 @@ endpoints:
     base_url: http://172.17.48.1:13065/v1
     api_key_env: HY3_API_KEY
     models:
-      # 2026-10-18 跨模型 A/B（三轮重复，同一批用例）选出：
-      #   glm-5.3-flash      确认型任务中位 8 步  ← 选它
-      #   Qwen3.8-Flash      确认型任务中位 8 步
-      #   deepseek-v4.1-flash 确认型任务中位 14 步（原来用的）
-      # 三者答案正确率都是 3/3。glm 在简单任务上 4-6 步，与 deepseek 的 4 步接近。
-      # light 保持 deepseek-v4.1-flash：只做事件匹配/摘要，便宜即可。
-      # 2026-10-22 修（模型名与网关目录不一致，导致模型调用全部 404）：
-      # 网关目录里的实际 id 是下面这几个（GET /v1/models 实测）：
-      #   space-bunny | minimax-m3.1-flash | sn-deepseek-v4-1-flash-1017
-      #   deepseek-v4-1-flash-1017 | glm-5.3-flash | DeepSeek-Flash
-      # 而配置里写的是 `deepseek-v4.1-flash`（点）与 `Qwen3.8-Flash`（目录里没有）
-      # → 网关返回 404 model_not_found，路由将其判为「端点不可用」
-      # → 两个候选端点全挂 → ALL_ENDPOINTS_DOWN → 任务全部 paused（实测：
-      #   日志「模型不可用 → paused(endpoints_unreachable)」）。
-      # 修法采用目录里的真名；工具调用能力已逐个实测（都 tool_calls=1）：
-      #   deepseek-v4-1-flash-1017 23.7s / sn-deepseek-v4-1-flash-1017 31.5s
-      #   minimax-m3.1-flash 13.2s / glm-5.3-flash 5.4s / DeepSeek-Flash 31.5s
-      primary: deepseek-v4-1-flash-1017
-      light:   deepseek-v4-1-flash-1017
+      # ── 2026-10-24 延迟重测（选型依据，脚本与原始样本见 docs/acceptance/model-latency/）──
+      # 方法：① 单轮带 tools + tool_choice:auto 的 TTFT；② 两轮真主循环形状
+      # （工具调用 → 喂回结果收尾）；③ 4 轮多步循环（"还有文件没看"逼它继续调）；
+      # ④ light 轨无工具单轮短答。全部同一提示词、temperature=0、socket 超时 45s。
+      #
+      # 两轮主循环总墙钟（OK 样本，DeepSeek-V4.1-Flash 样本数最大）：
+      #   deepseek-v4.1-flash       p50  2.9s（2.8–3.2s）  8/8 通过  ← 选它
+      #   DeepSeek-Flash            p50  4.2s（3.3–6.0s）  5/5 通过
+      #   deepseek-v4-1-flash-1017  p50 11.4s（6.6–26.8s） 7/8 通过 ← 原 primary，换下
+      #   GLM-5.3-Flash             p50  7.4s（2.9–34.3s） 4/5 通过（含 40s 超时）
+      #   Qwen3.8-Flash             p50  4.2s（3.9–33.8s） 4/5 通过（含 40s 超时）
+      #   minimax-m3.1-flash        双峰，最好 1.3s / 最坏 61.8s → 不用
+      #
+      # 4 轮多步（更接近"查三处再总结"）：
+      #   deepseek-v4.1-flash 3.9s（2 轮就收工）3/3 / DeepSeek-Flash 27.9s 2/3 /
+      #   GLM-5.3-Flash 50.5s 1/3
+      #
+      # light 轨无工具短答（事件匹配形状）：
+      #   deepseek-v4.1-flash 1.41s 6/6 分类正确 / Qwen3.8-Flash 1.58s 5/6 /
+      #   DeepSeek-Flash 1.65s 6/6 / GLM-5.3-Flash 1.67s 6/6
+      #
+      # 两个坑（都实测踩过）：
+      #   * 工具名：网关对 `fs.read` 这种点分名会 400 "tool name is invalid or
+      #     duplicated"（deepseek-v4.1-flash 实测）。transport 已把点分名消毒成
+      #     `fs_read` 再上送（MR §3.1 编解码归 transport），所以 daemon 侧不受影响；
+      #     但**手写 curl/脚本直接调网关时必须自己消毒**，否则会误判成"模型不能用"。
+      #   * 目录会变：2026-10-22 记的"deepseek-v4.1-flash / Qwen3.8-Flash 不在目录"
+      #     今天已不成立（GET /v1/models 现有 12 个 id，两者都在）。换模型前先拉
+      #     目录，别信旧注释。
+      #
+      # 历史（2026-10-18 A/B）里 glm-5.3-flash 用更少步数完成确认型任务，故曾选它；
+      # 今天复测 glm 的尾延迟不可接受（40s 超时、多步 50s），换回 deepseek 族。
+      primary: deepseek-v4.1-flash
+      light:   deepseek-v4.1-flash
     # 模型级 fallback 链（语义见下方注释块）：主模型限流/5xx 时换同名族的下一个，
     # 端点与凭据不换、熔断不结算。**只用实测能调工具的模型**，别把 hy3 放进 primary 链。
-    fallback_models: { primary: [glm-5.3-flash, minimax-m3.1-flash], light: [glm-5.3-flash] }
+    # 顺序按 2026-10-24 实测的第二/第三快且通过率高者排：
+    #   一号备份 DeepSeek-Flash（两轮 4.2s，5/5）
+    #   二号备份 GLM-5.3-Flash（两轮 7.4s，4/5；尾延迟差但正确率高，作最后兜底）
+    fallback_models: { primary: [DeepSeek-Flash, GLM-5.3-Flash], light: [DeepSeek-Flash] }
     # 2026-10-17：模型级 fallback 链（迁移自 PilotDeck runFallbackChain / RouterFallbackConfig）。
     #
     # 是什么：同一端点内再分一层——models[track] 先试，失败且故障是"模型级"
