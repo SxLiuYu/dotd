@@ -62,6 +62,9 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: python -m pip install --disable-pip-version-check -r voice/requirements-integration.txt
       - name: Clean-machine onboard
-        run: npm run setup:all:check
+        run: |
+          export DOTD_HOME="$RUNNER_TEMP/dotd-home"
+          node scripts/init-config.mjs
+          npm run setup:all:check
         env:
           DOTD_FLEET: stub

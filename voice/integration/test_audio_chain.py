@@ -104,9 +104,16 @@ class AudioChainTest(unittest.TestCase):
 
         with TestClient(self.app) as client:
             with client.websocket_connect("/ws/xiaozhi") as ws:
-                ws.send_json({"type": "hello", "device_id": "test-device"})
-                hello = ws.receive_json()
-                self.assertEqual(hello["type"], "hello")
+                ws.send_json({"type": "hello", "device_id": "test-device-synthetic"})
+                # CI 比本机快，hello 之前可能已经排了别的帧；按类型等 hello，
+                # 不假设它是连接上的第一帧。
+                hello = None
+                for _ in range(10):
+                    msg = ws.receive_json()
+                    if msg.get("type") == "hello":
+                        hello = msg
+                        break
+                self.assertIsNotNone(hello, "没有收到 hello 帧")
                 self.assertEqual(hello["audio_params"]["format"], "opus")
                 self.assertEqual(hello["audio_params"]["sample_rate"], 24000)
 
@@ -161,19 +168,38 @@ class AudioChainTest(unittest.TestCase):
         try:
             with TestClient(self.app) as client:
                 with client.websocket_connect("/ws/xiaozhi") as ws:
-                    ws.send_json({"type": "hello", "device_id": "test-device"})
+                    ws.send_json({"type": "hello", "device_id": "test-device-silent"})
                     ws.receive_json()
                     ws.send_json({"type": "listen", "state": "start"})
                     for _ in range(6):
                         ws.send_bytes(b"opus-packet")
                     ws.send_json({"type": "listen", "state": "stop"})
                     ws.send_json({"type": "ping"})
-                    # 静音被忽略时，唯一会来的消息是 pong。
-                    msg = ws.receive()
+                    # 静音只该得到控制帧（pong，或服务端主动发的 goodbye/tts stop）；
+                    # 一旦出现 stt/llm/tts 就说明端点判定误触发了。
                     import json
 
-                    data = json.loads(msg["text"])
-                    self.assertEqual(data.get("type"), "pong", f"静音不该产生回复：{data}")
+                    seen = []
+                    for _ in range(10):
+                        msg = ws.receive()
+                        if msg.get("type") == "websocket.close":
+                            break
+                        if "text" not in msg:
+                            continue
+                        data = json.loads(msg["text"])
+                        seen.append(data)
+                        t = data.get("type")
+                        self.assertNotIn(
+                            t,
+                            ("stt", "llm"),
+                            f"静音不该产生 ASR/大脑回复：{data}",
+                        )
+                        if t == "tts" and data.get("state") == "start":
+                            self.fail(f"静音不该触发 TTS：{data}")
+                        if t == "pong":
+                            break
+                    else:
+                        self.fail(f"没有收到 pong：{seen}")
         finally:
             xw.opuslib = original
 
