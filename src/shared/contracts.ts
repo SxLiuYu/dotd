@@ -452,6 +452,18 @@ export interface EndpointDef {
   enabled: boolean;
   timeouts: { connect_ms: number; idle_ms: number; total_ms: number };
   emergencyEligible: boolean;
+  /**
+   * 原样并入 `/chat/completions` 请求体的额外字段（2026-10-23，语音延迟用）。
+   *
+   * 典型用法是关掉推理模型的隐式思考：
+   *   `extra_body: { chat_template_kwargs: { enable_thinking: false } }`
+   * 实测 Qwen3.8-Flash 在 17.5k 字符上下文下首 token 从 31.4s 降到 0.9–1.3s；
+   * 顶层 `enable_thinking: false` 被网关忽略（仍 31s），必须放进 chat_template_kwargs。
+   *
+   * 约束：`model / messages / stream / tools / tool_choice / max_tokens / temperature`
+   * 由 dotd 自己的字段决定，extraBody 不能覆盖（见 HttpTransport）。
+   */
+  extraBody?: Record<string, unknown>;
   local?: {
     health_url: string;
     warm_check?: {
@@ -808,7 +820,7 @@ export interface DotExecStatus {
 
 export type MemoryArea = 'memory' | 'notes' | 'manuals' | 'archive';
 export type HomeRelPath = string;
-export type ThreadChannel = 'web' | 'telegram' | 'feishu' | 'cli' | 'email' | 'event' | 'heartbeat';
+export type ThreadChannel = 'web' | 'telegram' | 'feishu' | 'cli' | 'email' | 'event' | 'heartbeat' | 'voice';
 export type ThreadStatus = 'active' | 'idle' | 'sealed' | 'purged';
 export type MsgRole = 'user' | 'assistant' | 'system';
 export type MsgKind =
@@ -863,6 +875,11 @@ export interface Thread {
 
 export interface ContextBundle {
   memoryMd: string;
+  /**
+   * 人格文件（M3，2026-10-23）：`/dot/home/IDENTITY.md` 的原文，≤1 KB。
+   * 空串 = 主人没写；此时请求体与没有这个功能时逐字一致（静态测试守住）。
+   */
+  identityMd: string;
   manualExcerpts: Array<{ path: HomeRelPath; text: string }>;
   summary: string | null;
   recentMessages: Message[];
@@ -960,6 +977,17 @@ export interface MemoryPort {
    * （Runner 日志 hasFn=false），长会话只能靠硬裁，越聊越记不住开头。
    */
   refreshContextSummary?(threadId: string): Promise<boolean>;
+  /**
+   * 人格文件（M3，2026-10-23）：`/dot/home/IDENTITY.md`。
+   * 可选：旧装配没有实现时，`/api/memory/identity` 回 501（不假装空人格）。
+   */
+  readIdentity?(dotId: string): Promise<string | null>;
+  writeIdentity?(dotId: string, text: string): Promise<MemoryWriteResult>;
+  /**
+   * 写一条笔记（M4，2026-10-24）：`notes/YYYY-MM-DD-<slug>.md`。
+   * 可选：未装配时 `/api/memory/import` 回 501（不假装导入成功）。
+   */
+  writeNote?(dotId: string, path: string, text: string): Promise<MemoryWriteResult>;
 }
 
 /** MEM §8 listThreads 的最小投影（SF /api/conversations 只展示这些字段）。 */

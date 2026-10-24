@@ -1,0 +1,10 @@
+# Charlie 可选依赖 — 本地 ASR / ESP32 / 音频处理
+# 缺失会自动降级：SenseVoice→百度ASR，VAD→固定静音，ESP32 Opus→不可用
+# 安装：pip install -r requirements-optional.txt
+silero-vad          # Silero 神经网络 VAD（ESP32 流式语音，0.48s 尾静音）
+sounddevice         # 音频 I/O
+soundfile           # 音频文件读写
+vosk                # 离线 ASR 降级（英文小模型）
+opuslib>=3.0.1      # Opus 编解码（ESP32 双向音频）
+sherpa_onnx         # SenseVoice 本地 ASR（26ms vs 百度 327ms，需模型文件）
+paho-mqtt>=2.0

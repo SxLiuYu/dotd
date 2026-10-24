@@ -809,3 +809,115 @@ button.more {
     margin-bottom: 12px;
   }
 }
+
+/* ── 动态（M1，2026-10-23）─────────────────────────────────────────── */
+
+.feed-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.feed-item.attention-high {
+  border-left-color: var(--danger, #e5534b);
+}
+
+.feed-item.attention-normal {
+  border-left-color: var(--accent);
+}
+
+.feed-item.attention-low {
+  border-left-color: var(--muted);
+}
+
+.feed-title {
+  margin: 6px 0 2px;
+  word-break: break-word;
+  font-size: 14px;
+}
+
+.feed-prov {
+  margin: 4px 0 0;
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.feed-kind {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+}
+
+.badge-high {
+  color: var(--danger, #e5534b);
+  border-color: var(--danger, #e5534b);
+}
+
+.badge-normal {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.badge-low {
+  color: var(--muted);
+}
+
+.button-link {
+  display: inline-block;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  text-decoration: none;
+  font-size: 12px;
+}
+
+.feed-detail {
+  margin-top: 14px;
+  border-left-color: var(--accent);
+}
+
+/* ── L1 任务状态条（M2，2026-10-23）───────────────────────────────── */
+
+.task-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.task-strip.attention {
+  border-left-color: var(--danger, #e5534b);
+}
+
+/* ── 人格编辑器（M3，2026-10-23）───────────────────────────────────── */
+
+.identity-editor {
+  width: 100%;
+  box-sizing: border-box;
+  background: #0e1117;
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  resize: vertical;
+}

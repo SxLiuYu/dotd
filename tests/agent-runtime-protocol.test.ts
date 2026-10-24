@@ -126,6 +126,8 @@ test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sid
     'search.web', 'search.fetch',
     // 2026-10-22：memory.search 直接读宿主的 mem_messages（FTS5），容器里没有库，不进容器
     'memory.search',
+    // 2026-10-22 第 7 轮：ask 由 gate 签 question 单、daemon 执行，同样不进容器
+    'ask',
   ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),

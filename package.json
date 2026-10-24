@@ -21,7 +21,18 @@
     "test:fast": "node --import tsx --test --test-concurrency=4 tests/*.test.ts",
     "build:web": "npm --prefix web-ui run build",
     "setup": "node scripts/setup.mjs",
-    "setup:check": "node scripts/setup.mjs --check"
+    "setup:check": "node scripts/setup.mjs --check",
+    "voice:check": "node scripts/voice-check.mjs",
+    "voice:bridge": "python -m voice.integration.dotd_bridge",
+    "voice:test": "node --import tsx --test tests/voice-bridge.test.ts tests/voice-mcp-seam.test.ts tests/cortex-router.test.ts tests/voice-memory-push.test.ts tests/voice-audio-chain.test.ts",
+    "charlie:check": "python -m voice.integration.one_system --check",
+    "charlie:start": "python -m voice.integration.one_system",
+    "charlie:test": "node --import tsx --test tests/one-system.test.ts tests/one-system-supervisor.test.ts tests/voice-bridge.test.ts tests/voice-mcp-seam.test.ts tests/cortex-router.test.ts tests/voice-memory-push.test.ts tests/voice-audio-chain.test.ts",
+    "voice:device": "node scripts/fake-device.mjs",
+    "onboard": "node scripts/onboard.mjs",
+    "setup:all": "node scripts/setup-all.mjs --install",
+    "setup:all:check": "node scripts/setup-all.mjs --check",
+    "up": "node scripts/setup-all.mjs --install --start"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.76.0",

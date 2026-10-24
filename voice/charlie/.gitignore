@@ -1,0 +1,59 @@
+# 敏感配置（全部 env 变体）
+.env*
+!.env.example
+
+# 运行时数据
+conversation_history.json
+reminders.json
+reminders.json.lock
+reminders.json.scheduler.lock
+suggestions_state.json
+suggestions_state.json.lock
+suggestions_state.json.runner.lock
+conversation_history.json.lock
+preferences.json.lock
+# FR-14 设备→用户映射（含家庭成员称呼，属个人配置，不入库）
+device_users.json
+device_users.json.tmp.*
+
+# HTTPS证书
+cert/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# 临时音频
+/tmp/*_reply.wav
+/tmp/*_test.wav
+/tmp/voice_reply.wav
+/tmp/watchdog.log
+/tmp/voice_srv.log
+/tmp/voice_https.log
+
+# 旧测试文件(含硬编码密钥)
+tests/old/
+tunnel_url.txt
+preferences.json
+logs/
+# 测试音频文件
+audio_000.wav
+*.wav
+!cert/*.pem
+# 百度 OAuth token 缓存（含 access_token，绝不入库）
+.baidu_token.json
+.baidu_token_tmp*.json
+evolution_data.json
+models/
+.coverage
+_probe_*.py
+persona_state.json
+_probe_realtime.py
+_probe_rest.sh
+_probe_d.py
+_probe_e.py
+_probe_f.py

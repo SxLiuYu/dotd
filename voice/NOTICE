@@ -1,0 +1,33 @@
+voice/ 目录的上游归属与许可状态
+================================
+
+本目录包含第三方代码（Charlie 语音助手），原样 vendored 进 dotd，用于「语音前端」这一层。
+
+  上游仓库  https://github.com/SxLiuYu/charlie-voice-assistant
+  引入提交  710d2c4bd2d4d015b0e7ee5af4038e89e4d25827（2026-09-22）
+  引入日期  2026-10-23
+  版权      归上游作者（SxLiuYu 及其贡献者）所有
+
+许可状态（2026-10-24 定案）
+---------------------------
+
+上游 README 声明 MIT，但上游仓库当时**没有 LICENSE 文件**
+（GitHub API 的 `license` 字段为 null，2026-10-23 与 2026-10-24 两次核对一致）。
+
+2026-10-24 开源发布前处理：
+
+- 本仓库维护者即上游作者（GitHub `SxLiuYu`，上游提交者 `yujinze`），
+  因此在本目录补入 `voice/LICENSE`（MIT），与上游 README 的声明一致；
+- `voice/` 下的上游代码按 **MIT** 分发；`voice/integration/` 下的新增代码
+  同时可按仓库根目录的 Apache-2.0 使用（双许可，取更宽松的那份即可）；
+- 若未来从第三方 fork 引入代码，必须在 `voice/NOTICE` 里逐个补上来源与许可。
+
+本目录的本地改动
+----------------
+
+只有 `voice/integration/`（dotd 桥、皮层分流、记忆源、推送决策、单进程启动器）
+是 dotd 自己的代码，许可以仓库根目录为准（也可按上面的 MIT 双许可）；
+`voice/` 下的其余文件一律视为上游原样代码，升级时整目录替换。
+
+`voice/integration/` 之外若需要改行为：改 `voice/integration/`，或回上游提 PR，
+不要在本目录里打补丁（见 `voice/VENDOR.md` 的边界约定）。

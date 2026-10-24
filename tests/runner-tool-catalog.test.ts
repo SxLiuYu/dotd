@@ -92,6 +92,7 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
   'mail.search',
   'mail.draft',
   'mail.send',
+  'ask',
   'calendar.list',
   'calendar.conflicts',
   'calendar.add',

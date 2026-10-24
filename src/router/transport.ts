@@ -676,6 +676,9 @@ export class HttpTransport implements ModelTransport {
     const res = await rawHttp('POST', `${call.endpoint.baseUrl}/chat/completions`, {
       headers,
       body: JSON.stringify({
+        // 端点级额外字段（如 `chat_template_kwargs: { enable_thinking: false }`）先展开，
+        // 下面的核心字段后展开 → 核心字段永远赢，配置改不了 model/messages/stream。
+        ...(call.endpoint.extraBody ?? {}),
         model: call.model,
         messages: toWireMessages(call.messages),
         ...(mapped.wire !== undefined ? { tools: mapped.wire } : {}),
@@ -709,6 +712,8 @@ export class HttpTransport implements ModelTransport {
       const res = await rawHttp('POST', `${call.endpoint.baseUrl}/chat/completions`, {
         headers,
         body: JSON.stringify({
+          // 同 chat()：core 字段后展开，extraBody 覆盖不了它们。
+          ...(call.endpoint.extraBody ?? {}),
           model: call.model,
           messages: toWireMessages(call.messages),
           ...(mapped.wire !== undefined ? { tools: mapped.wire } : {}),

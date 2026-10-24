@@ -1,0 +1,2 @@
+NAME      IMAGE                 COMMAND                  SERVICE   CREATED         STATUS                   PORTS
+charlie   charlie-dotd:latest   "/app/entrypoint.sh …"   charlie   2 minutes ago   Up 2 minutes (healthy)   0.0.0.0:8000->8000/tcp, [::]:8000->8000/tcp, 1883/tcp, 0.0.0.0:8443->8443/tcp, [::]:8443->8443/tcp, 8888/udp

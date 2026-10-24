@@ -10,11 +10,25 @@
  * token：`localStorage.dotd_token`，登录页写入；无 token 时各视图显示提示而非静默 401。
  */
 
-const BASE = (import.meta.env.VITE_DOTD_BASE as string | undefined)?.replace(/\/$/, '') ?? '';
+/**
+ * 一套系统（2026-10-23）：dotd 控制台挂在 Charlie 的 `/console/` 下。
+ * 同源 + 相对 base 构建，因此这里只需按路径前缀补 `/console`。
+ * 该前缀下的请求由 Charlie 反代，并在服务端注入 master token；
+ * 浏览器端不放真实 token（`getToken` 返回 sentinel）。
+ */
+const PROXIED_CONSOLE =
+  typeof window !== 'undefined' && window.location.pathname.startsWith('/console');
+
+const BASE =
+  (import.meta.env.VITE_DOTD_BASE as string | undefined)?.replace(/\/$/, '') ??
+  (PROXIED_CONSOLE ? '/console' : '');
 
 const TOKEN_KEY = 'dotd_token';
 
 export function getToken(): string | null {
+  // /console 下由 Charlie 反代注入真实 token；这里给一个 sentinel，
+  // 避免把 master token 写进浏览器存储。
+  if (PROXIED_CONSOLE) return 'proxied';
   try {
     return window.localStorage.getItem(TOKEN_KEY);
   } catch {
@@ -133,6 +147,48 @@ export interface EndpointRankRow {
   roles: Record<string, string>;
 }
 
+/** 动态时间线的一条（GET /api/feed，M1 2026-10-23）。 */
+export interface FeedItem {
+  id: string;
+  kind: 'task' | 'approval' | 'event' | 'schedule' | 'calendar' | 'system';
+  at: number;
+  title: string;
+  body: string | null;
+  attention: 'low' | 'normal' | 'high';
+  taskId: string | null;
+  approvalId: number | null;
+  provenance: { source: string; ref: string; note?: string };
+  action: { kind: string; label: string; goal?: string } | null;
+}
+
+/** 任务摘要（GET /api/tasks/:id 的 summary，M2 2026-10-23）。 */
+export interface TaskSummary {
+  state: string;
+  stateLine: string;
+  doing: string | null;
+  elapsedMs: number | null;
+  heartbeatAgeMs: number | null;
+  stalled: boolean;
+  next: string | null;
+  needsOwner: boolean;
+  progress: { done: number; total: number } | null;
+}
+
+export interface TaskBody {
+  task: {
+    id: string;
+    title: string;
+    status: string;
+    priority: number;
+    dotId: string;
+    attempt: number;
+    createdAt: number;
+    updatedAt: number;
+  };
+  steps: unknown[];
+  summary?: TaskSummary;
+}
+
 export interface StatusBody {
   ok: boolean;
   service: string;
@@ -168,6 +224,18 @@ export const api = {
   },
 
   approvals: () => request<{ approvals: ApprovalRow[] }>('GET', '/api/approvals?state=pending&limit=100'),
+
+  /** 动态时间线（只读投影：任务 / 审批 / 未识别事件 / 定时失败 / 今日日程）。 */
+  feed: (limit = 100) => request<{ items: FeedItem[]; generatedAt: number }>('GET', `/api/feed?limit=${limit}`),
+
+  /** 单任务 + 一行摘要（M2）。 */
+  task: (id: string) => request<TaskBody>('GET', `/api/tasks/${encodeURIComponent(id)}`),
+
+  /** 人格文件（M3）：GET 读，PUT 写（≤1 KB）。 */
+  identity: () =>
+    request<{ path: string; text: string; exists: boolean; limitBytes: number }>('GET', '/api/memory/identity'),
+  saveIdentity: (text: string) =>
+    request<{ ok: boolean; warning?: string; path: string; limitBytes: number }>('PUT', '/api/memory/identity', { text }),
 
   decide: (id: number, verdict: Verdict, note?: string) =>
     request<{ ok: boolean; finalStatus: string; reason?: string }>('POST', `/api/approvals/${id}/decision`, {

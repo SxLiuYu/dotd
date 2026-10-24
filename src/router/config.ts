@@ -225,6 +225,28 @@ function inlineMap(v: string): Record<string, string> {
 }
 
 /**
+ * `extra_body` 的行内值 → 真正的 JSON 值。
+ *
+ * 行内解析器把 `false` / `1` 都当字符串；JSON 请求体要求布尔和数字是真类型，
+ * 否则 vLLM 的 `{% if enable_thinking %}` 会把 "false" 当成立。
+ */
+function coerceExtraBody(v: InlineValue | undefined): unknown {
+  if (v === undefined) return undefined;
+  if (typeof v === 'string') {
+    const s = scalar(v);
+    if (s === 'true') return true;
+    if (s === 'false') return false;
+    if (s === 'null') return null;
+    if (s.length > 0 && /^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+    return s;
+  }
+  if (Array.isArray(v)) return v.map((item) => coerceExtraBody(item));
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v)) out[k] = coerceExtraBody(val);
+  return out;
+}
+
+/**
  * 解析 `{ primary: [a, b] }` 行内映射为字符串数组映射（fallback_models 用）。
  *
  * 与 inlineMap 的差别只在数组值不被 JSON.stringify 成文本——fallback 链要的是
@@ -578,6 +600,8 @@ interface MutableEndpoint {
   local?: Record<string, string>;
   /** P1-1：端点顶层的生产并发上限（与 `local.max_concurrency` 不同，远程端点用）。 */
   maxConcurrency?: number;
+  /** 原样并入请求体的额外字段（`extra_body: { … }`）。 */
+  extraBody?: Record<string, unknown>;
 }
 
 function applyEndpointField(ep: MutableEndpoint, key: string, value: string): void {
@@ -613,6 +637,13 @@ function applyEndpointField(ep: MutableEndpoint, key: string, value: string): vo
     case 'max_concurrency': {
       const n = Number(scalar(value));
       if (Number.isFinite(n) && n > 0) ep.maxConcurrency = Math.floor(n);
+      break;
+    }
+    // `extra_body: { chat_template_kwargs: { enable_thinking: false } }` —— 原样并入
+    // 请求体。行内映射的标量一律是字符串，这里按字面量还原 boolean/number
+    // （"false" 传给 Jinja 模板仍是真值，必须转成真正的 false）。
+    case 'extra_body': {
+      ep.extraBody = coerceExtraBody(new InlineParser(value).map()) as Record<string, unknown>;
       break;
     }
     case 'models': {
@@ -709,6 +740,9 @@ function finalizeEndpoint(ep: MutableEndpoint): EndpointDef {
   // P1-1：端点顶层的 max_concurrency = 生产请求并发上限（远程端点用，与 local: 段无关）。
   if (ep.maxConcurrency !== undefined && ep.maxConcurrency > 0) {
     base.maxConcurrency = ep.maxConcurrency;
+  }
+  if (ep.extraBody !== undefined && Object.keys(ep.extraBody).length > 0) {
+    base.extraBody = ep.extraBody;
   }
   if (ep.local === undefined) return base;  const raw = ep.local;
   const local: NonNullable<EndpointDef['local']> = {

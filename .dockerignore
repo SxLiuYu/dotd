@@ -1,0 +1,20 @@
+# docker/.dockerignore 挂在仓库根（构建上下文 = 仓库根）
+# 目的：把 node_modules / .git / 验收产物挡在上下文外。Dockerfile 里每个 COPY 都是显式路径，
+# 所以这里排掉不影响构建正确性，只影响上传体积和缓存命中。
+
+node_modules
+web-ui/node_modules
+web-ui/dist
+.git
+.merge-src
+.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.env
+.env.*
+*.log
+docs/acceptance
+docs/img
+coverage
+.tmp

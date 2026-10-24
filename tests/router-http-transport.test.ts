@@ -1057,3 +1057,43 @@ describe('错误类型契约', () => {
     assert.equal(classifyError(h).retryAfterMs, null);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// extra_body：端点级额外字段真的上了线，且覆盖不了核心字段
+// ═══════════════════════════════════════════════════════════════════
+
+describe('extra_body（端点级额外请求字段）', () => {
+  it('非流式：chat_template_kwargs 原样上送，model/messages 不可被覆盖', async () => {
+    const up = await upstream([
+      jsonHandler(200, chatBody({ choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] })),
+    ]);
+    const ep = endpointFor(up.baseUrl, {
+      extraBody: { chat_template_kwargs: { enable_thinking: false }, model: 'hijack', messages: [] },
+    });
+    await new HttpTransport().chat(
+      callFor(ep, { messages: [{ role: 'user', content: 'ping' }], maxTokens: 16 }),
+    );
+    const sent = up.requests[0]!.body as Record<string, unknown>;
+    assert.deepEqual(sent.chat_template_kwargs, { enable_thinking: false });
+    assert.equal(sent.model, 'test-model', '核心字段必须赢过 extraBody');
+    assert.deepEqual(sent.messages, [{ role: 'user', content: 'ping' }]);
+    assert.equal(sent.max_tokens, 16);
+    assert.equal(sent.stream, false);
+  });
+
+  it('流式：同一份 extraBody 也进 stream 请求体', async () => {
+    const up = await upstream([
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n');
+        res.write('data: [DONE]\n\n');
+        res.end();
+      },
+    ]);
+    const ep = endpointFor(up.baseUrl, { extraBody: { chat_template_kwargs: { enable_thinking: false } } });
+    await drainStream(new HttpTransport().stream(callFor(ep)));
+    const sent = up.requests[0]!.body as Record<string, unknown>;
+    assert.equal(sent.stream, true);
+    assert.deepEqual(sent.chat_template_kwargs, { enable_thinking: false });
+  });
+});

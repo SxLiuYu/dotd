@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Charlie 配置</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f17;color:#e0e0e0;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding:20px}
+.card{background:#1a1a2e;border-radius:16px;padding:32px;max-width:680px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{font-size:24px;margin-bottom:6px;display:flex;align-items:center;gap:10px}
+h1 .icon{width:36px;height:36px;background:linear-gradient(135deg,#667eea,#764ba2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px}
+.subtitle{color:#888;font-size:14px;margin-bottom:20px}
+.banner{padding:12px 14px;border-radius:8px;font-size:13px;margin-bottom:16px}
+.banner.demo{background:#f39c1222;color:#f39c12;border:1px solid #f39c1244}
+.banner.ok{background:#27ae6022;color:#27ae60;border:1px solid #27ae6044}
+.banner.err{background:#e74c3c22;color:#e74c3c;border:1px solid #e74c3c44}
+.group{margin-bottom:18px;border:1px solid #2a2a3e;border-radius:10px;overflow:hidden}
+.group-title{font-size:14px;font-weight:600;padding:10px 14px;background:#20202e;display:flex;align-items:center;justify-content:space-between;cursor:pointer;user-select:none}
+.group-title .chev{transition:transform .2s;color:#888}
+.group.collapsed .chev{transform:rotate(-90deg)}
+.group.collapsed .group-body{display:none}
+.group-body{padding:10px 14px}
+.field{margin-bottom:10px}
+.field:last-child{margin-bottom:0}
+.field label{display:flex;align-items:center;justify-content:space-between;font-size:13px;color:#aaa;margin-bottom:4px;gap:8px}
+.field label .key{font-family:monospace;color:#667eea;font-size:12px;flex:1}
+.badge{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:400;white-space:nowrap}
+.badge.required{background:#e74c3c22;color:#e74c3c}
+.badge.optional{background:#27ae6022;color:#27ae60}
+.badge.demo{background:#f39c1222;color:#f39c12}
+.badge.set{background:#3498db22;color:#3498db}
+.field input{width:100%;padding:9px 11px;background:#0f0f17;border:1px solid #333;border-radius:7px;color:#e0e0e0;font-size:14px;outline:none;transition:border .2s}
+.field input:focus{border-color:#667eea}
+.apply-btn{flex-shrink:0;padding:0 14px;background:#20202e;border:1px solid #667eea;border-radius:7px;color:#9ab0ff;font-size:12px;cursor:pointer;white-space:nowrap;display:flex;align-items:center;text-decoration:none}
+.apply-btn:hover{background:#252540}
+.field .hint{font-size:11px;color:#666;margin-top:3px}
+.field .hint a{color:#667eea;text-decoration:none}
+.demo-check{margin:8px 0 16px;padding:10px 14px;background:#f39c1222;border:1px solid #f39c1244;border-radius:8px;font-size:13px;color:#f39c12;display:flex;align-items:center;gap:8px}
+.demo-check input{width:auto}
+.btn{width:100%;padding:14px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:10px;color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:opacity .2s}
+.btn:active{opacity:.8}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.link-row{margin-top:16px;text-align:center}
+.link-row a{color:#667eea;text-decoration:none;font-size:13px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1><span class="icon">🎙️</span> Charlie 配置</h1>
+<p class="subtitle">按分组填写 API 密钥。未配置的项会自动降级或禁用。首次配置 3 分钟。</p>
+
+<div id="banner" class="banner" style="display:none"></div>
+<div class="group" style="margin-bottom:18px">
+  <div class="group-title" style="cursor:default">
+    <span>LLM 优先级</span>
+    <span style="font-size:11px;color:#888">拖拽排序，越靠前越优先</span>
+  </div>
+  <div class="group-body">
+    <div id="llm-priority-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div>
+    <div class="btn-row" style="margin-top:0">
+      <button class="apply-btn" style="padding:6px 12px;border-radius:6px;font-size:12px" onclick="saveLLMPriority()">保存优先级</button>
+    </div>
+  </div>
+</div>
+<div id="groups"></div>
+
+<div id="demoBox" class="demo-check" style="display:none">
+  <input type="checkbox" id="demoAccept">
+  <label for="demoAccept">暂不配置 LLM（稍后在 /welcome 引导页注册免费 GLM Key）</label>
+</div>
+
+<button class="btn" id="saveBtn" onclick="save()">保存配置</button>
+<div class="link-row"><a href="/">← 返回首页</a></div>
+</div>
+
+<script>
+let groups=[], values={}, demoActive=false, llmAvailable=false;
+
+function enableDragSort(listId) {
+  const list = document.getElementById(listId);
+  let dragEl = null;
+  list.querySelectorAll('.llm-item').forEach(item => {
+    item.addEventListener('dragstart', e => { dragEl = item; e.dataTransfer.effectAllowed = 'move'; item.style.opacity = '0.4'; });
+    item.addEventListener('dragend', () => { item.style.opacity = '1'; dragEl = null; });
+    item.addEventListener('dragover', e => {
+      e.preventDefault();
+      const after = getDragAfter(list, e.clientY);
+      if (after == null) list.appendChild(dragEl);
+      else list.insertBefore(dragEl, after);
+    });
+  });
+}
+
+function getDragAfter(container, y) {
+  const els = [...container.querySelectorAll('.llm-item:not([style*="opacity: 0.4"])')];
+  return els.reduce((closest, el) => {
+    const box = el.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset, element: el };
+    return closest;
+  }, { offset: -Infinity }).element;
+}
+
+async function loadLLMPriority(){
+  try{
+    const r = await fetch('/api/setup/llm-priority').then(res=>res.json()).catch(()=>({providers:[],priority:[]}));
+    const list = document.getElementById('llm-priority-list');
+    if(!list) return;
+    const priority = Array.isArray(r.priority) ? r.priority : [];
+    const providers = Array.isArray(r.providers) ? r.providers : [];
+    const byName = Object.fromEntries(providers.map(p=>[p.name, p]));
+    const ordered = priority.map(n=>byName[n]).filter(Boolean);
+    const rest = providers.filter(p=>!priority.includes(p.name));
+    const items = [...ordered, ...rest];
+    list.innerHTML = items.map((p, idx) => {
+      const dotColor = p.configured ? '#22c55e' : '#ef4444';
+      const label = p.configured ? '已配置' : '未配置';
+      return `<div class="llm-item" draggable="true" data-name="${p.name}" style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:#20202e;border:1px solid #2a2a3e;border-radius:7px;cursor:grab;user-select:none">
+        <div style="width:18px;text-align:center;font-size:12px;color:#888">${idx+1}</div>
+        <div class="status-dot" style="background:${dotColor};flex-shrink:0"></div>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;color:#e0e0e0">${p.label||p.name}</div>
+          <div style="font-size:11px;color:#666;font-family:monospace">${p.model||''}</div>
+        </div>
+        <span class="badge ${p.configured?'set':'optional'}">${label}</span>
+      </div>`;
+    }).join('');
+    enableDragSort('llm-priority-list');
+  }catch(e){console.error('loadLLMPriority failed', e)}
+}
+
+async function saveLLMPriority(){
+  const list = document.getElementById('llm-priority-list');
+  if(!list) return;
+  const items = list.querySelectorAll('.llm-item');
+  const priority = Array.from(items).map(el => el.getAttribute('data-name')).filter(Boolean);
+  try{
+    const r = await fetch('/api/setup/llm-priority', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority})});
+    const d = await r.json();
+    const b = document.getElementById('banner');
+    if(d && d.ok){
+      b.className='banner ok'; b.textContent='✅ LLM 优先级已保存'; b.style.display='block';
+    }else{
+      b.className='banner err'; b.textContent='❌ '+(d?.error||'保存失败'); b.style.display='block';
+    }
+  }catch(e){
+    const b = document.getElementById('banner');
+    b.className='banner err'; b.textContent='❌ 网络错误'; b.style.display='block';
+  }
+}
+
+async function load(){
+  try{
+    const [sr, vr] = await Promise.all([fetch('/api/setup/mcp-status'), fetch('/api/setup')]);
+    if(sr.ok) groups = (await sr.json()).groups || [];
+    if(vr.ok){
+      const d = await vr.json();
+      values = d;
+      demoActive = !!d.__demo_mode;
+      llmAvailable = !!d.__llm_available;
+    }
+  }catch(e){console.error('load failed', e)}
+  renderBanner();
+  renderGroups();
+  renderDemoBox();
+  loadLLMPriority();
+}
+
+function renderBanner(){
+  const b = document.getElementById('banner');
+  if(demoActive){
+    b.className = 'banner demo';
+    b.textContent = '⚠️ 未配置 LLM Key。推荐注册智谱 GLM 免费 Key（注册即送，glm-4.7-flash 永久免费）。填写 ARK_KEY/GLM_KEY 或勾选下方跳过可保存。';
+    b.style.display = 'block';
+  }else if(llmAvailable){
+    b.className = 'banner ok';
+    b.textContent = '✅ LLM 已配置，大脑使用完整模式';
+    b.style.display = 'block';
+  }
+}
+
+function renderGroups(){
+  const root = document.getElementById('groups');
+  root.innerHTML = '';
+  groups.forEach((g, gi) => {
+    const collapsed = g.key !== 'core' ? ' collapsed' : '';
+    const groupEl = document.createElement('div');
+    groupEl.className = 'group' + collapsed;
+    // 统计该组已配置数
+    const setCount = g.entries.filter(e => e.configured).length;
+    const total = g.entries.length;
+    groupEl.innerHTML = `
+      <div class="group-title" onclick="this.parentElement.classList.toggle('collapsed')">
+        <span>${g.label}</span>
+        <span style="font-size:11px;color:#888">${setCount}/${total} 已配置 <span class="chev">▼</span></span>
+      </div>
+      <div class="group-body">${g.entries.map(e => fieldHtml(e)).join('')}</div>
+    `;
+    root.appendChild(groupEl);
+  });
+}
+
+function fieldHtml(e){
+  const val = values[e.name] || '';
+  const type = e.secret ? 'password' : 'text';
+  let badge = '';
+  if(e.required) badge = `<span class="badge required">必需</span>`;
+  else if(e.demo_supported) badge = `<span class="badge demo">Demo可用</span>`;
+  else badge = `<span class="badge optional">可选</span>`;
+  if(e.configured) badge += ` <span class="badge set">已配置</span>`;
+  const apply = e.get_guide ? `<a class="apply-btn" href="${e.get_guide}" target="_blank">申请入口 →</a>` : '';
+  const hint = e.description ? `<div class="hint">${e.description}</div>` : '';
+  const ph = e.required ? '（必需）' : (e.default ? `默认: ${e.default}` : '');
+  return `<div class="field">
+    <label><span class="key">${e.name}</span>${badge}</label>
+    <div class="field-row" style="display:flex;gap:8px;align-items:stretch">
+      <input type="${type}" id="fld_${e.name}" data-key="${e.name}" value="${escapeAttr(val)}" placeholder="${escapeAttr(ph)}" autocomplete="off" style="flex:1;min-width:0">
+      ${apply}
+    </div>
+    ${hint}
+  </div>`;
+}
+
+function renderDemoBox(){
+  const box = document.getElementById('demoBox');
+  // 缺失必需项时显示 Demo 勾选框
+  const missingRequired = groups.flatMap(g => g.entries).filter(e => e.required && !e.configured);
+  if(missingRequired.length > 0){
+    box.style.display = 'flex';
+    document.getElementById('demoAccept').checked = demoActive;
+  }else{
+    box.style.display = 'none';
+  }
+}
+
+function escapeAttr(s){return String(s||'').replace(/"/g,'&quot;').replace(/</g,'&lt;')}
+
+async function save(){
+  const btn = document.getElementById('saveBtn');
+  const b = document.getElementById('banner');
+  btn.disabled = true; btn.textContent = '保存中...';
+  // 收集所有字段
+  const data = {};
+  document.querySelectorAll('input[data-key]').forEach(el => {
+    const k = el.dataset.key;
+    if(k && !k.startsWith('__')) data[k] = el.value;
+  });
+  data.demo_accept = document.getElementById('demoAccept').checked ? 'true' : 'false';
+  try{
+    const r = await fetch('/api/setup', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const d = await r.json();
+    if(d.ok){
+      b.className = 'banner ok';
+      b.textContent = '✅ 配置已保存并即时生效';
+      b.style.display = 'block';
+      btn.textContent = '已保存';
+    }else{
+      b.className = 'banner err';
+      b.textContent = '❌ ' + (d.error || '保存失败');
+      b.style.display = 'block';
+      btn.disabled = false; btn.textContent = '保存配置';
+    }
+  }catch(e){
+    b.className = 'banner err';
+    b.textContent = '❌ 网络错误';
+    b.style.display = 'block';
+    btn.disabled = false; btn.textContent = '保存配置';
+  }
+}
+
+load();
+</script>
+</body>
+</html>

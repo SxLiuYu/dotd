@@ -336,6 +336,22 @@ export interface MemoryService {
   atomicWrite(dotId: string, path: HomeRelPath, content: string): Promise<AtomicWritePlan>;
   /** §5.2 检查点 2 后半：/fs/ops rename 落规范路径并刷新索引。 */
   commitAtomicWrite(dotId: string, tmpPath: HomeRelPath, finalPath: HomeRelPath): Promise<boolean>;
+  /**
+   * 人格文件（M3，2026-10-23）：读 `/dot/home/IDENTITY.md`。
+   * 文件不存在返回 null（不是错误）；桥不可用也返回 null。
+   */
+  readIdentity(dotId: string): Promise<string | null>;
+  /**
+   * 写人格文件：≤1 KB，走 homeWriter（工具层 fs.write），覆盖写。
+   * IDENTITY.md 不进 mem_files_index（它不是笔记，不参与检索/整理）。
+   */
+  writeIdentity(dotId: string, text: string): Promise<MemoryWriteResult>;
+  /**
+   * 写一条笔记（M4，2026-10-24）：只接受 `notes/YYYY-MM-DD-<slug>.md`，
+   * 走 homeWriter（工具层 fs.write）并同步 mem_files_index。
+   * 旧记忆导入用它落盘；**不碰 MEMORY.md**（整理交给一次正常任务）。
+   */
+  writeNote(dotId: string, path: HomeRelPath, text: string): Promise<MemoryWriteResult>;
   /** §5.2 检查点 3：维护用检索（不进模型工具面，避免双轨检索）。 */
   searchHome(dotId: string, query: string, opts?: { limit?: number }): Promise<Array<{ path: HomeRelPath; snippet: string }>>;
   touchManualsLastUsed(dotId: string, paths: HomeRelPath[]): Promise<void>;

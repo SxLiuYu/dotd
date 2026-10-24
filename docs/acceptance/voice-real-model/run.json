@@ -1,0 +1,203 @@
+{
+  "generatedAt": "2026-10-23T17:19:14.798Z",
+  "model": "hy3 @ 172.17.48.1:13065 (real HTTP, no stub)",
+  "latency": {
+    "status": 0,
+    "json": {
+      "ok": true,
+      "device": {
+        "id": "dev_1d0c2d78fdd02544",
+        "name": "fake-dev-d4bc"
+      },
+      "runs": 5,
+      "passed": 5,
+      "firstDeltaP50Ms": 3172,
+      "endToEndP50Ms": 6213,
+      "endToEndP95Ms": 6515,
+      "proofSteps": 2,
+      "bundleHash": "1dfa3d8b1ee85cc23f2e2d5c6ef918be2776be13031ea29dfcb8febd3753f2e4",
+      "results": [
+        {
+          "index": 0,
+          "ok": true,
+          "taskId": "tk_mvl8h92m2ernhg",
+          "threadId": "thr_01M5MWAD181SQ6DQ2879VQV9GJ",
+          "deviceId": "dev_1d0c2d78fdd02544",
+          "status": "done",
+          "firstDeltaMs": 3501,
+          "endToEndMs": 6213,
+          "reply": "我可以帮你处理文件、联网搜索抓取信息、操作浏览器自动化、管理日历/邮件/GitHub/定时任务，以及读写本地记忆笔记等各类本地与联网事务。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "1dfa3d8b1ee85cc23f2e2d5c6ef918be2776be13031ea29dfcb8febd3753f2e4",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_1d0c2d78fdd02544",
+              "name": "fake-dev-d4bc",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 1,
+          "ok": true,
+          "taskId": "tk_mvl8hef4sndf0i",
+          "threadId": "thr_01M5MWAD181SQ6DQ2879VQV9GJ",
+          "deviceId": "dev_1d0c2d78fdd02544",
+          "status": "done",
+          "firstDeltaMs": 3172,
+          "endToEndMs": 6509,
+          "reply": "我能帮你读写本地文件与记忆笔记、联网搜索和抓取网页、自动化操作浏览器、管理日历/邮件/GitHub/定时任务，并处理各类本地与联网事务。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "0847ddd15d9e8cdbc755c7ad7d18e1ebd45658f969f7bc6fa68528f9c0a87b2e",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_1d0c2d78fdd02544",
+              "name": "fake-dev-d4bc",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 2,
+          "ok": true,
+          "taskId": "tk_mvl8hjzn8solol",
+          "threadId": "thr_01M5MWAD181SQ6DQ2879VQV9GJ",
+          "deviceId": "dev_1d0c2d78fdd02544",
+          "status": "done",
+          "firstDeltaMs": 2576,
+          "endToEndMs": 4764,
+          "reply": "我可以帮你读写本地文件与记忆笔记、联网搜索和抓取网页、自动化操作浏览器、管理日历/邮件/GitHub/定时任务，并处理各类本地与联网事务。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "1c1cc5124ea599689bacc02da550278c02749f6c3cd163cafa50276de2a379e8",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_1d0c2d78fdd02544",
+              "name": "fake-dev-d4bc",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 3,
+          "ok": true,
+          "taskId": "tk_mvl8ho7mdxymg5",
+          "threadId": "thr_01M5MWAD181SQ6DQ2879VQV9GJ",
+          "deviceId": "dev_1d0c2d78fdd02544",
+          "status": "done",
+          "firstDeltaMs": 1644,
+          "endToEndMs": 3991,
+          "reply": "我可以帮你读写本地文件与记忆笔记、联网搜索和抓取网页、自动化操作浏览器、管理日历/邮件/GitHub/定时任务，并处理各类本地与联网事务。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "6828fb25c2aac00bf2a79c59be3f71d7eaab50d6cab52120aa6387ee71c7609a",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_1d0c2d78fdd02544",
+              "name": "fake-dev-d4bc",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 4,
+          "ok": true,
+          "taskId": "tk_mvl8hru22y3eje",
+          "threadId": "thr_01M5MWAD181SQ6DQ2879VQV9GJ",
+          "deviceId": "dev_1d0c2d78fdd02544",
+          "status": "done",
+          "firstDeltaMs": 4254,
+          "endToEndMs": 6515,
+          "reply": "我可以帮你读写本地文件与记忆笔记、联网搜索和抓取网页、自动化操作浏览器、管理日历/邮件/GitHub/定时任务，并处理各类本地与联网事务。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "d29ce0288bb829f562a14bc10267508ce704777e7cd1af4f26c282ec00f6bec8",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_1d0c2d78fdd02544",
+              "name": "fake-dev-d4bc",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "toolTask": {
+    "run": {
+      "status": 0,
+      "json": {
+        "ok": true,
+        "device": {
+          "id": "dev_bccbbe911683f001",
+          "name": "fake-dev-be3d"
+        },
+        "runs": 1,
+        "passed": 1,
+        "firstDeltaP50Ms": 27970,
+        "endToEndP50Ms": 28000,
+        "endToEndP95Ms": 28000,
+        "proofSteps": 11,
+        "bundleHash": "8247019bd37fa239a4eca810fb75fa1e5fadf204135ca2289675b13c434eaf06",
+        "results": [
+          {
+            "index": 0,
+            "ok": true,
+            "taskId": "tk_mvl8hxipzaju3z",
+            "threadId": "thr_01M5MWBBZCZBFHFDWS5XPND313",
+            "deviceId": "dev_bccbbe911683f001",
+            "status": "done",
+            "firstDeltaMs": 27970,
+            "endToEndMs": 28000,
+            "reply": "<tool_calls:6124c78e>\n<tool_call:6124c78e>fs.list\n<tool_call:6124c78e>path\n<.>\n</tool_call:6124c78e>\n</tool_calls:6124c78e>",
+            "streamReason": "stream closed",
+            "proof": {
+              "bundleHash": "8247019bd37fa239a4eca810fb75fa1e5fadf204135ca2289675b13c434eaf06",
+              "steps": 11,
+              "approvals": 0,
+              "device": {
+                "id": "dev_bccbbe911683f001",
+                "name": "fake-dev-be3d",
+                "status": "active",
+                "channel": "voice"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "proof": {
+      "taskId": "tk_mvl8hxipzaju3z",
+      "bundleHash": "8247019bd37fa239a4eca810fb75fa1e5fadf204135ca2289675b13c434eaf06",
+      "steps": 11,
+      "toolSteps": 6,
+      "tools": [
+        "fs.list",
+        "fs.write",
+        "fs.list",
+        "fs.stat",
+        "fs.list",
+        "fs.write"
+      ],
+      "device": {
+        "id": "dev_bccbbe911683f001",
+        "name": "fake-dev-be3d",
+        "status": "active",
+        "channel": "voice"
+      },
+      "status": "done"
+    }
+  }
+}

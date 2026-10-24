@@ -1,0 +1,85 @@
+# docker/Dockerfile.voice —— 一套系统镜像：Charlie（壳）+ dotd（内核）
+#
+# 为什么是一个容器而不是两个：
+#   阶段 1 的托管关系是「Charlie 启动 dotd，退出时一起停」。拆两个服务就要再写
+#   重启编排/健康依赖；一个容器里由 one_system.py 当 PID 1 的子进程管理器，
+#   行为与本地 `npm run charlie:start` 完全一致。
+#
+# 产物：
+#   - Python 3.12 + ffmpeg + Charlie 核心依赖（ASR/TTS/ESP32）
+#   - Node 22 + dotd 源码与依赖（daemon 用 tsx 直接跑 TS，镜像不依赖预编译产物）
+#   - web-ui/dist（dotd 控制台，挂在 /console）
+#
+# 构建验收：2026-10-23 在 WSL2 Ubuntu-24.04 / Docker 29.1.3 上冷构建通过
+# （--no-cache 238 s，镜像 1.59 GB；日志与健康检查见 docs/acceptance/voice-docker/）。
+# 网络注意事项：pypi 直连超时的环境用构建参数换源，不要改默认值：
+#   DOTD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose ... up -d --build
+
+FROM node:22-bookworm-slim AS web
+WORKDIR /src/web-ui
+COPY web-ui/package.json web-ui/package-lock.json ./
+RUN npm ci
+COPY web-ui/ ./
+RUN npm run build
+
+FROM node:22-bookworm-slim AS node-deps
+WORKDIR /src
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM python:3.12-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    NODE_ENV=production \
+    CHARLIE_HOME=/data \
+    DOTD_HOME=/data \
+    DOTD_CONFIG=/data/config.yml \
+    DOTD_DB_PATH=/data/dotd.db \
+    DOTD_FLEET=stub \
+    CHARLIE_CORTEX=auto
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 首次启动的配置引导（空数据卷 → 可运行配置）。见 docker/entrypoint.sh 头注。
+COPY docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod 0755 /app/entrypoint.sh
+
+# Python 侧：只装核心依赖（本地 ASR/可选件缺失时 Charlie 会降级，不阻塞启动）
+#
+# PIP_INDEX_URL 做成构建参数，不写死镜像源：官方 pypi 在部分网络下不可达
+# （实测直连超时），但硬编码国内的镜像源会影响其他地区。默认官方，需要时：
+#   DOTD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose ... up -d --build
+ARG PIP_INDEX_URL=https://pypi.org/simple
+COPY voice/charlie/requirements-core.txt /tmp/charlie-requirements.txt
+RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /tmp/charlie-requirements.txt
+
+# Node 侧：依赖 + 源码 + 控制台
+COPY --from=node-deps /src/node_modules /app/node_modules
+COPY package.json package-lock.json tsconfig.json ./
+COPY src ./src
+COPY db ./db
+COPY config ./config
+COPY scripts ./scripts
+COPY voice ./voice
+COPY docs ./docs
+COPY --from=web /src/web-ui/dist /app/web-ui/dist
+
+# 运行期不需要的东西（上游 git 历史、缓存、测试产物）
+RUN rm -rf /app/voice/charlie/__pycache__ /app/.merge-src
+
+EXPOSE 8000 8443 1883 8888/udp
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8000/health >/dev/null || exit 1
+
+# 首次启动：entrypoint 生成 /data/config.yml 与默认配置 → one_system 拉起 dotd
+# （127.0.0.1:7788）→ 起 Charlie（0.0.0.0:8000）→ 自动注册本机设备（/data/voice/device.env）
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python", "-m", "voice.integration.one_system", "--port", "8000"]

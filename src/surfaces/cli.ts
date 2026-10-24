@@ -20,6 +20,8 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_DOT_ID } from '../shared/ids.ts';
 import { renderTaskView, type TaskView } from './task-view.ts';
+import { renderProofMarkdown, type ProofBundle } from './proof.ts';
+import { HANDOFF_PROMPT, MAX_IMPORT_BYTES } from './memory-import.ts';
 
 /** 本文件所在目录（入口判据用，与 src/daemon.ts 同一手法）。 */
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -119,7 +121,7 @@ export type ApiResult<T = unknown> =
   | { ok: false; kind: 'unreachable' | 'http' | 'parse'; status?: number; message: string };
 
 async function api<T>(
-  method: 'GET' | 'POST' | 'DELETE',
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   path: string,
   body: unknown | undefined,
   opts: CliOptions,
@@ -660,6 +662,276 @@ export function buildCli(opts: CliOptions = {}): Command {
         ? '\n\n（每天自动推送：已启用）'
         : '\n\n（想每天自动收到：在 ~/.dotd/config.yml 打开 surfaces.brief.enabled）';
       emit(o, r.body.text + tail);
+    });
+
+  program
+    .command('feed')
+    .description('动态时间线（GET /api/feed：任务 / 审批 / 未识别事件 / 定时失败 / 今日日程）')
+    .option('--limit <n>', '返回条数（默认 100，上限 200）', '100')
+    .action(async (opts: { limit?: string }) => {
+      const o = merged();
+      const qs = new URLSearchParams();
+      if (opts.limit !== undefined && opts.limit !== '') qs.set('limit', opts.limit);
+      const q = qs.toString() === '' ? '' : '?' + qs.toString();
+      const r = await api<{
+        items: Array<{
+          id: string;
+          kind: string;
+          at: number;
+          title: string;
+          body: string | null;
+          attention: 'low' | 'normal' | 'high';
+          taskId: string | null;
+          approvalId: number | null;
+        }>;
+        generatedAt: number;
+      }>('GET', `/api/feed${q}`, undefined, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      if (r.body.items.length === 0) {
+        emit(o, '动态是空的：没有在途任务、待批事项或今天的日程。');
+        return;
+      }
+      const label: Record<'low' | 'normal' | 'high', string> = {
+        high: '要你动手',
+        normal: '进行中',
+        low: '已结束',
+      };
+      const lines = [`动态（${r.body.items.length} 条，最新在上）：`];
+      for (const it of r.body.items) {
+        lines.push(`  ${formatWhen(it.at)}  [${label[it.attention]}]  ${it.title}`);
+        if (it.body !== null && it.body.length > 0) lines.push(`    ${it.body}`);
+        if (it.taskId !== null) lines.push(`    任务 ${it.taskId}`);
+        else if (it.approvalId !== null) lines.push(`    审批 #${it.approvalId}`);
+      }
+      emit(o, lines.join('\n'));
+    });
+
+  program
+    .command('prove <taskId>')
+    .description('执行凭证（GET /api/tasks/:id/proof：步骤 / 审批 / 模型调用 / 哈希对账）')
+    .option('--json', '输出原始凭证 JSON')
+    .option('--out <dir>', '同时写出 <dir>/PROOF.md 与 <dir>/proof.json')
+    .option('--args', '附带参数预览（可能含密钥/正文，慎用）')
+    .action(async (taskId: string, opts: { json?: boolean; out?: string; args?: boolean }) => {
+      const o = merged();
+      const qs = opts.args === true ? '?args=1' : '';
+      const r = await api<ProofBundle>(
+        'GET',
+        `/api/tasks/${encodeURIComponent(taskId)}/proof${qs}`,
+        undefined,
+        o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      const md = renderProofMarkdown(r.body);
+      if (opts.out !== undefined && opts.out !== '') {
+        const dir = resolve(opts.out);
+        try {
+          mkdirSync(dir, { recursive: true });
+          writeFileSync(join(dir, 'PROOF.md'), md, 'utf8');
+          writeFileSync(join(dir, 'proof.json'), JSON.stringify(r.body, null, 2) + '\n', 'utf8');
+        } catch (e: unknown) {
+          return fail(o, `写凭证失败：${String(e)}`, 2);
+        }
+        if (o.json !== true) {
+          emit(o, `${md}\n已写出：${join(dir, 'PROOF.md')}、${join(dir, 'proof.json')}`);
+          return;
+        }
+      }
+      emit(o, o.json === true ? render(r.body, true) : md);
+    });
+
+  // ── 语音设备（阶段 2，2026-10-23）────────────────────────────────
+  const deviceCmd = program
+    .command('device')
+    .description('语音设备：add <name> | list | rm <id>（令牌只在 add 时显示一次）');
+
+  deviceCmd
+    .command('add <name>')
+    .description('注册一台语音设备（返回一次性设备令牌）')
+    .option('--dot <dotId>', '归属的 dot（默认 dot1）')
+    .action(async (name: string, opts: { dot?: string }) => {
+      const o = merged();
+      const r = await api<{ id: string; name: string; dotId: string; token: string; status: string }>(
+        'POST',
+        '/api/devices',
+        opts.dot === undefined ? { name } : { name, dotId: opts.dot },
+        o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      emit(
+        o,
+        [
+          `已注册设备 ${r.body.name}（${r.body.id}）`,
+          '',
+          '把下面两行放进 Charlie 的环境里（或在 ~/.charlie/voice/device.env）：',
+          `DOTD_DEVICE_ID=${r.body.id}`,
+          `DOTD_DEVICE_TOKEN=${r.body.token}`,
+          '',
+          '令牌只显示这一次；丢了就 rm 后重新 add。',
+        ].join('\n'),
+      );
+    });
+
+  deviceCmd
+    .command('list')
+    .description('设备列表（不含令牌）')
+    .action(async () => {
+      const o = merged();
+      const r = await api<{
+        devices: Array<{ id: string; name: string; status: string; lastSeenAt: number | null; createdAt: number }>;
+      }>('GET', '/api/devices', undefined, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      if (r.body.devices.length === 0) {
+        emit(o, '还没有语音设备：dotd device add 客厅小屏');
+        return;
+      }
+      const lines = [`语音设备（${r.body.devices.length} 台）：`];
+      for (const d of r.body.devices) {
+        const seen = d.lastSeenAt === null ? '从未在线' : `最后在线 ${formatWhen(d.lastSeenAt)}`;
+        lines.push(`  ${d.id}  ${d.name}  [${d.status}]  ${seen}`);
+      }
+      emit(o, lines.join('\n'));
+    });
+
+  deviceCmd
+    .command('rm <id>')
+    .description('吊销设备（立即失效，不能恢复；重新 add 会得到新令牌）')
+    .action(async (id: string) => {
+      const o = merged();
+      const r = await api<{ ok: boolean; id: string; status: string }>(
+        'DELETE',
+        `/api/devices/${encodeURIComponent(id)}`,
+        undefined,
+        o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      emit(o, o.json === true ? render(r.body, true) : `已吊销 ${id}（所有 /api/device/* 立即 401）`);
+    });
+
+  deviceCmd
+    .command('rotate <id>')
+    .description('轮换设备令牌（旧令牌立即失效，新令牌只显示一次）')
+    .action(async (id: string) => {
+      const o = merged();
+      const r = await api<{ ok: boolean; id: string; token: string }>(
+        'POST',
+        `/api/devices/${encodeURIComponent(id)}/rotate`,
+        {},
+        o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      emit(o, o.json === true ? render(r.body, true) : `新令牌（只显示一次）：\nDOTD_DEVICE_TOKEN=${r.body.token}`);
+    });
+
+  program
+    .command('identity')
+    .description('人格文件 IDENTITY.md：不带参数=读；--set <file> 或 --text <...>=写（≤1 KB）')
+    .option('--set <file>', '从文件读入并保存')
+    .option('--text <text>', '直接保存这段文字')
+    .action(async (opts: { set?: string; text?: string }) => {
+      const o = merged();
+      const hasWrite = opts.set !== undefined || opts.text !== undefined;
+      if (!hasWrite) {
+        const r = await api<{ path: string; text: string; exists: boolean; limitBytes: number }>(
+          'GET',
+          '/api/memory/identity',
+          undefined,
+          o,
+        );
+        if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+        if (o.json === true) {
+          emit(o, render(r.body, true));
+          return;
+        }
+        if (!r.body.exists || r.body.text.trim() === '') {
+          emit(o, `还没有人格文件（${r.body.path}）。\n写一段：dotd identity --text "叫主人老张，语气简短"`);
+          return;
+        }
+        emit(o, r.body.text);
+        return;
+      }
+      let text: string;
+      if (opts.text !== undefined) {
+        text = opts.text;
+      } else {
+        try {
+          text = readFileSync(resolve(opts.set!), 'utf8');
+        } catch (e: unknown) {
+          return fail(o, `读不到文件：${String(e)}`, 2);
+        }
+      }
+      const r = await api<{ ok: boolean; warning?: string; path: string; limitBytes: number }>(
+        'PUT',
+        '/api/memory/identity',
+        { text },
+        o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      emit(o, r.body.ok ? `已写入 ${r.body.path}（上限 ${r.body.limitBytes} 字节）` : String((r.body as { warning?: string }).warning ?? '写入失败'));
+    });
+
+  program
+    .command('import [file]')
+    .description('旧助手记忆导入：--print-prompt 打印交接提示词；给文件则导入成 notes/ 笔记')
+    .option('--print-prompt', '只打印"让旧助手整理记忆"的提示词')
+    .option('--source <name>', '来源标识（chatgpt / claude / charlie …）', 'unknown')
+    .option('--text <text>', '直接导入这段文字（不想走文件时用）')
+    .action(async (file: string | undefined, opts: { printPrompt?: boolean; source?: string; text?: string }) => {
+      const o = merged();
+      if (opts.printPrompt === true) {
+        emit(o, HANDOFF_PROMPT);
+        return;
+      }
+      let text: string;
+      if (opts.text !== undefined) {
+        text = opts.text;
+      } else if (file !== undefined && file.length > 0) {
+        try {
+          text = readFileSync(resolve(file), 'utf8');
+        } catch (e: unknown) {
+          return fail(o, `读不到文件：${String(e)}`, 2);
+        }
+      } else {
+        return fail(
+          o,
+          '给一个文件：dotd import memory.md --source chatgpt（先 dotd import --print-prompt 让旧助手整理）',
+          2,
+        );
+      }
+      const r = await api<{ ok: boolean; path: string; bytes: number; limitBytes: number; warning?: string }>(
+        'POST',
+        '/api/memory/import',
+        { text, source: opts.source ?? 'unknown' },
+        o,
+      );
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      emit(
+        o,
+        r.body.ok
+          ? `已导入 ${r.body.path}（${r.body.bytes} / 上限 ${r.body.limitBytes} 字节）
+原始快照不会自动改进 MEMORY.md；整理请投一次正常任务。`
+          : String(r.body.warning ?? '导入失败'),
+      );
     });
 
   program

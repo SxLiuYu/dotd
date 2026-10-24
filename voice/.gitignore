@@ -1,0 +1,88 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+.opencode/
+.zcode/
+
+# Secrets / environment
+.env
+.env.*
+
+# Logs
+*.log
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Runtime data
+*.lock
+conversation_history.json*
+preferences.json*
+reminders.json*
+suggestions_state.json*
+tunnel_url.txt
+audio_000.wav
+logs/
+workspace/
+data/
+notes/
+*.json.lock
+decision_history.json
+episodic_memories.json
+pushed_hot_topics.json
+snapshot.json
+pending_confirmation.json
+
+# 构建产物
+build/
+dist/
+*.zip
+*.aiff
+charlie/web/vosk/
+charlie/skills/mimo-vision/
+
+# Baize build artifacts (source code IS tracked)
+Baize/node_modules/
+Baize/dist/
+Baize/data/
+Baize/logs/
+Baize/coverage/
+Baize/.env
+
+# 营销文案（本地保留，不提交 Git 仓库）
+docs/social-media-帖子内容.md
+docs/social-media/
+# 构建产物 / 本地环境（不提交）
+charlie/dist/
+charlie/build/
+charlie/.env
+charlie/.baidu_token.json
+assistant-kid/
+
+# 运行时缓存
+charlie/.baidu_token*.json
+
+# 交付用 patch / 运行时 token 缓存
+/*.patch
+charlie/.baidu_token*.json
+
+# 图标源
+charlie/charlie.ico
+
+# ESP32 固件镜像（16MB，通过 GitHub Release 分发，不进 git）
+firmware/*.bin
+
+# 技能本地密钥（不进 git）
+charlie/skills/*/.env.local
+charlie/skills/*/.env
+ci-build/
+release-v3.5.2/
+release-upload/
+release-artifacts/
+opus-extract/
+opus-msys2.tar.zst

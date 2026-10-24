@@ -1,0 +1,1075 @@
+"""Management/config/PWA routes: setup, esp32, preferences, behaviors, protocols, evolution, logs, tts, mcp, internal push.
+
+Extracted from voice_server.py.
+"""
+import os, sys, json, time, hashlib, logging, asyncio, struct, zlib, platform, tempfile
+try:
+    import fcntl
+except ImportError:  # Windows 无 fcntl
+    import fcntl_compat as fcntl
+import requests
+
+from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from app.http_helpers import (
+    json_response, html_response, file_not_modified_response, file_etag_token,
+    weak_etag, if_none_matches, not_modified_response, etag_headers, manifest_response,
+)
+from app.state import _metrics, sse_client_count, _ws_client_count
+from app.auth import AUTH_TOKEN
+from app.brain_health import _brain_is_warm
+from app.config import http_port, https_port
+from app.notifications import async_push_tts_to_xiaozhi, _get_lan_ip
+from app import env_catalog
+from app.background_task import BackgroundTask
+
+log = logging.getLogger("magic")
+
+def _safe_error(e: Exception, context: str = "") -> JSONResponse:
+    """Log the full error server-side, return a generic message to the client."""
+    log.error(f"[manage] {context} error: {e}", exc_info=True)
+    return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+router = APIRouter(tags=["manage"])
+
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TUNNEL_FILE = os.path.join(PROJECT_DIR, "tunnel_url.txt")
+_LOG_DIR = os.environ.get("ASSISTANT_KID_LOG_DIR", os.path.join(PROJECT_DIR, "logs"))
+_start_time = time.time()  # voice_server.py will update this
+
+if getattr(sys, 'frozen', False):
+    _ENV_FILE = os.path.join(os.path.dirname(sys.executable), ".env")
+else:
+    _ENV_FILE = os.path.join(PROJECT_DIR, ".env")
+
+def set_start_time(t):
+    global _start_time
+    _start_time = t
+
+# ===== PWA / static routes =====
+
+@router.api_route("/manifest.json", methods=["GET", "HEAD"])
+async def manifest(request: Request):
+    return manifest_response(request)
+
+@router.get("/service-worker.js")
+async def service_worker(request: Request):
+    sw_path = os.path.join(PROJECT_DIR, "web", "service-worker.js")
+    if os.path.exists(sw_path):
+        with open(sw_path, "r", encoding="utf-8") as f:
+            return Response(content=f.read(), media_type="application/javascript",
+                          headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+    return Response(status_code=404)
+
+@router.get("/icon.svg")
+async def icon_svg(request: Request):
+    icon_path = os.path.join(PROJECT_DIR, "web", "icon.svg")
+    if os.path.exists(icon_path):
+        with open(icon_path, "r", encoding="utf-8") as f:
+            return Response(content=f.read(), media_type="image/svg+xml",
+                          headers={"Cache-Control": "public, max-age=86400"})
+    return Response(status_code=404)
+
+def _build_app_icon_png() -> bytes:
+    size = 64
+    bg = (15, 12, 41)
+    fg = (233, 69, 96)
+    cx = cy = size // 2
+    radius = size // 3
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)
+        for x in range(size):
+            color = fg if (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2 else bg
+            raw.extend(color)
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return b"".join((
+        b"\x89PNG\r\n\x1a\n",
+        chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)),
+        chunk(b"IDAT", zlib.compress(bytes(raw), 9)),
+        chunk(b"IEND", b""),
+    ))
+
+_APP_ICON_PNG = _build_app_icon_png()
+_ICON_HEADERS = {"Cache-Control": "public, max-age=86400"}
+_APP_ICON_ETAG = 'W/"' + hashlib.sha256(_APP_ICON_PNG).hexdigest()[:16] + '"'
+
+@router.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def web_client(request: Request):
+    html_path = os.path.join(PROJECT_DIR, "web", "voice.html")
+    return html_response(request, html_path, "voice-html")
+
+@router.api_route("/manage", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def manage_page(request: Request):
+    html_path = os.path.join(PROJECT_DIR, "web", "manage.html")
+    return html_response(request, html_path, "manage-html")
+
+@router.api_route("/favicon.ico", methods=["GET", "HEAD"])
+@router.api_route("/apple-touch-icon.png", methods=["GET", "HEAD"])
+@router.api_route("/apple-touch-icon-precomposed.png", methods=["GET", "HEAD"])
+async def app_icon(request: Request):
+    if if_none_matches(request, _APP_ICON_ETAG):
+        headers = dict(_ICON_HEADERS)
+        headers["ETag"] = _APP_ICON_ETAG
+        headers["Vary"] = "Accept-Encoding"
+        return Response(status_code=304, headers=headers)
+    content = b"" if request.method == "HEAD" else _APP_ICON_PNG
+    headers = dict(_ICON_HEADERS)
+    headers["ETag"] = _APP_ICON_ETAG
+    headers["Vary"] = "Accept-Encoding"
+    headers["Content-Length"] = str(len(_APP_ICON_PNG))
+    return Response(content=content, media_type="image/png", headers=headers)
+
+@router.api_route("/test", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def voice_test(request: Request):
+    html_path = os.path.join(PROJECT_DIR, "web", "voice_test.html")
+    return html_response(request, html_path, "voice-test-html")
+
+@router.api_route("/setup", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def setup_page(request: Request):
+    html_path = os.path.join(PROJECT_DIR, "web", "setup.html")
+    return html_response(request, html_path, "setup-html")
+
+@router.api_route("/welcome", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def welcome_page(request: Request):
+    html_path = os.path.join(PROJECT_DIR, "web", "welcome.html")
+    return html_response(request, html_path, "welcome-html")
+
+# ===== Metrics / health / tunnel =====
+
+@router.get("/api/metrics")
+async def metrics(request: Request):
+    return json_response(request, lambda: _metrics.summary(exclude_endpoint="/api/metrics"),
+                        etag_token=_metrics.token(exclude_endpoint="/api/metrics"))
+
+@router.get("/api/audit")
+async def audit_stats(request: Request):
+    """功能调用审计统计: 区分用户调用/测试调用/系统调用"""
+    from app.audit_log import get_call_stats
+    source = request.query_params.get("source")
+    return get_call_stats(source)
+
+@router.get("/api/setup/llm-priority")
+async def llm_priority_status():
+    from app.llm_config import PROVIDERS, _get_priority_list, _is_provider_configured
+    import os
+    priority = _get_priority_list()
+    return {
+        "priority": priority,
+        "providers": [
+            {
+                "name": n,
+                "label": p["label"],
+                "key_env": p["key_env"],
+                "model": os.getenv(p["model_env"], p["default_model"]),
+                "configured": _is_provider_configured(n),
+            }
+            for n, p in PROVIDERS.items()
+        ],
+    }
+
+@router.post("/api/setup/llm-priority")
+async def save_llm_priority(request: Request):
+    from app.audit_log import audit_log
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "JSON 格式错误"}, status_code=400)
+    priority = data.get("priority", [])
+    from app.llm_config import PROVIDERS
+    valid = [p for p in priority if p in PROVIDERS]
+    if not valid:
+        return JSONResponse({"ok": False, "error": "优先级链不能为空"}, status_code=400)
+    _write_env_file(_ENV_FILE, {"LLM_PRIORITY": ",".join(valid)})
+    _reload_runtime_env()
+    audit_log("api:setup:llm_priority", input_data=",".join(valid), action="save")
+    return {"ok": True, "message": "LLM 优先级已保存", "priority": valid}
+
+@router.get("/api/tunnel")
+async def tunnel_status(request: Request):
+    cached = file_not_modified_response(request, TUNNEL_FILE, "tunnel")
+    if cached is not None:
+        return cached
+    tunnel_token = file_etag_token(TUNNEL_FILE, "tunnel")
+    # Lazy import to avoid circular dependency
+    try:
+        import voice_server
+        voice_server._reload_cors_origins()
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 197: {e}")
+        pass
+    try:
+        with open(TUNNEL_FILE, "r", encoding="utf-8") as f:
+            url = f.read().strip()
+        tunnel_token_after_read = file_etag_token(TUNNEL_FILE, "tunnel")
+        if url:
+            return json_response(request, {"active": True, "url": url},
+                                etag_token=tunnel_token if tunnel_token == tunnel_token_after_read else None)
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 206: {e}")
+        pass
+    tunnel_token_after_read = file_etag_token(TUNNEL_FILE, "tunnel")
+    return json_response(request, {"active": False, "url": None, "message": "隧道未运行, 运行 bash start_tunnel.sh 启动"},
+                        etag_token=tunnel_token if tunnel_token == tunnel_token_after_read else None)
+
+@router.get("/health")
+def health():
+    uptime_s = int(time.time() - _start_time) if _start_time else 0
+    # Check subsystem status
+    mqtt_ok = False
+    feishu_ws_ok = False
+    try:
+        from app.mqtt_server import get_server
+        mqtt_ok = get_server() is not None
+    except Exception:
+        pass
+    try:
+        import feishu_ws
+        feishu_ws_ok = getattr(feishu_ws, "_started", False)
+    except Exception:
+        pass
+    return {
+        "ok": True, "service": "magic-phone-voice", "version": "3.2.0",
+        "uptime_seconds": uptime_s, "uptime_human": f"{uptime_s//3600}h{(uptime_s%3600)//60}m",
+        "brain_ready": _brain_is_warm(), "websocket_clients": _ws_client_count(),
+        "sse_clients": sse_client_count(), "auth_enabled": bool(AUTH_TOKEN),
+        "mqtt_running": mqtt_ok, "feishu_ws_connected": feishu_ws_ok,
+    }
+
+# ===== Preferences =====
+class PreferenceRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=50)
+    value: str = Field(..., min_length=1, max_length=200)
+
+@router.get("/api/preferences")
+async def get_preferences(request: Request):
+    from voice_agent import preferences_conditional
+    prefs, prefs_token = preferences_conditional(lambda etag: if_none_matches(request, etag), weak_etag)
+    if prefs is None:
+        return not_modified_response(weak_etag(prefs_token))
+    return json_response(request, {"total": len(prefs), "preferences": prefs}, etag_token=prefs_token)
+
+@router.post("/api/preferences")
+async def set_preference_api(req: PreferenceRequest):
+    from app.audit_log import audit_log
+    from voice_agent import set_preference
+    msg = set_preference(req.key, req.value)
+    audit_log("api:preferences", input_data=f"{req.key}={req.value}", output_data=msg, action="set")
+    return {"ok": True, "message": msg, "key": req.key, "value": req.value}
+
+@router.delete("/api/preferences/{key}")
+async def del_preference_api(key: str):
+    from app.audit_log import audit_log
+    from voice_agent import del_preference
+    msg = del_preference(key)
+    audit_log("api:preferences", input_data=key, output_data=msg, action="delete")
+    return {"ok": True, "message": msg}
+
+@router.get("/api/roles")
+async def list_roles():
+    """获取所有可用角色"""
+    from agent.roles import get_all_roles, get_current_role
+    roles = get_all_roles()
+    current = get_current_role()
+    return {
+        "current": current,
+        "roles": [
+            {
+                "id": rid,
+                "name": r["name"],
+                "description": r["description"],
+                "wake_words": r.get("wake_words", []),
+            }
+            for rid, r in roles.items()
+        ],
+    }
+
+
+class RoleSwitchRequest(BaseModel):
+    role_id: str = Field(..., min_length=1, max_length=20)
+
+
+@router.post("/api/roles/switch")
+async def switch_role_api(req: RoleSwitchRequest):
+    """切换角色"""
+    from app.audit_log import audit_log
+    from agent.roles import switch_role
+    ok, msg = switch_role(req.role_id)
+    audit_log("api:roles", input_data=req.role_id, output_data=msg, action="switch")
+    return {"ok": ok, "message": msg, "role_id": req.role_id}
+
+
+@router.get("/api/sessions")
+async def list_sessions():
+    from voice_agent import _session_summaries
+    sessions = _session_summaries()
+    return {"total": len(sessions), "sessions": sessions}
+
+@router.get("/api/context")
+async def get_context(session_id: str = "default"):
+    from voice_agent import _context_summaries, _history_snapshot, list_preferences, _estimate_msg_tokens as _est_tokens
+    hist = _history_snapshot(session_id)
+    summary = _context_summaries.get(session_id, "")
+    prefs = list_preferences()
+    total_tokens = sum(_est_tokens(m) for m in hist) if hist else 0
+    return {
+        "session_id": session_id[:16] + "..." if len(session_id) > 16 else session_id,
+        "history_count": len(hist), "estimated_tokens": total_tokens, "token_budget": 4000,
+        "context_summary": summary[:200] if summary else None,
+        "preferences_count": len(prefs), "preferences": prefs,
+    }
+
+# ===== Behaviors / decisions / devices =====
+@router.get("/api/decisions")
+async def decision_status():
+    try:
+        from app import load_magic_module
+        _dec = load_magic_module("magic_decisions", "magic-decisions.py")
+        if _dec:
+            try:
+                from voice_agent import get_user_state
+                user_state = get_user_state()
+            except Exception:
+                user_state = {"state": "unknown"}
+            return {"user_state": user_state, "rules": _dec.get_rules(), "history": _dec._load_decision_history(), "summary": _dec.decisions_summary()}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.get("/api/devices")
+async def list_devices():
+    try:
+        from app.state import snapshot_xiaozhi_clients
+        from app.mqtt_server import get_server
+        ws_clients = snapshot_xiaozhi_clients()
+        ws_devices = [{"id": cid[:16] + "...", "type": "websocket", "connected_at": info.get("connected_at", ""), "device_key": info.get("device_key", "")} for cid, info in ws_clients.items()]
+        mqtt_server = get_server()
+        mqtt_devices = []
+        if mqtt_server:
+            import app.mqtt_server as _mqtt
+            for did, sess in _mqtt._sessions.items():
+                addr = sess.get("addr")
+                mqtt_devices.append({"id": did, "type": "mqtt", "udp_addr": f"{addr[0]}:{addr[1]}" if addr else "waiting...", "connected_at": sess.get("timestamp", 0), "since_seconds": round(time.time() - sess.get("timestamp", time.time()), 1)})
+        return {"total": len(ws_devices) + len(mqtt_devices), "websocket_count": len(ws_devices), "mqtt_count": len(mqtt_devices), "websocket_devices": ws_devices, "mqtt_devices": mqtt_devices, "mqtt_server_running": mqtt_server is not None, "mqtt_udp_port": mqtt_server.udp_port if mqtt_server else 0}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.get("/api/decisions/config")
+async def decisions_config():
+    try:
+        from app import load_magic_module
+        _dec = load_magic_module("magic_decisions", "magic-decisions.py")
+        if not _dec:
+            return {"error": "magic-decisions模块未加载"}
+        rules = _dec.get_rules()
+        rule_summary = [{"id": r["id"], "priority": r.get("priority", 0), "confirm": r.get("confirm", False), "condition": r.get("condition", {}).get("check_desc", "")} for r in rules]
+        feedback_file = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
+        feedback = {}
+        try:
+            with open(feedback_file, "r", encoding="utf-8") as f:
+                feedback = json.load(f)
+        except Exception as e:
+            log.debug(f"[app.routes.manage] error at line 353: {e}")
+            pass
+        return {"cooldown_hours": 12, "rule_count": len(rule_summary), "rules": rule_summary, "feedback": feedback}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.get("/api/behaviors")
+async def behaviors_status():
+    try:
+        import datetime as _dt
+        from collections import Counter
+        history = {}
+        try:
+            hf = os.path.join(PROJECT_DIR, "data", "decision_history.json")
+            with open(hf, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception as e:
+            log.debug(f"[app.routes.manage] error at line 369: {e}")
+            pass
+        trigger_hours = []
+        trigger_counts = Counter()
+        for rid, info in history.items():
+            if info.get("trigger_time"):
+                try:
+                    t = _dt.datetime.fromisoformat(info["trigger_time"])
+                    trigger_hours.append(t.hour)
+                    trigger_counts[rid] += 1
+                except Exception as e:
+                    log.debug(f"[app.routes.manage] error at line 379: {e}")
+                    pass
+        hour_dist = dict(Counter(trigger_hours)) if trigger_hours else {}
+        top_triggered = trigger_counts.most_common(5)
+        feedback = {}
+        try:
+            ff = os.path.join(PROJECT_DIR, "data", "decision_feedback.json")
+            with open(ff, "r", encoding="utf-8") as f:
+                feedback = json.load(f)
+        except Exception as e:
+            log.debug(f"[app.routes.manage] error at line 388: {e}")
+            pass
+        feedback_scores = {}
+        for r in (history if isinstance(history, dict) else {}):
+            fb = feedback.get(r, {"positive": 0, "negative": 0})
+            total = fb["positive"] + fb["negative"]
+            score = fb["positive"] / total if total > 0 else None
+            feedback_scores[r] = {"score": round(score, 2) if score is not None else None, "total": total}
+        return {"decision_triggers": top_triggered, "hour_distribution": hour_dist, "feedback_scores": feedback_scores, "total_decisions_triggered": sum(trigger_counts.values())}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.get("/api/habits")
+async def habits_status():
+    try:
+        import datetime as _dt
+        habits_file = os.path.join(PROJECT_DIR, "data", "habits.json")
+        if not os.path.exists(habits_file):
+            return {"total": 0, "habits": {}, "insight": "暂无习惯数据，开始记录吧"}
+        with open(habits_file, "r", encoding="utf-8") as f:
+            habits = json.load(f)
+        today = _dt.date.today()
+        result = {}
+        for habit, data in habits.items():
+            logs = data.get("logs", [])
+            streak = 0
+            check = today
+            for d_str in sorted(set(logs), reverse=True):
+                try:
+                    d = _dt.date.fromisoformat(d_str)
+                    if (check - d).days <= streak:
+                        streak += 1
+                    else:
+                        break
+                except Exception:
+                    break
+            result[habit] = {"total_days": len(logs), "streak": streak, "week_days": len([d for d in logs if _dt.date.fromisoformat(d) >= today - _dt.timedelta(days=today.weekday())]) if logs else 0, "last_log": sorted(logs)[-1] if logs else None, "created": data.get("created", ""), "completed_today": today.strftime("%Y-%m-%d") in logs}
+        return {"total": len(result), "habits": result, "insight": f"已记录{sum(r['total_days'] for r in result.values())}次习惯打卡" if result else ""}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.get("/api/memory")
+async def memory_status(request: Request):
+    query = request.query_params.get("query", "").strip()
+    try:
+        from app import load_magic_module
+        _mem = load_magic_module("magic_memory", "magic-memory.py")
+        if not _mem:
+            return {"total": 0, "tags": {}, "recent": []}
+        if query:
+            results = _mem.recall_hybrid(query, k=10)
+            return {
+                "total": len(results),
+                "tags": {},
+                "recent": [{"datetime": m.get("datetime", ""), "summary": m.get("summary", "")} for m in results],
+                "query": query,
+            }
+        return _mem.get_memory_summary()
+    except Exception as e:
+        return _safe_error(e)
+
+@router.delete("/api/memory")
+async def memory_delete(request: Request):
+    query = request.query_params.get("query", "").strip()
+    if not query:
+        return JSONResponse({"error": "缺少 query 参数"}, status_code=400)
+    try:
+        from app import load_magic_module
+        _mem = load_magic_module("magic_memory", "magic-memory.py")
+        if not _mem:
+            return JSONResponse({"error": "记忆模块未加载"}, status_code=500)
+        result = _mem.forget(query)
+        return {"ok": True, "message": result}
+    except Exception as e:
+        return _safe_error(e)
+
+# ===== Setup / config =====
+def _parse_env_file(path):
+    result = {}
+    if not os.path.exists(path):
+        return result
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    result[k.strip()] = v.strip()
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 478: {e}")
+        pass
+    return result
+
+def _mask_sensitive(key: str, value: str) -> str:
+    """对敏感配置值做脱敏：以 _KEY/_SECRET/_TOKEN/_PASSWORD 结尾且非空时掩码末4位。"""
+    if not value:
+        return value
+    upper_key = key.upper()
+    if any(
+        upper_key.endswith(suffix)
+        for suffix in ("_KEY", "_SECRET", "_TOKEN", "_PASSWORD")
+    ):
+        if len(value) <= 8:
+            return "******"
+        return f"****{value[-4:]}"
+    return value
+
+def _write_env_file(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    original_lines = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                original_lines = f.readlines()
+        except Exception:
+            original_lines = []
+    existing_keys = set()
+    out_lines = []
+    pending_updates = dict(data)
+    for raw_line in original_lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            out_lines.append(raw_line)
+            continue
+        k = stripped.split("=", 1)[0].strip()
+        existing_keys.add(k)
+        if k in data and data[k]:
+            out_lines.append(f"{k}={data[k]}\n")
+            pending_updates.pop(k, None)
+        else:
+            out_lines.append(raw_line)
+    new_added = False
+    for entry in env_catalog.all_entries():
+        if entry.name in pending_updates and entry.name not in existing_keys:
+            if not new_added and (not out_lines or not out_lines[-1].endswith("\n\n")):
+                out_lines.append("\n# === 通过 setup 页面新增 ===\n")
+                new_added = True
+            out_lines.append(f"{entry.name}={pending_updates[entry.name]}\n")
+    # 原子整版替换：同目录 tempfile → flush+fsync → os.replace
+    dir_name = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError):
+                log.warning(f"[setup] 文件锁获取失败（并发写入）：{path}")
+            f.writelines(out_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+def _reload_runtime_env():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_ENV_FILE, override=True)
+        log.info(f"[setup] os.environ 已从 {_ENV_FILE} 重载")
+    except Exception as e:
+        log.warning(f"[setup] load_dotenv 重载失败: {e}")
+    try:
+        from app import llm_config as _llm_cfg
+        _llm_cfg.reload()
+    except Exception as e:
+        log.warning(f"[setup] llm_config.reload 失败: {e}")
+    try:
+        from agent import asr_tts as _asr_tts
+        _asr_tts.reload()
+    except Exception as e:
+        log.warning(f"[setup] asr_tts.reload 失败: {e}")
+    try:
+        import voice_agent
+        voice_agent.reload_brain_config()
+    except Exception as e:
+        log.warning(f"[setup] reload_brain_config 失败: {e}")
+
+_SETUP_WHITELIST = set(env_catalog.setup_whitelist_keys())
+
+
+def _verify_openai_compat_key(api_key: str, base: str, label: str) -> tuple[bool, str]:
+    """验证 OpenAI 兼容 API Key（GET /models）"""
+    if not api_key:
+        return False, f"请填入 {label} API Key"
+    try:
+        r = requests.get(f"{base}/models",
+                         headers={"Authorization": f"Bearer {api_key}"},
+                         timeout=8)
+        if r.status_code == 200 and r.json().get("data"):
+            return True, f"{label} Key 验证通过"
+        return False, f"{label} Key 无效: HTTP {r.status_code}"
+    except Exception as e:
+        return False, f"无法连接 {label} 验证服务器（{e}），Key 已保存"
+
+
+def _verify_stepfun_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("STEPFUN_KEY", ""),
+        os.getenv("STEPFUN_LLM_BASE", "https://api.stepfun.com/step_plan/v1"),
+        "StepFun",
+    )
+
+
+def _verify_agnes_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("AGNES_KEY", ""),
+        os.getenv("AGNES_BASE", "https://apihub.agnes-ai.com/v1"),
+        "Agnes",
+    )
+
+
+def _verify_glm_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("GLM_KEY", ""),
+        os.getenv("GLM_BASE", "https://open.bigmodel.cn/api/paas/v4"),
+        "智谱 GLM",
+    )
+
+
+def _verify_ark_key(api_key: str = "") -> tuple[bool, str]:
+    return _verify_openai_compat_key(
+        api_key or os.getenv("ARK_KEY", ""),
+        os.getenv("ARK_BASE", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+        "火山 ARK",
+    )
+
+@router.get("/api/welcome/status")
+async def welcome_status():
+    status = env_catalog.render_welcome_status()
+    status["has_env"] = os.path.exists(_ENV_FILE)
+    status["ollama_online"] = False  # Ollama已移除
+    return status
+
+@router.get("/api/setup")
+async def get_setup():
+    data = _parse_env_file(_ENV_FILE)
+    for entry in env_catalog.all_entries():
+        if entry.name not in data:
+            data[entry.name] = entry.default
+    for key in list(data.keys()):
+        data[key] = _mask_sensitive(key, data[key])
+    data["__demo_mode"] = env_catalog.demo_mode_active()
+    data["__llm_available"] = env_catalog.llm_available()
+    data["__missing_required"] = [e.name for e in env_catalog.missing_required()]
+    return data
+
+@router.post("/api/setup")
+async def post_setup(request: Request):
+    from app.audit_log import audit_log
+    try:
+        data = await request.json()
+    except Exception:
+        audit_log("api:setup", input_data="invalid_json", success=False, error="bad_request", action="save")
+        return JSONResponse({"ok": False, "error": "请求数据格式错误"}, status_code=400)
+    safe_data = {k: str(v).strip() for k, v in data.items() if k in _SETUP_WHITELIST and str(v).strip() and not str(v).startswith("****")}
+    demo_accept = str(data.get("demo_accept", "false")).lower() in ("1", "true", "yes", "on")
+    try:
+        _write_env_file(_ENV_FILE, safe_data)
+        _reload_runtime_env()
+        existing = _parse_env_file(_ENV_FILE)
+        llm_ready = env_catalog.llm_available()
+        audit_log("api:setup", input_data=f"keys={list(safe_data.keys())}", output_data=f"llm_ready={llm_ready}", action="save")
+        return {"ok": True, "message": "配置已保存并即时生效", "llm_ready": llm_ready}
+    except Exception as e:
+        audit_log("api:setup", input_data=f"keys={list(safe_data.keys())}", success=False, error=str(e), action="save")
+        return JSONResponse({"ok": False, "error": f"保存失败: {e}"}, status_code=500)
+
+@router.post("/api/setup/verify")
+async def verify_setup(request: Request):
+    from app.audit_log import audit_log
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    results = {}
+    audit_log("api:setup:verify", input_data=f"verify_keys={list(body.keys())}", action="verify")
+    def _check_stepfun():
+        ok, msg = _verify_stepfun_key(body.get("STEPFUN_KEY", ""))
+        results["stepfun"] = {"ok": ok, "message": msg}
+    def _check_agnes():
+        ok, msg = _verify_agnes_key(body.get("AGNES_KEY", ""))
+        results["agnes"] = {"ok": ok, "message": msg}
+    def _check_glm():
+        ok, msg = _verify_glm_key(body.get("GLM_KEY", ""))
+        results["glm"] = {"ok": ok, "message": msg}
+    def _check_ark():
+        ok, msg = _verify_ark_key(body.get("ARK_KEY", ""))
+        results["ark"] = {"ok": ok, "message": msg}
+    def _check_baidu():
+        from agent import asr_tts as _at
+        ok, msg = _at.verify_baidu_key(body.get("BAIDU_APP_ID", ""), body.get("BAIDU_API_KEY", ""), body.get("BAIDU_SECRET_KEY", ""))
+        results["baidu"] = {"ok": ok, "message": msg}
+    tasks = []
+    if body.get("STEPFUN_KEY") or env_catalog.is_configured("STEPFUN_KEY"):
+        tasks.append(_check_stepfun)
+    if body.get("AGNES_KEY") or env_catalog.is_configured("AGNES_KEY"):
+        tasks.append(_check_agnes)
+    if body.get("GLM_KEY") or env_catalog.is_configured("GLM_KEY"):
+        tasks.append(_check_glm)
+    if body.get("ARK_KEY") or env_catalog.is_configured("ARK_KEY"):
+        tasks.append(_check_ark)
+    if body.get("BAIDU_API_KEY") or env_catalog.is_configured("BAIDU_API_KEY"):
+        tasks.append(_check_baidu)
+    loop = asyncio.get_event_loop()
+    await asyncio.gather(*[loop.run_in_executor(None, t) for t in tasks])
+    all_ok = all(r.get("ok") for r in results.values()) if results else True
+    return {"ok": all_ok, "results": results}
+
+@router.get("/api/setup/mcp-status")
+async def setup_mcp_status():
+    return {
+        "groups": [{"key": g, "label": env_catalog.group_label(g), "entries": [{"name": e.name, "configured": e.is_set, "required": e.required, "demo_supported": e.demo_supported, "description": e.description, "get_guide": e.get_guide} for e in env_catalog.entries_for_group(g)]} for g in env_catalog.groups_in_order() if env_catalog.entries_for_group(g)],
+        "demo_mode": env_catalog.demo_mode_active(),
+        "llm_available": env_catalog.llm_available(),
+    }
+
+# ===== ESP32 =====
+_esp32_flash = BackgroundTask("esp32_flash")
+
+@router.api_route("/esp32-setup", methods=["GET", "HEAD"], response_class=HTMLResponse)
+async def esp32_setup_page(request: Request):
+    html_path = os.path.join(PROJECT_DIR, "web", "esp32_setup.html")
+    return html_response(request, html_path, "esp32-setup-html")
+
+@router.get("/api/esp32/detect-port")
+async def esp32_detect_port():
+    import glob as _glob
+    ports = []
+    system = platform.system()
+    if system == "Windows":
+        for i in range(1, 257):
+            port = f"COM{i}"
+            if os.path.exists(port):
+                ports.append({"device": port, "board": "ESP32"})
+    else:
+        for pattern in ["/dev/cu.usbmodem*", "/dev/cu.usbserial*"]:
+            for dev in _glob.glob(pattern):
+                ports.append({"device": dev, "board": "ESP32"})
+    return {"ports": ports}
+
+@router.post("/api/esp32/flash")
+async def esp32_flash(request: Request):
+    from app.audit_log import audit_log
+    try:
+        data = await request.json()
+    except Exception:
+        audit_log("api:esp32_flash", success=False, error="bad_request", action="flash")
+        return JSONResponse({"ok": False, "error": "请求数据格式错误"}, status_code=400)
+    port = data.get("port", "")
+    if not port:
+        audit_log("api:esp32_flash", success=False, error="missing_port", action="flash")
+        return JSONResponse({"ok": False, "error": "缺少串口字段: port"}, status_code=422)
+    if not _esp32_flash.start(_esp32_flash_worker, port):
+        audit_log("api:esp32_flash", input_data=port, success=False, error="already_running", action="flash")
+        return {"started": False, "message": "已有烧录在进行中"}
+    audit_log("api:esp32_flash", input_data=port, output_data="started", action="flash")
+    return {"started": True, "message": "烧录已启动"}
+
+def _find_esp32_firmware():
+    fw_name = "charlie-esp32-flash-16MB.bin"
+    candidates = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", PROJECT_DIR)
+        candidates.append(os.path.join(meipass, "firmware", fw_name))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), "firmware", fw_name))
+    candidates.append(os.path.join(os.path.dirname(PROJECT_DIR), "firmware", fw_name))
+    candidates.append(os.path.join(PROJECT_DIR, "firmware", fw_name))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"固件 {fw_name} 未找到。")
+
+def _esp32_flash_worker(port):
+    fw_path = _find_esp32_firmware()
+    _esp32_flash.update_progress(f"读取固件 {os.path.basename(fw_path)}")
+    _esp32_flash.update_progress("esptool 烧录中（约 30-60 秒，请勿断开设备）")
+    import esptool
+    argv = ["--chip", "esp32s3", "-p", port, "-b", "115200", "write_flash", "--flash_mode", "dio", "--flash_freq", "80m", "--flash_size", "16MB", "0x0", fw_path]
+    try:
+        esptool.main(argv)
+    except SystemExit as e:
+        if getattr(e, "code", 0) not in (0, None):
+            raise RuntimeError(f"esptool 退出码 {e.code}")
+    _esp32_flash.update_progress("烧录完成")
+    _esp32_flash.set_result("flashed", True)
+    lan_ip = _get_lan_ip() or "127.0.0.1"
+    try:
+        r = requests.get(f"http://{lan_ip}:{http_port()}/xiaozhi/ota", timeout=3)
+        _esp32_flash.set_result("connectivity", r.status_code == 200)
+    except Exception:
+        _esp32_flash.set_result("connectivity", False)
+
+@router.get("/api/esp32/config-info")
+async def esp32_config_info():
+    lan_ip = _get_lan_ip() or ""
+    port = http_port()
+    ws_url = f"ws://{lan_ip}:{port}/ws/xiaozhi"
+    if AUTH_TOKEN:
+        ws_url += f"?token={AUTH_TOKEN}"
+    return {"lan_ip": lan_ip, "http_port": port, "ota_url": f"http://{lan_ip}:{port}/xiaozhi/ota", "ws_url": ws_url, "ap_prefix": "lc-s3-wifi-1.54tft-", "portal_url": "http://192.168.4.1"}
+
+@router.get("/api/esp32/flash-status")
+async def esp32_flash_status():
+    return _esp32_flash.status()
+
+# ===== Model download =====
+_model_download = BackgroundTask("model_download")
+
+def _check_model_exists():
+    model_path = os.getenv("SENSE_VOICE_MODEL", os.path.join(PROJECT_DIR, "models", "sense-voice"))
+    return os.path.exists(os.path.join(model_path, "model.int8.onnx"))
+
+def _download_model_worker():
+    import subprocess
+    script = os.path.join(PROJECT_DIR, "scripts", "download-models.py")
+    subprocess.run([sys.executable, script], check=True, capture_output=True, text=True, cwd=PROJECT_DIR)
+
+@router.post("/api/setup/download-model")
+async def download_model():
+    from app.audit_log import audit_log
+    import voice_server
+    if _model_download.is_active():
+        audit_log("api:download_model", success=False, error="already_running", action="download")
+        return {"started": False, "message": "已有下载在进行中"}
+    if voice_server._check_model_exists():
+        audit_log("api:download_model", output_data="already_exists", action="download")
+        return {"started": False, "message": "模型已存在", "model_exists": True}
+    audit_log("api:download_model", output_data="started", action="download")
+    _model_download.start(_download_model_worker)
+    return {"started": True, "message": "下载已启动（237MB，后台进行）"}
+
+@router.get("/api/setup/download-status")
+async def download_status():
+    import voice_server
+    s = _model_download.status()
+    return {"downloading": s["active"], "error": s["error"], "model_exists": voice_server._check_model_exists()}
+
+# ===== Protocols / evolution =====
+@router.get("/api/protocols")
+async def protocols_status():
+    try:
+        from app import load_magic_module
+        _sc = load_magic_module("magic_scenes", "magic-scenes.py")
+        if _sc:
+            protocols = _sc._load_protocols()
+            result = [{"key": key, "name": proto.get("name", key), "triggers": ", ".join(proto.get("triggers", [])), "step_count": len(proto.get("steps", [])), "is_builtin": key in _sc._BUILTIN_PROTOCOLS} for key, proto in protocols.items()]
+            return {"protocols": result}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.post("/api/protocols/learn")
+async def protocols_learn(body: dict):
+    from app.audit_log import audit_log
+    try:
+        from app import load_magic_module
+        _sc = load_magic_module("magic_scenes", "magic-scenes.py")
+        if _sc:
+            result = _sc.learn_protocol(body.get("name", ""), body.get("trigger_words", ""), body.get("steps_description", ""))
+            audit_log("api:protocols:learn", input_data=body.get("name", ""), output_data=result, action="learn")
+            return {"ok": True, "message": result}
+    except Exception as e:
+        audit_log("api:protocols:learn", input_data=body.get("name", ""), success=False, error=str(e), action="learn")
+        return _safe_error(e)
+
+@router.get("/api/evolution")
+async def evolution_status():
+    try:
+        from app import load_magic_module
+        _evo = load_magic_module("magic_evolution", "magic-evolution.py")
+        if _evo:
+            data = _evo._load_evolution_data()
+            patterns = data.get("usage_patterns", {})
+            adaptation = data.get("adaptation_state", {})
+            learned = data.get("learned_preferences", {})
+            return {"total_conversations": patterns.get("total_conversations", 0), "response_style": adaptation.get("response_style", "default"), "topic_count": len(patterns.get("top_topics", [])), "preferences": learned, "active_hours": patterns.get("active_hours", []), "top_topics": patterns.get("top_topics", [])}
+    except Exception as e:
+        return _safe_error(e)
+
+@router.post("/api/evolution/learn")
+async def evolution_learn():
+    from app.audit_log import audit_log
+    try:
+        from voice_agent import _get_brain
+        brain = _get_brain("magic-evolution")
+        audit_log("api:evolution:learn", input_data="manual_trigger", action="learn")
+        for rsp in brain.run([{"role": "user", "content": "learn_from_history()"}]):
+            pass
+        return {"ok": True, "message": "学习完成"}
+    except Exception as e:
+        return _safe_error(e)
+
+# ===== Wake / user / logs =====
+@router.post("/api/wake/toggle")
+async def wake_toggle_api(enabled: bool = None):
+    from app.audit_log import audit_log
+    import local_wake
+    result = local_wake.toggle_wake(enabled)
+    audit_log("api:wake_toggle", input_data=f"enabled={enabled}", output_data=str(result), action="toggle")
+    return result
+
+@router.get("/api/wake/status")
+async def wake_status_api():
+    import local_wake
+    return local_wake.wake_status()
+
+@router.post("/api/user/switch")
+async def switch_user_api(user_id: str = "default"):
+    from app.audit_log import audit_log
+    from voice_agent import set_current_user, get_current_user
+    set_current_user(user_id)
+    audit_log("api:user_switch", input_data=user_id, output_data=get_current_user(), action="switch")
+    return {"user_id": get_current_user(), "message": f"已切换到用户: {user_id}"}
+
+@router.get("/api/user/current")
+async def current_user_api():
+    from voice_agent import get_current_user
+    return {"user_id": get_current_user()}
+
+@router.get("/api/logs")
+async def get_logs(lines: int = 100, filter: str = ""):
+    log_path = os.path.join(_LOG_DIR, "app.log")
+    if not os.path.exists(log_path):
+        return {"lines": [], "total": 0}
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+        if filter:
+            all_lines = [l for l in all_lines if filter in l]
+        tail = all_lines[-lines:]
+        return {"lines": tail, "total": len(tail), "file": log_path}
+    except Exception as e:
+        log.error(f"[manage] logs error: {e}", exc_info=True)
+        return {"error": "Failed to read logs", "lines": [], "total": 0}
+
+# ===== TTS voices =====
+AVAILABLE_TTS_VOICES = {
+    "Cherry": "Cherry - 自然女声", "Stella": "Stella - 温柔女声",
+    "Alex": "Alex - 沉稳男声", "Vega": "Vega - 活力女声",
+    "Nova": "Nova - 甜美女声", "Echo": "Echo - 中性声",
+    "Ethan": "Ethan - 成熟男声",
+}
+
+@router.get("/api/tts/voices")
+async def list_tts_voices():
+    import agent.asr_tts
+    # 读 get_effective_tts_config（角色级优先）而非全局 TTS_VOICE：
+    # 角色音色持久化到 preferences.json，重启后全局回退 env 默认值，
+    # 二者会分叉；UI 展示必须与实际合成音色一致
+    current, _ = agent.asr_tts.get_effective_tts_config()
+    voices = [{"id": key, "name": desc, "current": key == current} for key, desc in AVAILABLE_TTS_VOICES.items()]
+    return {"voices": voices, "current": current}
+
+@router.post("/api/tts/voice")
+async def set_tts_voice(request: Request):
+    from app.audit_log import audit_log
+    import agent.asr_tts as _at
+    from agent.roles import get_current_role, set_role_tts_voice
+    try:
+        data = await request.json()
+        voice_id = data.get("voice_id", "Cherry")
+    except Exception:
+        voice_id = "Cherry"
+    if voice_id not in AVAILABLE_TTS_VOICES:
+        audit_log("api:tts_voice", input_data=voice_id, success=False, error="unknown_voice", action="set")
+        return JSONResponse({"error": f"未知音色: {voice_id}"}, status_code=400)
+    _at.TTS_VOICE = voice_id
+    _at._tts_cache.clear()
+    # 同步更新当前激活角色的 tts_voice，使 get_effective_tts_config() 返回新值
+    try:
+        role_id = get_current_role()
+        set_role_tts_voice(role_id, voice_id)
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 950: {e}")
+        pass
+    audit_log("api:tts_voice", input_data=voice_id, output_data=voice_id, action="set")
+    return {"ok": True, "voice": voice_id, "name": AVAILABLE_TTS_VOICES[voice_id]}
+
+# ===== MCP =====
+@router.get("/api/mcp/servers")
+async def list_mcp_servers():
+    from app.mcp_gate import MCP_LABELS
+    from voice_agent import _build_brain, _brains
+    enabled_env = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life,magic-scenes,magic-evolution,magic-summary,magic-wardrobe,magic-browser,magic-apps,magic-feishu,magic-douyin,magic-taobao").split(",")
+    enabled_env = [s.strip() for s in enabled_env if s.strip()]
+    result = [{"id": key, "name": name, "enabled": key in enabled_env, "cached": key in _brains} for key, name in MCP_LABELS.items()]
+    return {"servers": result, "enabled_list": ",".join(enabled_env)}
+
+@router.post("/api/mcp/toggle")
+async def toggle_mcp_server(server_id: str = "", enabled: bool = True):
+    from app.audit_log import audit_log
+    if not server_id:
+        audit_log("api:mcp_toggle", success=False, error="missing_server_id", action="toggle")
+        return JSONResponse({"error": "缺少 server_id 参数"}, status_code=400)
+    current = os.getenv("MCP_SERVERS", "amap-maps,baize-skills,filesystem,magic-music,magic-reminder,magic-notes,magic-system,magic-info,magic-life,magic-scenes,magic-evolution,magic-summary,magic-wardrobe,magic-browser,magic-apps,magic-feishu,magic-douyin,magic-taobao")
+    enabled_list = [s.strip() for s in current.split(",") if s.strip()]
+    if enabled and server_id not in enabled_list:
+        enabled_list.append(server_id)
+    elif not enabled and server_id in enabled_list:
+        enabled_list.remove(server_id)
+    os.environ["MCP_SERVERS"] = ",".join(enabled_list)
+    from voice_agent import restart_brain
+    restart_brain()
+    audit_log("api:mcp_toggle", input_data=server_id, output_data=f"enabled={enabled}", action="toggle")
+    return {"ok": True, "server_id": server_id, "enabled": enabled, "enabled_list": enabled_list}
+
+# ===== Internal xiaozhi push =====
+@router.post("/api/internal/xiaozhi-push")
+async def _internal_xiaozhi_push(payload: dict, request: Request):
+    from app.audit_log import audit_log
+    internal_token = os.getenv("INTERNAL_API_TOKEN", "")
+    if internal_token:
+        auth = request.headers.get("X-Internal-Token", "")
+        if auth != internal_token:
+            audit_log("api:xiaozhi_push", success=False, error="unauthorized", action="push")
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    else:
+        client_ip = request.client.host if request.client else ""
+        if client_ip not in ("127.0.0.1", "::1", "localhost"):
+            audit_log("api:xiaozhi_push", success=False, error="forbidden", action="push")
+            return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    text = payload.get("text", "")
+    mp3_b64 = payload.get("mp3", "")
+    if not text or not mp3_b64:
+        audit_log("api:xiaozhi_push", success=False, error="missing_params", action="push")
+        return {"ok": False, "error": "missing text or mp3"}
+    # 与 push_tts_to_xiaozhi 保持一致：streaming 中不直推 WS，延迟投递
+    try:
+        from app.xiaozhi_ws import is_xiaozhi_streaming
+        if is_xiaozhi_streaming():
+            audit_log("api:xiaozhi_push", input_data=text[:50], action="push",
+                      output_data="deferred: streaming")
+            return JSONResponse({"ok": True, "deferred": True, "reason": "streaming"}, status_code=202)
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 1010: {e}")
+        pass
+    audit_log("api:xiaozhi_push", input_data=text[:50], action="push")
+    import base64 as _b64
+    from app.state import snapshot_xiaozhi_clients
+    mp3_data = _b64.b64decode(mp3_b64)
+    clients = snapshot_xiaozhi_clients()
+    pushed = 0
+    for cid, info in clients.items():
+        ws = info["ws"]
+        try:
+            await async_push_tts_to_xiaozhi(ws, text, mp3_data)
+            pushed += 1
+        except Exception as e:
+            log.warning(f"[xiaozhi-push] 内部转发失败 {cid}: {e}")
+    mqtt_pushed = False
+    try:
+        from app.mqtt_server import push_tts_to_mqtt
+        mqtt_pushed = push_tts_to_mqtt(text, mp3_data)
+        if mqtt_pushed:
+            pushed += 1
+    except Exception as e:
+        log.debug(f"[app.routes.manage] error at line 1031: {e}")
+        pass
+    return {"ok": True, "pushed": pushed, "total": len(clients), "mqtt": mqtt_pushed}

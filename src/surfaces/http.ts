@@ -36,11 +36,11 @@
  * | POST /hooks/:source                     | §5.1 ingest，202 {eventId}；dup 200 {eventId,dup:true} |
  */
 
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
-import type { EventBus } from '../shared/bus.ts';
+import type { BusChannel, EventBus } from '../shared/bus.ts';
 import type {
   ApprovalView,
   ControlPlane,
@@ -56,7 +56,8 @@ import type {
 } from '../shared/contracts.ts';
 import { ConfigError } from '../shared/errors.ts';
 import { DEFAULT_DOT_ID } from '../shared/ids.ts';
-import { LIMIT_ARCHIVE_BYTES } from '../memory/limits.ts';
+import { HOME_IDENTITY, LIMIT_ARCHIVE_BYTES, LIMIT_IDENTITY_MD } from '../memory/limits.ts';
+import { MAX_IMPORT_BYTES, buildImportNote } from './memory-import.ts';
 import { createSchedule, listSchedules, removeSchedule } from '../control-plane/schedules.ts';
 import { CronExpressionParser } from 'cron-parser';
 import type { HookConfig, SurfacesConfig } from './types.ts';
@@ -67,9 +68,12 @@ import { listOutbound } from './feishu-outbound.ts';
 import { SseBus, parseStreamQuery } from './sse.ts';
 import { createHeartbeatAdmin } from './heartbeat-tick.ts';
 import { buildTaskView, type CallLogRow } from './task-view.ts';
+import { buildTaskSummary } from './task-summary.ts';
 import { PLAN_MARKER, plansFromMessages } from '../runner/plan.ts';
 import { serveStatic } from './web.ts';
 import type { DailyBrief } from './daily-brief.ts';
+import type { FeedSnapshot } from './feed.ts';
+import type { ProofBundle } from './proof.ts';
 import type { ConnectionRow } from './connections.ts';
 import { connectionSummary, renderConnections } from './connections.ts';
 import {
@@ -116,12 +120,30 @@ export type Route =
   | 'heartbeat_admin'
   | 'hook_ingest'
   | 'task_by_id'
+  | 'task_proof'
+  | 'devices'
+  | 'device_by_id'
+  | 'device_rotate'
+  | 'device_turn'
+  | 'device_task'
+  | 'device_stream'
+  | 'device_events'
+  | 'device_approval'
+  | 'device_memory'
+  | 'device_memory_turn'
+  | 'device_prefs'
+  | 'device_pref_delete'
+  | 'device_proactive_decide'
+  | 'memory_prefs'
   | 'activity'
   | 'brief'
+  | 'feed'
   | 'connections'
   | 'logs'
   | 'memory_archive'
   | 'memory_restore'
+  | 'memory_identity'
+  | 'memory_import'
   | 'schedules'
   | 'schedule_by_id'
   | 'container'
@@ -151,6 +173,7 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   // 两个都是**只读聚合**，数据全部来自本机库与日历目录；不含任何凭证
   //（邮箱只到地址与主机名，模型端点只到 base_url 与模型名）。
   if (m === 'GET' && p === '/api/brief') return { route: 'brief', params: {} };
+  if (m === 'GET' && p === '/api/feed') return { route: 'feed', params: {} };
   if (m === 'GET' && p === '/api/connections') return { route: 'connections', params: {} };
   if (m === 'GET' && p === '/api/whoami') return { route: 'whoami', params: {} };
   if (m === 'POST' && p === '/api/messages') return { route: 'messages', params: {} };
@@ -189,6 +212,10 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   }
   if (m === 'GET' && p === '/api/memory/archive') return { route: 'memory_archive', params: {} };
   if (m === 'POST' && p === '/api/memory/restore') return { route: 'memory_restore', params: {} };
+  // M3（2026-10-23）：人格文件读写。GET 读，PUT 写（≤1 KB）。
+  if ((m === 'GET' || m === 'PUT') && p === '/api/memory/identity') return { route: 'memory_identity', params: {} };
+  // M4（2026-10-24）：旧助手记忆导入。只写 notes/，不碰 MEMORY.md。
+  if (m === 'POST' && p === '/api/memory/import') return { route: 'memory_import', params: {} };
   if (m === 'GET' && p === '/api/guard') return { route: 'guard', params: {} };
   if (m === 'GET' && p === '/api/breaker') return { route: 'breaker', params: {} };
   if (m === 'GET' && p === '/api/models/rank') return { route: 'models_rank', params: {} };
@@ -216,6 +243,54 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   mm = /^\/api\/approvals\/([^/]+)\/decision$/.exec(p);
   if (m === 'POST' && mm !== null) {
     return { route: 'approval_decision', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+
+  // 语音设备（2026-10-23，阶段 2）：主人管理设备；设备 token 只走 /api/device/*。
+  if (p === '/api/devices') {
+    if (m === 'GET') return { route: 'devices', params: {} };
+    if (m === 'POST') return { route: 'devices', params: {} };
+  }
+  mm = /^\/api\/devices\/([^/]+)$/.exec(p);
+  if (m === 'DELETE' && mm !== null) {
+    return { route: 'device_by_id', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+  mm = /^\/api\/devices\/([^/]+)\/rotate$/.exec(p);
+  if (m === 'POST' && mm !== null) {
+    return { route: 'device_rotate', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+  if (m === 'POST' && p === '/api/device/turn') return { route: 'device_turn', params: {} };
+  if (m === 'GET' && p === '/api/device/stream') return { route: 'device_stream', params: {} };
+  if (m === 'POST' && p === '/api/device/events') return { route: 'device_events', params: {} };
+  mm = /^\/api\/device\/tasks\/([^/]+)$/.exec(p);
+  if (m === 'GET' && mm !== null) {
+    return { route: 'device_task', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+  mm = /^\/api\/device\/approvals\/([^/]+)$/.exec(p);
+  if (m === 'POST' && mm !== null) {
+    return { route: 'device_approval', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+
+  // 阶段 5（2026-10-24）：单一记忆源 + 单一主动推送决策。
+  // 设备面：读自己的一整份记忆（消息 + 偏好）、补写反射轮次、写偏好、问「该不该推」。
+  if (m === 'GET' && p === '/api/device/memory') return { route: 'device_memory', params: {} };
+  if (m === 'POST' && p === '/api/device/memory/turn') {
+    return { route: 'device_memory_turn', params: {} };
+  }
+  if (m === 'PUT' && p === '/api/device/prefs') return { route: 'device_prefs', params: {} };
+  mm = /^\/api\/device\/prefs\/([^/]+)$/.exec(p);
+  if (m === 'DELETE' && mm !== null) {
+    return { route: 'device_pref_delete', params: { key: decodeURIComponent(mm[1]!) } };
+  }
+  if (m === 'POST' && p === '/api/device/proactive/decide') {
+    return { route: 'device_proactive_decide', params: {} };
+  }
+  // 主人面：Web/CLI 看语音侧偏好（与设备面同一张表，证明「一个事实源」）。
+  if (m === 'GET' && p === '/api/memory/prefs') return { route: 'memory_prefs', params: {} };
+
+  // 执行凭证（2026-10-23）：`dotd prove <taskId>` 的属主端点。只读，投影自本机 journal。
+  mm = /^\/api\/tasks\/([^/]+)\/proof$/.exec(p);
+  if (m === 'GET' && mm !== null) {
+    return { route: 'task_proof', params: { id: decodeURIComponent(mm[1]!) } };
   }
 
   // P1-6 可观测性：任务明细（CP getTask + getJournal 的投影，供 `dotd task <id>` 用）。
@@ -354,6 +429,56 @@ export function authenticate(
     return { kind: 'readonly', token };
   }
   return { kind: 'none', token: null, error: 'invalid' };
+}
+
+/** 语音设备身份（阶段 2）：设备 token 只认这条链，不碰 master/readonly。 */
+export interface DeviceAuth {
+  id: string;
+  dotId: string;
+  name: string;
+}
+
+/** 路由是否属于设备面（只允许设备 token）。 */
+export function isDeviceRoute(route: Route): boolean {
+  return (
+    route === 'device_turn' ||
+    route === 'device_task' ||
+    route === 'device_stream' ||
+    route === 'device_events' ||
+    route === 'device_approval' ||
+    route === 'device_memory' ||
+    route === 'device_memory_turn' ||
+    route === 'device_prefs' ||
+    route === 'device_pref_delete' ||
+    route === 'device_proactive_decide'
+  );
+}
+
+/** 设备 token 只存 sha256；库里没有明文。 */
+export function hashDeviceToken(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+/** 本地日期 `YYYY-MM-DD`（额度和主人的时区一致，不用 UTC 切日）。 */
+import { localDay } from './device-usage.ts';
+export { localDay };
+import {
+  decideDevicePush,
+  deleteDevicePref,
+  listDevicePrefs,
+  listDevicePushLog,
+  mirrorDeviceTurn,
+  setDevicePref,
+  snapshotDeviceMemory,
+  voicePushPolicy,
+} from './voice-memory.ts';
+
+export function findDeviceByToken(db: DatabaseSync, token: string): DeviceAuth | null {
+  const row = db
+    .prepare('SELECT id, dot_id AS dotId, name, status FROM devices WHERE token_hash = ?')
+    .get(hashDeviceToken(token)) as { id: string; dotId: string; name: string; status: string } | undefined;
+  if (row === undefined || row.status !== 'active') return null;
+  return { id: row.id, dotId: row.dotId, name: row.name };
 }
 
 /** 取 Authorization: Bearer 的 token 原文（不校验，没有返回 null）。 */
@@ -532,6 +657,16 @@ export interface HttpDeps {
    * 缺省 = `/api/brief` 回 503 —— 没装这条腿时明说，别回一句「今天没事」。
    */
   brief?: (nowMs?: number) => DailyBrief;
+  /**
+   * 动态（M1，2026-10-23）：同一份投影供 Web / `dotd feed`。
+   * 缺省 = `/api/feed` 回 503 —— 没装这条腿时明说，别回一条空时间线。
+   */
+  feed?: (nowMs?: number, opts?: { limit?: number; since?: number }) => FeedSnapshot;
+  /**
+   * 执行凭证（P1，2026-10-23）：journal + exec_calls + 审批 + 模型调用 + 审计的投影。
+   * 缺省 = 503；任务不存在 = 404。默认不含明文参数。
+   */
+  proof?: (taskId: string, opts?: { includeArgs?: boolean }) => ProofBundle | null;
   /** 已连接应用总览（D3）：同上，`insight.ts` 的 `buildConnectionsView`。 */
   connections?: () => ConnectionRow[];  now?(): Date;
   /**
@@ -552,6 +687,17 @@ function requiresMaster(route: Route): boolean {
       return false;
     case 'stream':
       return false; // token 可走 query（EventSource 不能带头）
+    case 'device_turn':
+    case 'device_task':
+    case 'device_stream':
+    case 'device_events':
+    case 'device_approval':
+    case 'device_memory':
+    case 'device_memory_turn':
+    case 'device_prefs':
+    case 'device_pref_delete':
+    case 'device_proactive_decide':
+      return false; // 设备 token 校验在 handle() 的设备分支里
     default:
       return true;
   }
@@ -731,6 +877,19 @@ export function createHttpServer(deps: HttpDeps): Server {
       return;
     }
 
+    // 设备面鉴权（阶段 2）：设备 token 只能走 /api/device/*，且只能看自己设备的任务。
+    let device: DeviceAuth | null = null;
+    if (isDeviceRoute(match.route)) {
+      const token = bearerFromHeaders(req.headers);
+      device = token === null ? null : findDeviceByToken(deps.db, token);
+      if (device === null) {
+        ingress.rejects.record({ source: 'http', actor: null, reason: 'auth', detail: '设备 token 缺失/非法/已吊销' });
+        json(res, 401, { error: 'auth', message: '缺少或非法的设备 token' });
+        return;
+      }
+      deps.db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now().getTime(), device.id);
+    }
+
     // 鉴权（hooks/:source 走 HMAC，/api/stream 走 query token）
     if (match.route === 'hook_ingest') {
       await handleHookIngest(req, res, url, match.params.source!);
@@ -739,6 +898,19 @@ export function createHttpServer(deps: HttpDeps): Server {
     if (requiresMaster(match.route)) {
       const auth = authenticate(req.headers, deps.cfg.http, method);
       if (auth.error === 'missing' || auth.error === 'invalid') {
+        // 设备令牌是**合法身份**，只是没有管理面权限 —— 403 而不是 401，
+        // 这样语音端能区分「令牌过期/吊销」和「走错门」。
+        const bearer = bearerFromHeaders(req.headers);
+        if (bearer !== null && findDeviceByToken(deps.db, bearer) !== null) {
+          ingress.rejects.record({
+            source: 'http',
+            actor: 'device',
+            reason: 'auth',
+            detail: `设备令牌访问管理面 ${method} ${pathname}`,
+          });
+          json(res, 403, { error: 'device_scope', message: '设备令牌只能访问 /api/device/*' });
+          return;
+        }
         ingress.rejects.record({ source: 'http', actor: null, reason: 'auth', detail: `Bearer token ${auth.error}` });
         json(res, 401, { error: 'auth', message: '缺少或非法的 Bearer token' });
         return;
@@ -804,6 +976,11 @@ export function createHttpServer(deps: HttpDeps): Server {
         json(res, 200, {
           ok: true,
           service: 'dotd',
+          /**
+           * 一套系统（2026-10-23）：Charlie 产品壳启动 dotd 子进程时用它做兼容声明。
+           * 只加字段，不改任何既有键；老前端忽略它。
+           */
+          apiVersion: 1,
           dotId: DEFAULT_DOT_ID,
           busSeq: deps.sse.currentSeq(),
           at: now().toISOString(),
@@ -1191,6 +1368,34 @@ export function createHttpServer(deps: HttpDeps): Server {
         return;
       }
 
+      // M1（2026-10-23，对标 Muse 动态页）：只读时间线。
+      // 数据全部来自已有属主（tasks/approvals/crontabs/events/日历），不写库、不推送。
+      case 'feed': {
+        const provider = deps.feed;
+        if (provider === undefined) {
+          json(res, 503, { error: 'feed', message: 'daemon 没装配动态投影（feedOf 未传）' });
+          return;
+        }
+        const limitRaw = url.searchParams.get('limit');
+        const sinceRaw = url.searchParams.get('since');
+        const limit = limitRaw === null ? undefined : Number(limitRaw);
+        const since = sinceRaw === null ? undefined : Number(sinceRaw);
+        if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
+          json(res, 400, { error: 'bad_limit', message: 'limit 必须是正整数' });
+          return;
+        }
+        if (since !== undefined && !Number.isFinite(since)) {
+          json(res, 400, { error: 'bad_since', message: 'since 必须是 epoch 毫秒' });
+          return;
+        }
+        try {
+          json(res, 200, provider(now().getTime(), { ...(limit !== undefined ? { limit } : {}), ...(since !== undefined ? { since } : {}) }));
+        } catch (cause) {
+          json(res, 500, { error: 'feed', message: `生成动态失败：${String(cause)}` });
+        }
+        return;
+      }
+
       // D3（2026-10-22）：已连接应用总览。只读；行里不含任何凭证（见 connections.ts 的约束）。
       case 'connections': {
         const provider = deps.connections;
@@ -1244,36 +1449,577 @@ export function createHttpServer(deps: HttpDeps): Server {
           },
           steps,
         };
+
+        // M2（2026-10-23）：一行摘要 —— 「它在干嘛 / 多久了 / 要不要我出手」。
+        // 计划与结果都从已有事实读，不新增表；没有计划时 summary.next=null，不猜。
+        const planRows = deps.db
+          .prepare(
+            `SELECT role, kind, content FROM mem_messages
+              WHERE task_id=? AND role='system' AND kind='text' AND content LIKE ?
+              ORDER BY seq ASC`,
+          )
+          .all(id, `${PLAN_MARKER}%`) as Array<{ role: string; kind: string; content: string }>;
+        const plan = plansFromMessages(
+          planRows.map((m, i) => ({
+            id: `plan:${i}`,
+            threadId: '',
+            seq: i,
+            role: m.role as 'system',
+            kind: m.kind as 'text',
+            content: m.content,
+            tokenEst: 0,
+            createdAt: 0,
+          })),
+        ).current;
+        let resultSummary: string | null = null;
+        try {
+          const row = deps.db
+            .prepare('SELECT summary FROM task_results WHERE task_id=?')
+            .get(id) as { summary?: string } | undefined;
+          resultSummary = typeof row?.summary === 'string' ? row.summary : null;
+        } catch {
+          resultSummary = null;
+        }
+        const summary = buildTaskSummary({
+          task,
+          steps,
+          plan,
+          resultSummary,
+          now: now().getTime(),
+        });
+
         if (url.searchParams.get('verbose') === '1' || url.searchParams.get('verbose') === 'true') {
           // P2-2：带上"它打算怎么干"。计划存成该任务在 thread 里的 system 消息
           // （kind='text' + PLAN_MARKER，见 src/runner/plan.ts 文件头的选型理由），
           // 这里只读不写：取该任务最后一条计划即当前版本。
-          const planMessages = deps.db
-            .prepare(
-              `SELECT role, kind, content FROM mem_messages
-                WHERE task_id=? AND role='system' AND kind='text' AND content LIKE ?
-                ORDER BY seq ASC`,
-            )
-            .all(id, `${PLAN_MARKER}%`) as Array<{ role: string; kind: string; content: string }>;
-          const plan = plansFromMessages(
-            planMessages.map((m, i) => ({
-              id: `plan:${i}`,
-              threadId: '',
-              seq: i,
-              role: m.role as 'system',
-              kind: m.kind as 'text',
-              content: m.content,
-              tokenEst: 0,
-              createdAt: 0,
-            })),
-          ).current;
           json(res, 200, {
             ...base,
+            summary,
             view: buildTaskView({ task, steps, callLogs, now: now().getTime(), plan }),
           });
           return;
         }
-        json(res, 200, base);
+        json(res, 200, { ...base, summary });
+        return;
+      }
+
+      // ── 语音设备面（阶段 2，2026-10-23）────────────────────────────
+      //
+      // 边界（docs/voice-merge-plan.md 阶段 2）：
+      //   - 设备 token 只能读自己设备产生的任务；读写都过 external_ref 校验。
+      //   - 设备永远不能批准危险动作（device_approval 恒 403 并记账）。
+      //   - 设备面不暴露 master 能力：/api/queue、/api/memory 等一律 401。
+      case 'devices': {
+        if (method === 'GET') {
+          const rows = deps.db
+            .prepare(
+              `SELECT d.id, d.dot_id AS dotId, d.name, d.status,
+                      d.last_seen_at AS lastSeenAt, d.created_at AS createdAt,
+                      d.daily_tasks AS dailyTasks, d.daily_chars AS dailyChars,
+                      d.daily_tokens AS dailyTokens,
+                      COALESCE(u.tasks, 0) AS usedTasks, COALESCE(u.chars, 0) AS usedChars,
+                      COALESCE(u.tokens, 0) AS usedTokens
+                 FROM devices d
+                 LEFT JOIN device_usage u ON u.device_id = d.id AND u.day = ?
+                ORDER BY d.created_at DESC LIMIT 200`,
+            )
+            .all(localDay(now().getTime())) as Array<Record<string, unknown>>;
+          json(res, 200, { devices: rows, day: localDay(now().getTime()) });
+          return;
+        }
+        if (method !== 'POST') {
+          json(res, 405, { error: 'method', message: `${method} /api/devices` });
+          return;
+        }
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { name?: unknown; dotId?: unknown };
+        const name = typeof b.name === 'string' ? b.name.trim().slice(0, 64) : '';
+        if (name.length === 0) {
+          json(res, 400, { error: 'schema', message: 'name 不能为空' });
+          return;
+        }
+        const dotId = typeof b.dotId === 'string' && b.dotId.length > 0 ? b.dotId : DEFAULT_DOT_ID;
+        const id = `dev_${randomBytes(8).toString('hex')}`;
+        const token = `dt_${randomBytes(32).toString('hex')}`;
+        deps.db
+          .prepare(
+            'INSERT INTO devices (id, dot_id, name, token_hash, status, created_at) VALUES (?,?,?,?,?,?)',
+          )
+          .run(id, dotId, name, hashDeviceToken(token), 'active', now().getTime());
+        // 明文 token 只在这里出现一次；之后只能吊销重建。
+        json(res, 201, { id, name, dotId, token, status: 'active' });
+        return;
+      }
+
+      case 'device_by_id': {
+        const id = match.params.id!;
+        const r = deps.db
+          .prepare("UPDATE devices SET status='revoked' WHERE id = ? AND status='active'")
+          .run(id);
+        if (r.changes === 0) {
+          json(res, 404, { error: 'not_found', message: `设备 ${id} 不存在或已吊销` });
+          return;
+        }
+        // 吊销后同一 token 立即失效：findDeviceByToken 只认 status='active'。
+        json(res, 200, { ok: true, id, status: 'revoked' });
+        return;
+      }
+
+      case 'device_rotate': {
+        const id = match.params.id!;
+        const token = `dt_${randomBytes(32).toString('hex')}`;
+        const r = deps.db
+          .prepare("UPDATE devices SET token_hash = ? WHERE id = ? AND status = 'active'")
+          .run(hashDeviceToken(token), id);
+        if (r.changes === 0) {
+          json(res, 404, { error: 'not_found', message: `设备 ${id} 不存在或已吊销` });
+          return;
+        }
+        json(res, 200, { ok: true, id, token, message: '旧令牌立即失效，把新令牌更新到设备/Charlie 配置' });
+        return;
+      }
+
+      case 'device_turn': {
+        const d = device!;
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { text?: unknown; threadId?: unknown };
+        const text = typeof b.text === 'string' ? b.text.trim() : '';
+        if (text.length === 0) {
+          json(res, 400, { error: 'schema', message: 'text 不能为空' });
+          return;
+        }
+
+        // 阶段 3：一台设备同一时刻只允许 1 个语音任务（说话不能排在批量任务后面，
+        // 也不能自己和自己抢上下文）。要并发请用另一台设备。
+        const inflight = deps.db
+          .prepare(
+            `SELECT t.id AS id FROM tasks t
+               JOIN mem_threads th ON th.id = t.thread_id
+              WHERE th.channel = 'voice' AND th.external_ref = ?
+                AND t.status IN ('queued','running','awaiting_approval','paused')
+              LIMIT 1`,
+          )
+          .get(d.id) as { id: string } | undefined;
+        if (inflight !== undefined) {
+          json(res, 409, {
+            error: 'device_busy',
+            message: `这台设备还有一个任务没结束（${inflight.id}）；等它说完再来`,
+            taskId: inflight.id,
+          });
+          return;
+        }
+
+        // 配额：0 = 不限额（显式关闭）。计数按本地日期，跨天自动换行。
+        const day = localDay(now().getTime());
+        const quota = deps.db
+          .prepare('SELECT daily_tasks AS tasks, daily_chars AS chars, daily_tokens AS tokens FROM devices WHERE id = ?')
+          .get(d.id) as { tasks: number; chars: number; tokens: number } | undefined;
+        const used = deps.db
+          .prepare('SELECT tasks, chars, tokens FROM device_usage WHERE device_id = ? AND day = ?')
+          .get(d.id, day) as { tasks: number; chars: number; tokens: number } | undefined;
+        const usedTasks = used?.tasks ?? 0;
+        const usedChars = used?.chars ?? 0;
+        const usedTokens = used?.tokens ?? 0;
+        if (quota !== undefined && quota.tasks > 0 && usedTasks >= quota.tasks) {
+          json(res, 429, {
+            error: 'device_quota',
+            message: `今天这台设备的任务额度用完了（${usedTasks}/${quota.tasks}）；明天再来`,
+            kind: 'tasks',
+            used: usedTasks,
+            limit: quota.tasks,
+          });
+          return;
+        }
+        if (quota !== undefined && quota.tokens > 0 && usedTokens >= quota.tokens) {
+          // token 是上一天/前几轮累计的，提交时就拒绝——不能让一整天的话都在
+          // 任务跑到模型才发现超支（那时已经花掉了）。
+          json(res, 429, {
+            error: 'device_quota',
+            message: `今天这台设备的 token 额度用完了（${usedTokens}/${quota.tokens}）；明天再来`,
+            kind: 'tokens',
+            used: usedTokens,
+            limit: quota.tokens,
+          });
+          return;
+        }
+        if (quota !== undefined && quota.chars > 0 && usedChars + text.length > quota.chars) {
+          json(res, 429, {
+            error: 'device_quota',
+            message: `今天这台设备的字数额度用完了（${usedChars}/${quota.chars}）；明天再来`,
+            kind: 'chars',
+            used: usedChars,
+            limit: quota.chars,
+          });
+          return;
+        }
+
+        const requested = typeof b.threadId === 'string' && b.threadId.length > 0 ? b.threadId : null;
+        let threadId: string;
+        if (requested !== null) {
+          const row = deps.db
+            .prepare('SELECT channel, external_ref AS externalRef FROM mem_threads WHERE id = ?')
+            .get(requested) as { channel: string; externalRef: string | null } | undefined;
+          if (row === undefined || row.channel !== 'voice' || row.externalRef !== d.id) {
+            json(res, 404, { error: 'not_found', message: `会话不属于该设备：${requested}` });
+            return;
+          }
+          threadId = requested;
+        } else {
+          // external_ref = device_id 的 partial UNIQUE 让同一设备复用同一条 voice 会话：
+          // 语音是连续对话，不该每句话开一个新 thread。
+          threadId = await deps.mem.openThread(d.dotId, 'voice', { externalRef: d.id, title: d.name });
+        }
+        await deps.mem.appendMessage(threadId, { role: 'user', kind: 'text', content: text });
+        const task: Task = deps.cp.submit({
+          title: text.slice(0, 60),
+          goal: text,
+          priority: 1,
+          dotId: d.dotId,
+          threadId,
+        });
+        deps.db
+          .prepare(
+            `INSERT INTO device_usage (device_id, day, tasks, chars, updated_at) VALUES (?,?,?,?,?)
+             ON CONFLICT(device_id, day) DO UPDATE SET
+               tasks = tasks + 1,
+               chars = chars + excluded.chars,
+               updated_at = excluded.updated_at`,
+          )
+          .run(d.id, day, 1, text.length, now().getTime());
+        json(res, 202, { taskId: task.id, threadId, status: task.status, deviceId: d.id });
+        return;
+      }
+
+      case 'device_task': {
+        const d = device!;
+        const id = match.params.id!;
+        const task = deps.cp.getTask(id);
+        if (task === null || task.threadId === null) {
+          json(res, 404, { error: 'not_found', message: `任务 ${id} 不存在` });
+          return;
+        }
+        const owner = deps.db
+          .prepare('SELECT external_ref AS externalRef FROM mem_threads WHERE id = ?')
+          .get(task.threadId) as { externalRef: string | null } | undefined;
+        if (owner === undefined || owner.externalRef !== d.id) {
+          // 不区分「不存在」和「不是你的」：别让设备枚举主人的任务 id。
+          json(res, 404, { error: 'not_found', message: `任务 ${id} 不存在` });
+          return;
+        }
+        const steps = deps.cp.getJournal(id);
+        let resultSummary: string | null = null;
+        try {
+          const row = deps.db
+            .prepare('SELECT summary FROM task_results WHERE task_id=?')
+            .get(id) as { summary?: string } | undefined;
+          resultSummary = typeof row?.summary === 'string' ? row.summary : null;
+        } catch {
+          resultSummary = null;
+        }
+        const summary = buildTaskSummary({
+          task,
+          steps,
+          plan: null,
+          resultSummary,
+          now: now().getTime(),
+        });
+        // 语音端要的是"能直接播报的一句话"：取本任务最后一条 assistant 正文。
+        // 不跨任务取（thread 会复用），否则上一轮的答复会被当成本轮结果念出来。
+        let reply: string | null = null;
+        try {
+          const row = deps.db
+            .prepare(
+              `SELECT content FROM mem_messages
+                WHERE task_id = ? AND role = 'assistant' AND kind = 'text'
+                ORDER BY seq DESC LIMIT 1`,
+            )
+            .get(id) as { content?: string } | undefined;
+          reply = typeof row?.content === 'string' && row.content.length > 0 ? row.content : null;
+        } catch {
+          reply = null;
+        }
+        json(res, 200, {
+          task: {
+            id: task.id,
+            title: task.title,
+            status: task.status,
+            priority: task.priority,
+            attempt: task.attempt,
+            createdAt: task.createdAt,
+            updatedAt: task.updatedAt,
+          },
+          summary,
+          reply,
+        });
+        return;
+      }
+
+      case 'device_stream': {
+        const d = device!;
+        const taskId = url.searchParams.get('task');
+        if (taskId === null || taskId.length === 0) {
+          json(res, 400, { error: 'schema', message: '缺少 task 参数' });
+          return;
+        }
+        const task = deps.cp.getTask(taskId);
+        if (task === null || task.threadId === null) {
+          json(res, 404, { error: 'not_found', message: `任务 ${taskId} 不存在` });
+          return;
+        }
+        const owner = deps.db
+          .prepare('SELECT external_ref AS externalRef FROM mem_threads WHERE id = ?')
+          .get(task.threadId) as { externalRef: string | null } | undefined;
+        if (owner === undefined || owner.externalRef !== d.id) {
+          json(res, 404, { error: 'not_found', message: `任务 ${taskId} 不存在` });
+          return;
+        }
+        await handleStream(req, res, url, {
+          taskId,
+          dotId: d.dotId,
+          deviceId: d.id,
+          channels: ['chat', 'approval', 'step'],
+        });
+        return;
+      }
+
+      case 'device_events': {
+        const d = device!;
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { kind?: unknown; detail?: unknown };
+        const kind = typeof b.kind === 'string' ? b.kind.trim() : '';
+        if (!/^[a-z][a-z0-9._-]{0,40}$/.test(kind)) {
+          json(res, 400, { error: 'schema', message: 'kind 必须是 [a-z][a-z0-9._-]{0,40}' });
+          return;
+        }
+        const detail =
+          typeof b.detail === 'string' ? b.detail.replace(/\s+/g, ' ').trim().slice(0, 500) : null;
+        const at = now().getTime();
+        const r = deps.db
+          .prepare('INSERT INTO voice_events (dot_id, device_id, kind, detail, at) VALUES (?,?,?,?,?)')
+          .run(d.dotId, d.id, kind, detail, at);
+        try {
+          deps.db
+            .prepare(
+              `INSERT INTO audit_log (ts, dot_id, actor, channel, action, tier, tool, decision, reason)
+               VALUES (datetime('now'), ?, 'agent', 'system', 'voice_reflex', 'read', ?, 'executed', ?)`,
+            )
+            .run(d.dotId, kind, detail);
+        } catch {
+          // 审计失败不能把记账吞掉；voice_events 已落库。
+        }
+        json(res, 201, { ok: true, id: Number(r.lastInsertRowid), at });
+        return;
+      }
+
+      case 'device_approval': {
+        // 语音设备不能代替主人点同意：这是合并方案里写死的一条边界。
+        const d = device!;
+        const raw = match.params.id!;
+        const n = Number(raw);
+        try {
+          deps.db
+            .prepare(
+              `INSERT INTO audit_log (ts, dot_id, actor, channel, action, tier, tool, decision, reason)
+               VALUES (datetime('now'), ?, 'agent', 'system', 'device_approval_denied', 'dangerous', 'approval', 'denied', ?)`,
+            )
+            .run(d.dotId, `设备 ${d.id} 尝试批准 #${Number.isFinite(n) ? n : '?'}；已拒绝`);
+        } catch {
+          /* 审计尽力而为，拒绝本身不能因此放过 */
+        }
+        json(res, 403, {
+          error: 'device_approval_forbidden',
+          message: '危险动作需要主人在手机/Web 批准；语音设备不能代替你点同意',
+          approvalId: raw,
+        });
+        return;
+      }
+
+      /**
+       * 阶段 5（2026-10-24）：单一记忆源。
+       *
+       * GET /api/device/memory?limit=&before=
+       *   设备读自己的一整份记忆：voice thread 的消息 + 偏好。
+       *   消息本来就在 dotd（/api/device/turn 写入），这里只是把它交回 Charlie，
+       *   让 Charlie 的 conversation_history.json 降级成缓存而不是第二个事实源。
+       */
+      case 'device_memory': {
+        const d = device!;
+        const limitRaw = Number(url.searchParams.get('limit') ?? '50');
+        if (!Number.isFinite(limitRaw) || limitRaw <= 0 || limitRaw > 200) {
+          json(res, 400, { error: 'schema', message: 'limit 必须是 1..200 的整数' });
+          return;
+        }
+        const beforeRaw = url.searchParams.get('before');
+        const beforeSeq = beforeRaw === null ? undefined : Number(beforeRaw);
+        if (beforeSeq !== undefined && (!Number.isFinite(beforeSeq) || beforeSeq < 0)) {
+          json(res, 400, { error: 'schema', message: 'before 必须是非负整数（消息 seq）' });
+          return;
+        }
+        const snap = await snapshotDeviceMemory(deps.db, deps.mem, d.id, {
+          limit: Math.floor(limitRaw),
+          beforeSeq,
+        });
+        json(res, 200, snap);
+        return;
+      }
+
+      /**
+       * POST /api/device/memory/turn {userText, reply, dedupeKey?}
+       *
+       * 反射/本地场景的回复不经过 dotd 的任务管线，过去只留在 Charlie 的本地
+       * history 里，Web 端看不见。设备把整轮补写回来，dotd 才是唯一历史。
+       * `dedupeKey` 由调用方给（例如 session + 时间戳），重试不会写两遍。
+       */
+      case 'device_memory_turn': {
+        const d = device!;
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { userText?: unknown; reply?: unknown; dedupeKey?: unknown };
+        const userText = typeof b.userText === 'string' ? b.userText.trim() : '';
+        const reply = typeof b.reply === 'string' ? b.reply.trim() : '';
+        if (userText === '' && reply === '') {
+          json(res, 400, { error: 'schema', message: 'userText 与 reply 至少有一个非空' });
+          return;
+        }
+        if (userText.length > 4000 || reply.length > 8000) {
+          json(res, 413, { error: 'too_large', message: '单轮正文超限（userText ≤4000 / reply ≤8000）' });
+          return;
+        }
+        const dedupeKey = typeof b.dedupeKey === 'string' ? b.dedupeKey.slice(0, 200) : undefined;
+        const r = await mirrorDeviceTurn(deps.db, deps.mem, d, {
+          userText,
+          reply,
+          dedupeKey,
+          nowMs: now().getTime(),
+        });
+        json(res, r.duplicate === true ? 200 : 201, { ok: true, ...r });
+        return;
+      }
+
+      /** PUT /api/device/prefs {key, value} —— 语音侧偏好写进 dotd。 */
+      case 'device_prefs': {
+        const d = device!;
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { key?: unknown; value?: unknown };
+        const key = typeof b.key === 'string' ? b.key.trim() : '';
+        if (!/^[A-Za-z0-9._-]{1,64}$/.test(key)) {
+          json(res, 400, { error: 'schema', message: 'key 必须是 [A-Za-z0-9._-]{1,64}' });
+          return;
+        }
+        if (typeof b.value !== 'string' || b.value.length > 2000) {
+          json(res, 400, { error: 'schema', message: 'value 必须是不超过 2000 字的字符串' });
+          return;
+        }
+        const pref = setDevicePref(deps.db, d.id, key, b.value, now().getTime());
+        json(res, 200, { ok: true, pref });
+        return;
+      }
+
+      /** DELETE /api/device/prefs/:key */
+      case 'device_pref_delete': {
+        const d = device!;
+        const key = match.params.key!;
+        const removed = deleteDevicePref(deps.db, d.id, key);
+        json(res, removed ? 200 : 404, removed ? { ok: true, key } : { error: 'not_found', key });
+        return;
+      }
+
+      /**
+       * POST /api/device/proactive/decide {kind, text}
+       *
+       * 唯一决策入口：Charlie 想问「这句主动话该不该说」，dotd 用同一套三道闸
+       * 回答。拒绝也是 200（调用方读 `allow`），不把「不许说」伪装成网络错误。
+       */
+      case 'device_proactive_decide': {
+        const d = device!;
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { kind?: unknown; text?: unknown };
+        const kind = typeof b.kind === 'string' ? b.kind.trim() : '';
+        if (!/^[a-z][a-z0-9._-]{0,40}$/.test(kind)) {
+          json(res, 400, { error: 'schema', message: 'kind 必须是 [a-z][a-z0-9._-]{0,40}' });
+          return;
+        }
+        const text = typeof b.text === 'string' ? b.text.trim().slice(0, 1000) : '';
+        const nowMs = now().getTime();
+        const decision = decideDevicePush(
+          deps.db,
+          d.id,
+          kind,
+          text,
+          nowMs,
+          localDay(nowMs),
+          voicePushPolicy(),
+        );
+        json(res, 200, { ...decision, kind, at: nowMs });
+        return;
+      }
+
+      /**
+       * GET /api/memory/prefs?device=&push=1 —— 主人面（master）。
+       *
+       * 不传 device 时按设备列一遍；`push=1` 附带最近决策日志。
+       * 这是「语音里说过的，Web 里记得」的可验证出口：同一张 device_prefs 表。
+       */
+      case 'memory_prefs': {
+        const only = url.searchParams.get('device');
+        const withPush = url.searchParams.get('push') === '1';
+        const rows =
+          only === null
+            ? (deps.db
+                .prepare(
+                  `SELECT id, name, dot_id AS dotId FROM devices
+                    WHERE status = 'active' ORDER BY created_at ASC`,
+                )
+                .all() as Array<{ id: string; name: string; dotId: string }>)
+            : (deps.db
+                .prepare(
+                  `SELECT id, name, dot_id AS dotId FROM devices
+                    WHERE id = ? AND status = 'active'`,
+                )
+                .all(only) as Array<{ id: string; name: string; dotId: string }>);
+        if (only !== null && rows.length === 0) {
+          json(res, 404, { error: 'not_found', message: `设备 ${only} 不存在或已吊销` });
+          return;
+        }
+        const devices = rows.map((r) => ({
+          deviceId: r.id,
+          name: r.name,
+          dotId: r.dotId,
+          prefs: listDevicePrefs(deps.db, r.id),
+          ...(withPush ? { pushLog: listDevicePushLog(deps.db, r.id, 50) } : {}),
+        }));
+        json(res, 200, { devices });
+        return;
+      }
+
+      /**
+       * GET /api/tasks/:id/proof —— 执行凭证（2026-10-23）。
+       *
+       * 只读投影。`?args=1` 才带明文参数预览（默认只给 hash），避免把 token / 邮件正文
+       * 意外写进别人会看的文件。
+       */
+      case 'task_proof': {
+        const provider = deps.proof;
+        if (provider === undefined) {
+          json(res, 503, { error: 'proof', message: 'daemon 没装配执行凭证投影（proofOf 未传）' });
+          return;
+        }
+        const id = match.params.id!;
+        try {
+          const bundle = provider(id, { includeArgs: url.searchParams.get('args') === '1' });
+          if (bundle === null) {
+            json(res, 404, { error: 'not_found', taskId: id, message: `任务 ${id} 不存在` });
+            return;
+          }
+          json(res, 200, bundle);
+        } catch (cause) {
+          json(res, 500, { error: 'proof', message: `生成执行凭证失败：${String(cause)}` });
+        }
         return;
       }
 
@@ -1463,6 +2209,89 @@ export function createHttpServer(deps: HttpDeps): Server {
         }
         const r = await deps.restoreMemoryArchive(want.trim());
         json(res, r.ok ? 200 : 400, r);
+        return;
+      }
+
+      // M3（2026-10-23）：人格文件。GET 读原文，PUT 覆盖写（≤1 KB）。
+      // 写入走 MemoryPort.writeIdentity → homeWriter（工具层 fs.write），
+      // 与记忆骨架同一条通道；HTTP 层不直接碰文件系统。
+      case 'memory_identity': {
+        const dotId = deps.dotId ?? DEFAULT_DOT_ID;
+        if (method === 'GET') {
+          const read = deps.mem.readIdentity;
+          if (read === undefined) {
+            json(res, 501, { error: 'not_configured', message: '本实例未装配人格文件读取' });
+            return;
+          }
+          try {
+            const text = await read.call(deps.mem, dotId);
+            json(res, 200, {
+              path: HOME_IDENTITY,
+              text: text ?? '',
+              exists: text !== null,
+              limitBytes: LIMIT_IDENTITY_MD.hard,
+            });
+          } catch (cause) {
+            json(res, 500, { error: 'identity', message: `读人格文件失败：${String(cause)}` });
+          }
+          return;
+        }
+        const write = deps.mem.writeIdentity;
+        if (write === undefined) {
+          json(res, 501, { error: 'not_configured', message: '本实例未装配人格文件写入' });
+          return;
+        }
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const text = (body as { text?: unknown }).text;
+        if (typeof text !== 'string') {
+          json(res, 400, { error: 'schema', message: '需要 text（字符串）' });
+          return;
+        }
+        const r = await write.call(deps.mem, dotId, text);
+        json(res, r.ok ? 200 : 400, {
+          ...r,
+          path: HOME_IDENTITY,
+          limitBytes: LIMIT_IDENTITY_MD.hard,
+        });
+        return;
+      }
+
+      // M4（2026-10-24）：旧助手记忆导入。正文 → `notes/YYYY-MM-DD-import-<source>.md`。
+      // 只落事实，不自动改 MEMORY.md；16 KB 上限（超了 413，让主人拆分）。
+      case 'memory_import': {
+        const write = deps.mem.writeNote;
+        if (write === undefined) {
+          json(res, 501, { error: 'not_configured', message: '本实例未装配记忆导入' });
+          return;
+        }
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const text = (body as { text?: unknown }).text;
+        const source = (body as { source?: unknown }).source;
+        if (typeof text !== 'string' || text.trim().length === 0) {
+          json(res, 400, { error: 'schema', message: '需要 text（旧助手整理的快照正文）' });
+          return;
+        }
+        const src = typeof source === 'string' && source.trim().length > 0 ? source : 'unknown';
+        const built = buildImportNote({ text, source: src, now: new Date() });
+        if (!built.ok) {
+          json(res, built.error === 'TOO_LARGE' ? 413 : 400, {
+            error: built.error,
+            message: built.message,
+            limitBytes: MAX_IMPORT_BYTES,
+          });
+          return;
+        }
+        const dotId = deps.dotId ?? DEFAULT_DOT_ID;
+        const r = await write.call(deps.mem, dotId, built.path, built.content);
+        json(res, r.ok ? 201 : 400, {
+          ...r,
+          path: built.path,
+          bytes: built.bytes,
+          limitBytes: MAX_IMPORT_BYTES,
+          note: r.ok ? '导入的是原始快照，整理 MEMORY.md 请投一次正常任务' : undefined,
+        });
         return;
       }
 
@@ -1732,13 +2561,29 @@ export function createHttpServer(deps: HttpDeps): Server {
     json(res, out.httpStatus, { eventId: out.eventId, dup: out.dup });
   }
 
-  /** §4.5 GET /api/stream：SSE 长连接（bus_seq 游标 + 断线补档）。 */
-  async function handleStream(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  /**
+   * §4.5 GET /api/stream：SSE 长连接（bus_seq 游标 + 断线补档）。
+   *
+   * `override`（阶段 2，2026-10-23）：语音设备面不能自己挑 dot/channel ——
+   * dotId 由设备 token 定死，taskId 必须来自 URL 且已校验归属。传了 override
+   * 就忽略 query 里的 topics/dot/task，只保留 last-event-id 断点。
+   */
+  async function handleStream(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    override?: { taskId?: string; dotId?: string; deviceId?: string; channels?: readonly BusChannel[] },
+  ): Promise<void> {
     if (deps.sse.subscriberCount() >= MAX_SSE_CONNECTIONS) {
       json(res, 503, { error: 'sse_limit', message: `SSE 连接上限 ${MAX_SSE_CONNECTIONS}（§2.2）` });
       return;
     }
-    const { topics, dotId, lastEventId } = parseStreamQuery(url.search, headerStr(req, 'last-event-id'));
+    const parsed = parseStreamQuery(url.search, headerStr(req, 'last-event-id'));
+    const topics = override?.channels ?? parsed.topics;
+    const dotId = override?.dotId ?? parsed.dotId;
+    const taskId = override?.taskId ?? parsed.taskId;
+    const deviceId = override?.deviceId;
+    const lastEventId = parsed.lastEventId;
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       // no-store：这条流里是任务内容/审批事件，中间代理（哪怕局域网里的缓存网关）
@@ -1750,7 +2595,7 @@ export function createHttpServer(deps: HttpDeps): Server {
     // 立即刷一帧注释，让客户端/代理确认连接建立
     res.write(': ok\n\n');
 
-    const sub = deps.sse.subscribe({ lastEventId, channels: topics, dotId }, (frame) => {
+    const sub = deps.sse.subscribe({ lastEventId, channels: topics, dotId, taskId, deviceId }, (frame) => {
       res.write(SseBus.formatFrame(frame));
       // chat.delta 高频：尽量即时下发（Node 的 socket 会自行合并写）
     });

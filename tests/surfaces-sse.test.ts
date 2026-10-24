@@ -358,15 +358,29 @@ test('parseStreamQuery：topics 过滤、dot、Last-Event-ID 头', () => {
   assert.deepEqual(parseStreamQuery('?topics=chat,queue', undefined), {
     topics: ['chat', 'queue'],
     dotId: undefined,
+    taskId: undefined,
     lastEventId: null,
   });
   assert.deepEqual(parseStreamQuery('?topics=bogus,chat&dot=dot2', '17'), {
     topics: ['chat'],
     dotId: 'dot2',
+    taskId: undefined,
     lastEventId: 17,
   });
-  assert.deepEqual(parseStreamQuery('', 'not-a-number'), { topics: [], dotId: undefined, lastEventId: null });
-  assert.deepEqual(parseStreamQuery('', '0'), { topics: [], dotId: undefined, lastEventId: 0 });
+  assert.deepEqual(parseStreamQuery('', 'not-a-number'), {
+    topics: [],
+    dotId: undefined,
+    taskId: undefined,
+    lastEventId: null,
+  });
+  assert.deepEqual(parseStreamQuery('', '0'), {
+    topics: [],
+    dotId: undefined,
+    taskId: undefined,
+    lastEventId: 0,
+  });
+  // 阶段 2：?task= 是设备流的过滤条件（HTTP 层会先校验归属）。
+  assert.equal(parseStreamQuery('?task=tk_9', undefined).taskId, 'tk_9');
 });
 
 test('attach：订阅全部 TOPICS 键（不重造事件名）', () => {
@@ -558,3 +572,168 @@ test('GET /api/stream：token 走 query（EventSource 不能带头）；缺 toke
   assert.equal((await anon.json() as { error: string }).error, 'auth');
   await anon.body!.cancel().catch(() => undefined);
 });
+
+// ── 阶段 2：按 taskId 过滤（语音设备互不串台）──────────────────────
+
+test('subscribe：带 taskId 时只收这个任务的事件（chat/step 都过滤）', async () => {
+  const dir = makeTempDataDir();
+  try {
+    const bus = new EventBus();
+    const sse = makeSse(dir, bus, false);
+    sse.attach();
+    const gotA: string[] = [];
+    const gotAny: string[] = [];
+    const a = sse.subscribe({ lastEventId: null, channels: ['chat', 'step'], taskId: 'tk_a' }, (f) => {
+      gotA.push(f.data);
+    });
+    const any = sse.subscribe({ lastEventId: null, channels: ['chat', 'step'] }, (f) => {
+      gotAny.push(f.data);
+    });
+
+    bus.publish('chat.delta', { kind: 'chat.delta', taskId: 'tk_b', delta: 'B' }, { dotId: 'dot1' });
+    bus.publish('exec.call.started', { kind: 'step.started', taskId: 'tk_a', seq: 1 }, { dotId: 'dot1' });
+    bus.publish('chat.final', { kind: 'chat.final', taskId: 'tk_a', text: 'A 完成' }, { dotId: 'dot1' });
+    bus.publish('chat.final', { kind: 'chat.final', taskId: 'tk_b', text: 'B 完成' }, { dotId: 'dot1' });
+    await new Promise((r) => setTimeout(r, 30));
+
+    assert.equal(gotA.length, 2, `只应收到 tk_a 的两帧：${gotA.join(' | ')}`);
+    assert.equal(gotA.some((d) => d.includes('B 完成')), false);
+    assert.equal(gotAny.length, 4, '不传 taskId 的订阅保持原行为（全部通道事件）');
+
+    a.unsubscribe();
+    any.unsubscribe();
+    sse.detach();
+  } finally {
+    dir.cleanup();
+  }
+});
+
+// ── 阶段 3：设备级断点续传（按设备游标 + 增量去重）────────────────────
+
+test('设备游标：重连不带 Last-Event-ID → 从该设备上次下发的 seq 续读，只补本任务', () => {
+  const dir = makeTempDataDir();
+  try {
+    const bus = new EventBus();
+    const sse = makeSse(dir, bus, true);
+    sse.attach();
+
+    const got: number[] = [];
+    const a = sse.subscribe(
+      { lastEventId: null, channels: ['chat', 'approval', 'step'], taskId: 'tk_a', deviceId: 'dev_a' },
+      (f) => got.push(f.id),
+    );
+    bus.publish('chat.delta', { taskId: 'tk_a', delta: '一' }, { dotId: 'dot1' });
+    bus.publish('exec.call.started', { taskId: 'tk_a' }, { dotId: 'dot1' });
+    bus.publish('chat.delta', { taskId: 'tk_b', delta: '别的任务' }, { dotId: 'dot1' });
+    assert.equal(got.length, 2, '只收 tk_a 的帧');
+    a.unsubscribe(); // 关闭时强制落盘
+
+    // 断线期间又来了两帧（仍属 tk_a）+ 一条别的任务
+    bus.publish('chat.delta', { taskId: 'tk_a', delta: '二' }, { dotId: 'dot1' });
+    bus.publish('chat.final', { taskId: 'tk_a', text: '完' }, { dotId: 'dot1' });
+    bus.publish('chat.final', { taskId: 'tk_b', text: '别人的' }, { dotId: 'dot1' });
+
+    // 补档帧在 initial 里返回（订阅前的历史不进实时回调，这是既有契约）
+    const b = sse.subscribe(
+      { lastEventId: null, channels: ['chat', 'approval', 'step'], taskId: 'tk_a', deviceId: 'dev_a' },
+      () => undefined,
+    );
+    const again = b.initial.map((f) => f.id);
+    assert.equal(again.length, 2, `只补断线期间的 2 帧：${again.join(',')}`);
+    assert.ok(again.every((id) => !got.includes(id)), '已下发过的帧不得重发');
+    assert.deepEqual(
+      again.map((id) => JSON.parse(sseFrameData(b.initial, id)).payload.taskId),
+      ['tk_a', 'tk_a'],
+    );
+
+    b.unsubscribe();
+    sse.detach();
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('设备游标：客户端 Last-Event-ID 比游标旧时取较大者（不重复下发）', () => {
+  const dir = makeTempDataDir();
+  try {
+    const bus = new EventBus();
+    const sse = makeSse(dir, bus, false);
+    sse.attach();
+
+    const a = sse.subscribe(
+      { lastEventId: null, channels: ['chat'], taskId: 'tk_a', deviceId: 'dev_a' },
+      () => undefined,
+    );
+    bus.publish('chat.delta', { taskId: 'tk_a', delta: '1' }, { dotId: 'dot1' });
+    bus.publish('chat.delta', { taskId: 'tk_a', delta: '2' }, { dotId: 'dot1' });
+    a.unsubscribe();
+    bus.publish('chat.delta', { taskId: 'tk_a', delta: '3' }, { dotId: 'dot1' });
+
+    // 客户端谎报/滞后（Last-Event-ID=0），服务端游标在 2 → 从 2 续读，只补第 3 帧
+    const b = sse.subscribe(
+      { lastEventId: 0, channels: ['chat'], taskId: 'tk_a', deviceId: 'dev_a' },
+      () => undefined,
+    );
+    assert.deepEqual(b.initial.map((f) => f.id), [3]);
+    b.unsubscribe();
+    sse.detach();
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('设备游标：落后超过环形缓冲 → resync（客户端拉终态校正）', () => {
+  const dir = makeTempDataDir();
+  try {
+    const bus = new EventBus();
+    const sse = makeSse(dir, bus, false, 3);
+    sse.attach();
+
+    const a = sse.subscribe(
+      { lastEventId: null, channels: ['chat'], taskId: 'tk_a', deviceId: 'dev_a' },
+      () => undefined,
+    );
+    // 先建立游标（断线时 seq=1），再在断线期间灌入超过窗口的事件
+    bus.publish('chat.delta', { taskId: 'tk_a', delta: 'boot' }, { dotId: 'dot1' });
+    a.unsubscribe();
+    for (let i = 0; i < 6; i++) bus.publish('chat.delta', { taskId: 'tk_a', delta: String(i) }, { dotId: 'dot1' });
+
+    const initial = sse.subscribe(
+      { lastEventId: null, channels: ['chat'], taskId: 'tk_a', deviceId: 'dev_a' },
+      () => undefined,
+    ).initial;
+    assert.equal(initial.length, 1);
+    assert.equal(initial[0]!.kind, 'resync');
+    sse.detach();
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('设备流：任务级订阅不发全局快照（审批/队列属于控制台，不下发给语音终端）', () => {
+  const dir = makeTempDataDir();
+  try {
+    const bus = new EventBus();
+    const sse = makeSse(dir, bus, true);
+    sse.attach();
+    for (let i = 0; i < 3; i++) bus.publish('approval:created', { taskId: 'tk_other' }, { dotId: 'dot1' });
+
+    const sub = sse.subscribe(
+      { lastEventId: 1, channels: ['chat', 'approval', 'step'], taskId: 'tk_a', deviceId: 'dev_a' },
+      () => undefined,
+    );
+    assert.equal(sub.initial.some((f) => f.kind === 'approval.snapshot'), false);
+    assert.equal(sub.initial.some((f) => f.kind === 'queue.snapshot'), false);
+    sub.unsubscribe();
+    sse.detach();
+  } finally {
+    dir.cleanup();
+  }
+});
+
+/** 从一组帧里按 id 取 data（测试小工具）。 */
+function sseFrameData(frames: Array<{ id: number; data: string }>, id: number): string {
+  const f = frames.find((x) => x.id === id);
+  assert.ok(f !== undefined, `帧 ${id} 不存在`);
+  return f!.data;
+}

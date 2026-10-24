@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 配置向导</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:#0f0f17;color:#e0e0e0;min-height:100vh;display:flex;justify-content:center;padding:20px}
+.card{background:#1a1a2e;border-radius:16px;padding:28px;max-width:600px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{font-size:22px;margin-bottom:6px}h1 .icon{font-size:24px}
+.subtitle{color:#888;font-size:14px;margin-bottom:20px;line-height:1.6}
+.field{margin-bottom:14px}.field label{display:block;font-size:13px;color:#aaa;margin-bottom:4px}
+.field input{width:100%;padding:10px 12px;background:#0f0f17;border:1px solid #333;border-radius:8px;color:#e0e0e0;font-size:14px}
+.field input:focus{border-color:#667eea}
+.field select{width:100%;padding:10px;background:#0f0f17;border:1px solid #333;border-radius:8px;color:#e0e0e0;font-size:14px}
+.btn{width:100%;padding:14px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:10px;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.secondary{background:#2a2a44;margin-top:8px}
+.status{padding:12px;border-radius:8px;font-size:13px;margin:12px 0;display:none;line-height:1.6}
+.status.ok{display:block;background:#27ae6022;color:#27ae60}.status.err{display:block;background:#e74c3c22;color:#e74c3c}
+.status.info{display:block;background:#3498db22;color:#3498db}
+.note{font-size:12px;color:#777;margin-top:8px;line-height:1.7}
+.step{display:none}.step.active{display:block}
+.stepper{display:flex;gap:8px;margin-bottom:22px}
+.dot{flex:1;height:4px;border-radius:2px;background:#333}.dot.done{background:#27ae60}.dot.cur{background:#667eea}
+.guide{background:#0f0f17;border:1px solid #2a2a44;border-radius:10px;padding:16px;margin:14px 0}
+.guide h3{font-size:14px;color:#667eea;margin-bottom:10px}
+.guide ol{padding-left:20px;font-size:13px;line-height:1.9;color:#c0c0c0}
+.guide ol b{color:#e0e0e0}
+.code{display:flex;align-items:center;gap:8px;background:#16161f;border:1px solid #333;border-radius:8px;padding:10px 12px;margin:10px 0}
+.code code{flex:1;font-size:13px;color:#7ee787;word-break:break-all;font-family:Consolas,monospace}
+.copy{background:#667eea;color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap}
+.copy:hover{background:#764ba2}
+.warn{background:#f39c1218;border:1px solid #f39c1244;color:#f39c12;border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;margin:10px 0}
+a{color:#667eea}
+</style>
+</head>
+<body>
+<div class="card">
+<h1><span class="icon">⌚</span> ESP32 配置向导</h1>
+<p class="subtitle">第一步用 USB 烧录干净固件；第二步手机连设备热点配网。整套流程约 3 分钟。</p>
+
+<div class="stepper"><div class="dot cur" id="d1"></div><div class="dot" id="d2"></div></div>
+
+<!-- 第一步：烧录 -->
+<div class="step active" id="step1">
+  <h3 style="font-size:15px;margin-bottom:12px">① 烧录固件</h3>
+  <div id="status" class="status"></div>
+  <div class="field">
+    <label>串口设备</label>
+    <select id="port"><option value="">点击检测...</option></select>
+  </div>
+  <button class="btn secondary" onclick="detectPort()">🔍 检测串口</button>
+  <div style="height:8px"></div>
+  <button class="btn" id="flashBtn" onclick="flash()">开始烧录</button>
+  <p class="note">
+    烧录的固件已擦除所有 WiFi 与服务器信息，不含任何个人凭证。<br>
+    烧录完成后请勿拔掉 USB，继续第二步用手机配网。<br>
+    Windows 若检测不到串口，请安装 CP210x/CH340 驱动。
+  </p>
+</div>
+
+<!-- 第二步：配网 -->
+<div class="step" id="step2">
+  <h3 style="font-size:15px;margin-bottom:12px">② 手机配网</h3>
+  <div id="cfgStatus" class="status ok">✅ 固件烧录完成！请按以下步骤在手机上配置：</div>
+
+  <div class="guide">
+    <h3>📱 配置步骤</h3>
+    <ol>
+      <li>保持设备通电，用手机打开 <b>WiFi 设置</b>，连接名为 <br><code id="apName" style="color:#f39c12">lc-s3-wifi-1.54tft-XXXX</code> 的热点（无密码）。</li>
+      <li>连上后手机通常自动弹出配置页；如未弹出，打开浏览器访问 <br><b>http://192.168.4.1</b></li>
+      <li>在页面上选择你家的 <b>WiFi</b> 并输入密码。</li>
+      <li>点 <b>“高级设置 / Advanced”</b>，在 OTA URL 栏填入下方地址后保存：</li>
+    </ol>
+    <div class="code">
+      <code id="otaUrl">加载中...</code>
+      <button class="copy" onclick="copyText('otaUrl')">复制</button>
+    </div>
+    <ol start="5">
+      <li>保存后设备重启，自动连接 WiFi 并接入 Charlie。设备屏幕显示时间即成功。</li>
+    </ol>
+  </div>
+
+  <div class="warn" id="ipWarn" style="display:none">
+    ⚠️ 未能自动获取本机局域网 IP。请确认电脑已连 WiFi/路由器，在 Charlie 设置中查看本机 IP，
+    然后用 <code>http://&lt;电脑IP&gt;:&lt;端口&gt;/xiaozhi/ota</code> 作为 OTA 地址。
+  </div>
+
+  <p class="note">
+    OTA 地址告诉设备去哪里获取 Charlie 的 WebSocket 连接信息。设备配网后会自动调用该地址，
+    无需手动填写 WebSocket 地址。请确保手机配网时，<b>电脑和 ESP32 连在同一路由器下</b>。
+  </p>
+  <button class="btn secondary" onclick="location.reload()">重新开始</button>
+</div>
+
+<div style="text-align:center;margin-top:16px"><a href="/" style="color:#888;text-decoration:none;font-size:13px">← 返回</a></div>
+</div>
+<script>
+const st=document.getElementById('status');
+function setStatus(cls,msg){st.className='status '+cls;st.textContent=msg}
+
+async function detectPort(){
+  setStatus('info','检测中...');
+  try{
+    const r=await fetch('/api/esp32/detect-port');const d=await r.json();
+    const sel=document.getElementById('port');sel.innerHTML='';
+    if(d.ports&&d.ports.length){
+      d.ports.forEach(p=>{const o=document.createElement('option');o.value=p.device;o.textContent=p.device+' ('+(p.board||'未知')+')';sel.appendChild(o)});
+      setStatus('ok','检测到 '+d.ports.length+' 个串口，选择后点开始烧录');
+    }else{
+      sel.innerHTML='<option value="">未检测到串口</option>';
+      setStatus('err','未检测到 ESP32 串口。请用数据线连接设备并安装驱动。');
+    }
+  }catch(e){setStatus('err','检测失败: '+e)}
+}
+
+async function flash(){
+  const port=document.getElementById('port').value;
+  if(!port){setStatus('err','请先选择串口');return}
+  const btn=document.getElementById('flashBtn');btn.disabled=true;btn.textContent='烧录中...';
+  setStatus('info','烧录中（约 30-60 秒），请勿断开设备...');
+  try{
+    const r=await fetch('/api/esp32/flash',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})});
+    const d=await r.json();
+    if(d.started){pollStatus()}else{setStatus('err','启动失败: '+(d.message||''));resetBtn()}
+  }catch(e){setStatus('err','错误: '+e);resetBtn()}
+}
+function resetBtn(){const b=document.getElementById('flashBtn');b.disabled=false;b.textContent='开始烧录'}
+
+async function pollStatus(){
+  const poll=async()=>{
+    try{
+      const r=await fetch('/api/esp32/flash-status');const d=await r.json();
+      if(d.done){
+        if(d.error){setStatus('err','❌ 烧录失败: '+d.error);resetBtn()}
+        else{setStatus('ok','✅ 烧录完成！');goStep2()}
+      }else{st.textContent='烧录中... '+(d.progress||'');setTimeout(poll,2000)}
+    }catch(e){setTimeout(poll,2000)}
+  };
+  poll();
+}
+
+function goStep2(){
+  document.getElementById('d1').className='dot done';
+  document.getElementById('d2').className='dot cur';
+  document.getElementById('step1').classList.remove('active');
+  document.getElementById('step2').classList.add('active');
+  loadConfigInfo();
+}
+
+async function loadConfigInfo(){
+  try{
+    const r=await fetch('/api/esp32/config-info');const d=await r.json();
+    if(d.ota_url&&d.lan_ip){
+      document.getElementById('otaUrl').textContent=d.ota_url;
+      if(d.ap_prefix) document.getElementById('apName').textContent=d.ap_prefix+'XXXX';
+    }else{
+      document.getElementById('otaUrl').textContent='(未能获取 IP，请见下方说明)';
+      document.getElementById('ipWarn').style.display='block';
+    }
+  }catch(e){
+    document.getElementById('otaUrl').textContent='(获取失败: '+e+')';
+    document.getElementById('ipWarn').style.display='block';
+  }
+}
+
+function copyText(id){
+  const t=document.getElementById(id).textContent;
+  navigator.clipboard.writeText(t).then(()=>{
+    const btns=document.getElementsByClassName('copy');
+    for(const b of btns){const o=b.textContent;b.textContent='已复制';setTimeout(()=>b.textContent=o,1500)}
+  });
+}
+
+detectPort();
+</script>
+</body>
+</html>

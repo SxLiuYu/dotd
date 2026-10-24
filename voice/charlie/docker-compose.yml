@@ -1,0 +1,38 @@
+# Charlie 语音助手 — docker-compose.yml
+# 用法:
+#   1. 复制 .env.example 为 .env，填入你的API密钥
+#   2. docker-compose up -d
+#   3. 浏览器打开 http://localhost:8000
+
+services:
+  charlie:
+    build: .
+    container_name: charlie
+    ports:
+      - "8000:8000"
+      - "1883:1883"       # MQTT broker（需外部提供，例如本地 mosquitto 或设置 MQTT_BROKER 环境变量指向已有服务）
+      - "8888:8888/udp"   # UDP 音频（MQTT 协议）
+      - "8443:8443"       # HTTPS
+    env_file:
+      - .env
+    volumes:
+      # 持久化数据(对话历史/提醒/偏好/百度token)
+      - charlie-data:/app/data
+      - charlie-logs:/app/logs
+      - charlie-notes:/app/notes
+      # 音乐缓存(可选, 如果用ncm-cli)
+      # - charlie-music:/root/.local/bin
+    environment:
+      - ASSISTANT_KID_DATA_DIR=/app/data
+      - ASSISTANT_KID_LOG_DIR=/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  charlie-data:
+  charlie-logs:
+  charlie-notes:

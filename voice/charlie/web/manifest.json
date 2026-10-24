@@ -1,0 +1,29 @@
+{
+  "name": "Charlie - AI语音助理",
+  "short_name": "Charlie",
+  "description": "中国版贾维斯 - AI语音助理，全屋智能家居控制",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f0c29",
+  "theme_color": "#e94560",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    }
+  ],
+  "categories": [
+    "productivity",
+    "lifestyle",
+    "utilities"
+  ],
+  "lang": "zh-CN",
+  "dir": "ltr"
+}

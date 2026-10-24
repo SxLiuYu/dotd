@@ -1,0 +1,56 @@
+# docker/compose.voice.yml —— 一套系统一键起（cloud / box 共用）
+#
+# 用法：
+#   cp docker/voice.cloud.env.example .env      # 云主机
+#   cp docker/voice.box.env.example .env        # 家里盒子/树莓派
+#   编辑 .env（至少 DOTD_MASTER_TOKEN 与一个模型 key）
+#   docker compose -f docker/compose.voice.yml up -d --build
+#   curl http://127.0.0.1:8000/health
+#
+# 只暴露 Charlie 的 8000/8443；dotd 只监听容器内回环，外部拿不到管理面。
+# 数据只有 /data 一个卷：dotd 的库/记忆 + Charlie 的 voice 子目录都在里面。
+
+services:
+  charlie:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.voice
+      args:
+        # 直连 pypi 超时的网络下换镜像源（不改 Dockerfile 默认值）：
+        #   DOTD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose ... up -d --build
+        PIP_INDEX_URL: ${DOTD_PIP_INDEX_URL:-https://pypi.org/simple}
+    image: charlie-dotd:latest
+    container_name: charlie
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      CHARLIE_HOME: /data
+      DOTD_HOME: /data
+      DOTD_CONFIG: /data/config.yml
+      DOTD_DB_PATH: /data/dotd.db
+      # cloud：工具跑容器需要挂 docker.sock；box 档位不建议开（见 docs/voice-quickstart.md）
+      DOTD_FLEET: ${DOTD_FLEET:-stub}
+      CHARLIE_CORTEX: ${CHARLIE_CORTEX:-auto}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "8000:8000"       # Charlie（Web / ESP32 WS / 反向代理的 /console）
+      - "8443:8443"       # Charlie HTTPS
+    volumes:
+      - voice-data:/data
+      # cloud 档位才需要：让 dotd 的 docker 工具能起兄弟容器
+      # - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  voice-data:

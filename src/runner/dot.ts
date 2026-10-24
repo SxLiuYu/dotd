@@ -515,7 +515,7 @@ interface LlmStep {
 }
 
 /** CP §12 `ctx`：装填 messages、喂结果、判 done、记账。 */
-class RunContext {
+export class RunContext {
   readonly messages: Message[] = [];
   /** 已成功执行、尚未以全文回喂给模型的工具结果（callId → resultJson）。 */
   private readonly pendingResults = new Map<string, string>();
@@ -795,6 +795,8 @@ class RunContext {
   /** 任务目标：恒为最后一条 user 消息（§4.1 事件任务没有历史对话时它是唯一输入）。 */
   buildMessages(bundle: {
     memoryMd: string;
+    /** M3（2026-10-23）：主人写的人格文件；空串 = 没写，不产出任何消息。 */
+    identityMd?: string;
     manualExcerpts: Array<{ path: string; text: string }>;
     summary: string | null;
   }): Message[] {
@@ -832,6 +834,27 @@ class RunContext {
       tokenEst: 60,
       createdAt: 0,
     });
+
+    // ①c 人格文件（M3，2026-10-23）。
+    //
+    // 位置：时间之后、文件记忆之前。它是「主人希望你怎么跟他说话」，
+    // 不是「关于主人的事实」，所以不进 MEMORY.md 那一段；
+    // 也没塞进 4900 字符的 DOT_SYSTEM_PROMPT —— 那份是恒定手册，人格是可改的。
+    // 空串 = 主人没写：一条消息都不产出，请求体与加这个功能之前逐字一致。
+    const identity = bundle.identityMd ?? '';
+    if (identity.trim().length > 0) {
+      const content = `# IDENTITY.md（主人给你的人格设定）\n${identity}`;
+      out.push({
+        id: 'sys:identity',
+        threadId: '',
+        seq: 0,
+        role: 'system',
+        kind: 'text',
+        content,
+        tokenEst: Math.ceil(content.length / 3.5),
+        createdAt: 0,
+      });
+    }
 
     // ② 文件记忆快照（任务开始时注入的那一份；内容由 MemoryService 控预算）。
     const fileParts: string[] = [];
@@ -1269,38 +1292,42 @@ export class DotRunner {
     // 实测证明提示词不够 —— 同类任务它直接 shell.run 手写了一遍，压根没想起去查。
     let toolInventory: string | null = null;
     try {
+      // 能力目录里没有 tool.list 就别白跑一次（2026-10-23：stub fleet 的镜像模拟
+      // 实现了 fs/shell 但没有 tool.list，语音任务每轮都会留下 unknown_tool 噪音）。
       // 复用 toolCall()：它负责补 issued_at 等必需字段。
       // 2026-10-19 踩坑：手写对象漏了 issued_at，容器回 400「字段 issued_at 必须是非空字符串」，
       // 而外层只看到 "发现 0 个工具" —— 症状完全看不出是字段缺失。
-      const r = await this.exec.runTool(
-        toolCall(task, `inventory_${task.id}`, 'tool.list', {}, 60_000),
-      );
-      // 诊断（2026-10-19：这条链路查了两小时没定位，先把原始结构打出来）
-      const raw = JSON.stringify(r).slice(0, 400);
-      this.log(`runner: tool.list 原始返回 ${task.id}：${raw}`);
-      const payload = (r as { result?: { tools?: Array<Record<string, unknown>> } }).result;
-      const tools = Array.isArray(payload?.tools) ? payload.tools : [];
-      const usable = tools.filter(
-        (x) => typeof x['name'] === 'string' && typeof x['description'] === 'string' && String(x['description']).length > 0,
-      );
-      this.log(`runner: 工具清单 ${task.id}：发现 ${usable.length} 个自造工具`);
-      if (usable.length > 0) {
-        // 措辞刻意写成"指令"而不是"告知"：2026-10-19 实测，只写
-        // "（这些是以前造的，别重写）" 时模型照样手写 shell.run —— 它把这句当成背景信息。
-        // 改了三点：① 明确说"先检查"；② 给出具体调用格式；③ 说明什么时候才该新造。
-        toolInventory =
-          '# 你已有的自造工具（动手前先看这份清单）\n' +
-          usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
-          '\n' +
-          '\n**规则**：\n' +
-          // 2026-10-19 实测踩坑：动态工具已注册成**独立工具**（名字就是 word-count，
-          // 参数直接是 manifest.params），但清单还写着"用 tool.invoke(name, args) 调它"，
-          // 于是模型把参数包成 {name:'word-count', args:{text}} 发给 word-count 本身，
-          // 造成一层多余嵌套。措辞必须与"它现在是一个独立工具"的事实一致。
-          '1. 上面有能干这活的 → **直接调用那个工具**（它的名字就是工具名，参数按该工具的参数填），' +
-          '**不要**用 shell.run 重写一遍；\n' +
-          '2. 没有但以后还会重复 → 用 tool.create 造一个（造完记得也 invoke 一次自测）；\n' +
-          '3. 只有一次性临时活、上面也没有对口的，才直接用 shell.run。';
+      if (await this.hasToolList()) {
+        const r = await this.exec.runTool(
+          toolCall(task, `inventory_${task.id}`, 'tool.list', {}, 60_000),
+        );
+        // 诊断（2026-10-19：这条链路查了两小时没定位，先把原始结构打出来）
+        const raw = JSON.stringify(r).slice(0, 400);
+        this.log(`runner: tool.list 原始返回 ${task.id}：${raw}`);
+        const payload = (r as { result?: { tools?: Array<Record<string, unknown>> } }).result;
+        const tools = Array.isArray(payload?.tools) ? payload.tools : [];
+        const usable = tools.filter(
+          (x) => typeof x['name'] === 'string' && typeof x['description'] === 'string' && String(x['description']).length > 0,
+        );
+        this.log(`runner: 工具清单 ${task.id}：发现 ${usable.length} 个自造工具`);
+        if (usable.length > 0) {
+          // 措辞刻意写成"指令"而不是"告知"：2026-10-19 实测，只写
+          // "（这些是以前造的，别重写）" 时模型照样手写 shell.run —— 它把这句当成背景信息。
+          // 改了三点：① 明确说"先检查"；② 给出具体调用格式；③ 说明什么时候才该新造。
+          toolInventory =
+            '# 你已有的自造工具（动手前先看这份清单）\n' +
+            usable.map((x) => `- ${String(x['name'])}：${String(x['description'])}`).join('\n') +
+            '\n' +
+            '\n**规则**：\n' +
+            // 2026-10-19 实测踩坑：动态工具已注册成**独立工具**（名字就是 word-count，
+            // 参数直接是 manifest.params），但清单还写着"用 tool.invoke(name, args) 调它"，
+            // 于是模型把参数包成 {name:'word-count', args:{text}} 发给 word-count 本身，
+            // 造成一层多余嵌套。措辞必须与"它现在是一个独立工具"的事实一致。
+            '1. 上面有能干这活的 → **直接调用那个工具**（它的名字就是工具名，参数按该工具的参数填），' +
+            '**不要**用 shell.run 重写一遍；\n' +
+            '2. 没有但以后还会重复 → 用 tool.create 造一个（造完记得也 invoke 一次自测）；\n' +
+            '3. 只有一次性临时活、上面也没有对口的，才直接用 shell.run。';
+        }
       }
     } catch (err) {
       this.log(`runner: 工具清单注入失败 ${task.id}：${err instanceof Error ? err.message : String(err)}`);
@@ -1887,6 +1914,7 @@ export class DotRunner {
   /** 文件记忆只在任务开始时注入一次；这里持有该快照供后续每步复用。 */
   private cachedBundle(ctx: RunContext): {
     memoryMd: string;
+    identityMd?: string;
     manualExcerpts: Array<{ path: string; text: string }>;
     summary: string | null;
   } {
@@ -1894,6 +1922,7 @@ export class DotRunner {
     if (cached !== undefined) {
       return cached as {
         memoryMd: string;
+        identityMd?: string;
         manualExcerpts: Array<{ path: string; text: string }>;
         summary: string | null;
       };
@@ -1905,7 +1934,12 @@ export class DotRunner {
   /** 缓存 bundle（runTask ⑤ 注入后调一次）。 */
   private cacheBundle(
     ctx: RunContext,
-    bundle: { memoryMd: string; manualExcerpts: Array<{ path: string; text: string }>; summary: string | null },
+    bundle: {
+      memoryMd: string;
+      identityMd?: string;
+      manualExcerpts: Array<{ path: string; text: string }>;
+      summary: string | null;
+    },
   ): void {
     (ctx as unknown as { __bundle?: unknown }).__bundle = bundle;
   }

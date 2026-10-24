@@ -1,0 +1,1 @@
+{"ok":true,"service":"charlie","product":"charlie+dotd","voice":"ok","kernel":"ok","kernelDetail":{"state":"running","pid":9,"restarts":0,"apiVersion":1,"lastError":null,"health":{"ok":true,"service":"dotd","apiVersion":1,"dotId":"dot1","busSeq":468,"at":"2026-10-23T22:55:38.935Z"}},"apiVersion":1,"at":1792796140541}

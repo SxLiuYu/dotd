@@ -1,6 +1,25 @@
 # dotd —— 自主 Dot 系统
 
+**开源的个人 agent：dotd（大脑）+ Charlie（嘴和手）。**
+
+[![ci](https://github.com/SxLiuYu/dotd/actions/workflows/ci.yml/badge.svg)](https://github.com/SxLiuYu/dotd/actions/workflows/ci.yml)
+[![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![voice: MIT](https://img.shields.io/badge/voice-MIT-green.svg)](voice/LICENSE)
+
 常驻单进程个人 AI Agent daemon：TypeScript 单进程 + SQLite + 每 Dot 一个 Playwright 容器（`package.json:5`）。
+语音端（ESP32 / ASR / TTS / 红外）在同一个仓库的 `voice/`，靠 HTTP + MCP 接到内核。
+
+```bash
+git clone https://github.com/SxLiuYu/dotd && cd dotd
+npm run setup:all     # Node + Python 依赖 + 体检（一条命令，两边都装）
+npm run up            # 启动 Charlie，它会托管 dotd
+```
+
+- 30 分钟上手：[`docs/voice-quickstart.md`](docs/voice-quickstart.md)
+- 安全边界与漏洞报告：[`SECURITY.md`](SECURITY.md)
+- 怎么贡献：[`CONTRIBUTING.md`](CONTRIBUTING.md)
+- **诚实状态**：真机音频（麦克风/ASR 准确率/Opus）尚未验证；真模型首条延迟
+  P50 4.8 s，未达方案目标（证据在 `docs/acceptance/`，不写成达标）。
 
 **英文版见 [README.en.md](README.en.md)。** 细节以本文件为准。
 
@@ -469,6 +488,38 @@ dotd 的立身之本是**完全自托管，唯一允许的外部依赖是可换 
 
 **环依赖用惰性 holder 打破**：CP 的 lowBrain/exec/governance/sealTask 在 CP 之后才 init，故建 memHolder/execHolder/govHolder/routerHolder，CP 侧只在运行期经闭包读，MR/GOV/EX 就位后回填（`src/daemon.ts:459-462,513-545`）。
 
+### 语音端：Charlie 合并（2026-10-23）
+
+`voice/` 是 [Charlie 语音助手](https://github.com/SxLiuYu/charlie-voice-assistant) 的上游源码
+（vendored，`voice/VENDOR.md` 记录了提交与许可风险）。合并口径是 **Charlie 是嘴和手，dotd 是大脑和账本**：
+
+- 语音/红外/ESP32/ASR/TTS 留在 Python；队列/审批/审计/记忆/凭证留在 dotd。
+- 需要规划的任务走 `voice/integration/dotd_bridge.py` → `POST /api/messages`；
+  终态后从会话里取 assistant 正文播报，并带 `bundleHash`。
+- Charlie 的 `magic-*.py` 本身就是 FastMCP stdio server，dotd 的 `mcp.call` 直接连
+  （示例 `config/mcp-servers.voice.yml`，默认不生效）。
+- 体检：`npm run voice:check`；接缝测试：`npm run voice:test`。
+- **设备面（阶段 2）**：`dotd device add <name>` 注册一台语音终端；设备令牌只能走
+  `/api/device/*`，只能读自己设备的任务，**不能批准任何危险动作**。
+  近路任务走 `POST /api/device/turn`（`voice` 会话、`external_ref=deviceId`），
+  `dotd prove` 与 `dotd feed` 都能看到设备维度与反射记账。
+- 假设备验收：`npm run voice:device -- --base http://127.0.0.1:7788 --create`。
+- **单一记忆源（阶段 5）**：dotd 是唯一事实源。`GET /api/device/memory` 返回设备自己的
+  消息与偏好；反射/本地场景轮次由 `POST /api/device/memory/turn` 补写（幂等）；
+  偏好写 `PUT /api/device/prefs`，管理面 `GET /api/memory/prefs` 读同一张表。
+  Charlie 侧的 `conversation_history.json` / `preferences.json` 降级为缓存
+  （`voice/integration/dotd_memory.py`）。
+- **单一主动推送决策（阶段 5）**：`POST /api/device/proactive/decide` 是唯一决策入口，
+  复用 dotd 的三道闸，再加每日上限与同文去重；每次决策写 `device_push_log`。
+  Charlie 只负责「怎么说」（`voice/integration/push_gate.py`）。
+- 真模型延迟实测：首条增量 P50 **4.80 s**、端到端 P50 **10.98 s**、P95 **23.46 s**
+  （见 [`docs/acceptance/voice-real-latency/REPORT.md`](docs/acceptance/voice-real-latency/REPORT.md)）；
+  方案 §7.1 的「简单问答 < 2.5 s」**未达标**，瓶颈在模型网关 TTFT，不在 dotd 调度。
+- 音频链路：无硬件条件下用合成 PCM 跑通 WS → VAD → ASR/大脑接缝 → TTS 回发
+  （[`docs/acceptance/voice-audio-sim/REPORT.md`](docs/acceptance/voice-audio-sim/REPORT.md)）；
+  真麦克风/真 ASR 准确率/真 Opus 编解码仍未验证。
+- 一个安装入口：`npm run setup:all`（Node + Python + 体检）、`npm run up`（再加启动）。
+
 ### 那套 11 工具契约为什么存在
 
 封闭词表共 11 名（`src/shared/contracts.ts:610-621`，与 `src/exec/protocol.ts:96` 的 `CAPABILITY_CATALOG` 逐个同形）：
@@ -570,7 +621,11 @@ tier1 → tier2 → tier3 → tier4 **单向**，失败永远向前降级，绝�
 
 ## 许可
 
-Apache License 2.0，见 [LICENSE](LICENSE)。
+- 内核与集成层：**Apache License 2.0**，见 [LICENSE](LICENSE)；
+- `voice/`（Charlie 上游代码）：**MIT**，见 [voice/LICENSE](voice/LICENSE) 与
+  [voice/NOTICE](voice/NOTICE)。两套许可不冲突：取更宽松的那份即可。
+
+第三方依赖与来源登记见 `THIRD_PARTY.md`（如有新增请同步补充）。
 
 ## 相关文档
 

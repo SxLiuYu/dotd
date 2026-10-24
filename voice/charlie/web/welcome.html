@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Charlie 配置引导</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#0f0f17;color:#e0e0e0;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+.card{background:#1a1a2e;border-radius:16px;padding:36px;max-width:560px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.45)}
+h1{font-size:24px;margin-bottom:6px;text-align:center}
+.subtitle{color:#888;font-size:13px;text-align:center;margin-bottom:24px}
+/* 进度条 */
+.progress{display:flex;justify-content:center;gap:0;margin-bottom:26px}
+.progress .stage{display:flex;align-items:center;gap:8px}
+.progress .dot{width:26px;height:26px;border-radius:50%;background:#2a2a3e;color:#666;border:1px solid #333;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;flex-shrink:0}
+.progress .stage.active .dot{background:#667eea;color:#fff;border-color:#667eea}
+.progress .stage.done .dot{background:#27ae60;color:#fff;border-color:#27ae60}
+.progress .stage .lbl{font-size:12px;color:#666}
+.progress .stage.active .lbl,.progress .stage.done .lbl{color:#bbb}
+.progress .bar{width:34px;height:2px;background:#333;margin:0 6px}
+.progress .bar.done{background:#27ae60}
+.step{display:none}.step.active{display:block}
+.stage-title{font-size:17px;font-weight:600;margin-bottom:4px}
+.stage-desc{color:#888;font-size:13px;margin-bottom:18px;line-height:1.5}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12px;color:#aaa;margin-bottom:6px}
+.field-row{display:flex;gap:8px;align-items:stretch}
+.field-row input{flex:1;min-width:0}
+input{width:100%;padding:11px 13px;background:#0f0f17;border:1px solid #333;border-radius:8px;color:#e0e0e0;font-size:14px;outline:none;transition:border .2s}
+input:focus{border-color:#667eea}
+input::placeholder{color:#555}
+.apply-btn{flex-shrink:0;padding:0 14px;background:#20202e;border:1px solid #667eea;border-radius:8px;color:#9ab0ff;font-size:12px;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:4px;text-decoration:none}
+.apply-btn:hover{background:#252540}
+.hint{font-size:12px;color:#667;line-height:1.6;margin:14px 0;padding:12px 14px;background:#20202e;border-radius:8px}
+.hint b{color:#9ab0ff}
+.btn{width:100%;padding:13px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:10px;color:#fff;font-size:15px;font-weight:600;cursor:pointer;margin-top:10px;transition:opacity .2s}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn:active:not(:disabled){opacity:.8}
+.btn-row{display:flex;gap:10px;margin-top:10px}
+.btn-row .btn{margin-top:0}
+.btn.secondary{background:#20202e;border:1px solid #333;color:#aaa}
+.link-row{text-align:center;margin-top:18px}
+.link-row a{color:#555;text-decoration:none;font-size:12px}
+.link-row a:hover{color:#888}
+.banner{padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:14px;display:none}
+.banner.ok{display:block;background:rgba(39,174,96,.15);color:#6ee7a7;border:1px solid #27ae60}
+.banner.err{display:block;background:rgba(231,76,60,.12);color:#ff9a8a;border:1px solid #e74c3c}
+@media(max-width:480px){.progress .bar{width:18px}.progress .lbl{display:none}}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>🎙️ Charlie 配置引导</h1>
+<p class="subtitle">两步填好免费 Key，语音对话即可用</p>
+
+<div class="banner" id="banner"></div>
+
+<div class="progress">
+  <div class="stage" id="stg1"><div class="dot">1</div><span class="lbl">百度语音</span></div>
+  <div class="bar" id="bar1"></div>
+  <div class="stage" id="stg2"><div class="dot">2</div><span class="lbl">免费大脑</span></div>
+  <div class="bar" id="bar2"></div>
+  <div class="stage" id="stg3"><div class="dot">3</div><span class="lbl">完成</span></div>
+</div>
+
+<!-- 步骤1：百度 ASR/TTS -->
+<div class="step" id="step1">
+  <div class="stage-title">🎤 百度语音 Key（语音识别 + 语音合成）</div>
+  <div class="stage-desc">语音输入输出靠它。去百度智能云免费申请，复制下面三个值。</div>
+  <div class="field">
+    <label>App ID</label>
+    <div class="field-row">
+      <input id="BAIDU_APP_ID" placeholder="如 12345678" autocomplete="off">
+      <a class="apply-btn" href="https://console.bce.baidu.com/ai/#/ai/speech/overview/index" target="_blank">🔗 申请入口</a>
+    </div>
+  </div>
+  <div class="field">
+    <label>API Key</label>
+    <div class="field-row">
+      <input id="BAIDU_API_KEY" type="password" placeholder="百度 API Key" autocomplete="off">
+    </div>
+  </div>
+  <div class="field">
+    <label>Secret Key</label>
+    <div class="field-row">
+      <input id="BAIDU_SECRET_KEY" type="password" placeholder="百度 Secret Key" autocomplete="off">
+    </div>
+  </div>
+  <div class="hint">在百度控制台「语音技术」创建应用，即可拿到这三项。新用户有 <b>免费额度</b>，足够日常体验。</div>
+  <button class="btn" id="next1" onclick="saveStep1()">下一步 →</button>
+</div>
+
+<!-- 步骤2：免费 LLM -->
+<div class="step" id="step2">
+  <div class="stage-title">🧠 免费 AI 大脑（智谱 GLM）</div>
+  <div class="stage-desc">国内可用的免费大模型，注册即可用。glm-4.7-flash OpenAI 兼容，无需充值。</div>
+  <div class="field">
+    <label>智谱 API Key</label>
+    <div class="field-row">
+      <input id="GLM_KEY" type="password" placeholder="..." autocomplete="off">
+      <a class="apply-btn" href="https://open.bigmodel.cn/apikey/platform" target="_blank">🔗 申请入口</a>
+    </div>
+  </div>
+  <div class="hint">打开上方入口 → 注册/登录 → 「API Keys」→ 添加新 API Key → 复制粘贴到这里。<b>glm-4.7-flash 永久免费，有合理频限。</b></div>
+  <div class="btn-row">
+    <button class="btn secondary" onclick="prev1()">← 上一步</button>
+    <button class="btn" id="next2" onclick="saveStep2()">下一步 →</button>
+  </div>
+</div>
+
+<!-- 步骤3：完成 -->
+<div class="step" id="step3">
+  <div style="text-align:center;font-size:42px;margin:10px 0 14px">✅</div>
+  <div class="stage-title" style="text-align:center">配置完成！</div>
+  <div class="stage-desc" style="text-align:center;margin-top:8px">Key 已保存并即时生效，回到主界面即可开始语音对话。</div>
+  <button class="btn" onclick="location.href='/'">进入主界面 →</button>
+  <div class="link-row"><a href="javascript:location.reload()">重新检测配置</a></div>
+</div>
+
+<div class="link-row"><a href="/setup">高级：完整 Key 配置页</a> · <a href="javascript:skipDemo()">暂时跳过（功能受限）</a></div>
+</div>
+
+<script>
+let cfg={};
+function show(id){document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active')}
+function setStage(n){
+  for(let i=1;i<=3;i++){const el=document.getElementById('stg'+i);el.classList.remove('active','done')}
+  for(let i=1;i<n;i++)document.getElementById('stg'+i).classList.add('done');
+  document.getElementById('stg'+n).classList.add('active');
+  for(let i=1;i<3;i++)document.getElementById('bar'+i).classList.toggle('done',i<n);
+}
+function banner(msg,type){const b=document.getElementById('banner');b.textContent=msg;b.className='banner '+(type||'')}
+async function loadStatus(){
+  try{
+    const r=await fetch('/api/welcome/status');const d=await r.json();
+    cfg=d;window._st=d;
+    // 已配智谱 GLM → 直接完成
+    if(d.glm_configured||d.ark_configured){show('step3');setStage(3);return}
+    // 已配百度三件套 → 进步骤2
+    if(d.baidu_configured){show('step2');setStage(2);return}
+    show('step1');setStage(1);
+  }catch(e){show('step1');setStage(1)}
+}
+function vals(){const o={};['BAIDU_APP_ID','BAIDU_API_KEY','BAIDU_SECRET_KEY','GLM_KEY'].forEach(k=>{const el=document.getElementById(k);if(el)o[k]=el.value.trim()});return o}
+async function postSetup(data){
+  const r=await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  return r.json();
+}
+async function verifyKeys(data){
+  // 保存后实时校验 Key 有效性（后台请求百度/智谱），结果展示给用户
+  try{
+    const r=await fetch('/api/setup/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    return await r.json();
+  }catch(e){return null}
+}
+function fmtVerify(v){
+  if(!v||!v.results)return '';
+  const msgs=[];
+  for(const [k,r] of Object.entries(v.results)){
+    const label=k==='glm'?'大脑':'语音';
+    msgs.push((r.ok?'✅':'⚠️')+label+'：'+r.message);
+  }
+  return msgs.join('　');
+}
+async function saveStep1(){
+  const v=vals();
+  if(!v.BAIDU_APP_ID||!v.BAIDU_API_KEY||!v.BAIDU_SECRET_KEY){banner('请先填完三项百度 Key（或点“暂时跳过”）','err');return}
+  document.getElementById('next1').disabled=true;
+  banner('正在保存并验证百度语音 Key…','');
+  try{
+    const d=await postSetup(v);
+    if(d.ok){
+      const vr=await verifyKeys(v);
+      const baidu=vr&&vr.results&&vr.results.baidu;
+      if(baidu&&!baidu.ok){banner('百度 Key 已保存，但验证未通过：'+baidu.message+'（可继续，之后在设置里修改）','err')}
+      else if(baidu&&baidu.ok){banner('百度语音 Key 已保存并验证通过 ✓','ok')}
+      else{banner('百度语音 Key 已保存 ✓','ok')}
+      show('step2');setStage(2);
+    }
+    else banner('保存失败：'+(d.error||''),'err');
+  }catch(e){banner('保存失败：'+e,'err')}
+  document.getElementById('next1').disabled=false;
+}
+async function saveStep2(){
+  const v={GLM_KEY:(document.getElementById('GLM_KEY').value||'').trim()};
+  if(!v.GLM_KEY){banner('请先填入智谱 GLM 免费 Key（或点“暂时跳过”）','err');return}
+  document.getElementById('next2').disabled=true;
+  banner('正在保存并验证智谱 GLM Key…','');
+  try{
+    const d=await postSetup(v);
+    if(d.ok){
+      const vr=await verifyKeys(v);
+      const glm=vr&&vr.results&&vr.results.glm;
+      if(glm&&!glm.ok){banner('GLM Key 已保存，但验证未通过：'+glm.message+'（可继续，之后在设置里修改）','err')}
+      else if(glm&&glm.ok){banner('免费大脑 Key 已保存并验证通过 ✓','ok')}
+      else{banner('免费大脑 Key 已保存 ✓','ok')}
+      show('step3');setStage(3);
+    }
+    else banner('保存失败：'+(d.error||''),'err');
+  }catch(e){banner('保存失败：'+e,'err')}
+  document.getElementById('next2').disabled=false;
+}
+function prev1(){show('step1');setStage(1)}
+async function skipDemo(){
+  try{await postSetup({demo_accept:'true'})}catch(e){}
+  banner('已切换为 Demo 模式（功能受限，随时可回此页填 Key）','ok');
+  setTimeout(()=>location.href='/',800);
+}
+loadStatus();
+</script>
+</body>
+</html>

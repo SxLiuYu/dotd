@@ -31,6 +31,8 @@ import {
   BUDGET_FILE_MEMORY_TOKENS,
   BUDGET_SESSION_TOKENS,
   DEFAULT_RECENT_MESSAGES,
+  HOME_IDENTITY,
+  LIMIT_IDENTITY_MD,
   MANUAL_EXCERPT_CHARS,
   MANUALS_TOP_N,
   tokensOfText,
@@ -294,6 +296,9 @@ export interface InjectResult extends ContextBundle {
   /** MEMORY.md 原文长度（超 4KB 时注入截断并 warning）。 */
   memoryMdBytes: number;
   memoryMdTruncated: boolean;
+  /** IDENTITY.md 原文长度（超 1KB 时截断；文件不存在为 0，不算错误）。 */
+  identityMdBytes: number;
+  identityMdTruncated: boolean;
   /** 超预算被砍掉的 manuals 条数（观测用）。 */
   droppedManuals: number;
   droppedMessages: number;
@@ -331,6 +336,30 @@ export async function readMemoryMd(
   const bytes = Buffer.byteLength(text, 'utf8');
   if (bytes <= maxBytes) return { text, truncated: false, error: null };
   return { text: text.slice(0, maxBytes), truncated: true, error: null };
+}
+
+/**
+ * 读 IDENTITY.md（M3，2026-10-23）。
+ *
+ * 与 MEMORY.md 的三点不同：
+ *   1. **不存在不是错误**：没写人格文件的主人占多数，返回 null + 空串，不记 memory_missed；
+ *   2. 硬上限 1 KB，超出按字节截断（宁可少一句，不能让每轮 prompt 被一份散文撑爆）；
+ *   3. 不解析段落：人格是自由文本，注入时原样带上。
+ */
+export async function readIdentityMd(
+  bridge: FsOpsBridge,
+  dotId: string,
+): Promise<{ text: string; truncated: boolean }> {
+  const raw = await bridge.read(dotId, HOME_IDENTITY);
+  if (raw === null) return { text: '', truncated: false };
+  const bytes = Buffer.byteLength(raw, 'utf8');
+  if (bytes <= LIMIT_IDENTITY_MD.hard) return { text: raw, truncated: false };
+  // 按字符截到硬上限以内；再 trim 掉可能的半个字符/半行。
+  let cut = raw.slice(0, LIMIT_IDENTITY_MD.hard);
+  while (Buffer.byteLength(cut, 'utf8') > LIMIT_IDENTITY_MD.hard && cut.length > 0) {
+    cut = cut.slice(0, -1);
+  }
+  return { text: cut, truncated: true };
 }
 
 /**
@@ -396,7 +425,15 @@ export async function buildContextBundle(
     memoryMdBytes = Buffer.byteLength(memoryMd, 'utf8');
     memoryMdTruncated = md.truncated;
   }
-  let fileTokens = tokensOfText(memoryMd);
+
+  // 人格文件（M3）：可选、≤1 KB。放在文件记忆之前计入预算 ——
+  // 它是「每轮都该在」的少量文本；超预算时先砍 manuals，不砍它。
+  const identity = await readIdentityMd(src.bridge, src.dotId);
+  const identityMd = identity.text;
+  const identityMdBytes = Buffer.byteLength(identityMd, 'utf8');
+  const identityMdTruncated = identity.truncated;
+
+  let fileTokens = tokensOfText(memoryMd) + tokensOfText(identityMd);
 
   // manuals 匹配片段（top-2，每篇截前 1KB）；超预算按 score 顺序丢
   const ranked = rankManuals(taskText, src.manuals);
@@ -446,6 +483,7 @@ export async function buildContextBundle(
 
   return {
     memoryMd,
+    identityMd,
     manualExcerpts,
     summary,
     recentMessages,
@@ -454,6 +492,8 @@ export async function buildContextBundle(
     bridgeError,
     memoryMdBytes,
     memoryMdTruncated,
+    identityMdBytes,
+    identityMdTruncated,
     droppedManuals,
     droppedMessages,
     summaryDropped,

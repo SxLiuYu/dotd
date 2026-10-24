@@ -1,0 +1,613 @@
+{
+  "generatedAt": "2026-10-23T18:09:39.915Z",
+  "model": "hy3 @ 172.17.48.1:13065（真 HTTP；容器 stub）",
+  "concurrency": {
+    "devices": 3,
+    "runsPerDevice": 3,
+    "wallMs": 57972,
+    "perDevice": [
+      {
+        "deviceId": "dev_986f1f103f676de5",
+        "name": "multi-dev-1",
+        "exit": 0,
+        "passed": 3,
+        "runs": 3,
+        "firstDeltaP50Ms": 13060,
+        "endToEndP50Ms": 17110,
+        "taskIds": [
+          "tk_mvla79qqg7uc12",
+          "tk_mvla7l0rdryn5v",
+          "tk_mvla7yrtiea6nm"
+        ],
+        "threads": [
+          "thr_01M5MZ2PRDP99J62DAJXNNG97F"
+        ],
+        "statuses": [
+          "done",
+          "done",
+          "done"
+        ],
+        "stderr": null
+      },
+      {
+        "deviceId": "dev_18339ee24fa069a2",
+        "name": "multi-dev-2",
+        "exit": 0,
+        "passed": 3,
+        "runs": 3,
+        "firstDeltaP50Ms": 11199,
+        "endToEndP50Ms": 14944,
+        "taskIds": [
+          "tk_mvla79pa56p5b3",
+          "tk_mvla7hkai77kye",
+          "tk_mvla7tn59z650k"
+        ],
+        "threads": [
+          "thr_01M5MZ2PPRCPQVTRTH3KPKSTHZ"
+        ],
+        "statuses": [
+          "done",
+          "done",
+          "done"
+        ],
+        "stderr": null
+      },
+      {
+        "deviceId": "dev_38bc7f2be52198eb",
+        "name": "multi-dev-3",
+        "exit": 0,
+        "passed": 3,
+        "runs": 3,
+        "firstDeltaP50Ms": 16411,
+        "endToEndP50Ms": 19394,
+        "taskIds": [
+          "tk_mvla79r2vrbgyp",
+          "tk_mvla7p824l7v1y",
+          "tk_mvla824ovadqon"
+        ],
+        "threads": [
+          "thr_01M5MZ2PRSYFKZ7Z00ANWHJYB2"
+        ],
+        "statuses": [
+          "done",
+          "done",
+          "done"
+        ],
+        "stderr": null
+      }
+    ],
+    "overlapProbe": {
+      "overlap": true,
+      "accepted": 3,
+      "windows": [
+        {
+          "taskId": "tk_mvla8hv9do2qbu",
+          "firstSeen": 1792778844820,
+          "end": 1792778856235,
+          "status": "done"
+        },
+        {
+          "taskId": "tk_mvla8hvmke5u6j",
+          "firstSeen": 1792778844823,
+          "end": 1792778864386,
+          "status": "done"
+        },
+        {
+          "taskId": "tk_mvla8hvxebo3hh",
+          "firstSeen": 1792778844825,
+          "end": 1792778875335,
+          "status": "done"
+        }
+      ],
+      "spanMs": 30515
+    }
+  },
+  "checks": [
+    {
+      "name": "3 台设备各自 3 轮全部 done",
+      "ok": true,
+      "detail": "multi-dev-1: 3/3 · multi-dev-2: 3/3 · multi-dev-3: 3/3"
+    },
+    {
+      "name": "任务互不重叠（9 个 taskId 唯一）",
+      "ok": true,
+      "detail": "9 unique"
+    },
+    {
+      "name": "3 台设备同时有在途任务（区间重叠，不是排队假装并发）",
+      "ok": true,
+      "detail": "accepted 3/3 · 重叠窗口 30515ms"
+    },
+    {
+      "name": "每台设备恰好一条会话（各自 3 轮复用同一条），且设备间不同",
+      "ok": true,
+      "detail": "JXNNG97F / 3KPKSTHZ / ANWHJYB2"
+    },
+    {
+      "name": "设备 A 读设备 B 的任务 → 404",
+      "ok": true,
+      "detail": "HTTP 404"
+    },
+    {
+      "name": "设备令牌打管理面 /api/queue → 403 device_scope",
+      "ok": true,
+      "detail": "HTTP 403"
+    },
+    {
+      "name": "同设备第二句 → 409 device_busy",
+      "ok": true,
+      "detail": "first 202 / second 409 device_busy"
+    },
+    {
+      "name": "A 真的把事实落盘（fs.write succeeded，不是口头答应）",
+      "ok": true,
+      "detail": "fs.write×3 · done"
+    },
+    {
+      "name": "B 的任务上下文里注入了含「花生」的 MEMORY.md（跨设备记忆注入）",
+      "ok": true,
+      "detail": "prompt 里有"
+    },
+    {
+      "name": "B（另一台设备）能召回「花生」",
+      "ok": true,
+      "detail": "你对花生过敏，涉及食物相关的事项我会主动提醒你。"
+    },
+    {
+      "name": "共享记忆但会话隔离：A/B 的 thread 不同",
+      "ok": true,
+      "detail": "JXNNG97F vs 3KPKSTHZ"
+    },
+    {
+      "name": "第三台设备（同题）同样能召回「花生」（记忆属于 dot，不属于设备）",
+      "ok": true,
+      "detail": "你对花生过敏，涉及食物相关的事项（点餐、零食、外卖、活动餐饮等）我会主动提醒你。"
+    },
+    {
+      "name": "事实落在 A 的会话里（写进去了）",
+      "ok": true,
+      "detail": "A 里 4 条含「花生」"
+    },
+    {
+      "name": "B/C 的会话里出现「花生」（跨设备答出来了）",
+      "ok": true,
+      "detail": "A 之外 4 条"
+    },
+    {
+      "name": "用户原话没有跨会话抄写（会话隔离，不是共享上下文）",
+      "ok": true,
+      "detail": "泄漏 0 条"
+    },
+    {
+      "name": "B 的凭证里确实调了 memory.search",
+      "ok": true,
+      "detail": "memory.search ×1"
+    }
+  ],
+  "memory": {
+    "write": {
+      "label": "A:记住",
+      "ok": true,
+      "taskId": "tk_mvlaa4dwa86puo",
+      "threadId": "thr_01M5MZ2PRDP99J62DAJXNNG97F",
+      "status": "done",
+      "reply": "我需要先读取现有的 MEMORY.md，以保留原有段落结构再追加内容。<tool_calls:6124c78e>\n<tool_call:6124c78e>fs.read</arg_value:6124c78e>\n<arg_key:6124c78e>path</arg_key:6124c78e>\n<arg_value:6124c78e>/dot/home/MEMORY.md</arg_value:6124c78e>\n</tool_call:6124c78e>\n</tool_calls:6124c78e>",
+      "waitedMs": 35740
+    },
+    "askB": {
+      "label": "B:提问",
+      "ok": true,
+      "taskId": "tk_mvlaavz3jvq656",
+      "threadId": "thr_01M5MZ2PPRCPQVTRTH3KPKSTHZ",
+      "status": "done",
+      "reply": "你对花生过敏，涉及食物相关的事项我会主动提醒你。",
+      "waitedMs": 14012
+    },
+    "askC": {
+      "label": "C:提问",
+      "ok": true,
+      "taskId": "tk_mvlab6sm5esf3u",
+      "threadId": "thr_01M5MZ2PRSYFKZ7Z00ANWHJYB2",
+      "status": "done",
+      "reply": "你对花生过敏，涉及食物相关的事项（点餐、零食、外卖、活动餐饮等）我会主动提醒你。",
+      "waitedMs": 9491
+    }
+  },
+  "trace": [
+    {
+      "at": "2026-10-23T18:06:27.794Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5109
+    },
+    {
+      "at": "2026-10-23T18:06:31.555Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:06:37.012Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5109
+    },
+    {
+      "at": "2026-10-23T18:06:39.119Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:06:41.505Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5109
+    },
+    {
+      "at": "2026-10-23T18:06:43.961Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:06:46.846Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5252
+    },
+    {
+      "at": "2026-10-23T18:06:48.928Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:06:52.526Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5252
+    },
+    {
+      "at": "2026-10-23T18:06:55.273Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:06:59.124Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5289
+    },
+    {
+      "at": "2026-10-23T18:07:00.765Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:07:03.596Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5396
+    },
+    {
+      "at": "2026-10-23T18:07:08.816Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:07:11.515Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5393
+    },
+    {
+      "at": "2026-10-23T18:07:14.382Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:07:20.187Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5466
+    },
+    {
+      "at": "2026-10-23T18:07:21.715Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 178
+    },
+    {
+      "at": "2026-10-23T18:07:24.959Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5534
+    },
+    {
+      "at": "2026-10-23T18:07:30.857Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5534
+    },
+    {
+      "at": "2026-10-23T18:07:32.990Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 198
+    },
+    {
+      "at": "2026-10-23T18:07:36.169Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5538
+    },
+    {
+      "at": "2026-10-23T18:07:40.440Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5538
+    },
+    {
+      "at": "2026-10-23T18:07:42.497Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 181
+    },
+    {
+      "at": "2026-10-23T18:07:44.383Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5638
+    },
+    {
+      "at": "2026-10-23T18:07:49.331Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5638
+    },
+    {
+      "at": "2026-10-23T18:07:51.993Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 198
+    },
+    {
+      "at": "2026-10-23T18:07:56.266Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 6080
+    },
+    {
+      "at": "2026-10-23T18:07:58.902Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5659
+    },
+    {
+      "at": "2026-10-23T18:08:03.325Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5659
+    },
+    {
+      "at": "2026-10-23T18:08:05.272Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5659
+    },
+    {
+      "at": "2026-10-23T18:08:06.834Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5755
+    },
+    {
+      "at": "2026-10-23T18:08:09.974Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5755
+    },
+    {
+      "at": "2026-10-23T18:08:12.517Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5659
+    },
+    {
+      "at": "2026-10-23T18:08:22.085Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5659
+    },
+    {
+      "at": "2026-10-23T18:08:23.916Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5809
+    },
+    {
+      "at": "2026-10-23T18:08:25.242Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5755
+    },
+    {
+      "at": "2026-10-23T18:08:29.263Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5659
+    },
+    {
+      "at": "2026-10-23T18:08:31.069Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 5755
+    },
+    {
+      "at": "2026-10-23T18:08:34.402Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 179
+    },
+    {
+      "at": "2026-10-23T18:08:41.358Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 7823
+    },
+    {
+      "at": "2026-10-23T18:08:42.961Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6022
+    },
+    {
+      "at": "2026-10-23T18:08:46.050Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6022
+    },
+    {
+      "at": "2026-10-23T18:08:51.002Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6116
+    },
+    {
+      "at": "2026-10-23T18:08:55.705Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6022
+    },
+    {
+      "at": "2026-10-23T18:09:00.336Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6116
+    },
+    {
+      "at": "2026-10-23T18:09:04.412Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6022
+    },
+    {
+      "at": "2026-10-23T18:09:07.640Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6298
+    },
+    {
+      "at": "2026-10-23T18:09:09.330Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6311
+    },
+    {
+      "at": "2026-10-23T18:09:17.115Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 5868
+    },
+    {
+      "at": "2026-10-23T18:09:19.465Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 5707
+    },
+    {
+      "at": "2026-10-23T18:09:21.128Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 193
+    },
+    {
+      "at": "2026-10-23T18:09:31.238Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 6397
+    },
+    {
+      "at": "2026-10-23T18:09:33.155Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 5837
+    },
+    {
+      "at": "2026-10-23T18:09:35.687Z",
+      "model": "hy3",
+      "hasMemoryNote": true,
+      "memoryMentionsPeanut": true,
+      "systemBytes": 5837
+    },
+    {
+      "at": "2026-10-23T18:09:37.810Z",
+      "model": "hy3",
+      "hasMemoryNote": false,
+      "memoryMentionsPeanut": false,
+      "systemBytes": 215
+    }
+  ],
+  "passed": 16,
+  "total": 16,
+  "ok": true
+}

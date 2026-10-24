@@ -1,11 +1,13 @@
 import type { ComponentType } from 'react';
 import { ChatView } from './views/ChatView.tsx';
+import { FeedView } from './views/FeedView.tsx';
 import { QueueView } from './views/QueueView.tsx';
 import { ActivityView } from './views/ActivityView.tsx';
 import { ApprovalsView } from './views/ApprovalsView.tsx';
 import { EventsView } from './views/EventsView.tsx';
 import { ModelsView } from './views/ModelsView.tsx';
 import { LogsView } from './views/LogsView.tsx';
+import { ProfileView } from './views/ProfileView.tsx';
 
 /**
  * web-ui/src/views.tsx —— 七视图登记表（surfaces.md §7 主视图集）。
@@ -45,6 +47,12 @@ export const VIEWS: ViewDef[] = [
     Component: ChatView,
   },
   {
+    id: 'feed',
+    title: '动态',
+    source: 'GET /api/feed?limit= → tasks/approvals/crontabs/events/日历的只读时间线；GET /api/tasks/:id 看单条摘要',
+    Component: FeedView,
+  },
+  {
     id: 'queue',
     title: '队列',
     source: 'GET /api/queue?status=<csv> → cp.list() 投影；POST /api/queue/:id/cancel；SSE topics=queue',
@@ -79,6 +87,12 @@ export const VIEWS: ViewDef[] = [
     title: '日志',
     source: 'SSE /api/stream?topics=log；游标 bus_seq（Last-Event-ID 重连）',
     Component: LogsView,
+  },
+  {
+    id: 'profile',
+    title: '人格',
+    source: 'GET /api/memory/identity · PUT /api/memory/identity → /dot/home/IDENTITY.md（≤1 KB，每轮任务注入）',
+    Component: ProfileView,
   },
 ];
 

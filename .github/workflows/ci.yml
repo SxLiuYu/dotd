@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node deps
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Python deps (integration layer)
+        run: python -m pip install --disable-pip-version-check -r voice/requirements-integration.txt
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Full test suite
+        run: npm test
+        env:
+          DOTD_FLEET: stub
+          DOTD_MODEL_TRANSPORT: stub
+          CI: '1'
+
+      - name: Voice integration tests (bridge / router / memory / push / audio)
+        run: npm run voice:test
+        env:
+          DOTD_FLEET: stub
+          DOTD_MODEL_TRANSPORT: stub
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npm ci --no-audit --no-fund
+      - run: python -m pip install --disable-pip-version-check -r voice/requirements-integration.txt
+      - name: Clean-machine onboard
+        run: npm run setup:all:check
+        env:
+          DOTD_FLEET: stub

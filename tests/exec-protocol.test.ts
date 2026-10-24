@@ -103,7 +103,7 @@ test('端点表：八个 RUNTIME_PATHS 与契约逐字对应', () => {
 });
 
 test('能力目录：46 名工具（20 容器 + 1 记忆 + 8 宿主 mail + 7 日历（写 3 + 读 4）+ 4 连接器 + 1 保险库 + 3 浏览器 web.* + 2 搜索 search.*）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
-  assert.equal(CAPABILITY_CATALOG.length, 46); // 42 + fs.grep + memory.search + calendar.list + calendar.conflicts（2026-10-22）
+  assert.equal(CAPABILITY_CATALOG.length, 47); // 42 + fs.grep + memory.search + calendar.list + calendar.conflicts + ask（2026-10-22）
   const by = new Map(CAPABILITY_CATALOG.map((c) => [c.name, c]));
   const expect: Record<string, [string, number, string]> = {
     'fs.read': ['sync', 60_000, 'safe'],
@@ -111,6 +111,9 @@ test('能力目录：46 名工具（20 容器 + 1 记忆 + 8 宿主 mail + 7 日
     'fs.list': ['sync', 60_000, 'safe'],
     'fs.grep': ['sync', 60_000, 'safe'],
     'memory.search': ['sync', 60_000, 'safe'],
+    // 提问不是「重放安全」的问题，而是**这个调用本身不该被自动执行**：
+    // 它的产物是等主人回答。unknown 是契约 J2 里唯一贴切的取值。
+    ask: ['sync', 60_000, 'unknown'],
     'fs.stat': ['sync', 60_000, 'safe'],
     'shell.run': ['async', 1_800_000, 'unknown'],
     'browser.open': ['async', 1_800_000, 'unknown'],
@@ -403,6 +406,23 @@ test('stub runtime：进程重启后 doing → aborted，同 call_id 返回 inte
   }
 });
 
+test('stub runtime：能力目录里登记的工具必须能应答 —— tool.list 返回空清单而非 unknown_tool', async () => {
+  const t = makeTempDataDir();
+  try {
+    const svc = new ExecServiceImpl({ db: t.db, bus: t.bus, cfg: { tokenDir: t.root } });
+    await svc.boot(['dot-a']);
+    // 前提：目录里确实登记了它（否则这条测试就没意义）
+    assert.equal(findCapability('tool.list') !== null, true);
+
+    const r = await svc.runTool(call({ call_id: 'c-tl', tool: 'tool.list', args: {} }));
+    assert.equal(r.status, 'ok');
+    // 首次派发返回明文载荷（重放才只回 result_hash）
+    assert.deepEqual((r.result as { tools?: unknown[] }).tools, []);
+  } finally {
+    t.cleanup();
+  }
+});
+
 test('stub runtime：fs.read 超过 4MB → too_large；路径越界 → path_outside_home', async () => {
   const t = makeTempDataDir();
   try {
@@ -530,7 +550,7 @@ test('getCapabilities：容器 /capabilities 优先，回退宿主 catalog；形
     // （回退路径整目录可见）
     // 2026-10-22：fs.grep 进容器侧（19 → 20）。它是模型主动找回过去的手段，
     // 见 MemoryService 摘要修复与 Letta 的 LoCoMo 结论。
-    assert.equal(caps.length, 46);
+    assert.equal(caps.length, 47);
     for (const c of caps) {
       assert.ok(['safe', 'replayable', 'unknown'].includes(c.sideEffect));
       assert.ok(['sync', 'async'].includes(c.mode));

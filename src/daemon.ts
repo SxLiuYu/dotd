@@ -111,6 +111,7 @@ import type { MemoryServiceImpl } from './memory/MemoryService.ts';
 import { assertHttpConfig, startHttpServer } from './surfaces/http.ts';
 import { loadSurfacesConfig } from './surfaces/config.ts';
 import { SseBus } from './surfaces/sse.ts';
+import { accountDeviceTaskTokens } from './surfaces/device-usage.ts';
 import {
   NULL_TELEGRAM_GATEWAY,
   NULL_FEISHU_GATEWAY,
@@ -123,6 +124,8 @@ import { briefDayKey } from './surfaces/daily-brief.ts';
 import { startDailyBriefPush } from './surfaces/daily-brief-push.ts';
 import { startConnectionWatch } from './surfaces/connection-watch-push.ts';
 import { buildBrief, buildConnectionsView, type InsightDeps } from './surfaces/insight.ts';
+import { collectFeed } from './surfaces/feed.ts';
+import { collectProof } from './surfaces/proof.ts';
 import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
 
 /** A2：保险库目录（DOTD_VAULT_DIR 可覆盖；缺省 /root/.dotd——钥匙也在那台机上）。 */
@@ -676,6 +679,12 @@ function memPortOf(memory: MemoryServiceImpl): MemoryPort {
     // 长会话只能靠 8000 token 硬裁，越聊越记不住开头。
     // Runner 侧日志形如：DIAG-SUM ... hasFn=false。
     refreshContextSummary: (threadId) => memory.refreshContextSummary(threadId),
+    // M3（2026-10-23）：人格文件读写。必须转发 —— 不然 HTTP 层拿到的是 undefined，
+    // `/api/memory/identity` 会一律 501（与 2026-10-19 摘要那次漏转发同型）。
+    readIdentity: (dotId) => memory.readIdentity(dotId),
+    writeIdentity: (dotId, text) => memory.writeIdentity(dotId, text),
+    // M4（2026-10-24）：旧记忆导入落成一条笔记。同样必须转发（漏转发 = 501）。
+    writeNote: (dotId, path, text) => memory.writeNote(dotId, path, text),
   };
 }
 
@@ -773,10 +782,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 190）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 212）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 190 });
+    const res = migrate(db, { expectedVersion: 212 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -815,6 +824,21 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     },
   });
   sseBus.attach();
+
+  // ②b 设备 token 配额记账（阶段 3）：语音任务到终态时，把 tasks.usage_tokens 的
+  //    增量记到设备当天用量上。非语音任务（thread 无 external_ref）自动跳过；
+  //    幂等由 device_token_ledger 保证（任务重跑/终态事件重复都不会重复计费）。
+  bus.on('task.state', (ev) => {
+    const p = ev.payload as { taskId?: unknown; to?: unknown } | null;
+    if (typeof p?.taskId !== 'string') return;
+    if (p.to !== 'done' && p.to !== 'failed' && p.to !== 'cancelled') return;
+    try {
+      accountDeviceTaskTokens(db, p.taskId);
+    } catch (err) {
+      // 记账失败不能影响任务收口；下一条终态事件会再试（ledger 保证不重复）
+      process.emitWarning(`[device-usage] 记账失败 ${p.taskId}：${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
 
   // ③ CP（先建：其余模块的回调都指向它）。sealTask 钩子经 holder 惰性取 MEM
   //    （契约 M3：MEM 在 CP 之后 init，但 Queue.finish 运行期才调钩子）；
@@ -1881,6 +1905,14 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       httpHost: surfCfg.http.host,
       httpPort: surfCfg.http.port,
     });
+  // M1（2026-10-23）：动态投影。与 brief/connections 共用同一份取数口径；
+  // 只读，不参与任何推送决策（「该不该打扰」仍归 proactive/progress 三道闸）。
+  const feedOf = (nowMs: number = Date.now(), opts: { limit?: number; since?: number } = {}) =>
+    collectFeed({ db, calendarDir: insightDeps.calendarDir }, nowMs, opts);
+  // P1（2026-10-23）：执行凭证。只读投影，默认不含明文参数。
+  // cp.getTask/getJournal 是唯一事实源；exec_calls 提供记账哈希。
+  const proofOf = (taskId: string, opts: { includeArgs?: boolean } = {}) =>
+    collectProof(db, cp, taskId, Date.now(), opts.includeArgs === true);
 
   const server = await startHttpServer({
     db,
@@ -1916,6 +1948,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     // D1/D3：同一份取数闭包同时供 HTTP（`dotd brief` / `dotd connections`）与飞书推送。
     brief: briefOf,
     connections: connectionsOf,
+    // M1：动态页（只读投影；Web / `dotd feed` 共用一个入口）。
+    feed: feedOf,
+    proof: proofOf,
     webRoot: cfg.webRoot,
     // §5.7 求救自检要真值：顺序/兜底文件直接从 router 的 alerts 配置取，
     // 不让 /api/channels 与 `dotd sos-test` 拿编译期默认值猜（2026-10-17）。

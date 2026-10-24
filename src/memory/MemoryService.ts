@@ -48,7 +48,9 @@ import {
   isNotePath,
   isReadonlyPhase,
   isReservedPath,
+  HOME_IDENTITY,
   LIMIT_HOME_BYTES,
+  LIMIT_IDENTITY_MD,
   normalizeHomePath,
   isMemoryPath,
   SUMMARIZE_MESSAGE_THRESHOLD,
@@ -648,6 +650,7 @@ export class MemoryServiceImpl implements MemoryService {
     }
     return {
       memoryMd: bundle.memoryMd,
+      identityMd: bundle.identityMd,
       manualExcerpts: bundle.manualExcerpts,
       summary: bundle.summary,
       recentMessages: bundle.recentMessages,
@@ -850,6 +853,82 @@ export class MemoryServiceImpl implements MemoryService {
       }
     }
     return ok;
+  }
+
+  /**
+   * 读人格文件（M3）。文件不存在 = null，不是错误 —— 大多数主人不会写它。
+   */
+  async readIdentity(dotId: string): Promise<string | null> {
+    const text = await this.bridge.read(dotId, HOME_IDENTITY);
+    return text === null ? null : text;
+  }
+
+  /**
+   * 写人格文件（M3）：≤1 KB，覆盖写。
+   *
+   * 为什么走 homeWriter 而不是 bridge：FsOpsBridge 是只读面（契约 S4' 无 write），
+   * 覆盖写由工具层 fs.write 承担（自动建父目录、过沙箱护栏）。
+   * 不进 mem_files_index：IDENTITY.md 不是笔记，不该被 FS 检索/整理任务碰到。
+   */
+  async writeIdentity(dotId: string, text: string): Promise<MemoryWriteResult> {
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes > LIMIT_IDENTITY_MD.hard) {
+      return {
+        ok: false,
+        error: 'HARD_LIMIT',
+        warning: `IDENTITY.md 上限 ${LIMIT_IDENTITY_MD.hard} 字节（当前 ${bytes}），请删到 1 KB 以内`,
+      };
+    }
+    if (this.homeWriter === null) {
+      return {
+        ok: false,
+        error: 'READONLY_PHASE',
+        warning: '容器写入通道未就绪（homeWriter 未注入）——稍后再试，或先确认容器在跑',
+      };
+    }
+    const written = await this.writeHomeFile(dotId, HOME_IDENTITY, text);
+    return written
+      ? { ok: true }
+      : {
+          ok: false,
+          error: 'HARD_LIMIT',
+          warning: '写入失败：容器不可达或 fs.write 被拒',
+        };
+  }
+
+  /**
+   * 写一条笔记（M4，2026-10-24）：旧记忆导入用。
+   *
+   * 与 writeIdentity 的差别：
+   *  - 只接受 `notes/YYYY-MM-DD-<slug>.md`（limits.ts 的 NOTE_NAME_RE）；
+   *  - 过 beforeWrite 的全部限额（单文件 16 KB、notes 计数、home 容量）；
+   *  - **进 mem_files_index**（笔记就是要被检索/整理的）；
+   *  - 不碰 MEMORY.md —— 导入的原始快照先落成事实，整理交给一次正常任务。
+   */
+  async writeNote(dotId: string, path: HomeRelPath, text: string): Promise<MemoryWriteResult> {
+    const norm = normalizeHomePath(path);
+    if (norm === null || !isNotePath(norm)) {
+      return {
+        ok: false,
+        error: 'HARD_LIMIT',
+        warning: `笔记路径不合规（需要 notes/YYYY-MM-DD-<slug>.md）：${path}`,
+      };
+    }
+    const base = await this.beforeWrite(dotId, norm, text);
+    if (!base.ok) return base;
+    if (this.homeWriter === null) {
+      return {
+        ok: false,
+        error: 'READONLY_PHASE',
+        warning: '容器写入通道未就绪（homeWriter 未注入）——稍后再试，或先确认容器在跑',
+      };
+    }
+    const written = await this.writeHomeFile(dotId, norm, text);
+    if (!written) {
+      return { ok: false, error: 'HARD_LIMIT', warning: '写入失败：容器不可达或 fs.write 被拒' };
+    }
+    this.reconcileSeedIndex(dotId, norm, text);
+    return { ok: true };
   }
 
   async searchHome(

@@ -334,6 +334,13 @@ export class StubRuntime implements RuntimeClient {
     if (handler !== undefined) return handler(call, this.ctx());
 
     switch (call.tool) {
+      case 'tool.list': {
+        // 能力目录（CAPABILITY_CATALOG）里登记了 tool.list，stub 就必须能应答：
+        // 2026-10-23 Docker 验收里每个语音任务留下 14 次 unknown_tool，
+        // 因为 runner 的工具清单注入每轮都会查一次。镜像模拟没有 tools 目录，
+        // 所以答案是「没有自造工具」，而不是报错。
+        return done({ tools: [] });
+      }
       case 'fs.read': {
         const p = this.resolve(call.args.path);
         if (p === null) return fail(this.resolveErr(call.args.path), `路径不被允许：${String(call.args.path)}`);

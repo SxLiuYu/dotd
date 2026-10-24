@@ -368,3 +368,178 @@ test('/api/connections：没有 token → 401（总览里有端点与配置项�
     await close(h);
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// 四、M1 动态 / M3 人格（2026-10-23）
+// ═══════════════════════════════════════════════════════════════════
+
+test('/api/feed：装配缺 provider → 503（不回空时间线冒充「今天没事」）', async () => {
+  const h = await startServer();
+  try {
+    const res = await fetch(`${h.base}/api/feed`, { headers: auth });
+    assert.equal(res.status, 503);
+    assert.match(await res.text(), /动态/);
+  } finally {
+    await close(h);
+  }
+});
+
+test('/api/feed：provider 透传 limit/since，200 回 { items, generatedAt }', async () => {
+  const seen: Array<{ nowMs?: number; opts?: { limit?: number; since?: number } }> = [];
+  const h = await startServer({
+    feed: (nowMs, opts) => {
+      seen.push({ nowMs, opts });
+      return {
+        items: [
+          {
+            id: 'task:tk_1',
+            kind: 'task' as const,
+            at: 1,
+            title: '办完了：测试',
+            body: null,
+            attention: 'low' as const,
+            taskId: 'tk_1',
+            approvalId: null,
+            provenance: { source: 'owner' as const, ref: 'task:tk_1' },
+            action: null,
+          },
+        ],
+        generatedAt: 123,
+      };
+    },
+  });
+  try {
+    const res = await fetch(`${h.base}/api/feed?limit=10&since=5`, { headers: auth });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { items: unknown[]; generatedAt: number };
+    assert.equal(body.items.length, 1);
+    assert.equal(body.generatedAt, 123);
+    assert.equal(seen[0]?.opts?.limit, 10);
+    assert.equal(seen[0]?.opts?.since, 5);
+  } finally {
+    await close(h);
+  }
+});
+
+test('/api/memory/identity：装配缺实现 → 501（不假装空人格）', async () => {
+  const h = await startServer();
+  try {
+    const res = await fetch(`${h.base}/api/memory/identity`, { headers: auth });
+    assert.equal(res.status, 501);
+    assert.match(await res.text(), /人格/);
+  } finally {
+    await close(h);
+  }
+});
+
+test('/api/memory/identity：GET 读、PUT 写，形状与上限对得上', async () => {
+  let stored = '叫主人老张。';
+  const mem: MemoryPort = {
+    ...fakeMem,
+    readIdentity: () => Promise.resolve(stored),
+    writeIdentity: (_dotId, text) => {
+      stored = text;
+      return Promise.resolve({ ok: true });
+    },
+  };
+  const h = await startServer({ mem });
+  try {
+    const get = await fetch(`${h.base}/api/memory/identity`, { headers: auth });
+    assert.equal(get.status, 200);
+    const got = (await get.json()) as { text: string; exists: boolean; limitBytes: number; path: string };
+    assert.equal(got.text, '叫主人老张。');
+    assert.equal(got.exists, true);
+    assert.equal(got.limitBytes, 1024);
+    assert.equal(got.path, 'IDENTITY.md');
+
+    const put = await fetch(`${h.base}/api/memory/identity`, {
+      method: 'PUT',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: '语气简短。' }),
+    });
+    assert.equal(put.status, 200);
+    assert.equal(stored, '语气简短。');
+
+    const bad = await fetch(`${h.base}/api/memory/identity`, {
+      method: 'PUT',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 123 }),
+    });
+    assert.equal(bad.status, 400);
+  } finally {
+    await close(h);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// P1（2026-10-23）：GET /api/tasks/:id/proof —— 执行凭证
+// ═══════════════════════════════════════════════════════════════════
+
+test('/api/tasks/:id/proof：装配缺投影 → 503，明说缺哪条腿', async () => {
+  const h = await startServer();
+  try {
+    const res = await fetch(`${h.base}/api/tasks/tk1/proof`, { headers: auth });
+    assert.equal(res.status, 503);
+    assert.match(await res.text(), /凭证/);
+  } finally {
+    await close(h);
+  }
+});
+
+test('/api/tasks/:id/proof：任务不存在 → 404；存在 → 200 且默认不带明文参数', async () => {
+  const seen: Array<{ id: string; includeArgs: boolean | undefined }> = [];
+  const bundle = {
+    version: 1 as const,
+    generatedAt: 123,
+    task: {
+      id: 'tk1',
+      dotId: 'dot1',
+      title: '核对报价单',
+      goal: '核对',
+      status: 'done',
+      priority: 1,
+      attempt: 1,
+      runEpoch: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      stopReason: null,
+    },
+    result: { ok: true, summary: '完成' },
+    steps: [],
+    approvals: [],
+    modelCalls: [],
+    audit: [],
+    counts: {
+      steps: 0,
+      toolSteps: 0,
+      failedSteps: 0,
+      approvals: 0,
+      modelCalls: 0,
+      hashMismatches: 0,
+      hashUnverifiable: 0,
+    },
+    bundleHash: 'a'.repeat(64),
+  };
+  const h = await startServer({
+    proof: (id: string, opts?: { includeArgs?: boolean }) => {
+      seen.push({ id, includeArgs: opts?.includeArgs });
+      return id === 'tk1' ? bundle : null;
+    },
+  });
+  try {
+    const ok = await fetch(`${h.base}/api/tasks/tk1/proof`, { headers: auth });
+    assert.equal(ok.status, 200);
+    const body = (await ok.json()) as { bundleHash: string; steps: unknown[] };
+    assert.equal(body.bundleHash, 'a'.repeat(64));
+    assert.equal(seen[0]?.includeArgs, false, '默认绝不带明文参数');
+
+    const withArgs = await fetch(`${h.base}/api/tasks/tk1/proof?args=1`, { headers: auth });
+    assert.equal(withArgs.status, 200);
+    assert.equal(seen[1]?.includeArgs, true);
+
+    const missing = await fetch(`${h.base}/api/tasks/nope/proof`, { headers: auth });
+    assert.equal(missing.status, 404);
+  } finally {
+    await close(h);
+  }
+});

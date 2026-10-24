@@ -1,0 +1,131 @@
+{
+  "ok": true,
+  "device": {
+    "id": "dev_2e2d3b9cf0a39ab4",
+    "name": "fake-dev-7f9d"
+  },
+  "runs": 5,
+  "passed": 5,
+  "firstDeltaP50Ms": 4800,
+  "endToEndP50Ms": 10976,
+  "endToEndP95Ms": 23459,
+  "proofSteps": 2,
+  "bundleHash": "558ec58f826c33ace9d657455c2e03de8566b66277e3c8d290ace4a502227910",
+  "results": [
+    {
+      "index": 0,
+      "ok": true,
+      "taskId": "tk_mvlv7p97hnqwbi",
+      "threadId": "thr_01M5P0QQMPN0Z960V2TT6NMM7A",
+      "deviceId": "dev_2e2d3b9cf0a39ab4",
+      "status": "done",
+      "firstDeltaMs": 4800,
+      "endToEndMs": 8396,
+      "reply": "3+5 等于 8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "558ec58f826c33ace9d657455c2e03de8566b66277e3c8d290ace4a502227910",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_2e2d3b9cf0a39ab4",
+          "name": "fake-dev-7f9d",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 1,
+      "ok": true,
+      "taskId": "tk_mvlv7wa1p4cjpk",
+      "threadId": "thr_01M5P0QQMPN0Z960V2TT6NMM7A",
+      "deviceId": "dev_2e2d3b9cf0a39ab4",
+      "status": "done",
+      "firstDeltaMs": 18486,
+      "endToEndMs": 23459,
+      "reply": "3+5 等于 8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "470ed24be743fb3496007fa3fcabe87925d3bd1ad827d496c1caa498b9f54ba8",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_2e2d3b9cf0a39ab4",
+          "name": "fake-dev-7f9d",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 2,
+      "ok": true,
+      "taskId": "tk_mvlv8exkn05y1c",
+      "threadId": "thr_01M5P0QQMPN0Z960V2TT6NMM7A",
+      "deviceId": "dev_2e2d3b9cf0a39ab4",
+      "status": "done",
+      "firstDeltaMs": 3776,
+      "endToEndMs": 5120,
+      "reply": "3+5 等于 8。\n\n（这已经是第三次问同一个问题了——如果你是在测试我的稳定性，答案不会变。）",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "fb7f7f83c02f3a4e6918ebb1576029d8671ac93ef18d2a52622bdb42b3380b62",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_2e2d3b9cf0a39ab4",
+          "name": "fake-dev-7f9d",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 3,
+      "ok": true,
+      "taskId": "tk_mvlv8jfe6kxt6v",
+      "threadId": "thr_01M5P0QQMPN0Z960V2TT6NMM7A",
+      "deviceId": "dev_2e2d3b9cf0a39ab4",
+      "status": "done",
+      "firstDeltaMs": 3718,
+      "endToEndMs": 10976,
+      "reply": "3+5 等于 8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "37d4c24e9be145dc6715ab87a18b5111ebb839256e89f830ef66290321e0bae4",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_2e2d3b9cf0a39ab4",
+          "name": "fake-dev-7f9d",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 4,
+      "ok": true,
+      "taskId": "tk_mvlv8sg39na86x",
+      "threadId": "thr_01M5P0QQMPN0Z960V2TT6NMM7A",
+      "deviceId": "dev_2e2d3b9cf0a39ab4",
+      "status": "done",
+      "firstDeltaMs": 6883,
+      "endToEndMs": 16369,
+      "reply": "3+5 等于 8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "123a8d1e2d0665fe33a4966e9b047f809947d413e103dced160023886ca1963f",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_2e2d3b9cf0a39ab4",
+          "name": "fake-dev-7f9d",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    }
+  ]
+}

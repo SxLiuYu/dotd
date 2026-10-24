@@ -3,6 +3,14 @@ node_modules/
 .pnp.*
 .yarn/
 
+# Python（语音集成层）
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# dotd 是唯一事实源：Charlie 侧只留缓存文件，不入库
+voice/integration/memory-cache.json
+
 # 构建产物
 dist/
 *.tsbuildinfo
@@ -72,3 +80,6 @@ docs/acceptance/soak-day0.txt
 
 # quarantine for stray files written by mis-encoded script paths
 _quarantine-*/
+
+# 合并评估用的上游 git 历史（不在 voice/ 内，避免嵌套仓库）
+.merge-src/

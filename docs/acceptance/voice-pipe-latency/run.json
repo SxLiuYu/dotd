@@ -1,0 +1,142 @@
+{
+  "generatedAt": "2026-10-23T17:06:26.253Z",
+  "upstream": {
+    "ttftMs": 300,
+    "chunks": 8,
+    "gapMs": 40
+  },
+  "runs": 5,
+  "exit": 0,
+  "result": {
+    "ok": true,
+    "device": {
+      "id": "dev_866a4021435963a3",
+      "name": "fake-dev-66fd"
+    },
+    "runs": 5,
+    "passed": 5,
+    "firstDeltaP50Ms": 771,
+    "endToEndP50Ms": 1102,
+    "endToEndP95Ms": 1480,
+    "proofSteps": 2,
+    "bundleHash": "09b1e5cb53ee9ea10e89b047b88c19355ff941313d9b27249e7a3cbc8e6a6582",
+    "results": [
+      {
+        "index": 0,
+        "ok": true,
+        "taskId": "tk_mvl81w4s38pf7r",
+        "threadId": "thr_01M5MVMH76HPP4VY8PMWTXVFRN",
+        "deviceId": "dev_866a4021435963a3",
+        "status": "done",
+        "firstDeltaMs": 1413,
+        "endToEndMs": 1480,
+        "reply": "我在，这是一句固定",
+        "streamReason": "stream closed",
+        "proof": {
+          "bundleHash": "09b1e5cb53ee9ea10e89b047b88c19355ff941313d9b27249e7a3cbc8e6a6582",
+          "steps": 2,
+          "approvals": 0,
+          "device": {
+            "id": "dev_866a4021435963a3",
+            "name": "fake-dev-66fd",
+            "status": "active",
+            "channel": "voice"
+          }
+        }
+      },
+      {
+        "index": 1,
+        "ok": true,
+        "taskId": "tk_mvl81xtfkcam8f",
+        "threadId": "thr_01M5MVMH76HPP4VY8PMWTXVFRN",
+        "deviceId": "dev_866a4021435963a3",
+        "status": "done",
+        "firstDeltaMs": 796,
+        "endToEndMs": 1102,
+        "reply": "我在，这是一句固定",
+        "streamReason": "stream closed",
+        "proof": {
+          "bundleHash": "bd500ac02353dd0b829013fc28ec585e4f979f64691589dcbd13bad876d3bbf6",
+          "steps": 2,
+          "approvals": 0,
+          "device": {
+            "id": "dev_866a4021435963a3",
+            "name": "fake-dev-66fd",
+            "status": "active",
+            "channel": "voice"
+          }
+        }
+      },
+      {
+        "index": 2,
+        "ok": true,
+        "taskId": "tk_mvl81z7sti1jhh",
+        "threadId": "thr_01M5MVMH76HPP4VY8PMWTXVFRN",
+        "deviceId": "dev_866a4021435963a3",
+        "status": "done",
+        "firstDeltaMs": 565,
+        "endToEndMs": 776,
+        "reply": "我在，这是一句固定",
+        "streamReason": "stream closed",
+        "proof": {
+          "bundleHash": "c6e73bddc18270ee436c2979ffb7c7eda95ecfa729909fc89d42a74f0f720493",
+          "steps": 2,
+          "approvals": 0,
+          "device": {
+            "id": "dev_866a4021435963a3",
+            "name": "fake-dev-66fd",
+            "status": "active",
+            "channel": "voice"
+          }
+        }
+      },
+      {
+        "index": 3,
+        "ok": true,
+        "taskId": "tk_mvl820d16gc6as",
+        "threadId": "thr_01M5MVMH76HPP4VY8PMWTXVFRN",
+        "deviceId": "dev_866a4021435963a3",
+        "status": "done",
+        "firstDeltaMs": 659,
+        "endToEndMs": 746,
+        "reply": "我在，这是一句固定",
+        "streamReason": "stream closed",
+        "proof": {
+          "bundleHash": "bdd8ff0d38dc7ec518dc70744dac5a23848a68b8371b333b833aac3886e8bbb8",
+          "steps": 2,
+          "approvals": 0,
+          "device": {
+            "id": "dev_866a4021435963a3",
+            "name": "fake-dev-66fd",
+            "status": "active",
+            "channel": "voice"
+          }
+        }
+      },
+      {
+        "index": 4,
+        "ok": true,
+        "taskId": "tk_mvl821hkndrjpa",
+        "threadId": "thr_01M5MVMH76HPP4VY8PMWTXVFRN",
+        "deviceId": "dev_866a4021435963a3",
+        "status": "done",
+        "firstDeltaMs": 771,
+        "endToEndMs": 1140,
+        "reply": "我在，这是一句固定",
+        "streamReason": "stream closed",
+        "proof": {
+          "bundleHash": "550dcf28d6d320044bd01beff60854d73447868ae306fef65a41daf13565aada",
+          "steps": 2,
+          "approvals": 0,
+          "device": {
+            "id": "dev_866a4021435963a3",
+            "name": "fake-dev-66fd",
+            "status": "active",
+            "channel": "voice"
+          }
+        }
+      }
+    ]
+  },
+  "stderr": ""
+}

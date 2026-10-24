@@ -13,6 +13,9 @@ import react from '@vitejs/plugin-react';
  * - 生产构建产物由 surfaces 的 web.ts 静态托管（SF §5.2 路径表）。
  */
 export default defineConfig({
+  // 一套系统（2026-10-23）：相对 base 让产物既能挂在 dotd 根路径，也能挂在
+  // Charlie 的 /console/ 前缀下。hash 路由不依赖绝对路径。
+  base: './',
   plugins: [react()],
   server: {
     port: 5173,

@@ -1,0 +1,214 @@
+{
+  "generatedAt": "2026-10-23T16:57:05.222Z",
+  "model": "hy3 @ 172.17.48.1:13065 (real HTTP, no stub)",
+  "latency": {
+    "status": 0,
+    "json": {
+      "ok": true,
+      "device": {
+        "id": "dev_434a78a0bda68810",
+        "name": "fake-dev-ce04"
+      },
+      "runs": 8,
+      "passed": 8,
+      "firstDeltaP50Ms": 2574,
+      "endToEndP50Ms": 5850,
+      "endToEndP95Ms": 8765,
+      "proofSteps": 2,
+      "bundleHash": "14fa123ad5534b00c0e374a9ec0be3ed14895957ed96e88ba700b90d37dbe98f",
+      "results": [
+        {
+          "index": 0,
+          "ok": true,
+          "taskId": "tk_mvl7ou410oa9qd",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 4531,
+          "endToEndMs": 6946,
+          "reply": "我能帮你做文件读写与命令执行、联网搜索与网页浏览、邮件/日历/日程管理、GitHub 通知查看、定时任务设定，以及把重复活沉淀成可复用工具等本地开发与日常自动化事务。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "14fa123ad5534b00c0e374a9ec0be3ed14895957ed96e88ba700b90d37dbe98f",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 1,
+          "ok": true,
+          "taskId": "tk_mvl7p00qja83pl",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2574,
+          "endToEndMs": 5850,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "71fa051eea44e68859eaef4d9d52b852bc10f2a7aea76675fc5ad998d1545cec",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 2,
+          "ok": true,
+          "taskId": "tk_mvl7p5364nvkix",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2401,
+          "endToEndMs": 6218,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "dd30e68b17387d3590fc576bbc8f48635107a1b937330662aafa28eb55cfc4e1",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 3,
+          "ok": true,
+          "taskId": "tk_mvl7pafrv64u5b",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2375,
+          "endToEndMs": 6577,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "363777a311d1ad875bdda004c4f5d2c4266d2e4cd1b86d8d950ee8ac460f323d",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 4,
+          "ok": true,
+          "taskId": "tk_mvl7pg2dv1g4tw",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2721,
+          "endToEndMs": 5845,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "c4e37375472027d78c5afca64faa4899415e96012aa4496e87b052b9ac42bcca",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 5,
+          "ok": true,
+          "taskId": "tk_mvl7pl4ks8opvl",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2531,
+          "endToEndMs": 5137,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "b38be5b07fa55ae47a69283a665f398758c5346ea54ed97d2e4484825241935f",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 6,
+          "ok": true,
+          "taskId": "tk_mvl7ppn632nl5d",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2605,
+          "endToEndMs": 8765,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "70824e44e23d7cc683c6c391906a75e38ba42c117dbb8a6e4c399641ced34c1c",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        },
+        {
+          "index": 7,
+          "ok": true,
+          "taskId": "tk_mvl7pwykx5g9qt",
+          "threadId": "thr_01M5MV1YBA0DWHSCM85E41A0T2",
+          "deviceId": "dev_434a78a0bda68810",
+          "status": "done",
+          "firstDeltaMs": 2831,
+          "endToEndMs": 5848,
+          "reply": "我能帮你做文件与命令处理、联网搜索和网页操作、邮件/日历/日程与 GitHub 管理、定时任务，以及把重复活做成可复用工具等本地开发和日常自动化事情。",
+          "streamReason": "stream closed",
+          "proof": {
+            "bundleHash": "555d8cab57f1b004881139c5d47cc59e7c632643618bbdc1f5d58e7f5f7173f9",
+            "steps": 2,
+            "approvals": 0,
+            "device": {
+              "id": "dev_434a78a0bda68810",
+              "name": "fake-dev-ce04",
+              "status": "active",
+              "channel": "voice"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "toolTask": {
+    "run": {
+      "status": 0,
+      "json": null
+    },
+    "proof": null
+  }
+}

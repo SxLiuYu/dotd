@@ -29,6 +29,14 @@ export interface FileLimit {
 
 /** §3.4 表：MEMORY.md 软 3 KB / 硬 4 KB。 */
 export const LIMIT_MEMORY_MD: FileLimit = { soft: 3 * 1024, hard: 4 * 1024 };
+/**
+ * 人格文件（M3，2026-10-23）：1 KB 硬上限。
+ *
+ * 为什么不并进 MEMORY.md：那是「关于主人的事实」，这是「它该怎么跟主人说话」。
+ * 两者变化频率不同、预算也该分开；人格每轮都注入，1 KB 是刻意的紧箍咒——
+ * 写成长篇大论就不再是人格，而是 prompt 垃圾。
+ */
+export const LIMIT_IDENTITY_MD: FileLimit = { soft: 768, hard: 1024 };
 /** §3.4 表：单个 note / manual 软 8 KB / 硬 16 KB。 */
 export const LIMIT_NOTE_OR_MANUAL: FileLimit = { soft: 8 * 1024, hard: 16 * 1024 };
 /** §3.4 表：notes/ 未归档文件数软 60 / 硬 120（触发强制整理 §4.5）。 */
@@ -86,6 +94,8 @@ export function tokensOfText(text: string): number {
 export const RESERVED_PREFIXES = ['.dotd/', '.tmp/', '.archive/'] as const;
 
 export const HOME_INDEX_ROOT = 'MEMORY.md';
+/** 人格文件（M3）：与 MEMORY.md 同级，但**不进** mem_files_index（它不是笔记，不参与检索）。 */
+export const HOME_IDENTITY = 'IDENTITY.md';
 export const HOME_NOTES_DIR = 'notes/';
 export const HOME_MANUALS_DIR = 'manuals/';
 

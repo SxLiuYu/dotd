@@ -1,0 +1,41 @@
+# mcp-servers.voice.yml —— 把 Charlie 的宿主工具接进 dotd（2026-10-23）
+#
+# ⚠ 默认**不生效**。启用方式（二选一）：
+#   A. 把下面内容并进 config/mcp-servers.yml 的 servers 列表；
+#   B. 启动 daemon 时指定：DOTD_MCP_CONFIG=config/mcp-servers.voice.yml
+#
+# 前置条件：
+#   - Python 3.11+，且装了 Charlie 的 requirements-core（至少 `mcp`、`requests`）；
+#   - 从**仓库根目录**启动 daemon（下面的 args 是相对路径）；
+#     如果你的 cwd 不是仓库根，把 args 改成绝对路径。
+#
+# 安全语义（不要放宽）：
+#   - mcp.call 在 dotd 里是 dangerous 档，每次调用都要主人审批；
+#   - allow_tools 是白名单：server 后来多出工具，模型也调不到；
+#   - 这些 server 跑在**宿主**（不是容器），因为它们要碰红外/涂鸦/ESP32。
+
+servers:
+  - name: charlie-scenes
+    command: python
+    args: ["voice/charlie/magic-scenes.py"]
+    timeout_ms: 60000
+    allow_tools:
+      - goodnight
+      - good_morning
+      - movie_time
+      - leaving_home
+      - execute_scene
+      - list_protocols
+
+  - name: charlie-reminders
+    command: python
+    args: ["voice/charlie/magic-reminder.py"]
+    timeout_ms: 30000
+    allow_tools:
+      - add_reminder
+      - list_reminders
+      - delete_reminder
+      - set_timer
+      - get_calendar_today
+      - schedule_task
+      - list_alarms

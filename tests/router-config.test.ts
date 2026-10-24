@@ -395,3 +395,52 @@ alerts:
     assert.ok(fromCrlf.routing.light_events.length > 0, '续行列表不能被 CRLF 吞掉');
   });
 });
+// ═══════════════════════════════════════════════════════════════════
+// extra_body：端点级额外请求字段（2026-10-23，语音首句延迟）
+// ═══════════════════════════════════════════════════════════════════
+
+describe('extra_body：行内嵌套映射与字面量还原', () => {
+  it('解析 chat_template_kwargs.enable_thinking=false 为真布尔（"false" 字符串会骗过 Jinja）', () => {
+    const cfg = parseModelsYaml(
+      [
+        'version: 1',
+        'endpoints:',
+        '  - id: qwen-fast',
+        '    tier: 1',
+        '    base_url: http://127.0.0.1:9999/v1',
+        '    api_key_env: none',
+        '    models: { primary: Qwen3.8-Flash, light: Qwen3.8-Flash }',
+        '    extra_body: { chat_template_kwargs: { enable_thinking: false }, top_k: 20 }',
+        '',
+      ].join('\n'),
+    );
+    const ep = cfg.endpoints.find((e) => e.id === 'qwen-fast');
+    assert.ok(ep !== undefined, '端点应被解析');
+    assert.deepEqual(ep.extraBody, { chat_template_kwargs: { enable_thinking: false }, top_k: 20 });
+    assert.equal(
+      (ep.extraBody as { chat_template_kwargs: { enable_thinking: unknown } }).chat_template_kwargs
+        .enable_thinking,
+      false,
+      '必须是 boolean false，不能是字符串 "false"',
+    );
+    assert.equal((ep.extraBody as { top_k: unknown }).top_k, 20, '数字要还原成 number');
+  });
+
+  it('没写 extra_body 的端点不带这个键（老配置逐字不变）', () => {
+    const cfg = parseModelsYaml(
+      [
+        'version: 1',
+        'endpoints:',
+        '  - id: plain',
+        '    tier: 1',
+        '    base_url: http://127.0.0.1:9999/v1',
+        '    api_key_env: none',
+        '    models: { primary: m, light: m }',
+        '',
+      ].join('\n'),
+    );
+    const ep = cfg.endpoints.find((e) => e.id === 'plain');
+    assert.ok(ep !== undefined);
+    assert.equal(ep.extraBody, undefined);
+  });
+});

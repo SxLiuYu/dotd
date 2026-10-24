@@ -505,6 +505,35 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
   },
   {
     /**
+     * 宿主侧工具：**主动向主人提问**（2026-10-22 第 7 轮补，Muse §2.1 的最后一格）。
+     *
+     * 为什么必须有：在这之前，模型缺参数时只有三条路 —— 自己编一个、用 browser 到处试、
+     * 或者说「做不了」。而 Muse 原文的场景（「帮我寄个快递」但没给地址）它应当**停下来问**。
+     *
+     * 为什么不用审批面顶替：`/api/approvals` 管的是「这个动作准不准做」，
+     * 不是「这个信息你还没给」。两者混为一谈正是文档里那个假 ✅ 的来源（见
+     * docs/gap-vs-muse-dots.md §2.5）。所以这里签发的是 `kind='question'` 单 ——
+     * 同一个状态机、同一张卡片、同一条双通道，只是语义不同。
+     *
+     * 为什么 sideEffect 是 unknown：这不是"重放安全"的问题，而是**这个调用本身
+     * 不该被自动执行**——它的产物是等主人回答。gate 的 unknown 分支会签发审批单
+     * 并把任务挂起（`setAwaitingApproval`），主人回复写在 approvals.note 里，
+     * 恢复时 `claim()` 把它带回来。整条链现成的，不另造一套。
+     */
+    name: 'ask',
+    mode: 'sync',
+    max_deadline_ms: 60_000,
+    args_schema: obj(
+      {
+        question: str('要问主人的问题，一句话说清缺什么。别问「可以吗」，要问「是多少」'),
+        options: str('可选。几个候选答案，用 | 分隔，如「明天|后天|下周一」。给了主人可以一键选')
+      },
+      ['question'],
+    ),
+    sideEffect: 'unknown',
+  },
+  {
+    /**
      * 宿主侧工具：列已有日程（2026-10-22 补登能力目录）。
      *
      * 为什么必须补：实现早在 daemon.ts:1279 注册、tools.yml 也登记了 read 档，

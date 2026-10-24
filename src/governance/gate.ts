@@ -326,6 +326,45 @@ export async function evaluate(
   const def = lookupTool(catalog, call.tool);
   if (def === undefined) return deny('工具未登记');
 
+  // —— 1.5 提问（`ask`）：签发 question 单，挂起等主人回答 ——
+  //
+  // 为什么要在档位裁决**之前**单独拦：`ask` 不是"要不要执行这个动作"，
+  // 它本身就是"我在等你回答"。走档位只会落到 read 快速路径（直接放行、无回答），
+  // 或者落到 approve（签发 tool_call 单，语义仍是"准不准做"）。
+  // 两者都答非所问 —— 这正是文档里那个假 ✅ 的病根（§2.5）。
+  //
+  // question 单走同一状态机、同一张卡片、同一双通道（契约 §3.6 早就给了 kind 取值，
+  // 一直没人接线）。主人的回答经 `/answer N <文本>` 落到 approvals.note，
+  // decide() 把它并进 final_params_json.ownerNote，恢复时 claim() 带回来。
+  if (call.tool === 'ask') {
+    const question = typeof call.params.question === 'string' ? call.params.question.trim() : '';
+    if (question === '') return deny('ask：question 不能为空（要问什么，一句话）');
+    const optionsRaw = typeof call.params.options === 'string' ? call.params.options : '';
+    const options = optionsRaw.split('|').map((s) => s.trim()).filter((s) => s !== '');
+    const a = insertApproval(rt, ctx, call, {
+      kind: 'question',
+      tier: null,
+      reason: question,
+      paramsJson,
+      subjectKey: `ask:${call.callId}`,
+      subject: { kind: 'question', prompt: question, ...(options.length > 0 ? { options } : {}) },
+    });
+    const decisionId = insertDecision(db, {
+      decisionId: newDecisionId(),
+      dotId: ctx.dotId,
+      taskId: ctx.taskRef.taskId,
+      journalStep: call.callId,
+      kind: 'approve',
+      tier: null,
+      tool: call.tool,
+      paramsJson,
+      reason: question,
+      approvalId: a.id,
+    });
+    appendAudit(db, auditOf(ctx, call, decisionId, 'approve', null, `ask:${question}`));
+    return { kind: 'approve', approvalId: a.id };
+  }
+
   // —— 2. spend 参数契约（§2.5：钱都算不清的事不进审批）——
   if (def.tier === 'spend') {
     const chk = spendContractOk(def, call.params);
@@ -1082,7 +1121,30 @@ export async function decide(
   const to: ApprovalStatus = verdict === 'reject' ? 'rejected' : 'approved';
   const noteTrim = note === undefined ? null : sanitizeText(note).slice(0, 500);
   const nowIso = new Date().toISOString();
-  const finalParams = verdict === 'reject' ? null : current.paramsJson;
+  // **主人说的话必须随审批单回到执行方**（2026-10-22 第 7 轮修）。
+  //
+  // 原来这里原样回传 `current.paramsJson` —— 也就是**发单时的参数**。
+  // 于是 `note`（契约 §3.4：主人对这张单子的补充指令／回答）虽然写进了库、
+  // 也进了 audit，却**永远到不了模型**：claim() 读的就是 final_params_json，
+  // 而它等于原参数。`/answer N <文本>` 这条命令于是等于空转。
+  //
+  // 这个洞在 `ask` 之前不明显（工具调用类审批，"再补充一句"多半是锦上添花），
+  // 但 `ask` 的全部语义就是**主人的回答**：不带 note 回来，模型问了个寂寞。
+  //
+  // 合并而不是覆盖：note 是附加信息，不能顶掉工具本来要的参数。
+  // 键名用 `ownerNote` 而不是 `note`，避免和真把 note 当参数的工具撞名。
+  const finalParams = ((): string | null => {
+    if (verdict === 'reject') return null;
+    if (noteTrim === null || noteTrim === '') return current.paramsJson;
+    let base: Record<string, unknown> = {};
+    try {
+      const p = JSON.parse(current.paramsJson) as unknown;
+      if (typeof p === 'object' && p !== null) base = p as Record<string, unknown>;
+    } catch {
+      // 参数不是合法 JSON：仍要把回答带回去，宁可少参数也不能丢话
+    }
+    return JSON.stringify({ ...base, ownerNote: noteTrim });
+  })();
 
   let changes = 0;
   db.exec('BEGIN IMMEDIATE');

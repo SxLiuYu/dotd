@@ -721,3 +721,65 @@ rules.yml 条目 {"tool":"shop.buy","amountAtLeast":50000} 试图把 approve 放
 （`shop.checkout` 只存在于 :122-126 的**注释模板**与两个测试夹具里。）
 
 **未验**：真人收到卡片/进度的观感、跨网络稳定性、Muse 的记忆/并行/重试机制（见 `meta-muse.md` §8）。
+
+---
+
+## 11. 相处层：五个成本（2026-10-23 起）
+
+能力层（§2）和形态层（§3–§6）已经对齐之后，剩下的差距是**人和 agent 怎么相处**。
+这一节把 Muse 报道里的五个成本逐条落到 dotd 的可验收行为上；任务与写权限见
+[`goal-2026-10-23-muse-relationship.md`](./goal-2026-10-23-muse-relationship.md)。
+
+| 成本 | dotd 之前 | 现在 | 怎么验 | 状态 |
+|---|---|---|---|---|
+| **安装** | WSL + Docker + 环境变量，`setup` 3 步 | 不变 | `npm run setup -- --check` | 维持（这是自托管的定价） |
+| **选择** | 打开 Web 是空白输入框，七个视图各管一段 | M1 动态时间线：任务 / 审批 / 未识别事件 / 定时失败 / 今日日程合成一条 | `GET /api/feed`；`dotd feed` | ✅ 单测 10/10 |
+| **学习** | prompt 已隐藏内部名，但界面会吐 `web.snapshot` 这类工具名 | M2 状态条与进度统一走 `humanizeTool()`，补了 `web.*` / `net.*` / mail / calendar 等词条 | 真机看状态条；`tests/surfaces-task-summary.test.ts` | ✅ 单测 9/9 |
+| **监看** | `dotd task --verbose` 回答「花了多少 / 卡在哪 / 每步多久」——工程师视角 | M2 L1：`GET /api/tasks/:id` 的 `summary`，回答「在干嘛 / 多久了 / 要不要我出手」 | 同上；ChatView 状态条 | ✅ 单测 9/9 |
+| **自我介绍** | 人格硬编码在 `system-prompt.ts`，`MEMORY.md` 只有兴趣/关切/指针 | M3 `IDENTITY.md`（≤1 KB，独立 `sys:identity` 注记）+ `GET/PUT /api/memory/identity` + 人格视图 | `dotd identity`；`tests/memory-identity.test.ts` | ✅ 单测 5/5 |
+
+**M4（交接信 / 记忆导入）与 M5（主动建议）尚未开始**，在目标书里预留。
+
+三条刻意的边界：
+
+1. **动态是只读投影**：不写库、不推送；「该不该打扰」仍只归 `proactive.ts` 的三道闸。
+2. **人格不塞进 4900 字符的 system prompt**：它是可改内容，单独一条 `sys:identity`；
+   文件不存在时请求体逐字不变（`tests/memory-identity.test.ts` 守住）。
+3. **不编 ETA**：没有计划就没有「还剩几步」；只有当前步、已用时、心跳年龄。
+   在途步让心跳静止时不误报「卡住」——那是看门狗的老盲区（见 README「已知限制」）。
+
+**本节的证据口径**（2026-10-23 实跑）：
+- 新增测试 `surfaces-feed` 10 条、`surfaces-task-summary` 9 条、`memory-identity` 5 条、HTTP 路由 4 条，全绿；
+- `npx tsc --noEmit -p .` 与 `-p web-ui` 均 0 错误；
+- **全量 `npm test`：1920 / 1920，fail 0**（约 54s）；`npm run build:web` 成功；
+- `node scripts/smoke.mjs` **11 / 11**（7799 端口；7788 被现网 daemon 占用）。
+- 未验：真人观感、真实模型下人格语气的抽验（需要 daemon + 模型凭据）。
+
+---
+
+## 12. 执行凭证：把「我干了什么」变成可对账的产物（2026-10-23）
+
+相处层解决「敢用」，这一节解决「敢信」。dotd 的差异不在工具数量，而在**每一步都能被对账**：
+
+| 入口 | 产物 | 证据 |
+|---|---|---|
+| `GET /api/tasks/:id/proof` | JSON 凭证（步骤 / 审批 / 模型调用 / 审计 / 计数 / `bundleHash`） | 路由测试 22/22（503 / 200 / 404 / `?args=1`） |
+| `dotd prove <taskId>` | `PROOF.md` + `proof.json`（`--out <dir>`） | `tests/surfaces-proof.test.ts` 10/10 |
+| `?args=1` / `--args` | 参数/结果预览（默认关闭） | 单测断言默认 JSON 里不含明文 |
+
+**对账口径**：`exec_calls.args_hash` / `result_hash` 是执行面记账的权威值；导出时从 journal 的
+`args_json` / `result_json` 重算并比对。一致 → `hashMatch=true`；不一致 → `false`（显形）；
+无法重算（无 exec_calls、blob 指针）→ `null`（写「无从比对」，不假装一致）。
+
+**确定性**：`bundleHash = sha256(stableStringify(凭证去掉 generatedAt))`，同一 journal 两次导出
+哈希一致；任何一步状态/哈希变化都会改哈希。
+
+**边界（必须一起读）**：这是本机 journal 的投影，不是第三方公证，也没有签名。它证明
+「导出内容与执行面记账自洽」，不证明「数据库没被有本机权限的人改过」。要更强，把
+`bundleHash` 发布到外部（邮件 / Git / 时间戳服务）——凭证页末尾逐字写了这句。
+
+**本轮证据**：`npm test` **1932 / 1932，fail 0**（约 53s）；`tsc -p .` / `tsc -p web-ui` 0 错误；
+`build:web` 成功；冒烟 **11 / 11**（7799）。
+**真机证据**：在冒烟脚本临时副本里追加两条断言后跑 **13 / 13**——真 daemon 上
+`GET /api/tasks/tk_ev_1/proof` → 200、`bundleHash=71dc4fc38f94…`、3 步、默认无 `argsPreview`。
+**未验**：真实 Docker 任务上的凭证观感（冒烟是 stub fleet，但路由与 `exec_calls` 落账是真链路）。

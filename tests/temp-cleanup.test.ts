@@ -19,6 +19,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { basename } from 'node:path';
 import {
   makeTempDataDir,
   forceRemoveTempPath,
@@ -138,12 +139,16 @@ test('池模式：借还之间数据隔离，cleanup 后临时目录同样消失
 //
 // 判据：本文件建两个目录、**故意不删**，净增长必须被看见（先自证工具灵）；
 // 然后正常建删，净增长必须为 0。第一条是关键 —— 它证明这条判据不是恒真。
-test('计数工具自证：故意不删的目录必须被数出来（否则判据恒真）', () => {
-  const base = countTempDirs();
+//
+// 2026-10-24：全量并行跑时，别的文件恰好在本文件两次计数之间删掉自己的目录，
+// 净增长会被抵平（实测 384 → 384 偶发红）。改为「按名字确认新目录在其中」：
+// 仍然证明计数工具认得出本文件建的目录，但不再受并发删目录的影响。
+test('计数工具自证：新建的目录必须被数出来（否则判据恒真）', () => {
   const d = makeTempDataDir();
+  const names = readdirSync(tmpdir()).filter((n) => n.startsWith('dotd-test-'));
   assert.ok(
-    countTempDirs() > base,
-    `建了目录但 countTempDirs() 没变（${base} → ${countTempDirs()}）：判据会恒真，必须先修工具`,
+    names.includes(basename(d.root)),
+    `建了目录但 countTempDirs() 认不出它（${basename(d.root)} 不在 ${names.length} 个 dotd-test-* 里）：判据会恒真，必须先修工具`,
   );
   d.cleanup(); // 收尾（这一条只验证"数得到"）
 });
