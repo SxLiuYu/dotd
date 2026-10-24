@@ -1,0 +1,20 @@
+每轮语音任务的时间线（created_at 为 0 点，单位 ms）
+数据来源：临时 home + 端口 7799 + DOTD_FLEET=stub + fake-device，不碰在跑的 7788
+
+== task tk_mvmk2f4niwb92f done span=4718ms
+  step 1 llm start=+487ms dur=2682ms  args="用一句话回答：3+5 等于几？" result="3+5 等于 8。"
+  step 2 llm start=+3178ms dur=1536ms  args="任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。\n（" result="memory_redo:skip"
+  llm end=+3163ms primary deepseek-v4.1-flash 2628ms prompt=18936 comp=8
+  llm end=+4712ms primary deepseek-v4.1-flash 1520ms prompt=1232 comp=2
+
+== task tk_mvmk2jcjczq0bb done span=4112ms
+  step 1 llm start=+287ms dur=1907ms  args="用一句话回答：3+5 等于几？" result="3+5 等于 8。"
+  step 2 llm start=+2202ms dur=1907ms  args="任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。\n（" result="memory_redo:skip"
+  llm end=+2189ms primary deepseek-v4.1-flash 1888ms prompt=18959 comp=8
+  llm end=+4108ms primary deepseek-v4.1-flash 1892ms prompt=1232 comp=2
+
+== task tk_mvmk2nb3sz9msf done span=5055ms
+  step 1 llm start=+1020ms dur=2216ms  args="用一句话回答：3+5 等于几？" result="3+5 等于 8。"
+  step 2 llm start=+3243ms dur=1809ms  args="任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。\n（" result="memory_redo:skip"
+  llm end=+3230ms primary deepseek-v4.1-flash 2196ms prompt=18982 comp=8
+  llm end=+5051ms primary deepseek-v4.1-flash 1794ms prompt=1232 comp=2
