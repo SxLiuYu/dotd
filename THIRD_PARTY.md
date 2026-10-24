@@ -6,6 +6,7 @@
 |---|---|---|
 | `src/`、`scripts/`、`db/`、`web-ui/`、`config/`、`docs/` | 本项目原创 | Apache-2.0（`LICENSE`） |
 | `voice/charlie/`、`voice/scripts/` | [charlie-voice-assistant](https://github.com/SxLiuYu/charlie-voice-assistant)（vendored，提交 `710d2c4`） | MIT（`voice/LICENSE`） |
+| `voice/Baize/` | 同上（Charlie 上游随附的 Baize 模块；自带 `voice/Baize/LICENSE`） | Apache-2.0 |
 | `voice/integration/` | 本项目原创（运行时接缝） | Apache-2.0 或 MIT，二选一 |
 
 ## 运行时依赖（主要）
