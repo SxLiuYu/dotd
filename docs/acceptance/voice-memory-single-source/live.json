@@ -1,0 +1,24 @@
+{
+  "at": "2026-10-24T12:56:00+08:00",
+  "daemon": "127.0.0.1:7799 (temp home, DOTD_FLEET=stub, DOTD_GUARD_BASE_MB=1024)",
+  "python": {
+    "mirror1": true,
+    "mirror_dup": false,
+    "set_pref": true,
+    "history": [["user", "晚安"], ["assistant", "晚安，空调已关"]],
+    "prefs": {"wake_word": "小豆"},
+    "push_allow": [true, null],
+    "push_dup": [false, "duplicate"],
+    "push_throttle": [false, "throttled"],
+    "push_other_kind": [true, null]
+  },
+  "master_view": {
+    "prefs": [{"key": "wake_word", "value": "小豆"}],
+    "pushLog": [
+      {"kind": "home", "allowed": true, "reason": null},
+      {"kind": "weather", "allowed": false, "reason": "throttled"},
+      {"kind": "weather", "allowed": false, "reason": "duplicate"},
+      {"kind": "weather", "allowed": true, "reason": null}
+    ]
+  }
+}

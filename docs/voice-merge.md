@@ -256,6 +256,7 @@ npm run setup:all:check   # 只体检（CI 用）
 | 设备面 | `node --import tsx --test tests/surfaces-device.test.ts` | **18 / 18** |
 | 记忆源 / 推送决策（HTTP） | `node --import tsx --test tests/surfaces-voice-memory.test.ts` | **5 / 5** |
 | 记忆源 / 推送决策（Python） | `python -m unittest voice.integration.test_memory_push` | **8 / 8** |
+| 记忆源 / 推送决策（真进程） | 真 dotd + 真 `DeviceBridge`，见 `docs/acceptance/voice-memory-single-source/` | 补写/幂等/偏好/四类决策/留痕 **全对** |
 | 音频链路（合成 PCM） | `python -m unittest voice.integration.test_audio_chain` | **2 / 2** |
 | 全套 | `npm test` | **1990 / 1990**（阶段 5 新增 5 条 HTTP 用例 + 2 条 Python 包装） |
 | 类型检查 | `npx tsc --noEmit -p .` | 0 错误 |
