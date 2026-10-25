@@ -16,7 +16,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -75,4 +75,36 @@ test('config/models.yml：不设环境变量时，本机端点（tier1 主通道
     if (saved.model !== undefined) process.env.DOTD_MODEL_HOST = saved.model;
     if (saved.tier2 !== undefined) process.env.DOTD_TIER2_HOST = saved.tier2;
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2. 脚本不许把部署事实 `sed -i` 进仓库配置（2026-10-26）
+// ═══════════════════════════════════════════════════════════════════
+//
+// 上面那条测试守的是**结果**（文件里没有私有网段），这条守**过程**：
+// 只要还有脚本在 `sed -i ... config/models.yml`，下一次跑它就会把地址写回去，
+// 而"文件此刻是干净的"并不能阻止那件事。2026-10-26 实测：
+// `scripts/live-wsl-e2e.sh` 仍在这么做，且那份备份**从未被恢复**（脚本里没有
+// restore，cp 之后每个 exit 都不还原）—— 中途失败 = 仓库文件被永久改成部署事实。
+test('scripts/*.sh 不许 sed -i 改写仓库 config/*.yml（部署事实只能走环境变量）', () => {
+  const dir = join(REPO_ROOT, 'scripts');
+  const offenders: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.sh')) continue;
+    const text = readFileSync(join(dir, name), 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      // 注释行里允许出现这个写法（解释历史）。
+      if (/^\s*#/.test(line)) continue;
+      if (/\bsed\s+-i\b/.test(line) && /config\/[A-Za-z0-9._-]+\.ya?ml/.test(line)) {
+        offenders.push(`${name}: ${line.trim()}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    '把部署地址写进仓库配置、再拷贝回 Windows 就会进 git（2026-10-25 已踩过）。' +
+      '改成导出环境变量（DOTD_MODEL_HOST 等），让文件保持 ${ENV:-默认}：\n' +
+      offenders.join('\n'),
+  );
 });

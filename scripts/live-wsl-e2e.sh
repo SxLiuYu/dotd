@@ -81,11 +81,20 @@ GW=$(sed -n 's/^default via \([0-9.]*\).*/\1/p' /proc/net/route 2>/dev/null | he
 GW=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
 if [ -z "${GW:-}" ]; then bad "拿不到 WSL 默认网关"; exit 5; fi
 ok "gateway $GW"
-MODELS="$REPO_ROOT/config/models.yml"
-cp "$MODELS" "$LIVE_HOME-models.yml.bak" 2>/dev/null || true
-ORIG_URL=$(sed -n 's/^    base_url: \(http[^ ]*\)$/\1/p' "$MODELS" | head -1)
-sed -i "s#^    base_url: .*#    base_url: http://${GW}:13065/v1#" "$MODELS"
-ok "models.yml tier1: $ORIG_URL -> http://${GW}:13065/v1"
+
+# **不碰仓库文件**（2026-10-26 修）。
+#
+# 这里原来是 `sed -i 's#^    base_url: .*#…# "$REPO_ROOT/config/models.yml"`：
+# 把部署环境的网关 IP 写进磁盘上的仓库副本。config/models.yml 里出现过硬编码
+# `172.17.48.1`，来源就是这类脚本 —— 跑一次、下次 `cp` 回 Windows 就带进 git 了。
+# 而且那份备份 `$LIVE_HOME-models.yml.bak` **从来没有被恢复过**（脚本里没有 restore
+# 步骤，且 cp 之后的每个 exit 都不会还原），中途失败 = 仓库文件被永久改成部署事实。
+#
+# 现在 models.yml 用 `${DOTD_MODEL_HOST:-http://127.0.0.1:3065}` 占位
+# （与 wsl-daemon.sh §2 同一处修正），这里只导出环境变量：同一份仓库文件，
+# Windows 原生跑用默认值、WSL 里跑用网关地址，文件本身永远不含环境事实。
+export DOTD_MODEL_HOST="http://${GW}:13065"
+ok "DOTD_MODEL_HOST=$DOTD_MODEL_HOST（仓库 config/models.yml 未改动）"
 if ! curl -sf -m 15 -o /dev/null "http://${GW}:13065/v1/models" -H "Authorization: Bearer ${WB2API_KEY:-}"; then
   bad "经 relay 访问不到模型网关。先在 Windows 侧起 scripts/win-relay.mts（13065 -> 3065）。"
   exit 6

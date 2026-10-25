@@ -14,16 +14,15 @@ HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application
 MODEL="${1:?用法: $0 <model-id>}"
 echo "################ model = $MODEL ################"
 
-# 切模型：改 models.yml 的 primary（light 保持 flash，省成本）
-cp config/models.yml /tmp/models.yml.bak
-node --disable-warning=ExperimentalWarning -e '
-const fs = require("fs");
-const p = "config/models.yml";
-let t = fs.readFileSync(p, "utf8");
-t = t.replace(/^(\s*)primary: .*$/m, "$1primary: " + process.argv[1]);
-fs.writeFileSync(p, t);
-' "$MODEL"
-grep -E '^\s+(primary|light):' config/models.yml | head -2
+# 切模型：改 **daemon 真读的那份**（托管部署里是 ~/.dotd/models.yml），并读回验证。
+# 原来只改仓库副本 config/models.yml —— 靠 wsl-daemon.sh 启动时拷到 ~/.dotd 才
+# "碰巧生效"；用 one_system / charlie:start 重启时改动完全不生效，而脚本照样
+# 打印步数与正确率，看起来像"两个模型差不多"（2026-10-26，同类缺陷第九例）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/model-switch.sh"
+models_begin || exit 1
+models_set_primary "$MODEL"
+models_verify_primary "$MODEL" || exit 1
+grep -E '^\s+(primary|light):' "$_MODELS_RUNTIME" | head -2
 
 # 重启让它生效
 pkill -9 -f 'src/daemon.ts' 2>/dev/null || true

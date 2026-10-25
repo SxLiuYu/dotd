@@ -8,8 +8,13 @@ HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application
 
 MODEL="${1:-deepseek-v4.1-flash}"
 echo "=== 切到 $MODEL ==="
-sed -i "s/^\(\s*\)primary: .*/\1primary: $MODEL/" config/models.yml
-grep -E "^\s+primary:" config/models.yml | head -1
+# 改的是 daemon **真读的那份**（托管部署里是 ~/.dotd/models.yml），并读回验证。
+# 原来只 sed 仓库副本 config/models.yml：靠 wsl-daemon.sh 启动时拷过去才"碰巧生效"，
+# 换成 one_system / charlie:start 重启就完全没生效，而脚本照样打印步数。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/model-switch.sh"
+models_begin || exit 1
+models_set_primary "$MODEL"
+models_verify_primary "$MODEL" || exit 1
 
 echo
 echo "=== 重启 daemon 加载新配置 ==="

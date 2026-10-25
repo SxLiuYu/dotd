@@ -9,12 +9,11 @@ HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application
 MODEL="${1:?model}"
 ROUNDS="${2:-3}"
 
-cp config/models.yml /tmp/models.yml.ab
-node -e '
-const fs=require("fs");const p="config/models.yml";
-let t=fs.readFileSync(p,"utf8");
-t=t.replace(/^(\s*)primary: .*$/m,"$1primary: "+process.argv[1]);
-fs.writeFileSync(p,t);' "$MODEL"
+# 同 ab-models：改 daemon 真读的那份并读回验证（原来只改仓库副本，见 lib 头部注释）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/model-switch.sh"
+models_begin || exit 1
+models_set_primary "$MODEL"
+models_verify_primary "$MODEL" || exit 1
 
 pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
 sleep 3
@@ -66,4 +65,4 @@ for r in $(seq 1 "$ROUNDS"); do
   printf '  round%s  S5(确认型)=%-3s步 %s   S1(简单)=%-2s步\n' "$r" "$N" "$OK" "$N2"
 done
 
-cp /tmp/models.yml.ab config/models.yml
+models_restore

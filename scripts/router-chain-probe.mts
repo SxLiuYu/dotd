@@ -15,6 +15,7 @@
 
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadModelsConfig } from '../src/router/config.ts';
@@ -26,12 +27,26 @@ import { openDb } from '../db/conn.ts';
 import { migrate } from '../db/migrate.ts';
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url));
-const configDir = join(repoRoot, 'config');
+
+// 端点的"真配置"由 daemon 决定，不是仓库模板（2026-10-26 修，§18.13 同一类）。
+//
+// 原来这里写死 `join(repoRoot, 'config')` 并称之为"真 config/models.yml"。
+// 托管部署（live）里 daemon 读的是 `~/.dotd/models.yml`（`DOTD_CONFIG_DIR`
+// 或托管布局推断），仓库那份只是模板。两者此刻内容相同，所以**行为没差**——
+// 但这正是最坏的一种：等主人只在运行时那份里换了端点/模型，本探针会一路绿着
+// 验另一份文件，结论与线上无关。
+//
+// 判据与 doctor / onboard / probe-live-model 共用 `scripts/lib/env.mjs`。
+const { resolveConfigDir, configDirIsHostedGuess } = await import('./lib/env.mjs');
+const configDir = resolveConfigDir({ repoRoot, home: homedir() });
+const cfgNote = configDirIsHostedGuess({ home: homedir() })
+  ? `（DOTD_CONFIG_DIR 未设，按 ${join(homedir(), '.dotd', 'models.yml')} 存在推断为托管布局）`
+  : '';
 
 // ── 1. 真配置的候选序 ────────────────────────────────────────────────
 
 const cfg = loadModelsConfig(join(configDir, 'models.yml'));
-console.log('== 真 config/models.yml 的候选序（NORMAL 档）==');
+console.log(`== 真配置 ${join(configDir, 'models.yml')} 的候选序（NORMAL 档）${cfgNote} ==`);
 for (const track of ['primary', 'light'] as const) {
   const chain = pickCandidates(cfg.endpoints, 'NORMAL', track);
   console.log(

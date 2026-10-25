@@ -32,18 +32,18 @@ submit() {
     | sed -n 's/.*"taskId":"\([^"]*\)".*/\1/p'
 }
 
-cp config/models.yml /tmp/models.normal.bak
+# 改的是 **daemon 真读的那份**（托管部署里是 ~/.dotd/models.yml），并带 EXIT trap。
+# 原来只改仓库副本 config/models.yml 且手工 cp 恢复：中途失败（断言退出 / Ctrl-C /
+# daemon 起不来）就永久留在"端点指向 59999"的状态，下一次实验的基线是错的
+# （2026-10-26，同类缺陷第九例；判据见 scripts/lib/model-switch.sh 头部）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/model-switch.sh"
+models_begin || exit 1
 
 echo "======== 场景 A：模型端点全挂 ========"
 # 把 tier1 的 base_url 指到一个没人监听的端口
-python3 - <<'PY'
-import re
-p = 'config/models.yml'
-t = open(p, encoding='utf-8').read()
-t = re.sub(r'(base_url:\s*)https?://[^\s]+', r'\g<1>http://127.0.0.1:59999/v1', t, count=1)
-open(p, 'w', encoding='utf-8').write(t)
-print('  base_url → 127.0.0.1:59999（无人监听）')
-PY
+models_set_base_url http://127.0.0.1:59999/v1
+models_verify_base_url http://127.0.0.1:59999/v1 || exit 1
+echo "  base_url → 127.0.0.1:59999（无人监听）"
 pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
 sleep 3
 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
@@ -69,7 +69,7 @@ grep -iE 'circuit|熔断|AllEndpointsDown|paused' /tmp/dotd-wsl.log | tail -3 ||
 
 echo
 echo "======== 场景 B：恢复端点后能否继续干活 ========"
-cp /tmp/models.normal.bak config/models.yml
+models_restore
 pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
 sleep 3
 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
