@@ -116,6 +116,40 @@ check() {
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# 部署窗口闸门（2026-10-26）
+#
+# 现场：`scripts/wsl-deploy.sh` 的重启段是「SIGTERM 旧 supervisor → 等它退干净 →
+# 起新的」，中间有若干秒 7788 是**故意不通**的。cron 每 2 分钟跑本脚本，正好落进
+# 这个空档就会判定 daemon 死了并 `repair_daemon` —— 于是**第二份 supervisor** 被
+# 拉起，和部署脚本即将启动的那份抢 8000/7788。日志里同一秒两条 `===== 启动`、
+# 部署侧报 `30s 还没退，SIGKILL`，剩下的孤儿进程跑的还是重启前的旧代码。
+#
+# 修法：部署开始时写一个时间戳锁，本脚本在锁新鲜时**不做自愈**（检测/告警照旧 ——
+# 部署真挂了仍然会告警，只是不抢着起进程）。锁是文件+时间戳而不是 flock，因为
+# 部署脚本可能在 `set -e` 中途退出，残留的时间戳会在 LOCK_TTL 秒后自动失效，
+# 不会把自愈永久关掉。
+LOCK_FILE="${HOME:-/root}/.dotd/deploy.lock"
+LOCK_TTL=300
+
+deploy_in_progress() {
+  [ -f "$LOCK_FILE" ] || return 1
+  local t age
+  t=$(cat "$LOCK_FILE" 2>/dev/null || echo 0)
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  age=$(( $(date +%s) - t ))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$LOCK_TTL" ]
+}
+
+# 自愈前的统一入口：部署中就直说跳过，别静默（下次看日志要能解释"为什么没修"）。
+may_repair() {
+  if deploy_in_progress; then
+    logline "自愈:部署进行中（$LOCK_FILE，$(( $(date +%s) - $(cat "$LOCK_FILE") ))s 前），跳过修复"
+    return 1
+  fi
+  return 0
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # 自愈（2026-10-19）：检查失败时**先尝试修**，修不好再告警。
 #
 # 为什么需要：原来 watchdog 只发飞书通知，主人半夜收到"模型端点不可达"，
@@ -157,7 +191,10 @@ repair_relay() {
     return 1
   fi
   logline "自愈:尝试在 Windows 侧重启 relay"
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "\$env:RELAY_TTL_MS='0'; Start-Process -FilePath 'node' -ArgumentList '--import','tsx','scripts/win-relay.mts' -WorkingDirectory 'D:\toagi\dotd' -WindowStyle Hidden" >/dev/null 2>&1
+  # 工作目录必须是 `D:\dotd`（2026-10-26 对齐）：仓库里这份一直写着旧的
+  # `D:\toagi\dotd`，而 live 的 /usr/local/bin 副本早已改成 `D:\dotd` ——
+  # 两边不一致意味着"重新按仓库装一次 watchdog"会把 relay 自愈改回坏的。
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "\$env:RELAY_TTL_MS='0'; Start-Process -FilePath 'node' -ArgumentList '--import','tsx','scripts/win-relay.mts' -WorkingDirectory 'D:\dotd' -WindowStyle Hidden" >/dev/null 2>&1
   local gw i
   gw=$(ip route | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
   for i in $(seq 1 15); do
@@ -181,7 +218,10 @@ repair_container() {
     # 容器可能已不存在（被 rm 掉），退回 fleet 重建
     logline "自愈:docker start 失败，尝试 fleet 重建"
     cd /root/dotd 2>/dev/null || return 1
-    DOTD_FLEET=docker DOTD_MAX_RUNNING=1 timeout 180 bash scripts/wsl-daemon-start.sh >/dev/null 2>&1 || true
+    # 2026-10-26 修：这里原来调 `scripts/wsl-daemon-start.sh` —— **该文件不存在**
+    # （仓库和部署副本里都没有），于是"重建"这一步永远 exit 127，容器自愈的第二条
+    # 路径从来没生效过，只是日志里看着像试过。真正的启动器是 dotd-daemon-start.sh。
+    DOTD_FLEET=docker DOTD_MAX_RUNNING=1 timeout 180 bash scripts/dotd-daemon-start.sh >/dev/null 2>&1 || true
   fi
   local i
   for i in $(seq 1 30); do
@@ -203,12 +243,12 @@ c_relay() {
   [ -n "$gw" ] && timeout 5 bash -c "exec 3<>/dev/tcp/$gw/13065" 2>/dev/null
 }
 
-if ! c_daemon; then repair_daemon || true; fi
+if ! c_daemon; then may_repair && { repair_daemon || true; }; fi
 check daemon    "dotd daemon 不可达（127.0.0.1:7788）"                        c_daemon
-if ! c_docker; then repair_docker || true; fi
+if ! c_docker; then may_repair && { repair_docker || true; }; fi
 check docker    "docker 守护进程不可用"                                        c_docker
 # 容器是执行环境：没了就全瘫，检测到立刻修（不等告警阈值）
-if ! c_container; then repair_container || true; fi
+if ! c_container; then may_repair && { repair_container || true; }; fi
 check container "dotd 容器不在运行"                                            c_container
-if ! c_relay; then repair_relay || true; fi
+if ! c_relay; then may_repair && { repair_relay || true; }; fi
 check relay     "模型端点不可达（win-relay 13065）—— agent2api/relay 可能没起"  c_relay

@@ -125,9 +125,42 @@ if [ "$DO_RESTART" = "0" ]; then
   exit 0
 fi
 
+# ── 4.6 外部看门狗对齐（2026-10-26）──────────────────────────────────
+# /usr/local/bin/dotd-watchdog.sh 是**另一份拷贝**，cron 跑的是它、不是仓库里那份。
+# 这次就撞上了：仓库里 relay 自愈的工作目录还写着废弃的 D:\toagi\dotd，而 live
+# 那份早在 10-25 就手工改对了 —— 也就是说"照仓库重装一次 watchdog"会把自愈改回坏的。
+# 用 install 覆盖（与 rsync 同语义，幂等）：内容一致时不动 mtime，不一致才落盘。
+WD_SRC="$DST/scripts/dotd-watchdog.sh"
+WD_DST=/usr/local/bin/dotd-watchdog.sh
+if [ -f "$WD_SRC" ]; then
+  if cmp -s "$WD_SRC" "$WD_DST" 2>/dev/null; then
+    log "watchdog 已一致（$WD_DST）"
+  elif [ "$(id -u)" = "0" ] || [ -w "$(dirname "$WD_DST")" ]; then
+    install -m 755 "$WD_SRC" "$WD_DST" && log "watchdog 已更新：$WD_DST"
+  else
+    log "⚠️ 无权写 $WD_DST；watchdog 仍是旧版（需要 root 手工 install）"
+  fi
+  # cron 只在**缺**的时候提醒，不自动改 crontab：那是机器级状态，得人拍板。
+  if ! crontab -l 2>/dev/null | grep -q 'dotd-watchdog\.sh'; then
+    log "⚠️ crontab 里没有 dotd-watchdog.sh —— 外部看门狗不会跑（手工加：*/2 * * * * $WD_DST）"
+  fi
+fi
+
 # ── 5. 重启 daemon（优雅退出优先；起不来自动回滚到旧 PID 的日志供查）──────
 # one_system 托管模式：先 TERM supervisor（uvicorn 收信号 → sup.stop() 优雅带走
 # dotd 子进程），再兜底清残留 node 子进程；两边都等到退干净才起新的。
+#
+# 先占住"部署窗口"（2026-10-26）：下面的 kill→等→起 之间 7788 是**故意不通**的，
+# 而 cron 里每 2 分钟的 dotd-watchdog 会把这种不通当成"死了"，拉起第二份 supervisor
+# 跟本脚本抢 8000/7788（实测：同一秒两条 `===== 启动`、这边报 `30s 还没退，SIGKILL`、
+# 活下来的是跑旧代码的孤儿）。写一个时间戳锁，watchdog 在锁新鲜时只检测/告警、
+# 不自愈。脚本正常退出（含失败退出）就删锁，让它立刻能兜底；被 SIGKILL 时靠 TTL 过期。
+DEPLOY_LOCK="$HOME/.dotd/deploy.lock"
+mkdir -p "$HOME/.dotd"
+date +%s > "$DEPLOY_LOCK"
+trap 'rm -f "$DEPLOY_LOCK"' EXIT
+log "部署锁 $DEPLOY_LOCK（watchdog 自愈暂停，脚本退出即释放）"
+
 PIDS="$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)"
 if [ -n "$PIDS" ]; then
   log "SIGTERM supervisor+daemon: $(echo $PIDS | tr '\n' ' ')"

@@ -12,6 +12,32 @@ set -uo pipefail
 # 部署目录可用 DOTD_REPO_DIR 覆盖（wsl-deploy.sh 会传 /root/dotd）；默认仍是 ~/dotd。
 cd "${DOTD_REPO_DIR:-$HOME/dotd}" || exit 1
 
+# 单实例闸门（2026-10-26）。
+#
+# 现场：外部看门狗（cron `*/2`，/usr/local/bin/dotd-watchdog.sh）在部署的空档里
+# 看到 7788 不通就 `setsid bash scripts/dotd-daemon-start.sh`，而部署脚本自己也
+# 正要起一份 —— 两边都起，结果是**两个 supervisor 同时抢 8000/7788**：
+# 后绑定的那个 bind 失败退出，先抢到的那个在部署脚本的 SIGTERM 里被杀，
+# 剩下孤儿进程继续跑旧代码。日志里能看到同一秒两条 `===== 启动`。
+#
+# 用 flock 而不是 pidfile：pidfile 要考虑进程自杀/陈旧 pid 的清理，flock 在内核里
+# 跟着 fd 走，进程一死锁自动释放，没有"残留 pidfile 导致永远起不来"的坑。
+# fd 会跨 exec 保留（bash → python supervisor），所以锁的生命期就是进程的生命期。
+#
+# 没有 flock 时**不能拦**（2026-10-26 补）：老镜像/裁剪系统可能没有 util-linux，
+# 那样 `flock` 命令不存在 → 判断为"拿不到锁" → 永远 exit 0、daemon 再也不起来。
+# 宁可少一层保护也要能启动，所以先探存在性。
+LOCK=/tmp/dotd-one-system.lock
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    echo "[wsl-daemon] 已有实例持锁（$LOCK），本次不启动" >&2
+    exit 0
+  fi
+else
+  echo "[wsl-daemon] 没有 flock，跳过单实例闸门（同时起两份的风险自负）" >&2
+fi
+
 LOG=/tmp/dotd-wsl.log
 # 启动时把上一份日志**归档**而不是直接丢掉（2026-10-19）：
 # 崩溃重启后最想看的就是"上一次是怎么死的"，`: > $LOG` 会把它抹掉。
