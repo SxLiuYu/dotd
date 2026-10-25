@@ -233,6 +233,22 @@ def apply_env(paths: Paths, env: Optional[dict[str, str]] = None) -> None:
             target["SENSE_VOICE_MODEL"] = str(candidate)
 
 
+def asr_state(paths: Paths, env: Optional[dict[str, str]] = None) -> dict[str, Any]:
+    """"这台机器听不听得见" —— 给 `/health` 用（便宜判定，不加载模型）。
+
+    2026-10-25 的教训：`/health` 里 `"voice": "ok"` 是硬编码的。SenseVoice 模型
+    被 `rsync --delete` 删掉、云端 key 也没配时，ASR 四个引擎全灭、设备一句话
+    听不见，`/health` 仍是全绿 —— healthcheck、onboard、CI 全都放行。
+    所以把"本地模型在不在 / 云端 key 配了没"如实报出来。
+    """
+    try:
+        from voice.integration import asr_watch
+
+        return asr_watch.state(paths.home, env)
+    except Exception as exc:  # 观测项坏掉不能拖垮 health
+        return {"mode": "unknown", "ok": None, "error": str(exc)}
+
+
 # ─────────────────────────────────────────────────────────────────────
 # dotd 子进程
 # ─────────────────────────────────────────────────────────────────────
@@ -416,6 +432,10 @@ class KernelSupervisor:
             "service": "charlie",
             "product": "charlie+dotd",
             "voice": "ok",
+            # `voice` 一直硬编码 "ok" —— 而"听不见"（ASR 全链路失效）时它照样 ok。
+            # 2026-10-25 就是这样：/health 全绿、设备一句话都听不见。这里如实报
+            # 本地模型在不在、云端 key 配了没，让"能不能听"变成可观测的。
+            "asr": asr_state(self.paths),
             "kernel": status,
             "kernelDetail": snap.as_dict(),
             "https": https,

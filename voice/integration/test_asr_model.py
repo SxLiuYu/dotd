@@ -173,6 +173,36 @@ class AsrWatchTest(unittest.TestCase):
     def test_minutes_zero_does_not_start_thread(self) -> None:
         self.assertIsNone(asr_watch.watch_async(self.home, minutes=0))
 
+    def test_state_reports_local_when_model_present(self) -> None:
+        d = self._make_model(self.home)
+        st = asr_watch.state(self.home, {})
+        self.assertEqual(st["mode"], "local")
+        self.assertEqual(st["model"], str(d))
+        self.assertTrue(st["ok"])
+
+    def test_state_reports_none_when_deaf(self) -> None:
+        """这正是 2026-10-25 的状态：模型没了、云端 key 也没配 —— 设备是聋的，
+        而旧的 /health 只会说 `"voice": "ok"`。"""
+        st = asr_watch.state(self.home, {})
+        self.assertEqual(st["mode"], "none")
+        self.assertFalse(st["ok"], "既没本地模型也没云端 key，不能说 ok")
+
+    def test_state_accepts_cloud_fallback(self) -> None:
+        st = asr_watch.state(self.home, {"STEPFUN_KEY": "x"})
+        self.assertEqual(st["mode"], "cloud")
+        self.assertEqual(st["cloud"], ["stepfun"])
+        self.assertTrue(st["ok"])
+
+    def test_state_baidu_needs_all_three_keys(self) -> None:
+        st = asr_watch.state(self.home, {"BAIDU_APP_ID": "a", "BAIDU_API_KEY": "b"})
+        self.assertEqual(st["cloud"], [], "百度三个 key 缺一不可")
+        self.assertFalse(st["ok"])
+        st = asr_watch.state(
+            self.home,
+            {"BAIDU_APP_ID": "a", "BAIDU_API_KEY": "b", "BAIDU_SECRET_KEY": "c"},
+        )
+        self.assertEqual(st["cloud"], ["baidu"])
+
 
 class _Event:
     """poll 永远 False，用于跑有限的循环轮数。"""

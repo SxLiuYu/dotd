@@ -88,6 +88,48 @@ def adopt(home: Path, found: Path) -> None:
     log.info("[asr] SenseVoice 模型已就位，后续识别走本地：%s", found)
 
 
+# 云端 ASR 需要哪些环境变量（与上游 `_ASR_PROVIDERS` 的判定一致）。
+_BAIDU_KEYS = ("BAIDU_APP_ID", "BAIDU_API_KEY", "BAIDU_SECRET_KEY")
+
+
+def cloud_providers(env: Optional[dict[str, str]] = None) -> list[str]:
+    """已配置的云端 ASR 供应商名字。"""
+    src = os.environ if env is None else env
+    ok = []
+    if all((src.get(k) or "").strip() for k in _BAIDU_KEYS):
+        ok.append("baidu")
+    if (src.get("STEPFUN_KEY") or "").strip():
+        ok.append("stepfun")
+    return ok
+
+
+def state(home: Path, env: Optional[dict[str, str]] = None) -> dict:
+    """"能不能听"的可观测状态（放进 /health）。
+
+    2026-10-25 的教训：`/health` 里 `voice: "ok"` 是硬编码的，ASR 整条链全灭时
+    它照样是 ok —— 于是所有自动检查（healthcheck、onboard、CI）都放行，设备却是聋的。
+    这里只做**便宜**的判定（看文件、看环境变量），不加载模型。
+    """
+    src = os.environ if env is None else env
+    local = resolve(home)
+    cloud = cloud_providers(src)
+    if (src.get("SENSE_VOICE_DISABLED") or "").strip() == "1":
+        mode = "disabled"
+    elif local is not None:
+        mode = "local"
+    elif cloud:
+        mode = "cloud"
+    else:
+        mode = "none"
+    return {
+        "mode": mode,
+        "model": str(local) if local is not None else None,
+        "cloud": cloud,
+        # 有本地模型或至少一个云端 key 才谈得上"能听"。
+        "ok": mode in ("local", "cloud"),
+    }
+
+
 def watch_async(
     home: Path,
     *,
