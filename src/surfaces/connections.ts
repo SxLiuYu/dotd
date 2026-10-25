@@ -3,8 +3,10 @@
  *
  * 要解决什么问题
  *   dotd 的连接能力散在六个地方：邮箱账号（mail_accounts 表）、日历源（.ics 目录）、
- *   连接器（connectors/registry.ts 的 github / rss）、MCP server（config/mcp-servers.yml）、
- *   模型端点（config/models.yml）、通知通道（飞书 app_id + owner_chat_id）与 HTTP 控制台。
+ *   连接器（connectors/registry.ts 的 github / rss）、MCP server（`<configDir>/mcp-servers.yml`，
+ *   通常是 `~/.dotd/`；仓库 config/ 下那份只是模板）、
+ *   模型端点（`<configDir>/models.yml`，通常 `~/.dotd/`；同样是模板 vs 运行期两份）、
+ *   通知通道（飞书 app_id + owner_chat_id）与 HTTP 控制台。
  *   于是主人心里只有一个问题：「我到底连了什么？哪个断了？」
  *   今天没有任何一处能回答它 —— 每一处要么只有日志，要么只在**成功时**才留下痕迹，
  *   而坏掉的那一处恰恰是看不见的（失败是沉默的）。
@@ -70,7 +72,7 @@ export interface ConnectionCalendarSource {
   errors: string[];
 }
 
-/** MCP server 事实。toolCount 是握手后拿到的工具数。 */
+/** MCP server 事实。toolCount 是配置里 allowTools 白名单的条数（不是握手拿到的工具数）。 */
 export interface ConnectionMcpServer {
   name: string;
   toolCount: number;
@@ -285,17 +287,29 @@ function mcpRows(servers: ConnectionMcpServer[]): ConnectionRow[] {
         name: 'MCP 工具通道',
         status: 'not_configured',
         detail: '没有配置任何 MCP server',
-        hint: '在 config/mcp-servers.yml 里添加 server',
+        // 2026-10-26：路径改成 daemon **真正会读**的位置。
+        // daemon 读 `DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')`，
+        // 托管部署里 configDir 是 `~/.dotd`。原来写 `config/mcp-servers.yml`，
+        // 人会去改仓库模板，而那份没人读。
+        hint: '在 <home>/mcp-servers.yml（通常 ~/.dotd/）里添加 server；仓库 config/ 下那份只是模板',
       },
     ];
   }
-  // 能列出来就说明已经握手成功过（toolCount 是握手拿到的事实），所以一律 connected。
+  // `toolCount` 是**配置里声明的白名单条数**（`allowTools?.length`），不是握手拿到的
+  // 工具总数 —— `loadMcpServers()` 只解析 YAML，`McpClient.listTools()` 要等真正
+  // 调用时才跑。所以「已声明」不等于「连得上」：command 写错、机器上没有那个可执行
+  // 文件，这里照样显示 connected。
+  //
+  // 2026-10-26 改了文案（原来 detail 是 `${toolCount} 个工具`，注释还写着
+  // "能列出来就说明已经握手成功过" —— 那是错的）。status 值保留 'connected'
+  // 不动（控制台/脚本在读它，改语义要单独决定）；先把话说准，不让人以为这里探过活。
   return servers.map((s) => ({
     kind: 'mcp',
     id: s.name,
     name: s.name,
     status: 'connected',
-    detail: `${s.toolCount} 个工具`,
+    detail:
+      s.toolCount > 0 ? `已声明（白名单 ${s.toolCount} 个工具）` : '已声明（未限制工具白名单）',
   }));
 }
 
@@ -334,7 +348,10 @@ function modelRows(models: ConnectionModelEndpoint[]): ConnectionRow[] {
         name: `${m.tier} · ${endpointHost(m.endpoint)}`,
         status: 'not_configured',
         detail: `已禁用（${m.endpoint} · ${m.model}）`,
-        hint: '在 config/models.yml 里把该端点的 enabled 改成 true',
+        // 与 MCP 那条同一个坑（2026-10-26）：daemon 读的是 `<configDir>/models.yml`，
+        // 托管部署里是 `~/.dotd/models.yml`（且热加载）。写死 `config/models.yml`
+        // 会把人指去改仓库模板 —— 那份没人读。
+        hint: '在运行期的 models.yml（通常 ~/.dotd/）里把该端点的 enabled 改成 true；仓库 config/ 下那份只是模板',
       };
     }
     return {

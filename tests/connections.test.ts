@@ -266,27 +266,37 @@ test('连接器：detail 用 registry 的 desc，不自己编状态描述', () =
   assert.equal(row?.detail, 'Issues / Pulls（未认证公开 API，限速 60 请求/小时）');
   assert.equal(row?.name, 'GitHub');
 });// ── 6. MCP ─────────────────────────────────────────────────────
-test('MCP：一个 server 都没配 → 一行 not_configured，hint 指向 config/mcp-servers.yml', () => {
+test('MCP：一个 server 都没配 → 一行 not_configured，hint 指向 daemon 真正读的那份', () => {
   const rows = buildConnections({ ...base(), mcpServers: [] });
   const row = pick(rows, 'mcp', 'mcp');
   assert.equal(row?.status, 'not_configured');
   assert.equal(row?.name, 'MCP 工具通道');
-  assert.match(row?.hint ?? '', /config\/mcp-servers\.yml/);
+  const hint = row?.hint ?? '';
+  // 必须指向运行期路径（<home>/，通常 ~/.dotd），而不是仓库里的模板 ——
+  // 人会照着 hint 去改仓库 config/，那份 daemon 不读。
+  assert.match(hint, /mcp-servers\.yml/);
+  assert.match(hint, /\.dotd|<home>/);
+  assert.match(hint, /模板/);
   assert.equal(pickAll(rows, 'mcp').length, 1);
 });
 
-test('MCP：每个 server 一行，status=connected，detail 写工具数', () => {
+test('MCP：每个 server 一行，status=connected，detail 只敢说「已声明」', () => {
   const rows = buildConnections({
     ...base(),
     mcpServers: [
       { name: 'fs', toolCount: 9 },
       { name: 'playwright', toolCount: 4 },
+      { name: 'noop', toolCount: 0 },
     ],
   });
-  assert.equal(pickAll(rows, 'mcp').length, 2);
+  assert.equal(pickAll(rows, 'mcp').length, 3);
   assert.equal(pick(rows, 'mcp', 'fs')?.status, 'connected');
-  assert.equal(pick(rows, 'mcp', 'fs')?.detail, '9 个工具');
-  assert.equal(pick(rows, 'mcp', 'playwright')?.detail, '4 个工具');
+  assert.equal(pick(rows, 'mcp', 'fs')?.detail, '已声明（白名单 9 个工具）');
+  assert.equal(pick(rows, 'mcp', 'playwright')?.detail, '已声明（白名单 4 个工具）');
+  // toolCount=0 是「没写 allowTools」，不是「握手拿到 0 个工具」。
+  assert.equal(pick(rows, 'mcp', 'noop')?.detail, '已声明（未限制工具白名单）');
+  // 不许再出现「N 个工具」这种会被读成「探测过、连得上」的说法。
+  assert.doesNotMatch(pick(rows, 'mcp', 'fs')?.detail ?? '', /^\d+ 个工具$/);
   assert.equal(pick(rows, 'mcp', 'fs')?.hint, undefined);
 });
 
@@ -304,7 +314,11 @@ test('模型端点：禁用的端点也要出现，状态 not_configured，detai
   assert.equal(off?.status, 'not_configured');
   assert.match(off?.detail ?? '', /已禁用/);
   assert.match(off?.detail ?? '', /backup\.example\.com/, '关着的端点也要说清是哪一个');
-  assert.match(off?.hint ?? '', /config\/models\.yml/);
+  // 与 MCP 那条同一个坑：daemon 读 <configDir>/models.yml（托管部署是 ~/.dotd），
+  // 写死 config/models.yml 会把人指去改一份没人读的模板。
+  assert.match(off?.hint ?? '', /models\.yml/);
+  assert.match(off?.hint ?? '', /\.dotd/);
+  assert.match(off?.hint ?? '', /模板/);
 });
 
 test('模型端点：启用的端点 connected，detail 写 endpoint 与 model', () => {

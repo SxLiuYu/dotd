@@ -436,6 +436,31 @@ test('sos-test：daemon 不可达 → 退码 7（§5.6 原文）', async () => {
   assert.match(captured.err.join(''), /连不上 daemon/);
 });
 
+test('提示里出现的 `dotd <命令>` 必须是真注册过的命令（别再把人指去撞墙）', () => {
+  // 2026-10-26 现场：`dotd task <不存在的 id>` 的提示写的是「可用 `dotd queue` 看待办」。
+  // `queue` 从来没注册过 —— 人照着敲，得到的是「未知命令：queue」+ exit 2。
+  // 「下一步命令」是给人在卡住时看的，它本身不该再把人的路堵死一次。
+  const src = readFileSync(join(REPO_ROOT, 'src', 'surfaces', 'cli.ts'), 'utf8');
+  const registered = new Set(buildCli().commands.map((c) => c.name()));
+  const bad: string[] = [];
+  let scanned = 0;
+  for (const raw of src.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith('*') || line.startsWith('/**') || line.startsWith('//')) continue;
+    // `npm --prefix dotd run serve` 里的 dotd 是包名，不是命令前缀。
+    if (line.includes('npm ')) continue;
+    for (const m of raw.matchAll(/dotd ([a-z][a-z0-9-]*)/g)) {
+      const name = m[1]!;
+      scanned += 1;
+      if (!registered.has(name)) bad.push(`${name} ← ${line}`);
+    }
+  }
+  assert.deepEqual(bad, [], `这些提示指向了不存在的命令：\n${bad.join('\n')}`);
+  // 防"空扫描通过"：正则一旦写错（比如以后改了提示格式），上面那个 deepEqual
+  // 会因为 bad 恒空而变成永远绿 —— 那正是本仓库反复踩的"检查器看不见自己"。
+  assert.ok(scanned >= 5, `只扫到 ${scanned} 处 \`dotd <命令>\`，正则可能失效了`);
+});
+
 test('asChannels：逐字段校验——字段缺失/类型错 → null（不把 undefined 当 false）', async () => {
   const { asChannels } = await import('../src/surfaces/cli.ts');
   assert.equal(asChannels(null), null);

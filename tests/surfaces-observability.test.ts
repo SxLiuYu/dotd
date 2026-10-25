@@ -445,7 +445,10 @@ describe('CLI：dotd task --verbose / dotd logs', () => {
     await cli.parseAsync(['node', 'dotd', 'task', 'tk_nope']);
     const text = c.captured.out.join('\n');
     assert.match(text, /不存在/);
-    assert.match(text, /dotd queue/, '要给出下一步命令');
+    // 下一步命令必须是**真存在**的。原来写 `dotd queue` —— 那个命令根本没注册，
+    // 敲下去只会得到「未知命令：queue」+ exit 2（2026-10-26 修）。
+    assert.match(text, /dotd status/, '要给出下一步命令（且这个命令真的存在）');
+    assert.doesNotMatch(text, /dotd queue/, '不许再指向不存在的命令');
   });
 
   test('dotd logs 打的是 /api/logs（不再是 /api/guard 凑），并渲染成可读行', async () => {

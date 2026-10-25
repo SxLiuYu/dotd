@@ -16,9 +16,9 @@
 
 import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
-import { isEnvRef, layeredEnv, parseEnvFile, tokenFiles, usableToken } from '../scripts/lib/env.mjs';
+import { isEnvRef, layeredEnv, parseEnvFile, resolveConfigDir, tokenFiles, usableToken } from '../scripts/lib/env.mjs';
 
 // 路径一律用 join 拼：lib 里也是 join（Windows 上是反斜杠），写死 '/' 会
 // 在 Linux 绿、Windows 红 —— 那种"只在某台机器上过"的测试比没有更糟。
@@ -209,6 +209,58 @@ describe('⑤ usableToken：`${VAR}` 是引用，不是令牌', () => {
   test('引用只在**整串**时才算引用（令牌里带 $ 不该被误杀）', () => {
     assert.equal(isEnvRef('abc${X}def'), false);
     assert.equal(usableToken('abc$0123456789abcdef'), 'abc$0123456789abcdef');
+  });
+});
+
+describe('⑥ resolveConfigDir：三处审计脚本必须看 daemon 读的那一份', () => {
+  // 现场（2026-10-26）：doctor / onboard / probe-live-model 各自拼路径。
+  // doctor 看仓库模板、onboard 也看仓库模板、probe 还是仓库模板 —— 而 daemon
+  // 在托管部署里读 `~/.dotd`（`DOTD_CONFIG_DIR` 由 one_system 设）。
+  // 于是同一台机器上「体检看模板、daemon 跑运行时」，结论可以完全相反。
+  // 判据收成一份放在 lib 里，这条测试钉住它与 `src/daemon.ts::resolveConfigDir` 同形。
+
+  const repo = join('/srv', 'dotd');
+  // 设了 DOTD_CONFIG_DIR 的分支会走 `resolve()`（daemon 侧也是 resolve），
+  // 期待值同样过一遍：Windows 上 `/home/u` 是"当前盘根"，join 与 resolve 不同形。
+  const abs = (p: string) => resolve(p);
+
+  test('没设 DOTD_CONFIG_DIR → 仓库 config/', () => {
+    // 这条分支是 `join(repoRoot, 'config')`（与 daemon 逐字一致，不做 resolve），
+    // 所以期望值也用 join —— 用 resolve 会在 Windows 上把 `/srv` 变成 `D:\srv`。
+    assert.equal(resolveConfigDir({ env: {}, repoRoot: repo }), join(repo, 'config'));
+    assert.equal(
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '' }, repoRoot: repo }),
+      join(repo, 'config'),
+    );
+    assert.equal(
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '   ' }, repoRoot: repo }),
+      join(repo, 'config'),
+      '纯空白等于没设',
+    );
+  });
+
+  test('设了 → 用它（托管部署里就是 ~/.dotd）', () => {
+    assert.equal(
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: join('/home', 'u', '.dotd') }, repoRoot: repo }),
+      abs(join('/home', 'u', '.dotd')),
+    );
+  });
+
+  test('~ 要展开（人和脚本都爱写 ~/.dotd）', () => {
+    assert.equal(
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '~/.dotd' }, repoRoot: repo, home: join('/home', 'u') }),
+      abs(join('/home', 'u', '.dotd')),
+    );
+    assert.equal(
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '~' }, repoRoot: repo, home: join('/home', 'u') }),
+      abs(join('/home', 'u')),
+    );
+  });
+
+  test('相对路径按 cwd 解析成绝对路径（daemon 侧也是 resolve）', () => {
+    const got = resolveConfigDir({ env: { DOTD_CONFIG_DIR: 'cfg' }, repoRoot: repo });
+    assert.ok(isAbsolute(got), `要绝对路径：${got}`);
+    assert.ok(got.endsWith('cfg'));
   });
 });
 

@@ -561,7 +561,10 @@ export function buildCli(opts: CliOptions = {}): Command {
       if (!r.ok) {
         // 404 = 任务不存在：给出人话 + 下一步，而不是一个裸 error
         if (r.kind === 'http' && r.status === 404) {
-          emit(o, `任务 ${taskId} 不存在。可用 \`dotd queue\` 看待办、\`dotd events\` 看最近入站事件。`);
+          // 2026-10-26：原来写 `dotd queue` —— 这个命令不存在（敲下去只会得到
+          // 「未知命令：queue」+ exit 2）。人照着提示走，等于被指到另一堵墙上。
+          // 看待办的命令是 `dotd status`（队列 + 熔断 + 待批审批）。
+          emit(o, `任务 ${taskId} 不存在。可用 \`dotd status\` 看待办、\`dotd events\` 看最近入站事件。`);
           return;
         }
         return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);

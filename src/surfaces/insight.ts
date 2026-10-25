@@ -45,7 +45,7 @@ export interface InsightDeps {
   dotId: string;
   /** 连接器目录（daemon 传 connectorCatalog()）；注入而不是内部读环境变量，便于测试。 */
   connectors: ConnectorInfo[];
-  /** MCP server（daemon 传 loadMcpServers() 的结果，**只有名字与工具数**）。 */
+  /** MCP server（daemon 传 loadMcpServers() 的结果，**只有名字与白名单条数**）。 */
   mcpServers: ConnectionMcpServer[];
   /** 模型端点（daemon 从 models.yml 投影，不带任何 key）。 */
   models: ConnectionModelEndpoint[];

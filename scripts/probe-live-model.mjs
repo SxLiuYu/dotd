@@ -8,7 +8,8 @@
  * （不能依赖网络/凭据，不能让日常门禁因为没 key 就红）。
  *
  * 做法（**只读真配置、打真网关、不碰真 ~/.dotd**）：
- *   1. 用 loadModelsConfig 读 config/models.yml，取 tier1 且 enabled 的首个端点；
+ *   1. 用 loadModelsConfig 读 `<DOTD_CONFIG_DIR>/models.yml`（缺省仓库 config/），
+ *      取 tier1 且 enabled 的首个端点；
  *   2. 从端点声明的 api_key_env 读 key（**不从别处偷**：不读 .env、不翻进程环境、
  *      不猜文件名）；
  *   3. key 缺失 → 打印清晰结论并 exit 0（"没配凭据"不是失败，是未验证）；
@@ -24,6 +25,8 @@
  *   2 = 环境/装配错误（配置读不出来、端点不存在等）
  */
 
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,13 +40,24 @@ async function main() {
   const { HttpTransport } = await import('../src/router/transport.ts');
 
   // ── 1. 读真配置，选端点 ─────────────────────────────────────────────
-  const cfgPath = join(REPO_ROOT, 'config', 'models.yml');
+  //
+  // 路径顺序与 daemon 一致（2026-10-26）：`DOTD_CONFIG_DIR` 优先，否则仓库 config/。
+  // 托管部署里 daemon 读的是 `~/.dotd/models.yml`（且热加载），原来这里写死仓库那份：
+  // 主人改过运行时配置后，这个"上线前体检"验的是另一份端点 —— 结论与线上无关。
+  // 判据与 doctor / onboard 共用 `scripts/lib/env.mjs`。
+  const { resolveConfigDir } = await import('./lib/env.mjs');
+  const configDir = resolveConfigDir({ repoRoot: REPO_ROOT, home: homedir() });
+  const cfgPath = join(configDir, 'models.yml');
   let cfg;
   try {
     cfg = loadModelsConfig(cfgPath);
   } catch (cause) {
     out(`[probe] 环境错误：读不出 ${cfgPath}`);
     out(`        ${cause instanceof Error ? cause.message : String(cause)}`);
+    const repoCfg = join(REPO_ROOT, 'config', 'models.yml');
+    if (cfgPath !== repoCfg && existsSync(repoCfg)) {
+      out(`        注意：仓库模板 ${repoCfg} 存在，但 daemon 不读它（改的是另一份）。`);
+    }
     return 2;
   }
 
@@ -54,7 +68,7 @@ async function main() {
 
   const candidates = (cfg.endpoints ?? []).filter((e) => e.enabled !== false && e.tier === 1);
   if (candidates.length === 0) {
-    out('[probe] 环境错误：config/models.yml 里没有 enabled 的 tier1 端点');
+    out(`[probe] 环境错误：${cfgPath} 里没有 enabled 的 tier1 端点`);
     return 2;
   }
   const ep =

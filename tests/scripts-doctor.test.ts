@@ -550,8 +550,52 @@ test('MCP：运行时那份不存在时，提示仓库模板存在但 daemon 不
   }
 });
 
-// ── 3. P2-1 MCP：声明了但起不来要判 fail；没声明要判 skip（不制造噪音） ──────────
+test('tier1：读的也是 DOTD_CONFIG_DIR 下的 models.yml（热加载那份），不是仓库模板', async () => {
+  // 与 MCP 那条同一个缺陷（2026-10-26 一起修的）：ModelRouter 读
+  // `join(cfg.configDir, 'models.yml')`，而 models.yml 从 2026-10-25 起是**热加载**的。
+  // 托管部署里主人改的是 `~/.dotd/models.yml`（改完不用重启），doctor 原来写死仓库
+  // 那份 → 运行时配置坏掉了它照样报 ok。这里造一份"运行时 tier1 被关掉"的世界来验。
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const runtimeDir = join(s.home, '.dotd');
+    writeFileSync(
+      join(runtimeDir, 'models.yml'),
+      [
+        'endpoints:',
+        '  - id: gone',
+        '    tier: 1',
+        '    base_url: "http://127.0.0.1:3065/v1"',
+        '    enabled: false',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    const results = await runChecks({
+      env: {
+        DOTD_MASTER_TOKEN: 'm',
+        DOTD_RO_TOKEN: 'r',
+        HOOK_GRAFANA: 'h',
+        DOTD_CONFIG_DIR: runtimeDir, // ← supervisor 就是这么设的
+      },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const r = byName(results, 'tier1-endpoint');
+    assert.equal(r.status, STATUS.FAIL, `必须看运行时那份：${r.title}`);
+    assert.ok(r.title.includes(runtimeDir), `要指出看的是哪个文件：${r.title}`);
+    // 关键：**被关掉的端点不能被当成"能用的端点"去探活**。
+    // 旧实现 `find(enabled) ?? endpoints[0]` 会兜底到那个 disabled 端点，
+    // 探通了就报 ok —— 「唯一的主端点被人关了」这件最该拦住的事反而藏起来了。
+    assert.match(r.title, /enabled: false|全部/, `要指出是"全被关了"：${r.title}`);
+    assert.match(String(r.next), /enabled 改成 true/, '要给可操作修法');
+  } finally {
+    s.cleanup();
+  }
+});
 
+// ── 3. P2-1 MCP：声明了但起不来要判 fail；没声明要判 skip（不制造噪音） ──────────
 /** 造一份只含 MCP 声明的临时配置，返回路径。 */
 function writeMcp(dir: string, body: string): string {
   const p = join(dir, 'mcp-servers.yml');
@@ -735,4 +779,25 @@ test('MCP：doctor 不打印 MCP 配置里的敏感值（env 段一律不进 det
   } finally {
     s.cleanup();
   }
+});
+
+test('parseTier1Endpoint：带引号的标量要按 router 的口径去引号（不是"不合法 URL"）', () => {
+  // doctor 的正则原来把 `base_url: "http://…/v1"` 的引号当值的一部分，
+  // 于是合法配置被判成"不是合法 URL"。router 的 scalar() 早就剥了引号。
+  const eps = parseTier1Endpoint(
+    [
+      'endpoints:',
+      '  - id: "quoted"',
+      '    tier: 1',
+      '    base_url: "http://127.0.0.1:3065/v1"',
+      "    api_key_env: 'HY3_API_KEY'",
+      '    models:',
+      '      primary: "deepseek-v4.1-flash"',
+    ].join('\n'),
+  );
+  assert.equal(eps.length, 1);
+  assert.equal(eps[0]!.id, 'quoted');
+  assert.equal(eps[0]!.baseUrl, 'http://127.0.0.1:3065/v1');
+  assert.equal(eps[0]!.apiKeyEnv, 'HY3_API_KEY');
+  assert.equal(eps[0]!.primaryModel, 'deepseek-v4.1-flash');
 });

@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolvePython } from './lib/python.mjs';
-import { layeredEnv, usableToken } from './lib/env.mjs';
+import { layeredEnv, resolveConfigDir, usableToken } from './lib/env.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -204,9 +204,20 @@ add(
 
 // ── 4. 模型 key（只报端点名，不报 key）─────────────────────────────
 
-const modelCfg = join(REPO, 'config', 'models.yml');
+// 读的必须是 daemon 会读的那份（2026-10-26）。ModelRouter 读
+// `join(cfg.configDir, 'models.yml')`，configDir = `DOTD_CONFIG_DIR ?? repo/config`；
+// 托管部署里那是 `~/.dotd/models.yml`。原来 onboard 写死仓库模板：
+// 主人在运行时那份里换了 api_key_env（或干脆只改了那份），onboard 却在
+// 另一份文件里数 key 名 —— 又一个"检查器看错地方"。
+// 判据与 doctor / probe-live-model 共用 `scripts/lib/env.mjs` 的 resolveConfigDir。
+const configDir = resolveConfigDir({ repoRoot: REPO, home: homedir() });
+const modelCfg = join(configDir, 'models.yml');
+const repoModelCfg = join(REPO, 'config', 'models.yml');
 let modelOk = false;
-let modelDetail = '未找到 config/models.yml';
+let modelDetail =
+  modelCfg !== repoModelCfg && existsSync(repoModelCfg)
+    ? `未找到 ${modelCfg}（仓库模板 ${repoModelCfg} 存在，但 daemon 不读它）`
+    : `未找到 ${modelCfg}`;
 if (existsSync(modelCfg)) {
   const text = readFileSync(modelCfg, 'utf8');
   const envNames = [...text.matchAll(/api_key_env:\s*(\S+)/g)].map((m) => m[1]).filter((v) => v && v !== 'none');
@@ -230,7 +241,8 @@ add(
     ? undefined
     : [
         '免费额度：注册智谱 GLM（https://open.bigmodel.cn/）拿一个永久免费 key；',
-        `写进 ${join(home, 'tokens.env')}：`,
+        // 说清楚是给**哪份** config 配 key：daemon 读的是上面那个 modelCfg。
+        `按 ${modelCfg} 里每个端点声明的 api_key_env 补 key，写进 ${join(home, 'tokens.env')}：`,
         '  HY3_API_KEY=<你的 key>',
         '  （只配了这一个 key 时，先只跑反射层也能用：点灯/场景词/提醒）',
       ].join('\n'),

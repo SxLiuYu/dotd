@@ -22,7 +22,36 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { homedir as osHomedir } from 'node:os';
+import { join, resolve } from 'node:path';
+
+/**
+ * 「daemon 到底会读哪个配置目录」——脚本侧的唯一实现（2026-10-26）。
+ *
+ * 与 `src/daemon.ts` 的 `resolveConfigDir()` 同判据：
+ *   有 `DOTD_CONFIG_DIR` 用它，否则 `repoRoot/config`。
+ * 托管部署（one_system）会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd`，那时**真正生效**的是
+ * `<home>/models.yml` / `<home>/mcp-servers.yml`，仓库 `config/` 下那份只是模板。
+ *
+ * 为什么收到这里：`doctor` / `onboard` / `probe-live-model` 三处审计脚本各自拼过
+ * 仓库路径，于是同一台机器上三个结论互相矛盾（医生看模板、上手体检看另一份、
+ * 真模型探针看第三份）。判据写死在一处，以后加脚本直接引用。
+ *
+ * `home` 参数只影响 `~` 展开（测试注入用）；生产不传即 `os.homedir()`。
+ */
+export function resolveConfigDir({ env = process.env, repoRoot, home = osHomedir() } = {}) {
+  const raw = (env.DOTD_CONFIG_DIR ?? '').trim();
+  if (raw.length > 0) {
+    const expanded =
+      raw === '~'
+        ? home
+        : raw.startsWith('~/') || raw.startsWith('~\\')
+          ? join(home, raw.slice(2))
+          : raw;
+    return resolve(expanded);
+  }
+  return join(repoRoot, 'config');
+}
 
 /**
  * 解析 `tokens.env` 文本为对象。

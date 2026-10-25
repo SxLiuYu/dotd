@@ -29,7 +29,7 @@ import { dirname, isAbsolute, join, resolve, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
-import { layeredEnv } from './lib/env.mjs';
+import { layeredEnv, resolveConfigDir as resolveConfigDirShared } from './lib/env.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..');
@@ -72,14 +72,12 @@ export const STRICT_ENV_KEYS = Object.freeze(
  * 而托管部署（one_system）会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd` ——
  * 两边看的不是同一个文件，doctor 的结论与 daemon 的行为无关。
  * 显式传 env / repoRoot 是为了测试能造世界；生产调用不传即取 process.env。
+ *
+ * 实现已挪到 `scripts/lib/env.mjs`（`onboard` / `probe-live-model` 也要用同一判据，
+ * 三份各写一遍必然漂移）。这里保留同名导出，老调用方与测试不用改。
  */
 export function resolveConfigDir(env = process.env, repoRoot = REPO_ROOT) {
-  const raw = env.DOTD_CONFIG_DIR;
-  if (raw !== undefined && raw.length > 0) {
-    const expanded = raw === '~' ? homedir() : raw.startsWith('~/') ? join(homedir(), raw.slice(2)) : raw;
-    return resolve(expanded);
-  }
-  return join(repoRoot, 'config');
+  return resolveConfigDirShared({ env, repoRoot, home: homedir() });
 }
 
 /**
@@ -138,6 +136,22 @@ export function resolveModelTransport(raw) {
   return { effective: 'real-http', raw: v };
 }
 
+/**
+ * 去掉 YAML 标量两端的引号。
+ *
+ * 与 `src/router/config.ts` 的 `scalar()` 同口径（2026-10-26）。doctor 原来直接拿
+ * 正则抓到的原文当值：`base_url: "http://…/v1"` 会被判成「不是合法 URL」，
+ * 而 router 解析同一行时早就把引号去掉了 —— 配置完全合法，红的是体检。
+ * 这类「体检和真正的解析器读法不一致」与本节其它几条是同一个形状。
+ */
+function unquote(v) {
+  const t = String(v).trim();
+  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+    return t.slice(1, -1);
+  }
+  return t;
+}
+
 /** 从极简 YAML 文本里抠出 tier1 端点（不引第三方 YAML：doctor 必须零依赖可跑）。 */
 export function parseTier1Endpoint(text) {
   const lines = String(text).split(/\r?\n/);
@@ -155,13 +169,20 @@ export function parseTier1Endpoint(text) {
     const idM = /^\s*-\s+id:\s*(\S+)\s*$/.exec(line);
     if (idM !== null) {
       if (cur !== null) out.push(cur);
-      cur = { id: idM[1], tier: null, baseUrl: null, apiKeyEnv: null, enabled: true, primaryModel: null };
+      cur = {
+        id: unquote(idM[1]),
+        tier: null,
+        baseUrl: null,
+        apiKeyEnv: null,
+        enabled: true,
+        primaryModel: null,
+      };
       continue;
     }
     if (cur === null) continue;
     const kv = (k) => {
       const m = new RegExp(`^\\s+${k}:\\s*(.+?)\\s*$`).exec(line);
-      return m === null ? null : m[1];
+      return m === null ? null : unquote(m[1]);
     };
     const tier = kv('tier');
     if (tier !== null) cur.tier = Number(tier);
@@ -172,7 +193,7 @@ export function parseTier1Endpoint(text) {
     const en = kv('enabled');
     if (en !== null) cur.enabled = en !== 'false';
     const prim = /^\s+primary:\s*(\S+)\s*$/.exec(line);
-    if (prim !== null && cur.primaryModel === null) cur.primaryModel = prim[1];
+    if (prim !== null && cur.primaryModel === null) cur.primaryModel = unquote(prim[1]);
   }
   if (cur !== null) out.push(cur);
   return out.filter((e) => e.tier === 1);
@@ -393,18 +414,52 @@ export async function runChecks(opts = {}) {
     'model-transport',
     STATUS.OK,
     `DOTD_MODEL_TRANSPORT=${mt.raw === '' ? '（未设）' : mt.raw} → ${mt.effective}`,
-    mt.effective === 'stub' ? '模型走内存 stub，零网络请求（门禁/演示用）' : '真 HTTP（会打 config/models.yml 里的端点）',
+    mt.effective === 'stub' ? '模型走内存 stub，零网络请求（门禁/演示用）' : '真 HTTP（会打 models.yml 里的端点）',
   );
 
   // 7/8. tier1 端点：这是唯一能承载 primary 轨的端点，断了所有交互任务都挂起
+  //
+  // 路径必须与 daemon 同源（2026-10-26，与上面 MCP 那条是同一个缺陷）：
+  // ModelRouter 读的是 `join(cfg.configDir, 'models.yml')`，而 configDir 就是
+  // `resolveConfigDir()`。托管部署里那是 `~/.dotd/models.yml`。doctor 原来写死
+  // 仓库那份 —— 而 models.yml 从 2026-10-25 起是**热加载**的：主人改的是
+  // `~/.dotd/models.yml`（改完不用重启就生效），doctor 却去看仓库模板。
+  // 于是「端点被改坏 / enabled 被关」这种事，daemon 那边已经在用坏配置，
+  // doctor 这边还报 ok —— 体检看的是一份没人读的文件。
   let tier1 = null;
-  const modelsPath = join(repoRoot, 'config', 'models.yml');
+  let tier1Disabled = null;
+  const modelsPath = join(resolveConfigDir(env, repoRoot), 'models.yml');
+  const repoModels = join(repoRoot, 'config', 'models.yml');
   if (existsSync(modelsPath)) {
     const endpoints = parseTier1Endpoint(readFileSync(modelsPath, 'utf8'));
-    tier1 = endpoints.find((e) => e.enabled) ?? endpoints[0] ?? null;
+    // **不要** `?? endpoints[0]` 兜底（2026-10-26 去掉）：tier1 全被 `enabled: false`
+    // 时，路由器的 `pickCandidates` 过滤后一个候选都没有 —— primary 轨真的无处可去。
+    // 原来兜底到第一个（被禁用的）端点去探测，探通了就报 ok：「配置里唯一的主端点
+    // 被关掉了」这件最该拦住的事，被一个"反正有个地址能连"掩盖了。
+    tier1 = endpoints.find((e) => e.enabled) ?? null;
+    if (tier1 === null && endpoints.length > 0) tier1Disabled = endpoints[0];
   }
-  if (tier1 === null || tier1.baseUrl === null) {
-    add('tier1-endpoint', STATUS.FAIL, 'config/models.yml 里没有可用的 tier1 端点', 'primary 轨无处可去，所有交互任务都会挂起', '检查 config/models.yml 的 endpoints[].tier: 1');
+  if (tier1 === null && tier1Disabled !== null) {
+    add(
+      'tier1-endpoint',
+      STATUS.FAIL,
+      `${modelsPath} 的 tier1 端点全部 enabled: false`,
+      `${tier1Disabled.id} 存在但被关着 —— 路由器选候选时会把它过滤掉，primary 轨没有任何端点可用，` +
+        '所有交互任务都会挂起',
+      `把 ${modelsPath} 里该端点的 enabled 改成 true`,
+    );
+  } else if (tier1 === null || tier1.baseUrl === null) {
+    const extra =
+      modelsPath !== repoModels && existsSync(repoModels)
+        ? `（仓库模板 ${repoModels} 存在，但 daemon 不读它）`
+        : '';
+    add(
+      'tier1-endpoint',
+      STATUS.FAIL,
+      `${modelsPath} 里没有可用的 tier1 端点`,
+      `primary 轨无处可去，所有交互任务都会挂起${extra}`,
+      `检查 ${modelsPath} 的 endpoints[].tier: 1`,
+    );
   } else {
     const expanded = expandWithDefault(tier1.baseUrl, env);
     if (!expanded.resolved) {
@@ -441,7 +496,7 @@ export async function runChecks(opts = {}) {
             STATUS.FAIL,
             `${tier1.id} 连不上 ${host}:${port}`,
             r.detail,
-            '先把网关起起来（docs/tier1-endpoint.md 有搭建步骤），或改 config/models.yml 换端点',
+            '先把网关起起来（docs/tier1-endpoint.md 有搭建步骤），或改 models.yml 换端点',
           );
         }
       }
@@ -548,7 +603,7 @@ export async function runChecks(opts = {}) {
         STATUS.FAIL,
         `MCP 配置写错了：${parsed.error}`,
         mcpPath,
-        '按 config/mcp-servers.yml 顶部的模板改：每个 server 必填 name 与 command',
+        `照仓库 config/mcp-servers.yml 顶部的模板改 ${mcpPath}：每个 server 必填 name 与 command`,
       );
     } else if (parsed.servers.length === 0) {
       add('mcp', STATUS.SKIP, '未启用', `${mcpPath} 里没有声明任何 server（servers: []）`);
@@ -573,7 +628,7 @@ export async function runChecks(opts = {}) {
           `已声明 ${parsed.servers.length} 个 MCP server`,
           `${parsed.servers.map((s) => s.name).join(', ')}——**每次调用都会走 dangerous 档人工审批**，` +
             'server 是宿主上运行的任意程序，只声明你信任的',
-          '不需要时把 config/mcp-servers.yml 改回 servers: []',
+          '不需要时把该文件改回 servers: []',
         );
       } else {
         add(
@@ -581,7 +636,7 @@ export async function runChecks(opts = {}) {
           STATUS.FAIL,
           `${bad.length} 个 MCP server 起不来`,
           bad.map((b) => `${b.server}：${b.why}`).join('; '),
-          '改 config/mcp-servers.yml 的 command/args（用绝对路径或确保在 PATH 里），然后重跑 npm run doctor',
+          `改 ${mcpPath} 的 command/args（用绝对路径或确保在 PATH 里），然后重跑 npm run doctor`,
         );
       }
     }

@@ -34,3 +34,17 @@ export function isEnvRef(value?: string | null): boolean;
 
 /** 可用的令牌值；太短 / 是引用 / 仍是 change-me 占位 → null。 */
 export function usableToken(value?: string | null): string | null;
+
+export interface ResolveConfigDirOptions {
+  env?: Record<string, string | undefined>;
+  /** 仓库根；`DOTD_CONFIG_DIR` 缺席时回落到 `<repoRoot>/config`。 */
+  repoRoot: string;
+  /** 只用于展开 `~`（测试注入）。 */
+  home?: string;
+}
+
+/**
+ * daemon 真正会读的配置目录（与 `src/daemon.ts` 的 `resolveConfigDir()` 同判据）。
+ * `DOTD_CONFIG_DIR` 优先，否则 `<repoRoot>/config`。
+ */
+export function resolveConfigDir(opts: ResolveConfigDirOptions): string;

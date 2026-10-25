@@ -1794,7 +1794,7 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
       const why = e instanceof Error ? e.message : String(e);
       log(
         `[vault] GitHub token 解密失败（github.com/token 条目存在但与当前 DOTD_MAIL_KEY 不匹配）：${why}。` +
-          'GitHub 连接器降级为 public-only —— 重录一次即可：dotd vault put github.com token',
+          'GitHub 连接器降级为 public-only —— 重录一次即可：dotd vault add github.com token',
       );
     }
   }
@@ -1964,7 +1964,7 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // 模型端点）只有装配层同时握在手上。HTTP 层只做序列化，CLI 只是瘦客户端，
   // 于是「手机看到的」与「命令行看到的」永远是同一份数据。
   //
-  // 模型端点与 MCP 都**只取展示字段**（tier / base_url / 模型名 / server 名 + 工具数），
+  // 模型端点与 MCP 都**只取展示字段**（tier / base_url / 模型名 / server 名 + 白名单条数），
   // 不含 api_key 与任何 env 值 —— 总览是拿来判断"哪条线断了"的，不是凭证清单。
   const insightDeps: InsightDeps = {
     db,
