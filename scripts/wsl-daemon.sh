@@ -129,8 +129,19 @@ echo "FLEET=$DOTD_FLEET HOME=$DOTD_HOME"
 # 重启本服务时必须 TERM 这个 supervisor（uvicorn 收到信号 → sup.stop() 带走子进程），
 # 只杀 node 子进程会被它自动重启 —— wsl-deploy.sh / rebuild-image.sh 已同步改。
 # Python 依赖：repo 根 .venv（voice/charlie/requirements-core.txt）；没有则回退系统 python3。
+#
+# 回退也找不到时**说清楚并退出**（2026-10-26）。原来 `PY="$(command -v python3)"`
+# 在 python3 也不存在时得到空串，下一行就变成 `exec "" …`，报一句
+# `: not found` —— 看着像脚本坏了，真相是"这台机器没装 python3"。
 export DOTD_REPO_ROOT="$PWD"
 PY="$PWD/.venv/bin/python"
-[ -x "$PY" ] || PY="$(command -v python3)"
+if [ ! -x "$PY" ]; then
+  PY="$(command -v python3 || true)"
+fi
+if [ -z "$PY" ] || [ ! -x "$PY" ]; then
+  echo "[wsl-daemon] 找不到 Python：$PWD/.venv/bin/python 不可执行，系统也没有 python3。" >&2
+  echo "[wsl-daemon] 装：apt install python3 python3-venv，然后 npm run setup:all（建 .venv 并装依赖）" >&2
+  exit 1
+fi
 echo "supervisor: $PY -m voice.integration.one_system --port 8000"
 exec "$PY" -m voice.integration.one_system --port 8000

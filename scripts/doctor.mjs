@@ -58,6 +58,31 @@ export const STRICT_ENV_KEYS = Object.freeze(
 );
 
 /**
+ * 配置目录：与 `src/daemon.ts` 的 `resolveConfigDir()` **同一判据**。
+ *
+ * ```ts
+ * export function resolveConfigDir(): string {
+ *   const env = process.env.DOTD_CONFIG_DIR;
+ *   if (env !== undefined && env.length > 0) return resolve(expandHome(env));
+ *   return join(REPO_ROOT, 'config');
+ * }
+ * ```
+ *
+ * 这个函数存在的理由（2026-10-26）：doctor 原来写死 `repoRoot/config`，
+ * 而托管部署（one_system）会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd` ——
+ * 两边看的不是同一个文件，doctor 的结论与 daemon 的行为无关。
+ * 显式传 env / repoRoot 是为了测试能造世界；生产调用不传即取 process.env。
+ */
+export function resolveConfigDir(env = process.env, repoRoot = REPO_ROOT) {
+  const raw = env.DOTD_CONFIG_DIR;
+  if (raw !== undefined && raw.length > 0) {
+    const expanded = raw === '~' ? homedir() : raw.startsWith('~/') ? join(homedir(), raw.slice(2)) : raw;
+    return resolve(expanded);
+  }
+  return join(repoRoot, 'config');
+}
+
+/**
  * 体检项清单（导出给 tests/scripts-doctor.test.ts 做结构断言：
  * 名字/顺序/必查项都是契约的一部分，删一项就该有测试红）。
  */
@@ -493,12 +518,26 @@ export async function runChecks(opts = {}) {
   // 11. MCP 外部工具（P2-1）：声明了 server 但 command 找不到 = 每次调用都失败，
   //     而失败只在"任务跑到那一步"时才暴露——正是 doctor 该提前拦下的那类坑。
   //     未声明任何 server 时显示"未启用"，**不制造噪音**（默认配置下用户不该被提醒）。
+  //
+  //     路径必须与 daemon 同源（2026-10-26 修）。daemon 读的是
+  //     `process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')`，
+  //     而 `resolveConfigDir()` = `DOTD_CONFIG_DIR` 或 `repoRoot/config`。
+  //     原来 doctor 写死 `repoRoot/config/mcp-servers.yml`：在托管部署里
+  //     supervisor 会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd`，**真正生效的是那一份**，
+  //     于是 doctor 检查的是仓库模板 —— 用户在 `~/.dotd` 里配好了 server，
+  //     doctor 说"未启用"；用户把仓库模板改坏了，doctor 报 fail 而那文件没人读。
+  //     两份都在时以 daemon 会读的那份为准，并顺带提示另一份是模板。
   const mcpPath =
     env.DOTD_MCP_CONFIG !== undefined && env.DOTD_MCP_CONFIG !== ''
       ? env.DOTD_MCP_CONFIG
-      : join(repoRoot, 'config', 'mcp-servers.yml');
+      : join(resolveConfigDir(env, repoRoot), 'mcp-servers.yml');
+  const repoMcp = join(repoRoot, 'config', 'mcp-servers.yml');
   if (!existsSync(mcpPath)) {
-    add('mcp', STATUS.SKIP, '未启用', `没有 ${mcpPath}（MCP 外部工具默认关闭）`);
+    const extra =
+      mcpPath !== repoMcp && existsSync(repoMcp)
+        ? `（仓库模板 ${repoMcp} 存在，但 daemon 不读它）`
+        : '';
+    add('mcp', STATUS.SKIP, '未启用', `没有 ${mcpPath}（MCP 外部工具默认关闭）${extra}`);
   } else {
     const parsed = parseMcpServers(readFileSync(mcpPath, 'utf8'));
     // 顺序要紧：**先判错误**再判"有没有声明"。写错的配置在解析失败时 servers 也是空的，

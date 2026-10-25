@@ -488,6 +488,68 @@ test('tier1 key 只在 tokens.env 里 → warn；两处都没有 → fail；环�
   }
 });
 
+test('MCP：默认路径跟 daemon 走 DOTD_CONFIG_DIR，不是仓库模板', async () => {
+  // daemon 读 `DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')`，
+  // 而 cfg.configDir = resolveConfigDir() = DOTD_CONFIG_DIR 或 repoRoot/config。
+  // 托管部署里 supervisor 把 DOTD_CONFIG_DIR 设成 ~/.dotd —— 那是**真正生效**的一份。
+  //
+  // 原来 doctor 写死 repoRoot/config：用户在 ~/.dotd 里配好 server，doctor 说"未启用"；
+  // 仓库模板被改坏时，doctor 又报 fail 而那个文件没人读。
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    // 运行时目录（~/.dotd）里放一份**写坏的**配置：缺 command → daemon 会拒绝加载
+    const runtimeDir = join(s.home, '.dotd');
+    writeFileSync(
+      join(runtimeDir, 'mcp-servers.yml'),
+      'servers:\n  - name: broken\n',
+      'utf8',
+    );
+    const results = await runChecks({
+      env: {
+        DOTD_MASTER_TOKEN: 'm',
+        DOTD_RO_TOKEN: 'r',
+        HOOK_GRAFANA: 'h',
+        HY3_API_KEY: 'k',
+        DOTD_CONFIG_DIR: runtimeDir, // ← supervisor 就是这么设的
+      },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.FAIL, 'doctor 必须看 daemon 真正会读的那份');
+    assert.match(mcp.title, /写错|缺 command/, `实际：${mcp.title}`);
+    assert.ok(mcp.detail.includes(runtimeDir), `要指出看的是哪个文件：${mcp.detail}`);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('MCP：运行时那份不存在时，提示仓库模板存在但 daemon 不读', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const results = await runChecks({
+      env: {
+        DOTD_MASTER_TOKEN: 'm',
+        DOTD_RO_TOKEN: 'r',
+        HOOK_GRAFANA: 'h',
+        HY3_API_KEY: 'k',
+        DOTD_CONFIG_DIR: join(s.home, 'empty-cfg'), // 里面没有 mcp-servers.yml
+      },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.SKIP);
+    assert.match(mcp.detail, /daemon 不读它/, `要说清模板不是生效的那份：${mcp.detail}`);
+  } finally {
+    s.cleanup();
+  }
+});
+
 // ── 3. P2-1 MCP：声明了但起不来要判 fail；没声明要判 skip（不制造噪音） ──────────
 
 /** 造一份只含 MCP 声明的临时配置，返回路径。 */

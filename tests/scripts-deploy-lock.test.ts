@@ -29,7 +29,7 @@
 
 import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -357,6 +357,51 @@ describe('④b 配置对齐必须改「源」，不是改产物', () => {
     const alignBlock = code.slice(code.indexOf('align-live-config.mts') - 400, code.indexOf('align-live-config.mts') + 400);
     assert.doesNotMatch(alignBlock, /\|\| true/, '`|| true` 会把配置漂移藏起来');
     assert.match(alignBlock, /exit 7/, '对齐失败要拦住重启');
+  });
+});
+
+describe('④c 启动器找不到 Python 时必须说话，不能 exec 空串', () => {
+  // 现场（2026-10-26 排查链的最后一环）：`PY="$(command -v python3)"` 在 python3
+  // 也不存在时得到空串，下一行变成 `exec "" …`，报
+  //     /path/wsl-daemon.sh: line 147: : not found
+  // 看起来像脚本语法坏了。真相是"这台机器没装 python3"。
+  test('PY 为空/不可执行时 exit 1 并给出安装命令', () => {
+    const code = stripComments(DAEMON);
+    // 必须显式判空，而不是只判 command -v 的结果
+    assert.match(code, /if \[ -z "\$PY" \] \|\| \[ ! -x "\$PY" \]/, '要同时判空与可执行');
+    assert.match(code, /找不到 Python/, '要说人话');
+    assert.match(code, /apt install python3/, '要给安装命令');
+    // 判据必须在 exec 之前
+    const gateAt = code.indexOf('找不到 Python');
+    const execAt = code.indexOf('exec "$PY"');
+    assert.ok(gateAt > 0 && execAt > gateAt, '闸门要在 exec 之前');
+  });
+
+  test('真跑：PATH 里没有 python3 且没有 .venv → 闸门触发（不是 exec 空串）', () => {
+    // 把闸门那段原样切出来跑（不手抄判据）。
+    const src = read('scripts/wsl-daemon.sh');
+    const start = src.indexOf('PY="$PWD/.venv/bin/python"');
+    const end = src.indexOf('exec "$PY"');
+    assert.ok(start > 0 && end > start, '切片锚点找不到');
+    const body = src.slice(start, end);
+    const dir = mkdtempSync(join(tmpdir(), 'dotd-py-'));
+    try {
+      writeFileSync(join(dir, 'snippet.sh'), `set -u
+${body}
+exit 0
+`, 'utf8');
+      const r = spawnSync('bash', [join(dir, 'snippet.sh')], {
+        encoding: 'utf8',
+        cwd: dir, // 没有 .venv
+        env: { PATH: '/nonexistent-py-test', HOME: dir },
+        // Windows 上 bash 找不到时给个明确的 skip 而不是假红
+      });
+      if (r.error !== undefined) return; // 没有可用的 bash：跳过（CI 的 Linux 会跑）
+      assert.equal(r.status, 1, `应当 exit 1，实际 ${r.status}；stderr=${r.stderr}`);
+      assert.match(r.stderr, /找不到 Python/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
