@@ -92,3 +92,67 @@ test('其它暂停原因(watermark/budget/tool_risk)不受影响', () => {
     cleanup();
   }
 });
+
+// ── 2026-10-25：重启后事件不补发，靠"最近一次成功调用"兜底恢复 ──────────────
+
+test('resumePausedAfterModelOk：暂停早于最近一次成功 → 回队', () => {
+  const { cp, db, cleanup } = fixture();
+  try {
+    const a = cp.submit({ title: 'a', goal: 'g', dotId: 'dot1' });
+    cp.pauseByReason(a.id, 'endpoints_unreachable');
+    const pausedAt = (db.prepare('SELECT updated_at FROM tasks WHERE id=?').get(a.id) as { updated_at: number }).updated_at;
+
+    assert.equal(cp.resumePausedAfterModelOk(pausedAt - 1), 0, '成功发生在暂停之前 → 不恢复');
+    let r = db.prepare('SELECT status FROM tasks WHERE id=?').get(a.id) as { status: string };
+    assert.equal(r.status, 'paused');
+
+    assert.equal(cp.resumePausedAfterModelOk(pausedAt + 1), 1, '成功发生在暂停之后 → 恢复');
+    const after = db.prepare('SELECT status, stop_reason FROM tasks WHERE id=?').get(a.id) as { status: string; stop_reason: string | null };
+    assert.equal(after.status, 'queued');
+    assert.equal(after.stop_reason, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test('resumePausedAfterModelOk：只碰 circuit_open / endpoints_unreachable，不碰配置与资源类暂停', () => {
+  const { cp, db, cleanup } = fixture();
+  try {
+    const transient = ['circuit_open', 'endpoints_unreachable'] as const;
+    const sticky = ['no_qualified_primary', 'watermark', 'budget', 'tool_risk'] as const;
+    const ids = new Map<string, string>();
+    for (const reason of [...transient, ...sticky]) {
+      const t = cp.submit({ title: reason, goal: 'g', dotId: 'dot1' });
+      cp.pauseByReason(t.id, reason);
+      ids.set(reason, t.id);
+    }
+    const n = cp.resumePausedAfterModelOk(Date.now() + 60_000);
+    assert.equal(n, 2, '只有两种"模型不可用"原因可恢复');
+
+    for (const reason of transient) {
+      const r = db.prepare('SELECT status FROM tasks WHERE id=?').get(ids.get(reason)!) as { status: string };
+      assert.equal(r.status, 'queued', `${reason} 应回队`);
+    }
+    for (const reason of sticky) {
+      const r = db.prepare('SELECT status, stop_reason FROM tasks WHERE id=?').get(ids.get(reason)!) as { status: string; stop_reason: string | null };
+      assert.equal(r.status, 'paused', `${reason} 不该被模型恢复路径带走`);
+      assert.equal(r.stop_reason, reason);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test('resumePausedAfterModelOk：非法时间戳不恢复（避免把"0"当成功过）', () => {
+  const { cp, db, cleanup } = fixture();
+  try {
+    const a = cp.submit({ title: 'a', goal: 'g', dotId: 'dot1' });
+    cp.pauseByReason(a.id, 'endpoints_unreachable');
+    assert.equal(cp.resumePausedAfterModelOk(0), 0);
+    assert.equal(cp.resumePausedAfterModelOk(Number.NaN), 0);
+    const r = db.prepare('SELECT status FROM tasks WHERE id=?').get(a.id) as { status: string };
+    assert.equal(r.status, 'paused');
+  } finally {
+    cleanup();
+  }
+});

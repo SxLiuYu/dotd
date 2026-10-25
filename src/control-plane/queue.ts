@@ -678,6 +678,47 @@ export class Queue {
     return Number(res.changes);
   }
 
+  /**
+   * 兜底恢复：**最近一次模型调用成功之后**才允许回队（2026-10-25 加）。
+   *
+   * 为什么还需要这一条：上面的 `resumeCircuitOpenTasks` 只挂在两个事件上
+   * （`router.breaker_changed(to=closed)` / `router.mode_changed` 从降级态恢复）。
+   * 现场实测有两种它覆盖不到的情况：
+   *   1. 网关短暂不可达后 daemon 重启 —— 断路器状态是**内存**的，重启后就是全新的
+   *      closed，不会补发 breaker_changed；mode 也一直是 NORMAL。于是暂停任务
+   *      永远不动（线上 3 条任务分别卡了 2 天、11 小时、27 分钟）。
+   *   2. 端点从没进过 open（模型级 bad_protocol 耗尽），却因 AllEndpointsDown 暂停。
+   *
+   * 判据用**成功调用时间**而不是"现在看起来健康"：调用方传入
+   * `SELECT MAX(ts) FROM model_call_log WHERE outcome='ok'`，本方法只恢复
+   * `updated_at < okAfterTs` 的任务 —— 即"暂停发生在最近一次成功之前"。
+   * 这样恢复后若再次失败，会拿到新的暂停时间；下一轮需要有一次**新的成功调用**
+   * 才可能再恢复，不会形成"恢复→失败→立刻恢复"的空转。
+   *
+   * @param okAfterTs 最近一次成功模型调用的时间戳（ms）；非法值 = 不恢复
+   * @returns 恢复的任务数
+   */
+  resumePausedAfterModelOk(okAfterTs: number): number {
+    if (!Number.isFinite(okAfterTs) || okAfterTs <= 0) return 0;
+    const res = this.db
+      .prepare(
+        `UPDATE tasks SET status='queued', stop_reason=NULL, run_at=NULL, updated_at=?
+         WHERE status='paused'
+           AND stop_reason IN ('circuit_open','endpoints_unreachable')
+           AND updated_at < ?`,
+      )
+      .run(Date.now(), Math.floor(okAfterTs));
+    if (res.changes > 0) {
+      this.deps.bus.publish('task.state', { to: 'queued', resumed: res.changes, reason: 'model_recovered' });
+      this.deps.record(
+        'watchdog',
+        'normal',
+        JSON.stringify({ modelRecoveredAfterOk: res.changes, okAfterTs }),
+      );
+    }
+    return Number(res.changes);
+  }
+
   // ── 会话绑定（契约 M2：唯一回写通道，禁止 Runner 直接 UPDATE tasks）──────
 
   /** CP §8 bindSession：Runner 首步回写 tasks 独有列（issue #8）。带 epoch 围栏。 */

@@ -509,6 +509,12 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
     resumeDotQueue(dotId) {
       queue.resumeDotQueue(dotId);
     },
+    // 2026-10-25：兜底恢复（重启后断路器/模式事件不补发，见 contracts.ts 注释）
+    resumePausedAfterModelOk(okAfterTs: number) {
+      const n = queue.resumePausedAfterModelOk(okAfterTs);
+      if (n > 0) scheduler.wake();
+      return n;
+    },
     taskImpact(): TaskImpact {
       return matcher.taskImpact();
     },
@@ -538,6 +544,8 @@ export function createControlPlane(deps: ControlPlaneDeps): ControlPlaneInstance
         },
         scheduler,
         approvalsReader ?? deps.approvals,
+        // 本进程实际会服务的 dot：用于审计"排队但永远不会被 pop"的任务
+        deps.dotIds ?? [],
       );
       guard.calibrateOrUseFallback();
       return report;

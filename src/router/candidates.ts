@@ -340,16 +340,31 @@ export function makeHttpFailure(status: number, body: string, retryAfterMs: numb
   });
 }
 
-/** 是否 primary 轨的工具调用格式非法（§4.1：bad_protocol 时把 tool_calling 记为 no）。 */
-export function isToolCallBadProtocol(resp: ChatResponse): boolean {
-  if (resp.toolCalls === undefined || resp.toolCalls.length === 0) return false;
-  return resp.toolCalls.some((tc) => {
-    if (tc.name.length === 0) return true;
+/**
+ * primary 轨工具调用格式非法时，给出**可诊断但不泄漏正文**的一行说明；
+ * 合法时返回 null（2026-10-25 加）。
+ *
+ * 为什么需要它：线上 10 分钟内连撞 9 次 bad_protocol，`model_call_log` 只记
+ * 一个 kind，日志里也只有一句"参数不是合法 JSON" —— 不知道是哪个工具、
+ * 参数有多长，也就分不清"模型胡说"和"输出被 max_tokens 截断"。
+ * 这里只报**工具名 + 参数长度 + JSON 解析错误**，绝不带参数内容
+ * （参数里可能有主人的地址、金额、邮件正文）。
+ */
+export function badProtocolDetail(resp: ChatResponse): string | null {
+  if (resp.toolCalls === undefined || resp.toolCalls.length === 0) return null;
+  for (const tc of resp.toolCalls) {
+    if (tc.name.length === 0) return 'tool_call 缺少工具名';
     try {
       JSON.parse(tc.arguments);
-      return false;
-    } catch {
-      return true;
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      return `工具 ${tc.name} 的 arguments 不是合法 JSON（长度 ${tc.arguments.length}）：${why}`;
     }
-  });
+  }
+  return null;
+}
+
+/** 是否 primary 轨的工具调用格式非法（§4.1：bad_protocol 时把 tool_calling 记为 no）。 */
+export function isToolCallBadProtocol(resp: ChatResponse): boolean {
+  return badProtocolDetail(resp) !== null;
 }

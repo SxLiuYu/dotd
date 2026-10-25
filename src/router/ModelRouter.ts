@@ -18,7 +18,7 @@
  */
 
 import type { DatabaseSync } from 'node:sqlite';
-import { existsSync } from 'node:fs';
+import { existsSync, watch, type FSWatcher } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
 import type { EventBus } from '../shared/bus.ts';
 import { StreamToolCallAccumulator, type AggregatedToolCall } from '../shared/tool-stream.ts';
@@ -47,9 +47,9 @@ import {
 } from '../shared/errors.ts';
 import { Breaker } from './breaker.ts';
 import {
+  badProtocolDetail,
   classifyError,
   isModelScopedKind,
-  isToolCallBadProtocol,
   localGate,
   modelChain,
   pickCandidates,
@@ -1033,8 +1033,11 @@ export class ModelRouter {
     // 一个模型。2026-10-17 修：原先在此处直接把端点记为 'no'，等于一个模型的坏响应
     // 杀死整个端点的 primary 资格——fallback 链下一个模型明明成功了，端点却因这个标记
     // 被 pickCandidates 滤掉，直到配置 reload。端点级判决挪到 runModelChain 的链尾。
-    if (isToolCallBadProtocol(outcome.response)) {
-      throw new BadProtocolError('tool_call 参数不是合法 JSON（§4.1 bad_protocol）');
+    // 2026-10-25：错误消息带上"哪个工具、参数多长、JSON 错在哪"（不含参数内容）。
+    // 原来只有一句"参数不是合法 JSON"，线上连撞 9 次也分不清是模型胡说还是被截断。
+    const bad = badProtocolDetail(outcome.response);
+    if (bad !== null) {
+      throw new BadProtocolError(`tool_call 格式非法（§4.1 bad_protocol）：${bad}`);
     }
     // 零用量空壳（迁移自 PilotDeck "zero-usage retry"）：200 + 有 choices 却什么都没
     // 生成。**必须在 settle 之前拦**——拦在后面的话 breaker 会记一个 ok 样本，
@@ -1638,9 +1641,70 @@ export class ModelRouter {
     return [...this.endpoints];
   }
 
-  /** 释放（daemon 关停）:停掉心跳回调。 */
+  // ── models.yml 热加载（2026-10-25 接线）────────────────────────────────
+  //
+  // 此前 `reloadConfig()` 只有测试在调，`reload_debounce_ms` 是个**死配置项**，
+  // 而注释/文档一直写着"改一行配置热切换"。结果是：改完 models.yml 必须重启
+  // daemon，主人看到的却是"保存了但没生效"。
+  //
+  // 由装配层显式调用 startWatching()（不在构造函数里自动起）：测试会创建
+  // 大量 router，自动监听文件描述符会泄漏，也让"读配置"变成有副作用的操作。
+  private watcher: FSWatcher | null = null;
+  private reloadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 开始监听 models.yml（幂等；daemon 装配层调用）。 */
+  startWatching(): void {
+    if (this.watcher !== null || this.disposed) return;
+    const file = join(this.configDir, 'models.yml');
+    try {
+      this.watcher = watch(file, { persistent: false }, () => this.scheduleReload());
+    } catch (cause) {
+      // 监听起不来不能影响启动：退化为"改配置需重启"，并且要说出来
+      console.error(`[router] models.yml 热加载未启用（${String(cause)}），改配置后需重启`);
+    }
+  }
+
+  /** 停止监听（dispose 会调；测试可手动调）。 */
+  stopWatching(): void {
+    if (this.reloadTimer !== null) {
+      clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+    if (this.watcher !== null) {
+      try {
+        this.watcher.close();
+      } catch {
+        // 已关
+      }
+      this.watcher = null;
+    }
+  }
+
+  /**
+   * 防抖后重载。**配置写坏时必须保住旧配置**：编辑器保存瞬间可能是半个文件，
+   * 直接抛出去会让一次误存变成"模型全灭"。所以失败只喊、不换配置。
+   */
+  private scheduleReload(): void {
+    if (this.disposed) return;
+    if (this.reloadTimer !== null) clearTimeout(this.reloadTimer);
+    const delay = Math.max(100, this.cfg.reload_debounce_ms);
+    this.reloadTimer = setTimeout(() => {
+      this.reloadTimer = null;
+      try {
+        this.reloadConfig();
+        console.error(`[router] models.yml 已热加载（${this.endpoints.length} 个端点）`);
+      } catch (cause) {
+        console.error(`[router] models.yml 热加载失败，继续用旧配置：${String(cause)}`);
+        this.bus.publish('config.models_reload_failed', { error: String(cause) });
+      }
+    }, delay);
+    this.reloadTimer.unref?.();
+  }
+
+  /** 释放（daemon 关停）:停掉心跳回调与配置监听。 */
   dispose(): void {
     this.disposed = true;
+    this.stopWatching();
   }
 
   /** 测试/诊断:1min 心跳回调本体（breaker.probe_timer）。 */

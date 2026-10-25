@@ -72,6 +72,8 @@ export interface RecoveryReport {
   heartbeatsCaughtUp: number;
   /** 步骤 6：重放的未决策事件数。 */
   eventsReplayed: number;
+  /** 步骤 6b：落在未注册 dot 上的排队任务（永远不会被 pop，必须可见）。 */
+  orphanQueued: string[];
 }
 
 /**
@@ -225,6 +227,7 @@ export async function recoverOnStartup(
   deps: RecoveryDeps,
   scheduler: Scheduler,
   approvalsReader?: ApprovalsReader,
+  knownDotIds: readonly string[] = [],
 ): Promise<RecoveryReport> {
   const report: RecoveryReport = {
     inFlightRecovered: [],
@@ -234,6 +237,7 @@ export async function recoverOnStartup(
     approvalsResumed: [],
     heartbeatsCaughtUp: 0,
     eventsReplayed: 0,
+    orphanQueued: [],
   };
 
   // 步骤 2：优雅标记判定（无优雅标记 = 崩溃）。只影响日志/审计，不影响恢复动作
@@ -255,6 +259,9 @@ export async function recoverOnStartup(
   deps.matcher.replayUndecidedEvents(200);
   report.eventsReplayed = undecided.length;
 
+  // 步骤 6b：审计"永远不会被派发"的排队任务（静默卡死 → 至少可见）
+  report.orphanQueued = auditOrphanQueuedTasks(deps.db, knownDotIds, deps.record);
+
   return report;
 }
 
@@ -273,4 +280,43 @@ export function reclaimTask(
 /** 供 index.ts 暴露的 Task 快照（测试/诊断用）。 */
 export function snapshotTask(task: Task): Task {
   return task;
+}
+
+/**
+ * 启动审计：找出**永远不会被派发**的排队任务（2026-10-25 加）。
+ *
+ * 现场：线上有一条 `dot_id='default'` 的 queued 任务，而 Runner 只认
+ * `DOTD_DOT_IDS`（当前 `dot1`）。`pop(dotId)` 按 dot 过滤，于是这条任务
+ * 从 2026-10-24 起一直排在队里 —— 没有报错、没有事件、面板上也看不出异常，
+ * 只是"主人让它干的事永远没人干"。
+ *
+ * 为什么只审计不自动改：`dot_id` 决定任务落到哪个容器/身份，猜错了比卡住更糟
+ * （可能拿另一个 dot 的登录态去执行）。所以这里做的是**把静默变成可见**：
+ * 启动时记一条 `watchdog/guarded` 事件 + 返回 id，由装配层打日志。
+ * 修法（单 dot 阶段）：`UPDATE tasks SET dot_id='dot1' WHERE id=…` 或取消重建。
+ *
+ * @param knownDotIds 本进程实际会服务的 dot（装配层的 DOTD_DOT_IDS）
+ * @returns 落在未知 dot 上的 queued 任务 id
+ */
+export function auditOrphanQueuedTasks(
+  db: DatabaseSync,
+  knownDotIds: readonly string[],
+  record: RecoveryDeps['record'],
+): string[] {
+  if (knownDotIds.length === 0) return [];
+  const placeholders = knownDotIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT id, dot_id FROM tasks
+        WHERE status = 'queued' AND dot_id NOT IN (${placeholders})
+        ORDER BY created_at`,
+    )
+    .all(...knownDotIds) as Array<{ id: string; dot_id: string }>;
+  if (rows.length === 0) return [];
+  record(
+    'watchdog',
+    'guarded',
+    JSON.stringify({ orphanQueued: rows.length, tasks: rows.map((r) => ({ id: r.id, dotId: r.dot_id })) }),
+  );
+  return rows.map((r) => r.id);
 }

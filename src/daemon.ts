@@ -1053,6 +1053,8 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   });
   routerHolder.r = router; // 回填：CP 的 lowBrain 从此刻起可读
   cpHolder.cp = cp; // 回填：SSE queue 通道快照从此刻起可读
+  // models.yml 热加载（2026-10-25 接线）：改配置不用重启。失败时保留旧配置并留痕。
+  router.startWatching();
 
   // ⑤ GOV（cp 钩子回填到真 CP；模块单例 initGovernance）
   const { catalog, warnings } = loadCatalog(
@@ -2396,6 +2398,15 @@ log(
   for (const f of recovery.inFlightFailed) {
     log(`[recovery] 在途对账失败 task=${f.taskId}（已兜底回 queued）：${f.error}`);
   }
+  // 落在未注册 dot 上的排队任务：`pop(dotId)` 按 dot 过滤，它们永远不会被执行。
+  // 不自动改 dot_id（猜错 = 用错容器/身份），但必须在启动时喊出来并给出修法。
+  if (recovery.orphanQueued.length > 0) {
+    log(
+      `[recovery] ${recovery.orphanQueued.length} 个排队任务属于未注册的 dot（永远不会被派发）：` +
+        recovery.orphanQueued.join(', ') +
+        `。修法：确认归属后 UPDATE tasks SET dot_id='${cfg.dotIds[0] ?? 'dot1'}' WHERE id=… 或取消重建`,
+    );
+  }
   // 副作用未知的孤儿步已降级为「等主人审批」——必须在启动时就喊出来，
   // 否则主人只会看到一条莫名卡住的任务（审批单本身经 approval:created → SSE 可见，
   // 也可 GET /api/approvals?state=pending 拉取）。
@@ -2454,6 +2465,31 @@ log(
       if (r.expired > 0 || r.reminded > 0) {
         log(`[gov] 审批扫描：到期 ${r.expired} 条、提醒 ${r.reminded} 条`);
       }
+    },
+  });
+
+  // 兜底恢复"模型不可用"挂起的任务（2026-10-25）。
+  //
+  // 事件驱动的那条（queue.resumeCircuitOpenTasks）只挂在 breaker_closed /
+  // mode_changed 上；而断路器状态在内存里，daemon 重启后就是全新 closed，
+  // **不会补发事件**，mode 也一直 NORMAL。线上实测：3 条 endpoints_unreachable
+  // 任务分别卡了 2 天 / 11 小时 / 27 分钟，期间模型早就恢复、新任务正常跑。
+  //
+  // 判据用"最近一次成功模型调用"而不是"现在看起来健康"：只恢复暂停时间早于
+  // 那次成功的任务。恢复后再失败会拿到新的暂停时间，需要一次**新的成功调用**
+  // 才会再恢复，不会空转。2 分钟一次足够快，也是一次单表 MAX 查询。
+  cp.scheduler.registerInternalJob({
+    name: 'cp.model-recovery',
+    kind: 'light',
+    everyMs: 2 * 60_000,
+    run: async () => {
+      const row = db
+        .prepare("SELECT MAX(ts) AS t FROM model_call_log WHERE outcome = 'ok'")
+        .get() as { t: number | null } | undefined;
+      const okAfterTs = Number(row?.t ?? 0);
+      if (!Number.isFinite(okAfterTs) || okAfterTs <= 0) return;
+      const n = cp.resumePausedAfterModelOk(okAfterTs);
+      if (n > 0) log(`[cp] 模型调用已恢复：${n} 个暂停任务回队`);
     },
   });
 
@@ -2527,6 +2563,8 @@ log(
     emergencyWatch.stop();
     // ① 停 pop 与心跳投递（scheduler.stop 内部停全部 registerInternalJob）
     cp.shutdown();
+    // ①b 停配置监听（2026-10-25）：否则关停过程中一次保存还会触发 reload
+    router.dispose();
     // ② 向在跑 Runner 协程传 AbortSignal，等它在当前步边界落 journal 后退出
     abort.abort();
     const grace = new Promise<void>((done) => setTimeout(done, cfg.shutdownGraceMs));

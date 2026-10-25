@@ -355,6 +355,16 @@ export interface ControlPlane {
   /** 契约 G3（O6 裁定）：per-dot 队列 pause/resume。 */
   pauseDotQueue(dotId: string): void;
   resumeDotQueue(dotId: string): void;
+  /**
+   * 2026-10-25：兜底恢复"模型不可用"挂起的任务，判据是**最近一次成功模型调用**。
+   *
+   * 事件驱动的恢复（breaker_changed / mode_changed）覆盖不到 daemon 重启：
+   * 断路器状态在内存里，重启后就是全新 closed，不补发事件；mode 也一直 NORMAL。
+   * 线上实测有任务因此卡了两天。装配层每 2 分钟扫一次，传
+   * `MAX(model_call_log.ts WHERE outcome='ok')`；只恢复暂停时间早于它的任务，
+   * 所以不会空转（再次失败会得到新的暂停时间，需要新的成功调用才会再恢复）。
+   */
+  resumePausedAfterModelOk(okAfterTs: number): number;
   /** 契约 T2：注入 ModelRouter.load。 */
   taskImpact(): TaskImpact;
 

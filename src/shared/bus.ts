@@ -80,6 +80,8 @@ export const TOPICS = {
   'event.received': 'log',
   // 配置热加载（MR §5.3 订阅）
   'config.models_reloaded': 'log',
+  // 热加载失败（文件写坏/校验不过）：旧配置继续用，但必须留痕（2026-10-25）
+  'config.models_reload_failed': 'log',
 } as const satisfies Record<string, BusChannel>;
 
 export type TopicName = keyof typeof TOPICS;

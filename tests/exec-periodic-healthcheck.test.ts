@@ -51,3 +51,35 @@ test('自愈必须经 booting 中转（状态机不允许 unhealthy → ready）
   assert.ok(bootingFirst > 0, '恢复路径应先 transition 到 booting');
   assert.ok(readyAfter > bootingFirst, 'booting 之后才 transition 到 ready');
 });
+
+// ── 2026-10-25：探活成功必须刷新 last_health_at ──────────────────────────
+//
+// 现场：/api/container 的 `lastHealthAt` 停在换容器那天（2026-10-24T03:20），
+// 而 periodicHealthCheck 每分钟都在成功。面板上"最近健康"是排查第一眼要看的
+// 字段，停更等于给了个会骗人的时间戳。
+
+test('探活成功会刷新 last_health_at（行为级，不只是源码里有这行）', async () => {
+  const { makeTempDataDir } = await import('./helpers.ts');
+  const { ExecServiceImpl } = await import('../src/exec/ExecService.ts');
+  const tmp = makeTempDataDir({ pool: true });
+  const exec = new ExecServiceImpl({ db: tmp.db, bus: tmp.bus, cfg: { tokenDir: tmp.root } });
+  try {
+    await exec.boot(['dot1']);
+    const before = tmp.db
+      .prepare("SELECT last_health_at FROM containers WHERE dot_id='dot1'")
+      .get() as { last_health_at: string | null } | undefined;
+    assert.ok(before !== undefined, 'stub boot 后应有容器行');
+
+    const r = await exec.periodicHealthCheck('dot1');
+    assert.equal(r.ok, true, 'stub backend 下探活应成功');
+
+    const after = tmp.db
+      .prepare("SELECT last_health_at FROM containers WHERE dot_id='dot1'")
+      .get() as { last_health_at: string | null };
+    assert.ok(after.last_health_at !== null, '成功探活后 last_health_at 不应为空');
+    assert.notEqual(after.last_health_at, before!.last_health_at, '成功探活必须刷新时间戳');
+  } finally {
+    exec.dispose();
+    tmp.cleanup();
+  }
+});

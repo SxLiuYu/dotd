@@ -1475,6 +1475,13 @@ export class ExecServiceImpl implements ExecService {
 
     if (ok) {
       this.healthFailStreak.delete(dotId);
+      // 2026-10-25 修：探活成功必须落 `last_health_at`。
+      // 现场：/api/container 一直显示 `lastHealthAt` 停在换容器那天，
+      // 而 periodicHealthCheck 每分钟都在成功 —— 面板上"最近健康"是排查
+      // 第一眼要看的东西，停更等于给了一个会骗人的时间戳。
+      // 写入放在状态机之前：状态迁移失败（例如状态机拒绝）不该连"探活成功"
+      // 这个事实一起丢掉。
+      this.fleet.touchHealth(dotId);
       if (row.state === 'unhealthy') {
         // 探活恢复 → 拉回可用态。
         // **必须走 unhealthy → booting → ready**（状态机定义的合法路径）：
@@ -1499,6 +1506,7 @@ export class ExecServiceImpl implements ExecService {
     const retryOk = await this.probeHealth(dotId);
     if (retryOk) {
       this.healthFailStreak.delete(dotId);
+      this.fleet.touchHealth(dotId); // 同上：token 刷新后的成功也是成功
       if (row.state === 'unhealthy') {
         try {
           this.fleet.transition(dotId, 'booting', { reason: 'periodic healthcheck 恢复(token 已刷新)' });
