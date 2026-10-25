@@ -79,4 +79,20 @@ export DOTD_NET_TOOLS="${DOTD_NET_TOOLS:-get}"
 export DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-3}"
 
 echo "FLEET=$DOTD_FLEET HOME=$DOTD_HOME"
-node --import tsx src/daemon.ts
+
+# 6. 一套系统：one_system 托管 dotd（2026-10-25 与 Charlie 合并启动）
+#
+# 以前这里直接 `node src/daemon.ts`，Charlie 另有一个容器自带一份 stub 版 dotd ——
+# 一台机器两套实例、两份库。现在交给 voice/integration/one_system.py：
+#   - 它把**这份真 dotd**（docker 执行面 / 真库 / 飞书）拉成子进程，退出自动退避重启；
+#   - 8000 成为统一入口（Charlie 语音 + /console 控制台 + /api 反代），7788 仍归 dotd；
+#   - 子进程 cwd=REPO_ROOT、env 继承本脚本全部导出（模型网关/FLEET/NET_TOOLS/
+#     MAX_RUNNING 都会传下去），日志统一进本文件的 /tmp/dotd-wsl.log，dotd 行带 [dotd] 前缀。
+# 重启本服务时必须 TERM 这个 supervisor（uvicorn 收到信号 → sup.stop() 带走子进程），
+# 只杀 node 子进程会被它自动重启 —— wsl-deploy.sh / rebuild-image.sh 已同步改。
+# Python 依赖：repo 根 .venv（voice/charlie/requirements-core.txt）；没有则回退系统 python3。
+export DOTD_REPO_ROOT="$PWD"
+PY="$PWD/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3)"
+echo "supervisor: $PY -m voice.integration.one_system --port 8000"
+exec "$PY" -m voice.integration.one_system --port 8000

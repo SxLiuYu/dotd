@@ -38,7 +38,10 @@ log() { echo "[deploy] $*"; }
 [ -f "$DST/package.json" ] || { echo "目标 $DST 没有 package.json（首次部署请先手工 clone/拷贝一次）" >&2; exit 3; }
 
 # ── 0. 记录现状（重启前的 PID、库版本），便于出问题回溯 ─────────────────
-OLD_PID="$(pgrep -f 'src/daemon\.ts' | head -1 || true)"
+# 现在的 daemon 由 one_system 托管（2026-10-25 起）：要抓的是 supervisor（python）
+# 和它手里的 dotd 子进程（node）两族 —— 只杀 node 会被 supervisor 自动重启，
+# 结果就是"部署完新代码、跑的还是旧进程"。
+OLD_PID="$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' | head -1 || true)"
 log "源=$SRC"
 log "目标=$DST"
 log "当前 daemon PID=${OLD_PID:-（未运行）}"
@@ -58,6 +61,7 @@ rsync -a --delete \
   --exclude '*.db-shm' \
   --exclude 'nul' \
   --exclude '_*' \
+  --exclude '.venv' \
   --exclude '.tmp-*' \
   --exclude 'tmp-*' \
   --exclude '*.log' \
@@ -104,16 +108,20 @@ if [ "$DO_RESTART" = "0" ]; then
 fi
 
 # ── 5. 重启 daemon（优雅退出优先；起不来自动回滚到旧 PID 的日志供查）──────
-if [ -n "$OLD_PID" ]; then
-  log "SIGTERM $OLD_PID（宽限 30s）"
-  kill -TERM "$OLD_PID" 2>/dev/null || true
+# one_system 托管模式：先 TERM supervisor（uvicorn 收信号 → sup.stop() 优雅带走
+# dotd 子进程），再兜底清残留 node 子进程；两边都等到退干净才起新的。
+PIDS="$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)"
+if [ -n "$PIDS" ]; then
+  log "SIGTERM supervisor+daemon: $(echo $PIDS | tr '\n' ' ')"
+  for p in $PIDS; do kill -TERM "$p" 2>/dev/null || true; done
   for _ in $(seq 1 30); do
-    kill -0 "$OLD_PID" 2>/dev/null || break
+    pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' >/dev/null 2>&1 || break
     sleep 1
   done
-  if kill -0 "$OLD_PID" 2>/dev/null; then
-    log "30s 还没退，SIGKILL"
-    kill -KILL "$OLD_PID" 2>/dev/null || true
+  LEFT="$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)"
+  if [ -n "$LEFT" ]; then
+    log "30s 还没退，SIGKILL: $(echo $LEFT | tr '\n' ' ')"
+    for p in $LEFT; do kill -KILL "$p" 2>/dev/null || true; done
     sleep 1
   fi
 fi
@@ -154,6 +162,11 @@ if [ "$CODE" != "200" ]; then
   exit 5
 fi
 
-NEW_PID="$(pgrep -f 'src/daemon\.ts' | head -1 || true)"
-log "完成：daemon PID=${NEW_PID:-?} 在 127.0.0.1:$PORT（旧 PID=${OLD_PID:-无}）"
+NEW_PID="$(pgrep -f 'voice\.integration\.one_system' | head -1 || true)"
+log "完成：supervisor PID=${NEW_PID:-?}（dotd 由其托管）在 127.0.0.1:$PORT（旧 PID=${OLD_PID:-无}）"
+# 8000 是合并后的统一入口（Charlie /console + /api 反代）；起不来要说出来，
+# 不能只验 7788 就宣布成功 —— 那正是"说上线了而实际没上线"的老路。
+V="$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)"
+log "GET :8000/health（charlie+dotd 统一入口）→ $V"
+[ "$V" = "200" ] || log "⚠️ 8000 未就绪（charlie 侧没起来）；看 /tmp/dotd-wsl.log"
 log "飞书长连接/模型热备由 daemon 自行恢复；可用 \`dotd sos-test\` 与 /api/status 复核。"

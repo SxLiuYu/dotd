@@ -82,14 +82,22 @@ if [ "$SWAP" = "1" ]; then
     echo "  无旧容器"
   fi
   # daemon 在跑就先优雅停掉：boot 才会重新 ensureImage + reconcile。
-  DPID=$(pgrep -f 'node .*src/daemon\.ts' | head -1)
-  if [ -n "$DPID" ]; then
-    echo "  停止 daemon (pid $DPID)…"
-    kill -TERM "$DPID" 2>/dev/null || true
+  # one_system 托管模式（2026-10-25 起）：TERM supervisor 才能带走 dotd 子进程，
+  # 只杀 node 会被 supervisor 自动重启，换镜像就成了空话。
+  DPIDS=$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)
+  if [ -n "$DPIDS" ]; then
+    echo "  停止 supervisor+daemon (pid $(echo $DPIDS | tr '\n' ' '))…"
+    for p in $DPIDS; do kill -TERM "$p" 2>/dev/null || true; done
     for _ in $(seq 1 30); do
       sleep 1
-      pgrep -f 'node .*src/daemon\.ts' >/dev/null 2>&1 || break
+      pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' >/dev/null 2>&1 || break
     done
+    LEFT=$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)
+    if [ -n "$LEFT" ]; then
+      echo "  30s 未退，SIGKILL"
+      for p in $LEFT; do kill -KILL "$p" 2>/dev/null || true; done
+      sleep 1
+    fi
   fi
   echo "  拉起 daemon…"
   setsid bash scripts/wsl-daemon.sh >/tmp/dotd-wsl.log 2>&1 < /dev/null &
