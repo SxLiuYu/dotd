@@ -29,6 +29,7 @@ import { dirname, isAbsolute, join, resolve, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
+import { layeredEnv } from './lib/env.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..');
@@ -43,9 +44,17 @@ export const STATUS = Object.freeze({ OK: 'ok', WARN: 'warn', FAIL: 'fail', SKIP
  * hooks[].secret 三处走 strict:true；memory 展开恒严格。
  * 其余（TG_BOT_TOKEN、FEISHU_* 六字段等）是 strict:false，未设置 → 空串 → daemon 照常起。
  * 这张表就是 doctor 判"缺 key 会拒启动"的唯一依据，**与实现同源**，不要凭印象加项。
+ *
+ * `DOTD_DB_PATH` **不在**这张表里（2026-10-26 改正）。它曾经在，理由是
+ * config.yml 的 `db.path: ${DOTD_DB_PATH}`。但那一行**根本没人读**：
+ * `loadSurfacesConfig` 只解析 `surfaces:` 节，`db:` 节连解析入口都没有；
+ * 真正的库路径由 `db/conn.ts` 的 `resolveDbPath()` 直接读 `process.env`，
+ * 缺了就回落到 `~/.dotd/dotd.db`——不是 fail-closed。
+ * 实测（live）：`env -u DOTD_DB_PATH` + 三个令牌齐全 → `loaded OK port=7788`。
+ * 把它留在表里等于声称"缺了会拒启动"，于是每台正常机器上都挂着一条假 ❌。
  */
 export const STRICT_ENV_KEYS = Object.freeze(
-  new Set(['DOTD_MASTER_TOKEN', 'DOTD_RO_TOKEN', 'HOOK_GRAFANA', 'DOTD_DB_PATH']),
+  new Set(['DOTD_MASTER_TOKEN', 'DOTD_RO_TOKEN', 'HOOK_GRAFANA']),
 );
 
 /**
@@ -150,23 +159,36 @@ export function parseTier1Endpoint(text) {
  * 旧实现只认"整个值恰好是一个占位符"，于是把带后缀的合法写法判成"不是合法 URL"，
  * 体检直接红 —— 那是体检脚本没跟上配置写法，不是配置有问题。
  * 与 src/router/config.ts 的 expandEnvText 同语义（同一份文件，两边都得认）。
+ *
+ * 返回值里的 `usedFallback` 是 2026-10-26 加的：**用了默认值**这件事必须让调用方
+ * 知道，否则又是"体检看错地方"。
+ *   live 上 `wsl-daemon.sh` 导出 `DOTD_MODEL_HOST=http://172.17.48.1:13065` 给
+ *   daemon（网关 relay）；而 doctor 在裸 shell 里跑，那里没有这个变量，于是按
+ *   默认值 `127.0.0.1:3065` 去探测——不通，报「网关没起」。而同一时刻 daemon
+ *   正用 relay 正常出字。默认值是"猜测"，猜出来的红不能当结论。
  */
 export function expandWithDefault(value, env) {
   const raw = String(value);
-  if (!raw.includes('${')) return { value, resolved: true };
+  if (!raw.includes('${')) return { value, resolved: true, usedFallback: false };
   const missing = [];
+  let usedFallback = false;
   const out = raw.replace(
     /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}\n]*))?\}/g,
     (_whole, name, fallback) => {
       const actual = env[name];
       if (actual !== undefined && actual !== '') return actual;
-      if (fallback !== undefined) return fallback;
+      if (fallback !== undefined) {
+        usedFallback = true;
+        return fallback;
+      }
       missing.push(name);
       return '';
     },
   );
-  if (missing.length > 0) return { value: out, resolved: false, missing: missing.join(', ') };
-  return { value: out, resolved: true };
+  if (missing.length > 0) {
+    return { value: out, resolved: false, missing: missing.join(', '), usedFallback };
+  }
+  return { value: out, resolved: true, usedFallback };
 }
 
 /** TCP 连通性探测（不握手、不发请求）：连上即通。 */
@@ -252,6 +274,13 @@ export async function runChecks(opts = {}) {
   const cfgPath = env.DOTD_CONFIG !== undefined && env.DOTD_CONFIG !== ''
     ? env.DOTD_CONFIG
     : join(home, '.dotd', 'config.yml');
+  // tokens.env 的 key 集合（只看键名/有没有值，不打印值）。用途见第 4 项：
+  // 一键启动（charlie:start / wsl-daemon.sh）会 source 它，裸 `npm run serve` 不会。
+  const tokens = layeredEnv({
+    home: env.DOTD_HOME !== undefined && env.DOTD_HOME !== '' ? env.DOTD_HOME : join(home, '.dotd'),
+    homedir: home,
+    processEnv: {},
+  });
   let cfgText = '';
   if (!existsSync(cfgPath)) {
     add(
@@ -280,22 +309,45 @@ export async function runChecks(opts = {}) {
       .join('\n');
     const placeholders = [...codeLines.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g)];
     const strict = placeholders.filter((m) => m[2] === undefined && STRICT_ENV_KEYS.has(m[1]));
-    const unset = strict.filter((m) => env[m[1]] === undefined || env[m[1]] === '').map((m) => m[1]);
-    const uniqueUnset = [...new Set(unset)];
-    if (uniqueUnset.length === 0) {
+    // 判定分三档，不能只问"进程环境里有没有"（2026-10-26 现场）：
+    //
+    //   live 上 3 个严格占位符（MASTER/RO/HOOK）都在 `~/.dotd/tokens.env` 里，
+    //   daemon 由 `charlie:start` / `wsl-daemon.sh` 拉起时**会 source 它**、跑得好好的；
+    //   而 `npm run doctor` 在裸 shell 里跑，`process.env` 是空的，于是报
+    //   「4 个严格占位符在环境里没有值」——**体检看错了地方**。
+    //
+    //   但反过来直接"文件里有就算有"也是错的：`npm run serve` 直接起 daemon 时
+    //   **没有人 source tokens.env**，那时它真的会 fail-closed 拒启动。
+    //
+    // 所以：环境里有 → OK；只在文件里 → WARN（当前 shell 起不来，但一键启动没问题）；
+    // 两处都没有 → FAIL（怎么办都不行）。
+    const fromEnv = (n) => env[n] !== undefined && env[n] !== '';
+    const missingHere = strict.map((m) => m[1]).filter((n) => !fromEnv(n));
+    const uniqueMissing = [...new Set(missingHere)];
+    const onlyInFile = uniqueMissing.filter((n) => tokens.has(n));
+    const nowhere = uniqueMissing.filter((n) => !tokens.has(n));
+    if (uniqueMissing.length === 0) {
       add(
         'placeholders',
         STATUS.OK,
         '配置里的严格占位符都能展开',
         `共 ${placeholders.length} 处占位符，其中 ${strict.length} 处严格（无默认值且不可缺省）`,
       );
+    } else if (nowhere.length === 0) {
+      add(
+        'placeholders',
+        STATUS.WARN,
+        `${onlyInFile.length} 个严格占位符只在 tokens.env 里（当前 shell 里没有）`,
+        `${onlyInFile.join(', ')} ← ${tokens.files.filter((p) => existsSync(p)).join(' / ')}`,
+        `直接 \`npm run serve\` 会拒启动（它不 source tokens.env）；用 \`npm run charlie:start\` 或先 \`set -a; . ~/.dotd/tokens.env; set +a\``,
+      );
     } else {
       add(
         'placeholders',
         STATUS.FAIL,
-        `${uniqueUnset.length} 个严格占位符在环境里没有值`,
-        uniqueUnset.join(', '),
-        `先 source ~/.dotd/tokens.env（PowerShell：dot-sourcing 后手动 export 到当前会话），再 npm run serve`,
+        `${nowhere.length} 个严格占位符在环境里和 tokens.env 里都没有值`,
+        nowhere.join(', '),
+        `写进 ~/.dotd/tokens.env（set -a; . ~/.dotd/tokens.env; set +a 后再起 daemon），或对一次性启动用环境变量`,
       );
     }
   } else {
@@ -347,6 +399,17 @@ export async function runChecks(opts = {}) {
         const r = await probe(host, port, 1_500);
         if (r.ok) {
           add('tier1-endpoint', STATUS.OK, `${tier1.id} ${expanded.value}`, `${r.detail}（${r.latencyMs}ms）`);
+        } else if (expanded.usedFallback) {
+          // 探的是 models.yml 的**默认值**，不是这个 shell 里配的地址 —— 探不通
+          // 说明不了"网关没起"（live 上真网关在 relay 的 13065，daemon 一直通着）。
+          // 判 WARN 并说清楚"我探的是哪个值、它从哪来"。
+          add(
+            'tier1-endpoint',
+            STATUS.WARN,
+            `${tier1.id} 的默认地址 ${host}:${port} 连不上（本次用的是默认值）`,
+            `${tier1.baseUrl} 展开为 ${expanded.value}；${r.detail}。如果你用一键启动（wsl-daemon.sh / charlie:start），它可能导出过别的地址，daemon 用的不是这个。`,
+            `设 DOTD_MODEL_HOST/对应变量后再跑本项，或确认网关确实起在 ${host}:${port}（docs/tier1-endpoint.md）`,
+          );
         } else {
           add(
             'tier1-endpoint',
@@ -365,6 +428,17 @@ export async function runChecks(opts = {}) {
       add('tier1-key', STATUS.OK, 'tier1 端点未声明 api_key_env', '免 key 端点（本地引擎）');
     } else if (env[keyEnv] !== undefined && env[keyEnv] !== '') {
       add('tier1-key', STATUS.OK, `${keyEnv} 已设置`, `长度 ${String(env[keyEnv]).length}（值不打印）`);
+    } else if (tokens.has(keyEnv)) {
+      // 同一类"看错地方"（2026-10-26）：live 上 HY3_API_KEY 在 tokens.env 里，
+      // 一键启动会 source 它，模型一路正常；裸 shell 里跑 doctor 却说"环境里没有"。
+      // 但只报 WARN 不报 OK：`npm run serve` 直接起时确实拿不到这个 key。
+      add(
+        'tier1-key',
+        STATUS.WARN,
+        `${keyEnv} 只在 tokens.env 里（当前 shell 里没有）`,
+        `来源 ${tokens.sources[keyEnv] ?? 'tokens.env'}（值不打印）`,
+        '一键启动（npm run charlie:start / wsl-daemon.sh）没问题；要让裸 `npm run serve` 也带上，先 set -a; . ~/.dotd/tokens.env; set +a',
+      );
     } else {
       add(
         'tier1-key',

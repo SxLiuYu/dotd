@@ -20,6 +20,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePython, pythonAtLeast } from './lib/python.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -45,20 +46,35 @@ for (const [rel, label] of need) {
 }
 
 // 2/3. Python
-const py = process.env.DOTD_PYTHON ?? 'python';
-const ver = spawnSync(py, ['--version'], { encoding: 'utf8' });
+//
+// `python` 在 Debian/Ubuntu/WSL 上**默认不存在**（只有 `python3`）。原来这里写死
+// `'python'`，于是 live 上报了两条红：Python 找不到 → `--check` 跑不起来 →
+// 被归因成"缺 token"。而同一台机器上 one_system 正由 .venv 的 python 正常服务。
+// 解析顺序见 scripts/lib/python.mjs 的文件头（显式指定 → .venv → python3 → python）。
+const pyResolved = resolvePython({ repoRoot: REPO, run: (bin, args) => spawnSync(bin, args, { encoding: 'utf8' }) });
+const py = pyResolved?.bin ?? (process.env.DOTD_PYTHON ?? 'python3');
+const ver = { status: pyResolved ? 0 : 1, stdout: pyResolved?.out ?? '', stderr: '' };
 if (ver.status !== 0) {
-  add('Python', 'fail', '找不到 python', '装 Python 3.11+，或设 DOTD_PYTHON 指向解释器');
+  add(
+    'Python ≥ 3.10',
+    'fail',
+    '找不到可用的 Python 解释器',
+    '装 Python 3.10+（apt install python3），或设 DOTD_PYTHON 指向解释器',
+  );
 } else {
   const text = `${ver.stdout}${ver.stderr}`.trim();
-  add('Python', 'ok', text);
-  const mods = spawnSync(py, ['-c', 'import mcp, requests'], { encoding: 'utf8' });
-  add(
-    'Python 依赖（mcp / requests）',
-    mods.status === 0 ? 'ok' : 'fail',
-    mods.status === 0 ? '已安装' : (mods.stderr || '').split('\n')[0],
-    mods.status === 0 ? '' : `cd voice/charlie && ${py} -m pip install -r requirements-core.txt`,
-  );
+  if (!pythonAtLeast(text, 3, 10)) {
+    add('Python ≥ 3.10', 'fail', `${text}（太旧）`, '升级到 3.10+；.venv 里的解释器优先，可用 DOTD_PYTHON 指定');
+  } else {
+    add('Python ≥ 3.10', 'ok', `${text}（用 ${py}）`);
+    const mods = spawnSync(py, ['-c', 'import mcp, requests'], { encoding: 'utf8' });
+    add(
+      'Python 依赖（mcp / requests）',
+      mods.status === 0 ? 'ok' : 'fail',
+      mods.status === 0 ? '已安装' : (mods.stderr || '').split('\n')[0],
+      mods.status === 0 ? '' : `"${py}" -m pip install -r voice/charlie/requirements-core.txt`,
+    );
+  }
 }
 
 // 3b. 记忆与主动推送的归属（阶段 5）
@@ -79,11 +95,13 @@ add(
 );
 
 // 4b. 一套壳的配置/令牌/控制台
-const check = spawnSync(py, ['-m', 'voice.integration.one_system', '--check'], {
-  cwd: REPO,
-  encoding: 'utf8',
-  env: { ...process.env },
-});
+const check = pyResolved
+  ? spawnSync(py, ['-m', 'voice.integration.one_system', '--check'], {
+      cwd: REPO,
+      encoding: 'utf8',
+      env: { ...process.env },
+    })
+  : { status: 127, stdout: '', stderr: '没有可用的 Python 解释器（见上一条）' };
 if (check.status === 0) {
   try {
     const info = JSON.parse(check.stdout);
@@ -120,7 +138,7 @@ if (check.status === 0) {
             ? '已禁用（SENSE_VOICE_DISABLED=1）'
             : '既没有本地模型也没有云端 key —— 设备会"听不见"',
       asr.mode === 'none' || asr.mode === 'unknown'
-        ? 'python -m voice.integration.asr_model voice/charlie/models/sense-voice（Docker 会自动下）'
+        ? `"${py}" -m voice.integration.asr_model voice/charlie/models/sense-voice（Docker 会自动下）`
         : '',
     );
   } catch {
@@ -131,7 +149,11 @@ if (check.status === 0) {
     '一套系统配置',
     'fail',
     (check.stdout || check.stderr || '').trim().split('\n').slice(-1)[0] || '--check 失败',
-    '设置 DOTD_MASTER_TOKEN，或把 tokens.env / config.yml 放到 ~/.dotd 或 ~/.charlie',
+    // 这条 next 之前无条件写"设置 DOTD_MASTER_TOKEN" —— 而 127/导入失败时也这么提示，
+    // 等于把工具自己的问题说成用户的配置问题（2026-10-26 现场就发生过一次）。
+    pyResolved
+      ? '设置 DOTD_MASTER_TOKEN，或把 tokens.env / config.yml 放到 ~/.dotd 或 ~/.charlie'
+      : '先解决上面的 Python 解释器问题再跑本项',
   );
 }
 

@@ -128,39 +128,78 @@ test('parseTier1Endpoint：从仓库真实 models.yml 里认出 tier1 与它的 
   assert.equal(ep.primaryModel, 'hy3');
 });
 
-test('expandWithDefault：${VAR:-默认} 在缺席时用默认值，不算缺', () => {
-  assert.deepEqual(expandWithDefault('${A:-http://h:1}', {}), { value: 'http://h:1', resolved: true });
-  assert.deepEqual(expandWithDefault('${A:-http://h:1}', { A: 'http://x:2' }), { value: 'http://x:2', resolved: true });
+test('expandWithDefault：${VAR:-默认} 在缺席时用默认值，不算缺（但要标出"用了默认值"）', () => {
+  // usedFallback 是 2026-10-26 加的：live 上 doctor 用默认值 127.0.0.1:3065 探测，
+  // 而 daemon 用的是 wsl-daemon.sh 导出的 172.17.48.1:13065。同样是"探不通"，
+  // "我自己配的地址不通"是 fail，"默认值不通"只能是 warn。
+  assert.deepEqual(expandWithDefault('${A:-http://h:1}', {}), {
+    value: 'http://h:1',
+    resolved: true,
+    usedFallback: true,
+  });
+  assert.deepEqual(expandWithDefault('${A:-http://h:1}', { A: 'http://x:2' }), {
+    value: 'http://x:2',
+    resolved: true,
+    usedFallback: false,
+  });
   const missing = expandWithDefault('${A}', {});
   assert.equal(missing.resolved, false);
   assert.equal(missing.missing, 'A');
-  // 普通字面量原样返回
+  // 普通字面量原样返回（没有占位符 = 不是默认值，是写死的事实）
   assert.deepEqual(expandWithDefault('http://127.0.0.1:7863/v1', {}), {
     value: 'http://127.0.0.1:7863/v1',
     resolved: true,
+    usedFallback: false,
   });
   // 占位符嵌在值中间（models.yml 的真实写法）：旧实现只认"整值即占位符"，
   // 会把这行判成"不是合法 URL"，体检红一片（2026-10-25 修）。
   assert.deepEqual(expandWithDefault('${A:-http://127.0.0.1:3065}/v1', {}), {
     value: 'http://127.0.0.1:3065/v1',
     resolved: true,
+    usedFallback: true,
   });
   assert.deepEqual(expandWithDefault('${A:-http://127.0.0.1:3065}/v1', { A: 'http://gw:13065' }), {
     value: 'http://gw:13065/v1',
     resolved: true,
+    usedFallback: false,
   });
   const partial = expandWithDefault('${A}/v1', {});
   assert.equal(partial.resolved, false);
   assert.equal(partial.missing, 'A');
 });
 
-test('STRICT_ENV_KEYS：严格展开的只有四处；FEISHU_* 等缺席是合法的', () => {
+test('STRICT_ENV_KEYS：严格展开的只有三处；DOTD_DB_PATH / FEISHU_* 缺席是合法的', () => {
+  // DOTD_DB_PATH 曾经在这张表里，因为 config.yml 写了 `db.path: ${DOTD_DB_PATH}`。
+  // 但那一行没人读（loadSurfacesConfig 只解析 surfaces: 节），真正的路径由
+  // db/conn.ts 直接读 process.env 并回落到 ~/.dotd/dotd.db —— 不是 fail-closed。
+  // 留在表里 = 每台正常机器上挂一条假 ❌（live 实测过）。
   assert.deepEqual(
     [...STRICT_ENV_KEYS].sort(),
-    ['DOTD_DB_PATH', 'DOTD_MASTER_TOKEN', 'DOTD_RO_TOKEN', 'HOOK_GRAFANA'],
+    ['DOTD_MASTER_TOKEN', 'DOTD_RO_TOKEN', 'HOOK_GRAFANA'],
   );
-  for (const k of ['FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'TG_BOT_TOKEN']) {
+  for (const k of ['FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'TG_BOT_TOKEN', 'DOTD_DB_PATH']) {
     assert.equal(STRICT_ENV_KEYS.has(k), false, `${k} 走非严格展开，不应被当成"缺了就起不来"`);
+  }
+});
+
+test('db: 节的 ${DOTD_DB_PATH} 不参与严格占位符判定（它没人读）', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(
+      s.home,
+      `${BASE_CFG}db:\n  path: \${DOTD_DB_PATH}\n  expected_user_version: 212\n`,
+    );
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h' },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const r = byName(results, 'placeholders');
+    assert.equal(r.status, STATUS.OK, `DOTD_DB_PATH 缺席不该判失败：${r.title} / ${r.detail}`);
+    assert.ok(!r.detail.includes('DOTD_DB_PATH'));
+  } finally {
+    s.cleanup();
   }
 });
 
@@ -266,7 +305,14 @@ test('tier1 端点连不上 → fail；连得上但没 key → 也 fail（这是
   const s = sandbox();
   try {
     writeConfig(s.home, BASE_CFG);
-    const env = { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h' };
+    // 显式给地址 = usedFallback:false。这时"连不上"是真结论，必须 fail。
+    // （不给地址时走 models.yml 的默认值，那是猜测 —— 见下一条测试。）
+    const env = {
+      DOTD_MASTER_TOKEN: 'm',
+      DOTD_RO_TOKEN: 'r',
+      HOOK_GRAFANA: 'h',
+      DOTD_MODEL_HOST: 'http://127.0.0.1:3065',
+    };
     const down = await runChecks({ env, home: s.home, repoRoot, probe: probeDown });
     assert.equal(byName(down, 'tier1-endpoint').status, STATUS.FAIL);
 
@@ -285,6 +331,33 @@ test('tier1 端点连不上 → fail；连得上但没 key → 也 fail（这是
     const okKey = byName(upKey, 'tier1-key');
     assert.equal(okKey.status, STATUS.OK);
     assert.ok(!okKey.detail.includes('sk-某值'), '绝不能把 key 的值打出来');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('tier1 用**默认值**探不通 → 只 warn（默认值是猜测，猜出来的红不能当结论）', async () => {
+  // live 实况（2026-10-26）：models.yml 写 `${DOTD_MODEL_HOST:-http://127.0.0.1:3065}`，
+  // wsl-daemon.sh 给 daemon 导出 172.17.48.1:13065（relay，通）；
+  // 而 doctor 在裸 shell 里跑，没有那个变量 → 按默认值探 3065 → 不通。
+  // 原来这条判 FAIL，于是"模型一路正常"的机器上永远挂着一条红。
+  const s = sandboxWithTokens();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h' }, // 没有 DOTD_MODEL_HOST
+      home: s.home,
+      repoRoot,
+      probe: probeDown,
+    });
+    const r = byName(results, 'tier1-endpoint');
+    assert.equal(r.status, STATUS.WARN, `默认值探不通不该判 fail：${r.title}`);
+    assert.match(r.title, /默认值/, '标题里必须写明"这是默认值"');
+    assert.match(String(r.next), /DOTD_MODEL_HOST|网关/, '要告诉人怎么让体检去看真地址');
+    // 关键：这条不能把退出码变成 1 —— 否则 CI / 部署门禁会被一条猜测挡住。
+    // （用带 tokens.env 的 sandbox：tier1-key 也会 WARN 而不是 FAIL，
+    //  这样退出码只反映"tier1-endpoint 这条猜测有没有被误判成 fail"。）
+    assert.equal(exitCodeFor(results), 0, '只有 warn 不该非零退出');
   } finally {
     s.cleanup();
   }
@@ -310,6 +383,106 @@ test('全部正常时退出码为 0，且报告里给得出结论', async () => 
     const text = formatReport(results);
     assert.ok(text.includes('结论：'), '人读模式下必须有结论行');
     assert.ok(results.every((r) => typeof r.title === 'string' && r.title.length > 0));
+  } finally {
+    s.cleanup();
+  }
+});
+
+// ── 2b. 严格占位符的三档判定：环境 / tokens.env / 都没有 ────────────────────
+//
+// 现场（2026-10-26，live）：`npm run doctor` 报
+//
+//     ❌ 4 个严格占位符在环境里没有值
+//        DOTD_DB_PATH, DOTD_MASTER_TOKEN, DOTD_RO_TOKEN, HOOK_GRAFANA
+//     ❌ 环境里没有 HY3_API_KEY
+//
+// 而这些值**都在** `~/.dotd/tokens.env` 里，daemon 由 `charlie:start` 拉起时
+// 会 source 它、跑得好好的。体检只读 process.env，于是把一台正常的机器报成红的。
+//
+// 但反过来"文件里有就算 OK"同样错：`npm run serve` 直接起 daemon 时**没有**
+// 任何东西 source tokens.env，它真的会 fail-closed。所以判据是三档：
+//   环境有 → OK｜只在文件 → WARN（一键启动没问题，裸 serve 会挂）｜都没有 → FAIL。
+
+function sandboxWithTokens(): { home: string; cleanup: () => void } {
+  const s = sandbox();
+  writeFileSync(
+    join(s.home, '.dotd', 'tokens.env'),
+    [
+      'export DOTD_MASTER_TOKEN=token-from-file-0123456789',
+      'export DOTD_RO_TOKEN=ro-from-file-0123456789',
+      'export HOOK_GRAFANA=hook-from-file',
+      'export HY3_API_KEY=sk-file-only',
+    ].join('\n'),
+    'utf8',
+  );
+  return s;
+}
+
+test('严格占位符只在 tokens.env 里 → warn（不是 fail：一键启动是好的）', async () => {
+  const s = sandboxWithTokens();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const results = await runChecks({ env: {}, home: s.home, repoRoot, probe: probeOk });
+    const r = byName(results, 'placeholders');
+    assert.equal(r.status, STATUS.WARN, '环境里没有但文件里有：不该判 fail');
+    assert.match(r.title, /tokens\.env/, '要指明"在文件里"');
+    assert.ok(r.detail.includes('DOTD_MASTER_TOKEN'), '要点名是哪几个');
+    assert.ok(!r.detail.includes('token-from-file'), '绝不能把值打出来');
+    assert.match(String(r.next), /charlie:start|set -a/, '要告诉人怎么让裸 serve 也带上');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('严格占位符两处都没有 → 仍然 fail（这条不能被上面的宽免征掉）', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r' }, // 缺 HOOK_GRAFANA，文件也没有
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const r = byName(results, 'placeholders');
+    assert.equal(r.status, STATUS.FAIL);
+    assert.ok(r.detail.includes('HOOK_GRAFANA'));
+    assert.ok(!r.detail.includes('DOTD_MASTER_TOKEN'), '已经有的不该出现在缺的名单里');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('tier1 key 只在 tokens.env 里 → warn；两处都没有 → fail；环境里有 → ok', async () => {
+  const s = sandboxWithTokens();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    const warn = byName(
+      await runChecks({ env: {}, home: s.home, repoRoot, probe: probeOk }),
+      'tier1-key',
+    );
+    assert.equal(warn.status, STATUS.WARN);
+    assert.ok(warn.detail.includes('tokens.env'), '要说出它从哪儿来的');
+    assert.ok(!warn.detail.includes('sk-file-only'), 'key 的值绝不能打印');
+
+    const ok = byName(
+      await runChecks({ env: { HY3_API_KEY: 'sk-live' }, home: s.home, repoRoot, probe: probeOk }),
+      'tier1-key',
+    );
+    assert.equal(ok.status, STATUS.OK);
+
+    // 换一个没有 tokens.env 的 home：两处都没有 → fail（这才是真缺 key）
+    const empty = sandbox();
+    try {
+      writeConfig(empty.home, BASE_CFG);
+      const fail = byName(
+        await runChecks({ env: {}, home: empty.home, repoRoot, probe: probeOk }),
+        'tier1-key',
+      );
+      assert.equal(fail.status, STATUS.FAIL);
+    } finally {
+      empty.cleanup();
+    }
   } finally {
     s.cleanup();
   }

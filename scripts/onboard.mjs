@@ -19,6 +19,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePython } from './lib/python.mjs';
+import { layeredEnv, usableToken } from './lib/env.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -40,13 +42,8 @@ function run(bin, args) {
   }
 }
 
-function firstVersion(bin, args) {
-  for (const b of process.env.DOTD_NODE ? [process.env.DOTD_NODE] : [bin]) {
-    const r = run(b, args);
-    if (r.ok) return { bin: b, out: r.out };
-  }
-  return null;
-}
+// 注意：这里不再是"把 DOTD_NODE 当作 python 候选"的那种复用（原来 firstVersion
+// 会把 DOTD_NODE 也当解释器试，是笔误）。Python 的解析全交给 resolvePython。
 
 // ── 1. Node / Python ────────────────────────────────────────────────
 
@@ -60,16 +57,24 @@ add(
   nodeMajor >= 22 ? undefined : '升级 Node 到 22+：https://nodejs.org/（node:sqlite 需要）',
 );
 
-const py =
-  firstVersion(process.env.DOTD_PYTHON ?? 'python', ['--version']) ??
-  firstVersion('python3', ['--version']);
+// Python：`python` 在 Debian/Ubuntu/WSL 上默认不存在（只有 `python3`），
+// 而且仓库在 /mnt 下时 Windows 的 .venv 也能被看见 —— 解析顺序统一交给
+// scripts/lib/python.mjs（显式指定 → 当前平台 .venv → python3 → python）。
+const pyResolved = resolvePython({
+  repoRoot: REPO,
+  run: (bin, args) => {
+    const r = spawnSync(bin, args, { encoding: 'utf8', timeout: 8000 });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  },
+});
+const py = pyResolved ? { bin: pyResolved.bin, out: pyResolved.out } : null;
 add(
   'python',
   'Python ≥ 3.10',
   'required',
   py !== null,
-  py?.out ?? '未找到 python',
-  py !== null ? undefined : '装 Python 3.10+（apt install python3 / brew install python）',
+  py ? `${py.out}（用 ${py.bin}）` : '未找到 Python 解释器',
+  py !== null ? undefined : '装 Python 3.10+（apt install python3 / brew install python），或设 DOTD_PYTHON',
 );
 
 // ── 2. 外部二进制 ───────────────────────────────────────────────────
@@ -105,19 +110,24 @@ add(
 // Docker 是数据卷 `<home>/voice/models/`（entrypoint 下到那儿）。只看前者会把
 // 容器部署误判成聋的。
 
-const asrHome =
-  process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
+// 配置根（后面所有"这台机器有什么"都从这里出发）。
+const home = process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
+
+// key 的"真相" = 进程环境 ∪ `<home>/tokens.env`（后者是 daemon 启动时 source 的那份）。
+// 只看 process.env 是错的：交互式 shell 不 source tokens.env，于是 live 机上
+// HY3/OPENROUTER/BACKUP **三个 key 都在文件里、daemon 用得正顺**，体检却报"缺模型 key"。
+const keys = layeredEnv({ home, homedir: homedir() });
+
+const asrHome = home;
 const senseModels = [
   join(asrHome, 'voice', 'models', 'sense-voice', 'model.int8.onnx'),
   join(REPO, 'voice', 'charlie', 'models', 'sense-voice', 'model.int8.onnx'),
 ].filter((p) => existsSync(p));
 // 百度要三个 key 齐全（上游判定如此），只算两个会给出"已配置"的假结论。
-const baiduReady = ['BAIDU_APP_ID', 'BAIDU_API_KEY', 'BAIDU_SECRET_KEY'].every(
-  (k) => (process.env[k] ?? '').length > 0,
-);
+const baiduReady = ['BAIDU_APP_ID', 'BAIDU_API_KEY', 'BAIDU_SECRET_KEY'].every((k) => keys.has(k));
 const cloudAsr = [
   ...(baiduReady ? ['baidu'] : []),
-  ...((process.env.STEPFUN_KEY ?? '').length > 0 ? ['stepfun'] : []),
+  ...(keys.has('STEPFUN_KEY') ? ['stepfun'] : []),
 ];
 const localAsr = senseModels.length > 0;
 add(
@@ -134,7 +144,9 @@ add(
     ? undefined
     : [
         '二选一：',
-        '  1. 本地（免费、26ms，推荐）：python -m voice.integration.asr_model ' +
+        // 提示里的命令必须**能直接粘贴就跑**：`python` 在 Debian/WSL 上不存在，
+        // 所以用这里已经解析出来的解释器（而不是假设叫 python）。
+        `  1. 本地（免费、26ms，推荐）："${py?.bin ?? 'python3'}" -m voice.integration.asr_model ` +
           'voice/charlie/models/sense-voice',
         '     直接跑上游脚本常常失败：它只有 GitHub release 一个源，国内会超时',
         '  2. 云端：在 tokens.env 里配 STEPFUN_KEY，或百度 BAIDU_APP_ID/API_KEY/SECRET_KEY',
@@ -144,7 +156,6 @@ add(
 
 // ── 3. 配置根与主人令牌（只看键名，不打印值）─────────────────────────
 
-const home = process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
 const cfgPath =
   process.env.DOTD_CONFIG ??
   [
@@ -163,25 +174,23 @@ if (cfgExists) {
   try {
     const text = readFileSync(cfgPath, 'utf8');
     const m = /master_token:\s*"?([^"\n]+)"?/.exec(text);
-    tokenOk = m !== null && m[1].trim().length >= 16 && !/change-me/i.test(m[1]);
+    // config.yml 里写的是 `${DOTD_MASTER_TOKEN}`（init-config 的默认形态）时，
+    // 它本身**不是**令牌，只是引用。原来只判"长度 ≥16 且不含 change-me"，
+    // 于是未展开的占位符长度 20 被当成真令牌 —— live 上这一行一直是假绿
+    // （2026-10-26）。daemon 拿到它之后是 expandEnv 展开，空则 fail-closed。
+    const tok = usableToken(m?.[1]);
+    tokenOk = tok !== null;
     tokenSource = tokenOk ? `${cfgPath} 的 surfaces.http.master_token` : '';
   } catch {
     tokenOk = false;
   }
 }
 if (!tokenOk) {
-  for (const p of [join(home, 'tokens.env'), join(homedir(), '.dotd', 'tokens.env')]) {
-    if (!existsSync(p)) continue;
-    try {
-      const m = /(?:export\s+)?DOTD_MASTER_TOKEN\s*=\s*"?([^"\n]+)"?/.exec(readFileSync(p, 'utf8'));
-      if (m && m[1].trim().length >= 16) {
-        tokenOk = true;
-        tokenSource = `${p} 的 DOTD_MASTER_TOKEN`;
-        break;
-      }
-    } catch {
-      /* ignore */
-    }
+  // 同样按 daemon 的眼光看 tokens.env（原来手写正则，漏了 `NAME = value` 的空格变体）。
+  const master = usableToken(keys.get('DOTD_MASTER_TOKEN'));
+  if (master !== null) {
+    tokenOk = true;
+    tokenSource = `${keys.sources.DOTD_MASTER_TOKEN ?? 'tokens.env'} 的 DOTD_MASTER_TOKEN`;
   }
 }
 add(
@@ -201,11 +210,15 @@ let modelDetail = '未找到 config/models.yml';
 if (existsSync(modelCfg)) {
   const text = readFileSync(modelCfg, 'utf8');
   const envNames = [...text.matchAll(/api_key_env:\s*(\S+)/g)].map((m) => m[1]).filter((v) => v && v !== 'none');
-  const present = envNames.filter((name) => (process.env[name] ?? '').length > 0);
+  // 与 daemon 同口径：进程环境 ∪ `<home>/tokens.env`（2026-10-26）。
+  // 原来只查 process.env，于是 live 机上三个 key 都在 tokens.env 里、daemon 用得
+  // 正顺，人一敲 onboard 却看见"缺模型 key" —— 检查器看错了地方，结论却指向用户。
+  const present = envNames.filter((name) => keys.has(name));
+  const uniq = [...new Set(envNames)];
   modelOk = present.length > 0;
   modelDetail = modelOk
-    ? `已配置 ${present.join(', ')}`
-    : `缺模型 key：${[...new Set(envNames)].join(' / ') || '（models.yml 未声明）'}`;
+    ? `已配置 ${[...new Set(present)].join(', ')}${keys.sources[present[0]] ? `（来自 ${keys.sources[present[0]]}）` : ''}`
+    : `缺模型 key：${uniq.join(' / ') || '（models.yml 未声明）'}${keys.files.length > 0 ? `（查过 ${keys.files.join(' 与 ')}）` : ''}`;
 }
 add(
   'model',
@@ -245,6 +258,7 @@ add(
 if (health !== null) {
   const token = findToken(cfgPath);
   if (token) {
+    let deviceLine = null;
     try {
       const res = await fetch(`${base}/api/devices`, {
         headers: { authorization: `Bearer ${token}` },
@@ -253,37 +267,50 @@ if (health !== null) {
       if (res.ok) {
         const body = await res.json();
         const n = Array.isArray(body.devices) ? body.devices.length : 0;
-        add(
-          'device',
-          '语音设备',
-          'optional',
-          n > 0,
-          n > 0 ? `${n} 台已注册` : '还没有设备',
-          n > 0 ? undefined : 'dotd device add 客厅小屏（然后把两行环境变量给 Charlie）',
-        );
+        deviceLine = {
+          ok: n > 0,
+          detail: n > 0 ? `${n} 台已注册` : '还没有设备',
+          fix: n > 0 ? undefined : 'dotd device add 客厅小屏（然后把两行环境变量给 Charlie）',
+        };
+      } else {
+        // 401 以前被静默吞掉：这一科**整行消失**，看起来像"没有这一项"。
+        // 说清楚是"令牌没通过"，否则人会以为设备检查通过或不存在。
+        deviceLine = {
+          ok: false,
+          detail: `令牌被拒（HTTP ${res.status}）`,
+          fix: '确认 config.yml 的 master_token 与 daemon 实际用的令牌一致（这里是展开后的值）',
+        };
       }
     } catch {
-      /* 忽略：设备检查是加分项 */
+      deviceLine = { ok: false, detail: `连不上 ${base}`, fix: '确认 daemon 在跑' };
     }
+    if (deviceLine !== null) {
+      add('device', '语音设备', 'optional', deviceLine.ok, deviceLine.detail, deviceLine.fix);
+    }
+  } else {
+    add(
+      'device',
+      '语音设备',
+      'optional',
+      false,
+      '没有可用的主人令牌，查不了设备',
+      '先修上面的「主人令牌」一项',
+    );
   }
 }
 
 function findToken(path) {
   try {
     const m = /master_token:\s*"?([^"\n]+)"?/.exec(readFileSync(path, 'utf8'));
-    if (m && m[1].trim().length >= 16 && !/change-me/i.test(m[1])) return m[1].trim();
+    const tok = usableToken(m?.[1]);
+    if (tok !== null) return tok;
   } catch {
     /* ignore */
   }
-  for (const p of [join(home, 'tokens.env'), join(homedir(), '.dotd', 'tokens.env')]) {
-    try {
-      const m = /(?:export\s+)?DOTD_MASTER_TOKEN\s*=\s*"?([^"\n]+)"?/.exec(readFileSync(p, 'utf8'));
-      if (m && m[1].trim().length >= 16) return m[1].trim();
-    } catch {
-      /* ignore */
-    }
-  }
-  return null;
+  // 第二来源用同一个分层口径（进程环境 ∪ tokens.env），不另抄一份文件列表 ——
+  // 抄两份迟早会漂，而漂掉的那份正是「语音设备」这一科的判据。
+  const fromEnv = usableToken(keys.get('DOTD_MASTER_TOKEN'));
+  return fromEnv;
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────

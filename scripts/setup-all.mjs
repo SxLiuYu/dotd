@@ -29,6 +29,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePython, venvPython as venvPythonPath } from './lib/python.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -68,9 +69,14 @@ function run(bin, args, opts = {}) {
 // ── 0. 基础工具 ─────────────────────────────────────────────────────
 
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const pythonCandidates = process.env.DOTD_PYTHON ? [process.env.DOTD_PYTHON] : ['python', 'python3'];
-const python = pythonCandidates.find((bin) => run(bin, ['--version']).ok) ?? null;
-record('python', python !== null, python ?? '未找到 python', python ? undefined : '装 Python 3.10+');
+// Python 解释器：解析顺序交给 scripts/lib/python.mjs（显式 → 当前平台 .venv →
+// python3 → python）。原来写死 ['python', 'python3'] —— Debian/Ubuntu/WSL 上
+// `python` 根本不存在（靠 python3 兜着），但 `.venv` 里的解释器永远排不上，
+// 于是"依赖已经装进 .venv"判成没装。顺序反过来还会在 /mnt 部署里跑到 Windows
+// 的 python.exe（DrvFs 能看见 .venv/Scripts），见 lib/python.mjs 文件头。
+const python =
+  resolvePython({ repoRoot: REPO, run: (bin, args) => run(bin, args) })?.bin ?? null;
+record('python', python !== null, python ?? '未找到 Python', python ? undefined : '装 Python 3.10+');
 
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 record('node', nodeMajor >= 22, `v${process.versions.node}`, nodeMajor >= 22 ? undefined : '升级 Node 到 22+');
@@ -91,11 +97,9 @@ if (!existsSync(nodeModules)) {
 
 // ── 2. Python venv + 集成层依赖 ─────────────────────────────────────
 
-function venvPython() {
-  const win = join(REPO, '.venv', 'Scripts', 'python.exe');
-  const posix = join(REPO, '.venv', 'bin', 'python');
-  return existsSync(win) ? win : existsSync(posix) ? posix : null;
-}
+// 本文件自己的 `venvPython()` 原来也是"先 Scripts 再 bin"，即 /mnt 部署里
+// 会挑到 Windows 的解释器。直接用 lib 里那份（只认当前平台布局）。
+const venvPython = () => venvPythonPath(REPO);
 
 if (CHECK_ONLY) {
   const vp = venvPython();
@@ -113,11 +117,15 @@ if (CHECK_ONLY) {
   );
 } else {
   let vp = venvPython();
-  if (vp === null) {
+  if (vp === null && python === null) {
+    // 一个解释器都没找到时不要再硬跑 `python -m venv`：Debian 上那句会回
+    // `python: not found`，看着像"venv 建不了"，其实是"根本没有 python"。
+    record('python-venv', false, '没有可用的 Python 解释器', '装 Python 3.10+（Debian/Ubuntu：apt install python3 python3-venv）');
+  } else if (vp === null) {
     if (!DRY) mkdirSync(join(REPO, '.venv'), { recursive: true });
-    const r = run(python ?? 'python', ['-m', 'venv', join(REPO, '.venv')]);
+    const r = run(python, ['-m', 'venv', join(REPO, '.venv')]);
     if (!r.ok) {
-      record('python-venv', false, r.out, '确认 python -m venv 可用（Debian 需要 python3-venv）');
+      record('python-venv', false, r.out, `确认 ${python} -m venv 可用（Debian 需要 python3-venv）`);
     } else {
       vp = venvPython();
       record('python-venv', DRY || vp !== null, vp ?? '[dry-run] .venv 将创建');
@@ -206,7 +214,13 @@ if (!ok) process.exit(1);
 
 if (START) {
   const vp = venvPython();
-  const py = vp ?? python ?? 'python';
+  const py = vp ?? python;
+  if (py === null) {
+    // 走到这里说明前面 `ok` 为真但没解释器（理论上不可能），仍然别撒谎说
+    // "正在启动"——直接报清楚。
+    console.error('\n找不到 Python 解释器，无法启动 Charlie。先跑 npm run setup:all。');
+    process.exit(1);
+  }
   if (!JSON_OUT) console.log(`\n启动 Charlie（会托管 dotd）：${py} -m voice.integration.one_system\n`);
   const r = DRY
     ? { ok: true }

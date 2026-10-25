@@ -1,0 +1,214 @@
+/**
+ * tests/scripts-env-layered.test.ts —— 「缺 key」不能是"读错了地方"。
+ *
+ * 现场（2026-10-26，live 机 `node scripts/onboard.mjs`）：
+ *
+ *     ⚠️  模型端点: 缺模型 key：HY3_API_KEY / OPENROUTER_API_KEY / BACKUP_API_KEY
+ *
+ * 三个 key **都在** `~/.dotd/tokens.env` 里，daemon 启动时 source 的正是它，
+ * 模型一路正常。错的只有体检：它只读 `process.env`，而交互式 shell 不 source
+ * tokens.env —— 于是"文件里有、进程里没有"被报成"机器上没有"。
+ *
+ * 判据的定义就是这段：**key 的真相 = 进程环境 ∪ `<home>/tokens.env`，进程优先**
+ * （与 shell `source` + 显式覆盖的语义一致）。写成测试是为了让"只查 process.env"
+ * 这个错误不能悄悄回来。
+ */
+
+import test, { describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { join } from 'node:path';
+
+import { isEnvRef, layeredEnv, parseEnvFile, tokenFiles, usableToken } from '../scripts/lib/env.mjs';
+
+// 路径一律用 join 拼：lib 里也是 join（Windows 上是反斜杠），写死 '/' 会
+// 在 Linux 绿、Windows 红 —— 那种"只在某台机器上过"的测试比没有更糟。
+const UHOME = join('/home', 'u');
+// 常规形态：CHARLIE_HOME / DOTD_HOME 指到自定义目录（Docker 里是 /data）。
+const HOME = join(UHOME, 'charlie-home');
+const homeTokens = join(HOME, 'tokens.env');
+// 兜底路径：home 没指到别处时 daemon 也会看 ~/.dotd/tokens.env。
+const DOTD_HOME = join(UHOME, '.dotd');
+const dotdTokens = join(DOTD_HOME, 'tokens.env');
+
+/** 造一个只有这些文件存在、内容是这些的世界。 */
+function world(files: Record<string, string>) {
+  return {
+    exists: (p: string) => p in files,
+    read: (p: string) => {
+      if (!(p in files)) throw new Error(`no such file: ${p}`);
+      return files[p]!;
+    },
+  };
+}
+
+describe('① parseEnvFile：tokens.env 是数据不是脚本', () => {
+  test('export 前缀 / 引号 / 空格变体 / 注释 / CRLF / BOM', () => {
+    const text = [
+      '\uFEFF# 注释',
+      'export A=1',
+      "B='two words'",
+      'C="quoted"',
+      'D = spaced',
+      '',
+      'E=',
+      'not a kv line',
+      'F=a=b=c',
+    ].join('\r\n');
+    assert.deepEqual(parseEnvFile(text), {
+      A: '1',
+      B: 'two words',
+      C: 'quoted',
+      D: 'spaced',
+      E: '',
+      F: 'a=b=c',
+    });
+  });
+
+  test('非字符串输入返回空对象（体检脚本不该崩）', () => {
+    assert.deepEqual(parseEnvFile(null), {});
+    assert.deepEqual(parseEnvFile(undefined), {});
+    // 类型上不可能，但运行期（JS 调用方）可能塞进来别的；不能因此崩掉整个体检。
+    assert.deepEqual(parseEnvFile(42 as unknown as string), {});
+  });
+
+  test('值里的 # 不当注释（只有行首井号才是）', () => {
+    assert.deepEqual(parseEnvFile('K=abc#def'), { K: 'abc#def' });
+  });
+});
+
+describe('② tokenFiles：home 就是 ~/.dotd 时不重复读', () => {
+  test('常规两处', () => {
+    assert.deepEqual(tokenFiles(HOME, UHOME), [homeTokens, dotdTokens]);
+  });
+
+  test('home == ~/.dotd → 去重成一条', () => {
+    assert.deepEqual(tokenFiles(join(UHOME, '.dotd'), UHOME), [dotdTokens]);
+  });
+});
+
+describe('③ layeredEnv：文件里的 key 也算"有"', () => {
+  test('只存在于 tokens.env 的 key → has() 为真（这条就是 live 上的假红）', () => {
+    const w = world({ [homeTokens]: 'HY3_API_KEY=abc\nBACKUP_API_KEY=bak\n' });
+    const keys = layeredEnv({ home: HOME, homedir: UHOME, processEnv: {}, ...w });
+    assert.equal(keys.has('HY3_API_KEY'), true, 'daemon 能用它，体检就不能说没有');
+    assert.equal(keys.has('BACKUP_API_KEY'), true);
+    assert.equal(keys.has('NOT_THERE'), false);
+  });
+
+  test('缺失时 get() 返回空串，不是 undefined', () => {
+    const keys = layeredEnv({ home: HOME, homedir: UHOME, processEnv: {}, ...world({}) });
+    assert.equal(keys.get('NOPE'), '');
+  });
+
+  test('进程环境优先于文件（显式覆盖）', () => {
+    const w = world({ [homeTokens]: 'HY3_API_KEY=from-file\n' });
+    const keys = layeredEnv({
+      home: HOME,
+      homedir: UHOME,
+      processEnv: { HY3_API_KEY: 'from-env' },
+      ...w,
+    });
+    assert.equal(keys.get('HY3_API_KEY'), 'from-env');
+  });
+
+  test('进程环境里是**空串**时退到文件（空值等于没设）', () => {
+    const w = world({ [homeTokens]: 'HY3_API_KEY=from-file\n' });
+    const keys = layeredEnv({
+      home: HOME,
+      homedir: UHOME,
+      processEnv: { HY3_API_KEY: '' },
+      ...w,
+    });
+    assert.equal(keys.get('HY3_API_KEY'), 'from-file');
+  });
+
+  test('两个文件都有 → 先读到的（<home>/tokens.env）优先', () => {
+    const w = world({
+      [homeTokens]: 'K=home\n',
+      [dotdTokens]: 'K=dotd\n',
+    });
+    const keys = layeredEnv({ home: HOME, homedir: UHOME, processEnv: {}, ...w });
+    assert.equal(keys.get('K'), 'home');
+  });
+
+  test('sources 只记路径，不记值（报错时可以说清"我看的是哪儿"）', () => {
+    const w = world({ [homeTokens]: 'HY3_API_KEY=sk-secret-value\n' });
+    const keys = layeredEnv({ home: HOME, homedir: UHOME, processEnv: {}, ...w });
+    assert.equal(keys.sources.HY3_API_KEY, homeTokens);
+    assert.doesNotMatch(JSON.stringify(keys.sources), /sk-secret-value/);
+  });
+
+  test('文件读不动 → 跳过，不抛（一个坏文件不该让体检整体失败）', () => {
+    const keys = layeredEnv({
+      home: HOME,
+      homedir: UHOME,
+      processEnv: {},
+      exists: (p) => p === homeTokens,
+      read: () => {
+        throw new Error('EACCES');
+      },
+    });
+    assert.equal(keys.has('ANY'), false);
+  });
+});
+
+describe('④ onboard 的判据：模型 key 用合并后的眼光', () => {
+  test('models.yml 声明的三个 key，只有文件里有 → 判定"已配置"', () => {
+    // 复刻 live 实况：process.env 里一个都没有，全在 tokens.env
+    const w = world({
+      [homeTokens]: [
+        'HY3_API_KEY=a',
+        'OPENROUTER_API_KEY=b',
+        'BACKUP_API_KEY=c',
+      ].join('\n'),
+    });
+    const keys = layeredEnv({ home: HOME, homedir: UHOME, processEnv: {}, ...w });
+    const declared = ['HY3_API_KEY', 'OPENROUTER_API_KEY', 'BACKUP_API_KEY'];
+    assert.equal(declared.filter((n) => keys.has(n)).length, 3);
+  });
+
+  // live 上的真实现场（2026-10-26）：tokens.env 里**有这两行**，但值是空的 ——
+  // `export OPENROUTER_API_KEY=`。所以「只报了 HY3_API_KEY」是**诚实**结论，
+  // 不是漏报。这条测试把"有行 ≠ 有值"钉住，免得以后有人把 has() 改成
+  // "键名出现过"，把一台真缺 key 的机器报成全绿。
+  test('有行但值为空 → 不算有（live 上 OPENROUTER/BACKUP 就是这样）', () => {
+    const w = world({
+      [homeTokens]: [
+        'HY3_API_KEY=a',
+        'export OPENROUTER_API_KEY=',
+        'export BACKUP_API_KEY=',
+      ].join('\n'),
+    });
+    const keys = layeredEnv({ home: HOME, homedir: UHOME, processEnv: {}, ...w });
+    assert.equal(keys.has('HY3_API_KEY'), true);
+    assert.equal(keys.has('OPENROUTER_API_KEY'), false, '空值等于没配，否则模型会拿空 key 去请求');
+    assert.equal(keys.has('BACKUP_API_KEY'), false);
+  });
+});
+
+describe('⑤ usableToken：`${VAR}` 是引用，不是令牌', () => {
+  test('init-config 生成的 ${DOTD_MASTER_TOKEN} 不算令牌', () => {
+    // live 的 config.yml 第 53 行长这样，长度 20 —— 最朴素的"≥16 就行"会把
+    // 它判成真令牌（onboard 那一行一直是假绿）。
+    assert.equal(usableToken('${DOTD_MASTER_TOKEN}'), null);
+    assert.equal(isEnvRef('${DOTD_MASTER_TOKEN}'), true);
+  });
+
+  test('带默认值的引用同样不算', () => {
+    assert.equal(usableToken('${DOTD_MASTER_TOKEN:-change-me}'), null);
+  });
+
+  test('真令牌要过长度与 change-me 两道', () => {
+    assert.equal(usableToken('0123456789abcdef0123456789abcdef'), '0123456789abcdef0123456789abcdef');
+    assert.equal(usableToken('short'), null);
+    assert.equal(usableToken('change-me-please-change-me'), null);
+    assert.equal(usableToken(undefined), null);
+    assert.equal(usableToken(''), null);
+  });
+
+  test('引用只在**整串**时才算引用（令牌里带 $ 不该被误杀）', () => {
+    assert.equal(isEnvRef('abc${X}def'), false);
+    assert.equal(usableToken('abc$0123456789abcdef'), 'abc$0123456789abcdef');
+  });
+});
+
