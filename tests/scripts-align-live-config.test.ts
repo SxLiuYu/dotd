@@ -12,7 +12,11 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { alignConfigText } from '../scripts/align-live-config.mts';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { alignConfigText, migrationsMax } from '../scripts/align-live-config.mts';
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const LIVE = `# 头部注释：不要动
 version: 1
@@ -43,15 +47,17 @@ surfaces:
 `;
 
 describe('align-live-config', () => {
-  it('一次对齐三处漂移：端口 7789→7788、删 telegram 段、expected_user_version 50→90', () => {
+  it('一次对齐三处漂移：端口 7789→7788、删 telegram 段、expected_user_version 50→212', () => {
+    // 版本号不再写死 90（那是"每次部署都把注记改成旧错"的源头），
+    // 缺省从 db/migrations 的最大 NNN 推导 —— 当前是 212。
     const { text, changes } = alignConfigText(LIVE);
     assert.equal(changes.length, 3, `改动应是三处，实际：${changes.join(' | ')}`);
-    assert.match(changes[0]!, /expected_user_version 50 → 90/);
+    assert.match(changes[0]!, /expected_user_version 50 → 212/);
     assert.match(changes[1]!, /端口 7789 → 7788/);
     assert.match(changes[2]!, /surfaces\.telegram 段/);
 
     assert.match(text, /^    port: 7788$/m);
-    assert.match(text, /^  expected_user_version: 90$/m);
+    assert.match(text, /^  expected_user_version: 212$/m);
     assert.doesNotMatch(text, /telegram:/);
     assert.doesNotMatch(text, /TG_BOT_TOKEN/);
   });
@@ -106,7 +112,7 @@ other:
     assert.match(text, /^  http:\n    port: 7788$/m);
     assert.match(text, /port: 3000/, 'ui.port 不是 HTTP 监听端口，不能动');
     assert.match(text, /port: 9223/, 'exec.runtime.port 是容器运行时端口，不能动');
-    assert.match(text, /^  expected_user_version: 90$/m);
+    assert.match(text, /^  expected_user_version: 212$/m);
     assert.match(text, /expected_user_version: 12/, '非 db 节的同名列不能动');
   });
 
@@ -135,5 +141,21 @@ other:
     const { text, changes } = alignConfigText('surfaces:\n  http:\n    port: 9000\n');
     assert.equal(changes.length, 1);
     assert.match(text, /port: 7788/);
+  });
+
+  // 2026-10-26：这一行以前写死 90，而 src/daemon.ts 里是 212、db/migrations 最大也是 212。
+  // 于是**每次部署**都热情地把 live 配置从 50 改成 90 —— 把一份本来就错的东西
+  // 从旧错改成新错，还写进备份目录。判据改成"从 migrations 推导"，这两条钉住它。
+  it('期望版本从 db/migrations 推导，不写死（当前 212）', () => {
+    assert.equal(migrationsMax(repoRoot), '212');
+    const { text } = alignConfigText('db:\n  expected_user_version: 50\n');
+    assert.match(text, /expected_user_version: 212/);
+  });
+
+  it('推导不出目标版本时不动这一行（不编数字）', () => {
+    // null = "推导不出来"：读不到 migrations 就不改，留着旧值比写个假的好。
+    const { text, changes } = alignConfigText('db:\n  expected_user_version: 50\n', { version: null });
+    assert.equal(changes.length, 0);
+    assert.match(text, /expected_user_version: 50/);
   });
 });

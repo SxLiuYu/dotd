@@ -296,6 +296,49 @@ describe('④ 自愈不得引用不存在的脚本', () => {
   });
 });
 
+describe('④b 配置对齐必须改「源」，不是改产物', () => {
+  // 现场（2026-10-26 部署）：日志写着
+  //     [align] expected_user_version 50 → 90（db.expected_user_version，第 47 行）
+  //     [align] 已写入 /root/.dotd/config.yml（备份 …）
+  // 部署完 grep 到的却仍是 50、telegram 段也还在。
+  //
+  // 因为 `wsl-daemon.sh` §3 每次启动都 `cp _config_src.yml ~/.dotd/config.yml`：
+  // 真正的 live 配置源是 `_config_src.yml`（git 不跟踪），`~/.dotd/config.yml`
+  // 只是它的产物。只对齐产物 = 下一次启动就被抹掉，而日志一路说"已写入"。
+  test('部署脚本对 _config_src.yml 也做对齐（否则改完就丢）', () => {
+    const code = stripComments(DEPLOY);
+    // 对齐目标是这两处：源（下次启动不会被抹掉）+ 产物（本次启动前生效）。
+    const loop = /for cfg in ([^\n]+);\s*do/.exec(code);
+    assert.ok(loop !== null, '应当有一圈"逐个对齐"的 for 循环');
+    assert.match(loop[1]!, /"\$DST\/_config_src\.yml"/, '必须对齐源文件 _config_src.yml');
+    assert.match(loop[1]!, /"\$HOME\/\.dotd\/config\.yml"/, '也要对齐产物（本次启动前就生效）');
+    assert.match(
+      code,
+      /align-live-config\.mts[^\n]*--config "\$cfg"/,
+      '循环里要真的调用 align',
+    );
+  });
+
+  test('启动器确实会覆盖产物 —— 所以"只改产物"一定被抹掉', () => {
+    // 这条钉住的是**为什么**要改源：只要这行还在，只改产物就是白工。
+    // 哪天启动器不再 cp 了，这条会红，那时可以重新讨论。
+    assert.match(
+      stripComments(DAEMON),
+      /cp _config_src\.yml "\$HOME\/\.dotd\/config\.yml"/,
+      'wsl-daemon.sh 每次启动都用 _config_src.yml 覆盖产物',
+    );
+  });
+
+  test('rsync 不同步 `_*`（源文件是部署机私有状态，不能被 --delete 掉）', () => {
+    // 用 includes 而不是正则：这里的字面量本身带 `*`，正则转义容易写成
+    // "一个或多个反斜杠"（第一版就是那么错的，测试红得莫名其妙）。
+    assert.ok(
+      DEPLOY.includes("--exclude '_*'"),
+      '少了这条，部署会删掉 _tokens_src.env / _config_src.yml',
+    );
+  });
+});
+
 describe('⑤ 语法闸门：三个脚本必须能被 bash 解析', () => {
   const bash = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' });
   const hasBash = bash.status === 0;

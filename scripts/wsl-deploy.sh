@@ -109,15 +109,28 @@ if [ "$DO_TEST" = "1" ]; then
 fi
 
 # ── 4.5 live 配置对齐（端口/退役段/迁移版本；只在真要重启时才动文件）──────
-# 不覆盖整个 config.yml：live 里有 ${VAR} 引用和运维手改注释，align 脚本做逐行
-# 外科手术并先备份到 ~/.dotd/backups/。幂等，已对齐时只打印一行。
+#
+# **必须对 `_config_src.yml` 对齐，不是 `~/.dotd/config.yml`**（2026-10-26 修）。
+#
+# 现场：这一段一直打印
+#     [align] expected_user_version 50 → 90（…，第 47 行）
+#     [align] 已写入 /root/.dotd/config.yml（备份 …）
+# 可部署完 grep 到的仍是 50、telegram 段还在。原因在下一步：
+# `wsl-daemon.sh` §3 每次都 `cp _config_src.yml "$HOME/.dotd/config.yml"` ——
+# 真正的 live 配置源是 `_config_src.yml`（git 不跟踪，是 Windows 侧手工放进去的
+# 那一份），`~/.dotd/config.yml` 只是它的**产物**。所以在这里改产物等于白做工，
+# 而且日志一路说"已写入"，人只会以为配置是对的。
+#
+# 两处都对齐：源（下次启动就不会被抹掉）+ 产物（本次启动前要生效）。
 if [ "$DO_RESTART" = "1" ] && [ "$DO_ALIGN" = "1" ]; then
-  if [ -f "$HOME/.dotd/config.yml" ]; then
-    log "对齐 $HOME/.dotd/config.yml"
-    node --import tsx "$DST/scripts/align-live-config.mts" --config "$HOME/.dotd/config.yml" || true
-  else
-    log "live 配置不在 $HOME/.dotd/config.yml，跳过对齐（首次部署请先跑 init-config）"
-  fi
+  for cfg in "$DST/_config_src.yml" "$HOME/.dotd/config.yml"; do
+    if [ -f "$cfg" ]; then
+      log "对齐 $cfg"
+      node --import tsx "$DST/scripts/align-live-config.mts" --config "$cfg" || true
+    else
+      log "$cfg 不存在，跳过（首次部署请先跑 init-config，并放好 _config_src.yml）"
+    fi
+  done
 fi
 
 if [ "$DO_RESTART" = "0" ]; then
