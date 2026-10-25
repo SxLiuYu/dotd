@@ -35,6 +35,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveConfigDir } from '../scripts/lib/env.mjs';
+
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel: string): string => readFileSync(join(REPO, rel), 'utf8');
 
@@ -486,6 +488,41 @@ describe('④d 运行期 mcp-servers.yml 是主人的声明，重启不许静默
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('④e 启动器必须导出 DOTD_CONFIG_DIR：审计脚本要读 daemon 读的那一份', () => {
+  // 现场（2026-10-26，live）：`DOTD_CONFIG_DIR` 只由 one_system._spawn 注入给
+  // **子进程**。人手动跑 `npm run doctor` / onboard / probe-live-model 时那个 shell
+  // 里没有它，于是 `resolveConfigDir()` 回落到仓库 `config/` —— 而 daemon 读的是
+  // `~/.dotd`。实测 doctor 打 `MCP 未启用 — /root/dotd/config/mcp-servers.yml`，
+  // 运行期那份是 `/root/.dotd/mcp-servers.yml`。体检看模板、daemon 跑运行期，
+  // 两边结论可以完全相反，而"看的是同一份文件"这件事没有任何测试拦着。
+  //
+  // 注意 config.yml 是**另一套**根：它按 `DOTD_CONFIG`（home 路径）读，不看 configDir。
+  // 所以这里钉的是 models.yml / mcp-servers.yml / tools.yml 这一族。
+  const line = DAEMON.split('\n').find((l) => /^\s*export\s+DOTD_CONFIG_DIR=/.test(l));
+
+  test('非注释行里真的有 export（写在注释里不算）', () => {
+    assert.ok(line !== undefined, 'wsl-daemon.sh 必须导出 DOTD_CONFIG_DIR');
+    assert.match(line!, /\$HOME\/\.dotd/, '托管部署的 configDir 就是 ~/.dotd（与 DOTD_HOME 同处）');
+  });
+
+  test('与 DOTD_HOME 指向同一个目录（两份配置根不能漂移）', () => {
+    const homeLine = DAEMON.split('\n').find((l) => /^\s*export\s+DOTD_HOME=/.test(l));
+    assert.ok(homeLine !== undefined);
+    const value = (l: string): string => l.slice(l.indexOf('=') + 1).replace(/^["']|["']$/g, '');
+    assert.equal(value(line!), value(homeLine!), 'DOTD_CONFIG_DIR 与 DOTD_HOME 必须是同一个目录');
+  });
+
+  test('真跑：导出后 resolveConfigDir 落在 HOME/.dotd，而不是仓库 config/', () => {
+    const home = join(tmpdir(), 'dotd-cfgdir-probe');
+    const r = spawnSync('bash', ['-c', `HOME=${JSON.stringify(home)}; ${line}; printf %s "$DOTD_CONFIG_DIR"`], {
+      encoding: 'utf8',
+    });
+    if (r.error !== undefined) return; // 没有 bash
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(resolveConfigDir({ env: { DOTD_CONFIG_DIR: r.stdout }, repoRoot: '/srv/dotd' }), resolve(join(home, '.dotd')));
   });
 });
 

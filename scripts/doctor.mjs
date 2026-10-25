@@ -29,7 +29,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
-import { layeredEnv, resolveConfigDir as resolveConfigDirShared } from './lib/env.mjs';
+import { configDirIsHostedGuess, layeredEnv, resolveConfigDir as resolveConfigDirShared } from './lib/env.mjs';
 import { looksLikePath, resolveCommand as resolveCommandShared } from './lib/command.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -72,13 +72,16 @@ export const STRICT_ENV_KEYS = Object.freeze(
  * 这个函数存在的理由（2026-10-26）：doctor 原来写死 `repoRoot/config`，
  * 而托管部署（one_system）会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd` ——
  * 两边看的不是同一个文件，doctor 的结论与 daemon 的行为无关。
- * 显式传 env / repoRoot 是为了测试能造世界；生产调用不传即取 process.env。
+ * 显式传 env / repoRoot / home 是为了测试能造世界；生产调用不传即取进程事实。
  *
  * 实现已挪到 `scripts/lib/env.mjs`（`onboard` / `probe-live-model` 也要用同一判据，
- * 三份各写一遍必然漂移）。这里保留同名导出，老调用方与测试不用改。
+ * 三份各写一遍必然漂移）。lib 里在"两个环境变量都没设"时还会按布局记号兜底
+ * （`<home>/.dotd/models.yml` 在 → 托管布局）—— 因为 live 上人手动跑 doctor 时
+ * 那个 shell 里确实没有 `DOTD_CONFIG_DIR`（它只由 one_system 注入子进程）。
+ * 兜底的前提与理由都写在 lib 的注释里。
  */
-export function resolveConfigDir(env = process.env, repoRoot = REPO_ROOT) {
-  return resolveConfigDirShared({ env, repoRoot, home: homedir() });
+export function resolveConfigDir(env = process.env, repoRoot = REPO_ROOT, home = homedir()) {
+  return resolveConfigDirShared({ env, repoRoot, home });
 }
 
 /**
@@ -429,7 +432,14 @@ export async function runChecks(opts = {}) {
   // doctor 这边还报 ok —— 体检看的是一份没人读的文件。
   let tier1 = null;
   let tier1Disabled = null;
-  const modelsPath = join(resolveConfigDir(env, repoRoot), 'models.yml');
+  const configDir = resolveConfigDir(env, repoRoot, home);
+  // 这句话是给"我到底在看哪一份"这个问题一个可核对的答案：托管布局是**推断**出来的
+  // （两个环境变量都没设，但 `<home>/.dotd/models.yml` 在）。运维看到它就知道
+  // "这条结论来自推断的路径"，而不是来自显式配置。
+  const guessNote = configDirIsHostedGuess({ env, home })
+    ? `（DOTD_CONFIG_DIR 未设，按 ${join(home, '.dotd', 'models.yml')} 存在推断为托管布局）`
+    : '';
+  const modelsPath = join(configDir, 'models.yml');
   const repoModels = join(repoRoot, 'config', 'models.yml');
   if (existsSync(modelsPath)) {
     const endpoints = parseTier1Endpoint(readFileSync(modelsPath, 'utf8'));
@@ -444,7 +454,7 @@ export async function runChecks(opts = {}) {
     add(
       'tier1-endpoint',
       STATUS.FAIL,
-      `${modelsPath} 的 tier1 端点全部 enabled: false`,
+      `${modelsPath} 的 tier1 端点全部 enabled: false${guessNote}`,
       `${tier1Disabled.id} 存在但被关着 —— 路由器选候选时会把它过滤掉，primary 轨没有任何端点可用，` +
         '所有交互任务都会挂起',
       `把 ${modelsPath} 里该端点的 enabled 改成 true`,
@@ -457,7 +467,7 @@ export async function runChecks(opts = {}) {
     add(
       'tier1-endpoint',
       STATUS.FAIL,
-      `${modelsPath} 里没有可用的 tier1 端点`,
+      `${modelsPath} 里没有可用的 tier1 端点${guessNote}`,
       `primary 轨无处可去，所有交互任务都会挂起${extra}`,
       `检查 ${modelsPath} 的 endpoints[].tier: 1`,
     );
@@ -577,7 +587,8 @@ export async function runChecks(opts = {}) {
   //
   //     路径必须与 daemon 同源（2026-10-26 修）。daemon 读的是
   //     `process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')`，
-  //     而 `resolveConfigDir()` = `DOTD_CONFIG_DIR` 或 `repoRoot/config`。
+  //     而 `resolveConfigDir()` = `DOTD_CONFIG_DIR` 或 `repoRoot/config`（托管布局
+  //     还会按 `<home>/.dotd/models.yml` 在不在兜底，见 lib/env.mjs 的注释）。
   //     原来 doctor 写死 `repoRoot/config/mcp-servers.yml`：在托管部署里
   //     supervisor 会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd`，**真正生效的是那一份**，
   //     于是 doctor 检查的是仓库模板 —— 用户在 `~/.dotd` 里配好了 server，
@@ -586,14 +597,17 @@ export async function runChecks(opts = {}) {
   const mcpPath =
     env.DOTD_MCP_CONFIG !== undefined && env.DOTD_MCP_CONFIG !== ''
       ? env.DOTD_MCP_CONFIG
-      : join(resolveConfigDir(env, repoRoot), 'mcp-servers.yml');
+      : join(configDir, 'mcp-servers.yml');
+  const mcpGuessNote = configDirIsHostedGuess({ env, home })
+    ? `（DOTD_CONFIG_DIR 未设，按 ${join(home, '.dotd', 'models.yml')} 存在推断为托管布局）`
+    : '';
   const repoMcp = join(repoRoot, 'config', 'mcp-servers.yml');
   if (!existsSync(mcpPath)) {
     const extra =
       mcpPath !== repoMcp && existsSync(repoMcp)
         ? `（仓库模板 ${repoMcp} 存在，但 daemon 不读它）`
         : '';
-    add('mcp', STATUS.SKIP, '未启用', `没有 ${mcpPath}（MCP 外部工具默认关闭）${extra}`);
+    add('mcp', STATUS.SKIP, '未启用', `没有 ${mcpPath}（MCP 外部工具默认关闭）${extra}${mcpGuessNote}`);
   } else {
     const parsed = parseMcpServers(readFileSync(mcpPath, 'utf8'));
     // 顺序要紧：**先判错误**再判"有没有声明"。写错的配置在解析失败时 servers 也是空的，
@@ -607,7 +621,7 @@ export async function runChecks(opts = {}) {
         `照仓库 config/mcp-servers.yml 顶部的模板改 ${mcpPath}：每个 server 必填 name 与 command`,
       );
     } else if (parsed.servers.length === 0) {
-      add('mcp', STATUS.SKIP, '未启用', `${mcpPath} 里没有声明任何 server（servers: []）`);
+      add('mcp', STATUS.SKIP, '未启用', `${mcpPath} 里没有声明任何 server（servers: []）${mcpGuessNote}`);
     } else {
       // 逐个核对：command 能否解析到 + args 里的脚本路径是否存在
       const bad = [];

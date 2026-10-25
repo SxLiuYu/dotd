@@ -550,6 +550,82 @@ test('MCP：运行时那份不存在时，提示仓库模板存在但 daemon 不
   }
 });
 
+test('托管布局：两个变量都没设时，按 ~/.dotd/models.yml 认出来源并说出来', async () => {
+  // 现场（2026-10-26 live）：`DOTD_CONFIG_DIR` 只由 one_system 注入 dotd **子进程**。
+  // 人手动跑 `npm run doctor` 时那个 shell 里没有它（`wsl-daemon.sh` 当时也没导出），
+  // 于是 doctor 去看仓库 `config/mcp-servers.yml`，打「MCP 未启用」，
+  // 而运行期那份 `~/.dotd/mcp-servers.yml` 根本没被读过。
+  //
+  // 判据：托管布局的记号是 `<home>/.dotd/models.yml` 存在（启动器每次启动都会刷进去）。
+  // 但"推断"必须**说出来** —— 运维得知道这条结论基于推断的路径，不是显式配置。
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    writeFileSync(join(s.home, '.dotd', 'models.yml'), 'endpoints: []\n', 'utf8');
+    writeFileSync(
+      join(s.home, '.dotd', 'mcp-servers.yml'),
+      'servers:\n  - name: broken\n', // 缺 command
+      'utf8',
+    );
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', HY3_API_KEY: 'k' },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.FAIL, '运行期那份写坏了，doctor 必须看见');
+    assert.match(mcp.title, /写错|缺 command/, `实际：${mcp.title}`);
+    assert.ok(mcp.detail.includes(join(s.home, '.dotd')), `要看 ~/.dotd 那份：${mcp.detail}`);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('推断要说出来：托管布局的 MCP 明细里带"按 … 推断"', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    writeFileSync(join(s.home, '.dotd', 'models.yml'), 'endpoints: []\n', 'utf8');
+    const results = await runChecks({
+      env: { DOTD_MASTER_TOKEN: 'm', DOTD_RO_TOKEN: 'r', HOOK_GRAFANA: 'h', HY3_API_KEY: 'k' },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.equal(mcp.status, STATUS.SKIP, '没有任何声明 → 未启用');
+    assert.match(mcp.detail, /推断为托管布局/, `要交代这个路径是推出来的：${mcp.detail}`);
+    assert.match(mcp.detail, /DOTD_CONFIG_DIR 未设/, '要说清为什么需要推断');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test('显式设了 DOTD_CONFIG_DIR 就不打"推断"（配置就是配置）', async () => {
+  const s = sandbox();
+  try {
+    writeConfig(s.home, BASE_CFG);
+    writeFileSync(join(s.home, '.dotd', 'models.yml'), 'endpoints: []\n', 'utf8');
+    const results = await runChecks({
+      env: {
+        DOTD_MASTER_TOKEN: 'm',
+        DOTD_RO_TOKEN: 'r',
+        HOOK_GRAFANA: 'h',
+        HY3_API_KEY: 'k',
+        DOTD_CONFIG_DIR: join(s.home, '.dotd'),
+      },
+      home: s.home,
+      repoRoot,
+      probe: probeOk,
+    });
+    const mcp = byName(results, 'mcp');
+    assert.doesNotMatch(mcp.detail, /推断/, `显式配置不该说成推断：${mcp.detail}`);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test('tier1：读的也是 DOTD_CONFIG_DIR 下的 models.yml（热加载那份），不是仓库模板', async () => {
   // 与 MCP 那条同一个缺陷（2026-10-26 一起修的）：ModelRouter 读
   // `join(cfg.configDir, 'models.yml')`，而 models.yml 从 2026-10-25 起是**热加载**的。

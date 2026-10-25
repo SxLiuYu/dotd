@@ -18,7 +18,7 @@ import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { isAbsolute, join, resolve } from 'node:path';
 
-import { isEnvRef, layeredEnv, parseEnvFile, resolveConfigDir, tokenFiles, usableToken } from '../scripts/lib/env.mjs';
+import { configDirIsHostedGuess, isEnvRef, layeredEnv, parseEnvFile, resolveConfigDir, tokenFiles, usableToken } from '../scripts/lib/env.mjs';
 
 // 路径一律用 join 拼：lib 里也是 join（Windows 上是反斜杠），写死 '/' 会
 // 在 Linux 绿、Windows 红 —— 那种"只在某台机器上过"的测试比没有更糟。
@@ -223,17 +223,26 @@ describe('⑥ resolveConfigDir：三处审计脚本必须看 daemon 读的那一
   // 设了 DOTD_CONFIG_DIR 的分支会走 `resolve()`（daemon 侧也是 resolve），
   // 期待值同样过一遍：Windows 上 `/home/u` 是"当前盘根"，join 与 resolve 不同形。
   const abs = (p: string) => resolve(p);
+  // **每个调用都显式给 home**：默认分支会去看 `<home>/.dotd/models.yml` 是否存在，
+  // 用真 home 的测试在"这台机器托管跑过"时会红/绿翻转 —— 那种只在某台机器上过的
+  // 测试比没有更糟。`emptyHome` 里什么文件都没有。
+  const emptyHome = join('/home', 'nobody');
+  const noModels = { exists: () => false };
+  const hostedHome = join('/home', 'hosted');
 
   test('没设 DOTD_CONFIG_DIR → 仓库 config/', () => {
     // 这条分支是 `join(repoRoot, 'config')`（与 daemon 逐字一致，不做 resolve），
     // 所以期望值也用 join —— 用 resolve 会在 Windows 上把 `/srv` 变成 `D:\srv`。
-    assert.equal(resolveConfigDir({ env: {}, repoRoot: repo }), join(repo, 'config'));
     assert.equal(
-      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '' }, repoRoot: repo }),
+      resolveConfigDir({ env: {}, repoRoot: repo, home: emptyHome, ...noModels }),
       join(repo, 'config'),
     );
     assert.equal(
-      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '   ' }, repoRoot: repo }),
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '' }, repoRoot: repo, home: emptyHome, ...noModels }),
+      join(repo, 'config'),
+    );
+    assert.equal(
+      resolveConfigDir({ env: { DOTD_CONFIG_DIR: '   ' }, repoRoot: repo, home: emptyHome, ...noModels }),
       join(repo, 'config'),
       '纯空白等于没设',
     );
@@ -261,6 +270,86 @@ describe('⑥ resolveConfigDir：三处审计脚本必须看 daemon 读的那一
     const got = resolveConfigDir({ env: { DOTD_CONFIG_DIR: 'cfg' }, repoRoot: repo });
     assert.ok(isAbsolute(got), `要绝对路径：${got}`);
     assert.ok(got.endsWith('cfg'));
+  });
+
+  // ── 分支 2：DOTD_CONFIG 所在目录 ──────────────────────────────────
+  //
+  // one_system 的判据是 `config_dir = DOTD_CONFIG_DIR or config_file.parent`
+  // （voice/integration/one_system.py:103）。审计脚本不跟这条走，就会在
+  // "只设了 DOTD_CONFIG、没设 DOTD_CONFIG_DIR"的部署里看仓库模板。
+  test('只设了 DOTD_CONFIG → 用它所在目录（与 one_system 同判据）', () => {
+    assert.equal(
+      resolveConfigDir({
+        env: { DOTD_CONFIG: join('/data', 'charlie', 'config.yml') },
+        repoRoot: repo,
+        home: emptyHome,
+        ...noModels,
+      }),
+      abs(join('/data', 'charlie')),
+    );
+    assert.equal(
+      resolveConfigDir({
+        env: { DOTD_CONFIG: '~/alt/config.yml' },
+        repoRoot: repo,
+        home: hostedHome,
+        ...noModels,
+      }),
+      abs(join(hostedHome, 'alt')),
+      '~ 也要展开（DOTD_CONFIG 与 DOTD_CONFIG_DIR 同一套展开规则）',
+    );
+  });
+
+  test('DOTD_CONFIG_DIR 优先于 DOTD_CONFIG（前者更具体）', () => {
+    assert.equal(
+      resolveConfigDir({
+        env: { DOTD_CONFIG_DIR: join('/x', 'cfg'), DOTD_CONFIG: join('/data', 'config.yml') },
+        repoRoot: repo,
+        home: emptyHome,
+        ...noModels,
+      }),
+      abs(join('/x', 'cfg')),
+    );
+  });
+
+  // ── 分支 3：托管布局记号 ──────────────────────────────────────────
+  //
+  // 现场：live 上 `npm run doctor` 打 `MCP 未启用 — /root/dotd/config/mcp-servers.yml`，
+  // 而 daemon（one_system 托管）读 `/root/.dotd/mcp-servers.yml`。那个 shell 里
+  // 两个环境变量都没有，所以只看变量就永远只能看到仓库模板 —— 体检看的是
+  // "没人读的文件"，却把结论报成"这台机器没配"。
+  test('两个变量都没设，但 <home>/.dotd/models.yml 在 → 认成托管布局', () => {
+    const exists = (p: string): boolean => p === join(hostedHome, '.dotd', 'models.yml');
+    assert.equal(
+      resolveConfigDir({ env: {}, repoRoot: repo, home: hostedHome, exists }),
+      abs(join(hostedHome, '.dotd')),
+    );
+  });
+
+  test('只有 ~/.dotd/config.yml（裸 init-config 的开发机）→ 仍是仓库 config/', () => {
+    // models.yml 是托管启动器刷进去的记号；开发机只有 init-config 写的 config.yml。
+    // 用 config.yml 当记号会把开发机也误导到 ~/.dotd —— 那里的 models.yml 不存在，
+    // 于是 doctor 报"缺 models.yml"，而 daemon 明明跑得好好的。
+    const exists = (p: string): boolean => p === join(hostedHome, '.dotd', 'config.yml');
+    assert.equal(
+      resolveConfigDir({ env: {}, repoRoot: repo, home: hostedHome, exists }),
+      join(repo, 'config'),
+    );
+  });
+
+  test('显式设了变量时不做布局推断（配置就是配置）', () => {
+    assert.equal(
+      resolveConfigDir({
+        env: { DOTD_CONFIG_DIR: join('/x', 'cfg') },
+        repoRoot: repo,
+        home: hostedHome,
+        exists: () => true,
+      }),
+      abs(join('/x', 'cfg')),
+    );
+    assert.equal(
+      configDirIsHostedGuess({ env: { DOTD_CONFIG_DIR: join('/x', 'cfg') }, home: hostedHome, exists: () => true }),
+      false,
+    );
   });
 });
 

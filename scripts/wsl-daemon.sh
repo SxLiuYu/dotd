@@ -115,6 +115,15 @@ fi
 export DOTD_HOME="$HOME/.dotd"
 export DOTD_DB_PATH="$HOME/.dotd/dotd.db"
 export DOTD_CONFIG="$HOME/.dotd/config.yml"
+# DOTD_CONFIG_DIR 必须在这里导出（2026-10-26 修）。
+#
+# 它原本只由 one_system._spawn 注入给 dotd 子进程 —— 那只是"daemon 自己看对了"。
+# 人手动跑 `npm run doctor` / onboard / probe-live-model 时，这个 shell 里没有该变量，
+# 于是 resolveConfigDir() 回落到仓库 config/：体检去读**模板**，而 daemon 读的是
+# `~/.dotd/`。实测 doctor 打出 `MCP 未启用 — /root/dotd/config/mcp-servers.yml`，
+# 而运行期那份是 `/root/.dotd/mcp-servers.yml` —— 审计看的文件没人读。
+# 注意 config.yml 是特例：它按 `DOTD_CONFIG`（home 路径）读，不看 configDir。
+export DOTD_CONFIG_DIR="$HOME/.dotd"
 export DOTD_FLEET=docker
 export DOTD_MODEL_TRANSPORT=real-http
 

@@ -23,34 +23,83 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir as osHomedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+
+/** `~/x` → `home/x`（与 daemon 的 expandHome 同语义）。 */
+function expandHomePath(raw, home) {
+  if (raw === '~') return home;
+  if (raw.startsWith('~/') || raw.startsWith('~\\')) return join(home, raw.slice(2));
+  return raw;
+}
 
 /**
  * 「daemon 到底会读哪个配置目录」——脚本侧的唯一实现（2026-10-26）。
  *
- * 与 `src/daemon.ts` 的 `resolveConfigDir()` 同判据：
- *   有 `DOTD_CONFIG_DIR` 用它，否则 `repoRoot/config`。
- * 托管部署（one_system）会把 `DOTD_CONFIG_DIR` 设成 `~/.dotd`，那时**真正生效**的是
- * `<home>/models.yml` / `<home>/mcp-servers.yml`，仓库 `config/` 下那份只是模板。
+ * 判据按顺序（先命中先用）：
+ *   1. `DOTD_CONFIG_DIR` —— 与 `src/daemon.ts::resolveConfigDir()` 逐字一致；
+ *   2. `DOTD_CONFIG` 所在目录 —— `one_system.resolve_paths()` 里
+ *      `config_dir = DOTD_CONFIG_DIR or config_file.parent`，同一判据；
+ *   3. `<home>/.dotd/models.yml` 存在 → `<home>/.dotd` —— **托管布局的记号**；
+ *   4. 都没有 → `repoRoot/config`（仓库模板，裸 `npm run serve` 时的形态）。
  *
- * 为什么收到这里：`doctor` / `onboard` / `probe-live-model` 三处审计脚本各自拼过
- * 仓库路径，于是同一台机器上三个结论互相矛盾（医生看模板、上手体检看另一份、
- * 真模型探针看第三份）。判据写死在一处，以后加脚本直接引用。
+ * 为什么需要 2/3（2026-10-26 live 现场）：
+ * 只有 1 时，人手动跑 `npm run doctor` 会去看仓库 `config/mcp-servers.yml`，
+ * 而 daemon（由 one_system 托管）读的是 `~/.dotd/mcp-servers.yml`。实测 doctor 打
+ * `MCP 未启用 — /root/dotd/config/mcp-servers.yml`，运行期那份没人读。
  *
- * `home` 参数只影响 `~` 展开（测试注入用）；生产不传即 `os.homedir()`。
+ * 为什么用「models.yml 存在」当记号：启动器 `wsl-daemon.sh` 的 §3.5 每次启动都把
+ * 仓库 `config/*.yml` 刷新进 `~/.dotd`，所以只要这台机器托管跑过，就一定有它；
+ * 而纯开发机（裸 `npm run serve`）只有 `~/.dotd/config.yml`（init-config 写的），
+ * 没有 models.yml —— 两种布局可区分，不需要额外状态文件。
+ *
+ * 为什么会话里的 1 和 3 可能给不同答案：裸 `npm run serve` 在托管机上会读仓库模板。
+ * 那只说明"托管机不要绕过启动器起 daemon"；启动器本身也导出 `DOTD_CONFIG_DIR`，
+ * 两条路径在正常部署下必须指向同一处（`tests/scripts-deploy-lock.test.ts` ④e 钉住）。
+ *
+ * **不读 `process.env` 之外的环境事实，也不猜"哪份更新"**：只按布局记号判断，
+ * 并在 doctor 的明细里显示实际路径，所以看错地方时人能一眼发现。
+ *
+ * `home` 只影响 `~` 展开与第 3 条；`exists` 供测试注入。
  */
-export function resolveConfigDir({ env = process.env, repoRoot, home = osHomedir() } = {}) {
+export function resolveConfigDir({
+  env = process.env,
+  repoRoot,
+  home = osHomedir(),
+  exists = existsSync,
+} = {}) {
   const raw = (env.DOTD_CONFIG_DIR ?? '').trim();
-  if (raw.length > 0) {
-    const expanded =
-      raw === '~'
-        ? home
-        : raw.startsWith('~/') || raw.startsWith('~\\')
-          ? join(home, raw.slice(2))
-          : raw;
-    return resolve(expanded);
-  }
+  if (raw.length > 0) return resolve(expandHomePath(raw, home));
+
+  const cfg = (env.DOTD_CONFIG ?? '').trim();
+  if (cfg.length > 0) return resolve(dirname(expandHomePath(cfg, home)));
+
+  // 托管布局的目录：`DOTD_HOME` 说了就以它为准（数据目录与配置目录在托管布局里同处），
+  // 否则 `~/.dotd`。用 `models.yml` 当记号的理由见上面的长注释。
+  const homeEnv = (env.DOTD_HOME ?? '').trim();
+  const hosted = homeEnv.length > 0 ? resolve(expandHomePath(homeEnv, home)) : join(home, '.dotd');
+  if (exists(join(hosted, 'models.yml'))) return resolve(hosted);
+
   return join(repoRoot, 'config');
+}
+
+/** 托管布局检查要看的那个目录（`DOTD_HOME` 优先，否则 `~/.dotd`）。 */
+function hostedDir({ env = process.env, home = osHomedir() } = {}) {
+  const homeEnv = (env.DOTD_HOME ?? '').trim();
+  return homeEnv.length > 0 ? resolve(expandHomePath(homeEnv, home)) : join(home, '.dotd');
+}
+
+/**
+ * 第 3 条（托管布局记号）是否命中 —— 仅供体检文案说明"我为什么看这份"。
+ * 显式设了环境变量时返回 false（那不是推断，是配置）。
+ */
+export function configDirIsHostedGuess({
+  env = process.env,
+  home = osHomedir(),
+  exists = existsSync,
+} = {}) {
+  if ((env.DOTD_CONFIG_DIR ?? '').trim().length > 0) return false;
+  if ((env.DOTD_CONFIG ?? '').trim().length > 0) return false;
+  return exists(join(hostedDir({ env, home }), 'models.yml'));
 }
 
 /**

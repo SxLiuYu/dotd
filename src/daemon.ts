@@ -32,7 +32,7 @@
  */
 
 import type { Server } from 'node:http';
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -162,11 +162,52 @@ export function resolveDataDir(): string {
   return join(homedir(), '.dotd');
 }
 
-/** 仓库 config/ 目录（MR models.yml / free-models.yml；GOV tools.yml / rules.yml；CP event-rules.yml）。 */
-export function resolveConfigDir(): string {
-  const env = process.env.DOTD_CONFIG_DIR;
-  if (env !== undefined && env.length > 0) return resolve(expandHome(env));
-  return join(REPO_ROOT, 'config');
+/**
+ * 仓库 config/ 目录（MR models.yml / free-models.yml；GOV tools.yml / rules.yml；CP event-rules.yml）。
+ *
+ * 判据必须与 `scripts/lib/env.mjs::resolveConfigDir` **逐字一致**：同一台机器上
+ * 「daemon 读哪份配置」只能有一个答案，否则体检报告与真实行为无关（2026-10-26）。
+ *
+ * 优先级：
+ *   1. `DOTD_CONFIG_DIR` —— 托管部署（one_system._spawn）就是这么传给子进程的；
+ *   2. `DOTD_CONFIG` 所在目录 —— one_system 的 `config_dir = DOTD_CONFIG_DIR or
+ *      config_file.parent`，同一判据；
+ *   3. `<home>/.dotd/models.yml` 存在 → `<home>/.dotd` —— 托管布局的记号。
+ *      启动器 `wsl-daemon.sh` 每次启动都把仓库 `config/*.yml` 刷进去，所以只要这台
+ *      机器托管跑过就一定有它；裸 `npm run serve` 的托管机上，原来看的是仓库模板
+ *      （体检看 ~/.dotd、daemon 读模板，正好是同一个缺陷的镜像）；
+ *   4. 都没有 → `join(REPO_ROOT, 'config')`（纯开发机）。
+ */
+export function resolveConfigDir(
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    repoRoot?: string;
+    home?: string;
+    exists?: (p: string) => boolean;
+  } = {},
+): string {
+  const env = opts.env ?? process.env;
+  const repoRoot = opts.repoRoot ?? REPO_ROOT;
+  const home = opts.home ?? homedir();
+  const exists = opts.exists ?? existsSync;
+  // `~` 必须按**同一个** home 展开（不能借全局 homedir）：测试注入 home 时，
+  // 一个用注入值一个用真 home，两边算出的路径不同 —— 那条"同判据"的测试就假绿。
+  const expand = (p: string): string =>
+    p === '~' ? home : p.startsWith('~/') || p.startsWith('~\\') ? join(home, p.slice(2)) : p;
+
+  const dir = env.DOTD_CONFIG_DIR;
+  if (dir !== undefined && dir.length > 0) return resolve(expand(dir));
+
+  const cfg = env.DOTD_CONFIG;
+  if (cfg !== undefined && cfg.length > 0) return dirname(resolve(expand(cfg)));
+
+  // 托管布局里配置目录与数据目录同处（`DOTD_HOME` / `~/.dotd`）。`DOTD_HOME` 说了
+  // 就以它为准 —— 只认 `~/.dotd` 会在 `CHARLIE_HOME=/data` 这类部署上又把两边拆开。
+  const homeEnv = (env.DOTD_HOME ?? '').trim();
+  const hosted = homeEnv.length > 0 ? resolve(expand(homeEnv)) : join(home, '.dotd');
+  if (exists(join(hosted, 'models.yml'))) return resolve(hosted);
+
+  return join(repoRoot, 'config');
 }
 
 /** web-ui 构建产物目录（SF web.ts 静态托管；缺 dist 时静态请求 404，不拒启动）。 */

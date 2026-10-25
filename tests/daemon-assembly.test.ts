@@ -14,6 +14,8 @@ import assert from 'node:assert/strict';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { latestMigrationVersion } from '../db/migrate.ts';
 import { makeTempDataDir, type TempDataDir } from './helpers.ts';
 
@@ -57,6 +59,9 @@ process.env.DOTD_MODEL_TRANSPORT = 'stub';
 process.env.DOTD_FLEET = 'stub';
 
 const { assembleDaemon, resolveConfigDir } = await import('../src/daemon.ts');
+
+/** 仓库根（从测试文件位置推，不用 cwd —— README「已知限制」记过这个坑）。 */
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
  * surfaces 配置（SF 加载器 fail-closed，六节缺一不可）——与 scripts/smoke.mjs 同款。
@@ -112,8 +117,12 @@ async function boot(): Promise<{ daemon: Awaited<ReturnType<typeof assembleDaemo
     cfg: {
       dataDir: tmp.root,
       dbPath: tmp.dbPath,
-      // 配置目录用仓库真实的 config/（models.yml 等六件），只有数据目录是临时的
-      configDir: resolveConfigDir(),
+      // 配置目录用仓库真实的 config/（models.yml 等六件），只有数据目录是临时的。
+      //
+      // **必须显式关掉托管布局推断**（`exists: () => false`）：不改的话，在托管过的
+      // 机器上（`~/.dotd/models.yml` 存在）这里会读到运行期配置 —— 测试结论就变成
+      // "取决于这台机器跑没跑过部署"。仓库根从本文件位置推，不依赖 cwd。
+      configDir: resolveConfigDir({ env: {}, repoRoot: REPO_ROOT, exists: () => false }),
       webRoot: join(tmp.root, 'no-dist'),
       configPath: writeSurfacesConfig(nextPort++),
       stubTransport: true,
@@ -189,6 +198,36 @@ test('装配：CP 与 EX 的循环依赖已打通（运行期可取到）', asyn
   const stats = await daemon.exec.getContainerStats('dot1');
   assert.notEqual(stats, null);
   assert.notEqual(stats, undefined);
+});
+
+test('resolveConfigDir：daemon 与审计脚本（scripts/lib/env.mjs）必须同判据', async () => {
+  // 同一台机器上「daemon 读哪份配置」只能有一个答案。两份实现（TS / 审计脚本）
+  // 各写一遍必然漂移 —— 2026-10-26 就漂了：TS 只看 DOTD_CONFIG_DIR，脚本也只看它，
+  // 于是 manual `npm run doctor` 在托管机上查仓库模板，而 daemon 读 ~/.dotd。
+  const { resolveConfigDir: resolveConfigDirScripts } = await import('../scripts/lib/env.mjs');
+  const hostedHome = join(tmp.root, 'hosted-home');
+  const hostedModels = join(hostedHome, '.dotd', 'models.yml');
+  const envs: Array<Record<string, string | undefined>> = [
+    {},
+    { DOTD_CONFIG_DIR: '' },
+    { DOTD_CONFIG_DIR: join(tmp.root, 'cfg') },
+    { DOTD_CONFIG_DIR: '~/.dotd' },
+    { DOTD_CONFIG: join(tmp.root, 'data', 'config.yml') },
+    { DOTD_CONFIG_DIR: join(tmp.root, 'cfg'), DOTD_CONFIG: join(tmp.root, 'data', 'config.yml') },
+  ];
+  // 两种布局各跑一遍：`exists` 说 models.yml 在（托管）/ 不在（纯开发机）
+  for (const exists of [(p: string) => p === hostedModels, () => false]) {
+    for (const env of envs) {
+      const a = resolveConfigDir({ env, repoRoot: REPO_ROOT, home: hostedHome, exists });
+      const b = resolveConfigDirScripts({ env, repoRoot: REPO_ROOT, home: hostedHome, exists });
+      assert.equal(a, b, `判据漂移：env=${JSON.stringify(env)} exists=${exists(hostedModels)}`);
+    }
+  }
+  // 以及：托管布局真的会被认出来（不是"两边一起错"）
+  assert.equal(
+    resolveConfigDir({ env: {}, repoRoot: REPO_ROOT, home: hostedHome, exists: (p) => p === hostedModels }),
+    join(hostedHome, '.dotd'),
+  );
 });
 
 test('关停：shutdown 幂等 + shutdown_marker + OUTBOX 留痕', async (t) => {

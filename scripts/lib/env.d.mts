@@ -37,14 +37,29 @@ export function usableToken(value?: string | null): string | null;
 
 export interface ResolveConfigDirOptions {
   env?: Record<string, string | undefined>;
-  /** 仓库根；`DOTD_CONFIG_DIR` 缺席时回落到 `<repoRoot>/config`。 */
+  /** 仓库根；两个环境变量都缺席且不是托管布局时回落到 `<repoRoot>/config`。 */
   repoRoot: string;
-  /** 只用于展开 `~`（测试注入）。 */
+  /** 用于展开 `~` 与托管布局记号（测试注入）。 */
   home?: string;
+  /** 「这个文件在不在」——测试注入，缺省 `existsSync`。 */
+  exists?: (path: string) => boolean;
 }
 
 /**
- * daemon 真正会读的配置目录（与 `src/daemon.ts` 的 `resolveConfigDir()` 同判据）。
- * `DOTD_CONFIG_DIR` 优先，否则 `<repoRoot>/config`。
+ * daemon 真正会读的配置目录。
+ *
+ * 顺序：`DOTD_CONFIG_DIR` → `DOTD_CONFIG` 所在目录 →
+ * `<home>/.dotd/models.yml` 存在时的 `<home>/.dotd`（托管布局）→ `<repoRoot>/config`。
+ * 与 `src/daemon.ts::resolveConfigDir()` 同判据（2026-10-26 把两边对齐）。
  */
 export function resolveConfigDir(opts: ResolveConfigDirOptions): string;
+
+/**
+ * 上一条的"托管布局"分支是否被用上了（两个环境变量都没设、只是推断）。
+ * 体检文案用它说明"这个路径是推出来的"，避免把推断当配置。
+ */
+export function configDirIsHostedGuess(opts?: {
+  env?: Record<string, string | undefined>;
+  home?: string;
+  exists?: (path: string) => boolean;
+}): boolean;
