@@ -44,6 +44,9 @@ log "目标=$DST"
 log "当前 daemon PID=${OLD_PID:-（未运行）}"
 
 # ── 1. 同步源码（node_modules 不同步：DrvFs 上拷 101MB 又慢又容易带坏原生模块）──
+# `_*` 必须排除：WSL 运行副本里有 `_tokens_src.env` / `_config_src.yml` 和一批
+# 临时排障脚本，它们**不在仓库里**。`--delete` 会把它们删掉，下一次重启
+# 就变成"source 不到凭据、daemon 带空 token 起来"——同步脚本亲手拆掉部署。
 rsync -a --delete \
   --exclude 'node_modules' \
   --exclude '.git' \
@@ -54,6 +57,7 @@ rsync -a --delete \
   --exclude '*.db-wal' \
   --exclude '*.db-shm' \
   --exclude 'nul' \
+  --exclude '_*' \
   --exclude '.tmp-*' \
   --exclude 'tmp-*' \
   --exclude '*.log' \
@@ -116,7 +120,13 @@ fi
 
 log "启动 daemon（DOTD_REPO_DIR=$DST）"
 mkdir -p "$HOME/.dotd"
-DOTD_REPO_DIR="$DST" setsid nohup bash "$DST/scripts/daemon-launch.sh" \
+# 必须用 wsl-daemon.sh，不能用 daemon-launch.sh（2026-10-25）：
+# 前者负责 WSL 特有的部署环境 —— DOTD_MODEL_HOST/DOTD_TIER2_HOST 走网关 relay、
+# DOTD_FLEET=docker、DOTD_NET_TOOLS、DOTD_HOME/DB_PATH/CONFIG、_config_src.yml 拷贝。
+# daemon-launch.sh 只 source ~/.dotd/tokens.env（里面没有这些），于是用默认值起：
+# 模型端点会退回 127.0.0.1:3065（WSL 里根本不通），执行面/出网策略也全丢。
+# 两条启动路径给同一份代码喂不同环境，是"部署完看着起来了、实际能力全没了"的根。
+DOTD_REPO_DIR="$DST" setsid nohup bash "$DST/scripts/wsl-daemon.sh" \
   >> "$HOME/.dotd/daemon.log" 2>&1 < /dev/null &
 disown 2>/dev/null || true
 

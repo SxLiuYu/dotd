@@ -9,7 +9,8 @@
 #   2. 数据目录用 ~/.dotd（与 Windows 侧同一套 config/tokens 语义）；
 #   3. netfuzz 的 fuzz 集群会吃掉 20GB 内存，与容器争资源——启动前必须确认 MemAvailable。
 set -uo pipefail
-cd "$HOME/dotd" || exit 1
+# 部署目录可用 DOTD_REPO_DIR 覆盖（wsl-deploy.sh 会传 /root/dotd）；默认仍是 ~/dotd。
+cd "${DOTD_REPO_DIR:-$HOME/dotd}" || exit 1
 
 LOG=/tmp/dotd-wsl.log
 # 启动时把上一份日志**归档**而不是直接丢掉（2026-10-19）：

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # 把 D 盘的项目同步到 WSL（WSL 里跑 daemon + 容器）
 set -uo pipefail
-WIN_SRC="/mnt/d/toagi/dotd"
+# 源目录：仓库就在 D:\dotd（旧值 /mnt/d/toagi/dotd 早已不存在，脚本每次都直接 exit 1，
+# 也就是"同步脚本从未真正同步过任何东西"）。
+WIN_SRC="/mnt/d/dotd"
 WSL_DST="$HOME/dotd"
 
 if [ ! -d "$WIN_SRC" ]; then echo "源目录不存在: $WIN_SRC"; exit 1; fi
