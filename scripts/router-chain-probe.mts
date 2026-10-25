@@ -57,9 +57,14 @@ const transport = new StubTransport({
     // tier2 light 好
     { endpointId: 'colibri-olmoe', track: 'light', content: 'olmoe 应答' },
   ],
-  // tier2 本地闸门两道在这里是**强制置真**，不是实测：warm_check 的 json_eq 要求
-  // /profile 顶层返回 expert_disk_s，而 Colibrì 把它藏在 turns[] 里，所以这道闸门
-  // 在真链路里目前是过不去的（见 candidates.ts 的 matchesJsonEq）。
+  // tier2 本地闸门：`health: true` 是**脚本设定**，不是实测（真链路里由 GET /health 判）。
+  //
+  // 这段注释原来写着「warm_check 的 json_eq 要求顶层 expert_disk_s，而 Colibrì 藏在
+  // turns[] 里，所以这道闸门在真链路里过不去」—— 那句话 2026-10-17 就已经不成立了
+  // （判据改成 `turns.last.expert_disk_s ≤ 0.1`，见 candidates.ts·matchesJsonMax）。
+  // 而 StubTransport 还在返回顶层形状，于是这个探针一直报"降级链断了"。
+  // 2026-10-26 把 stub 的形状改成真 Colibrì 那样（transport.ts·get），这里配
+  // `warm: true` 之后走的就是**与真配置同一套判据**，不再靠"强制置真"绕过。
   local: { 'colibri-olmoe': { health: true, warm: true } },
 });
 
@@ -102,7 +107,7 @@ if (process.argv.includes('--live')) {
     console.log(
       `== light 轨真请求：落到 ${r.meta.endpointId}（tier${r.meta.tier} / ${r.meta.model}）应答「${text}」==`,
     );
-    console.log(`   tried: ${r.meta.tried.map((t) => `${t.endpointId}:${t.outcome}`).join(' → ')}`);
+    console.log(`   tried: ${r.meta.tried.map((t) => `${t.endpointId}${t.model ? '/' + t.model : ''}:${t.ok ? 'ok' : (t.kind ?? 'fail')}`).join(' → ')}`);
   } catch (err) {
     const tried = (err as { tried?: readonly string[] }).tried;
     console.log(`== light 轨真请求：抛错 ${(err as Error).name}: ${(err as Error).message} ==`);
@@ -123,7 +128,7 @@ try {
   });
   const served = r.meta.endpointId;
   console.log(`== light 轨降级演练：落到 ${served}（tier${r.meta.tier} / ${r.meta.model}）==`);
-  console.log(`   tried: ${r.meta.tried.map((t) => `${t.endpointId}:${t.outcome}`).join(' → ')}`);
+  console.log(`   tried: ${r.meta.tried.map((t) => `${t.endpointId}${t.model ? '/' + t.model : ''}:${t.ok ? 'ok' : (t.kind ?? 'fail')}`).join(' → ')}`);
   if (served !== 'colibri-olmoe') {
     console.log(`   ✗ 预期落到 colibri-olmoe，实际 ${served}`);
     ok = false;
@@ -142,8 +147,17 @@ try {
   });
   console.log(`== primary 轨降级演练：落到 ${r.meta.endpointId}（tier${r.meta.tier}）==`);
 } catch (err) {
+  // primary 链只在 openrouter-main **一个端点**内换模型（fallback_models），
+  // 换完就无路可走 —— 所以"抛 AllEndpointsDown"是**预期**，不是失败。
+  // 但必须写清"试了几个模型"，否则下一人会把 4 次尝试读成 4 个端点。
   console.log(`== primary 轨降级演练：抛错 ${(err as Error).name}: ${(err as Error).message} ==`);
-  console.log('   （真实配置里 primary 只有 openrouter-main 一个候选，熔断即无路可走）');
+  const tried = (err as { tried?: Array<{ endpointId: string; model?: string }> }).tried ?? [];
+  const models = [...new Set(tried.map((t) => t.model).filter((m): m is string => m !== undefined))];
+  console.log(
+    `   （primary 只有 openrouter-main 这一个端点，端点内依次试了 ${tried.length} 次` +
+      (models.length > 0 ? `：${models.join(' / ')}` : '') +
+      '；跨端点没有备份 → 全挂即无路可走）',
+  );
 }
 
 db.close();

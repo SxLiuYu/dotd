@@ -316,9 +316,31 @@ export class StubTransport implements ModelTransport {
     }
     const isWarm = /\/profile(\?|$)/.test(new URL(url).pathname);
     if (isWarm) {
+      // 形状必须与**真 Colibrì** 一致（2026-10-26 修）：它把 expert_disk_s 嵌在
+      // `turns[]` 里（`{"seq":8,"turns":[{…,"expert_disk_s":10.01}]}`），而
+      // `config/models.yml` 的 warm 判据是 `turns.last.expert_disk_s ≤ 0.1`
+      // （见 candidates.ts·matchesJsonMax：顶层键那种写法是 2026-10-17 修掉的 bug，
+      // 修完判据指向 turns[] 了，stub 却没跟）。
+      //
+      // 原来这里返回顶层的 `{expert_disk_s: 0}`：按真配置跑降级链时，stub 自己的
+      // 形状对不上判据 → 判"不 warm" → tier2 永远用不上。代价是
+      // `scripts/router-chain-probe.mts` 一直报
+      // 「light 轨降级演练：抛错 全部模型端点均不可用」—— 看着像降级链断了，
+      // 其实是**测试替身**的形状过时。这是"检查器看错地方"的另一形态：
+      // 被判的是配置，出错的是探针。
       return st.warm
-        ? { ok: true, status: 200, json: { expert_disk_s: 0 }, latencyMs: st.warmMs }
-        : { ok: false, status: 200, json: { expert_disk_s: 12.5 }, latencyMs: st.warmMs };
+        ? {
+            ok: true,
+            status: 200,
+            json: { seq: 1, turns: [{ expert_disk_s: 0 }] },
+            latencyMs: st.warmMs,
+          }
+        : {
+            ok: false,
+            status: 200,
+            json: { seq: 1, turns: [{ expert_disk_s: 12.5 }] },
+            latencyMs: st.warmMs,
+          };
     }
     return st.health
       ? { ok: true, status: 200, json: { status: 'ok' }, latencyMs: st.healthMs }

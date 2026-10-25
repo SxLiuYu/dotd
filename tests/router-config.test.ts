@@ -25,7 +25,8 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { makeTempDataDir, type TempDataDir } from './helpers.ts';
 import { loadModelsConfig, parseModelsYaml } from '../src/router/config.ts';
-import { matchesJsonEq, matchesJsonMax, matchesWarmCheck } from '../src/router/candidates.ts';
+import { localGate, matchesJsonEq, matchesJsonMax, matchesWarmCheck } from '../src/router/candidates.ts';
+import { StubTransport } from '../src/router/transport.ts';
 
 let tmp: TempDataDir;
 
@@ -164,6 +165,35 @@ describe('真实 models.yml：warm_check 嵌套路径判据（MR §2.1）', () =
     const warm = { seq: 8, turns: [{ expert_disk_s: 10.013544 }, { expert_disk_s: 0.0 }] };
     assert.equal(matchesWarmCheck(cold, wc), false, '末条 turn 0.47s（冷）应不过');
     assert.equal(matchesWarmCheck(warm, wc), true, '末条 turn 0.0s（驻留）应过');
+  });
+
+  // 2026-10-26：stub 的 /profile 形状必须**能过真配置的判据**。
+  //
+  // 现场：`scripts/router-chain-probe.mts` 按真 models.yml 跑降级演练，一直报
+  // 「light 轨降级演练：抛错 全部模型端点均不可用」——看着像 tier2 降级链断了。
+  // 实际是 StubTransport.get() 还在返回顶层的 `{expert_disk_s: 0}`，而真判据是
+  // `turns.last.expert_disk_s ≤ 0.1`（2026-10-17 改的）。测试替身自己过时，
+  // 结论却指向被检查的链 —— 与 §18.11–18.14 同一类。
+  //
+  // 这条测试把两侧对接上：stub 的 warm=true 与 warm=false 分别喂给**真配置里的
+  // 那道闸**，必须一个过一个不过。以后任何一侧改形状都会红。
+  it('StubTransport 的 /profile 形状能过真配置的 warm 闸（否则探针会假报"链路断"）', async () => {
+    const cfg = loadModelsConfig(REAL_MODELS_YML);
+    const ep = cfg.endpoints.find((e) => e.id === 'colibri-olmoe');
+    assert.ok(ep !== undefined);
+    assert.ok(ep.local?.warm_check !== undefined);
+
+    const warmStub = new StubTransport({ local: { 'colibri-olmoe': { health: true, warm: true } } });
+    const warmGate = await localGate(warmStub, ep, { healthOkSince: null, graceUntil: null, lastWarmOkAt: null }, () => Date.now());
+    assert.equal(warmGate.ok, true, `warm=true 应过闸，实际：${warmGate.reason}`);
+
+    const coldStub = new StubTransport({ local: { 'colibri-olmoe': { health: true, warm: false } } });
+    const coldGate = await localGate(coldStub, ep, { healthOkSince: null, graceUntil: null, lastWarmOkAt: null }, () => Date.now());
+    assert.equal(coldGate.ok, false, 'warm=false 必须判不过（否则这道闸等于不存在）');
+    // 真配置里 colibri 的 warm_grace_ms = 150000：刚起来那会儿不过闸属于"加载中"，
+    // 不入熔断窗口。这条同时证明**宽限期真的被读进来了**（不是 0）。
+    assert.equal(coldGate.warming, true, '首次判负应在宽限期内 → 判加载中，不算故障');
+    assert.match(coldGate.reason, /宽限期内/);
   });
 
   it('matchesJsonMax：末元素语义 + 空历史放行 + 键不存在判负', () => {
