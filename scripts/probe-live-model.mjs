@@ -42,13 +42,64 @@ async function main() {
   const { loadModelsConfig } = await import('../src/router/config.ts');
   const { HttpTransport } = await import('../src/router/transport.ts');
 
+  // ── 0. 先把「运行期环境」拉进来（2026-10-26）────────────────────────
+  //
+  // 这是同一缺陷的**第六例**，也是最隐蔽的一例：§18.14 已经让本脚本去
+  // tokens.env / 运行中 daemon 里找 **key**，但 `models.yml` 里的
+  // `${DOTD_MODEL_HOST:-http://127.0.0.1:3065}` 是在 `loadModelsConfig()` 里
+  // 用 `process.env` 展开的（src/router/config.ts:expandEnvText）。于是 live 上
+  // 出现这个组合：
+  //
+  //   doctor  ✅ openrouter-main http://172.17.48.1:13065/v1  TCP 可连（4ms）
+  //   probe   ✗ connect ECONNREFUSED 127.0.0.1:3065
+  //
+  // 同一个 daemon、同一份 models.yml、同一个 key —— 差别只在"谁展开这个占位符"。
+  // 端点地址、配置目录、db 路径这些**运行期旋钮**必须按 daemon 的值来，
+  // 否则本脚本验的是另一台设备上的另一个网关，结论与线上无关。
+  //
+  // 白名单覆盖（`RUNTIME_KNOBS`）不含任何 key/token，所以第 2 步的凭据查找语义
+  // 不变：key 仍然走 进程环境 → tokens.env → daemon。
+  const { layeredEnv, resolveConfigDir } = await import('./lib/env.mjs');
+  const { liveDaemon, RUNTIME_KNOBS } = await import('./lib/live-daemon.mjs');
+  // `procRoot` 的默认值仍是 `/proc`；这个口子给两类场景：
+  //   ① 非标准挂载（容器里 hidepid/只读 /proc 的镜像）；
+  //   ② 测试要造一个"运行中的 daemon"，总不能在测试机上真起一个 dotd。
+  // 它只影响"去哪个目录读进程信息"，不改变任何判据。
+  const live = liveDaemon({
+    shellEnv: process.env,
+    ...(process.env.DOTD_PROC_ROOT ? { procRoot: process.env.DOTD_PROC_ROOT } : {}),
+  });
+
+  /** 这份环境是"运行中期许值"的来源说明，写进输出，避免又一个"实际生效"式误读。 */
+  let runtimeNote;
+  if (live === null) {
+    runtimeNote = '（没找到运行中的 daemon，按当前 shell 展开）';
+  } else if ('ambiguous' in live) {
+    runtimeNote = `（发现 ${live.ambiguous.length} 个 daemon 进程，无法确定哪个在服务，按当前 shell 展开）`;
+  } else {
+    runtimeNote = `（取值来自运行中的 daemon pid ${live.pid}）`;
+    // 只覆盖旋钮键；空串不覆盖（daemon 里空值等于没设）。
+    for (const k of RUNTIME_KNOBS) {
+      const v = live.env[k];
+      if (v !== undefined && v !== '') process.env[k] = v;
+    }
+  }
+
+  // home 与 tokens 必须在覆盖**之后**算：`DOTD_HOME` 本身就是旋钮之一，
+  // 先算再用就还是这个 shell 的 home（§18.14 的同一个错法）。
+  const home =
+    process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
+  const tokens = layeredEnv({ home, homedir: homedir() });
+
   // ── 1. 读真配置，选端点 ─────────────────────────────────────────────
   //
   // 路径顺序与 daemon 一致（2026-10-26）：`DOTD_CONFIG_DIR` 优先，否则仓库 config/。
   // 托管部署里 daemon 读的是 `~/.dotd/models.yml`（且热加载），原来这里写死仓库那份：
   // 主人改过运行时配置后，这个"上线前体检"验的是另一份端点 —— 结论与线上无关。
   // 判据与 doctor / onboard 共用 `scripts/lib/env.mjs`。
-  const { resolveConfigDir } = await import('./lib/env.mjs');
+  //
+  // 注意 `home` 也要按运行期取：上面已把 daemon 的 `DOTD_HOME` / `DOTD_CONFIG_DIR`
+  // 叠进 `process.env`，这里的 `home` 因此与 daemon 一致。
   const configDir = resolveConfigDir({ repoRoot: REPO_ROOT, home: homedir() });
   const cfgPath = join(configDir, 'models.yml');
   let cfg;
@@ -90,6 +141,9 @@ async function main() {
   out(`base_url  ${ep.baseUrl}`);
   out(`模型      ${model}`);
   out(`凭据变量  ${keyEnv === null ? '（该端点免鉴权）' : keyEnv}`);
+  // 端点地址是 `${DOTD_MODEL_HOST}` 展开出来的：必须交代替换值来自哪个进程，
+  // 否则「同一份 models.yml，doctor 说通、这里说不通」没法解释（见第 0 步注释）。
+  out(`运行期    ${runtimeNote}`);
   out('');
 
   // ── 2. 凭据检查（与 daemon 同眼光；缺就如实说缺，不失败）──────────────
@@ -100,12 +154,6 @@ async function main() {
   // 于是"模型正正常出字"和"本脚本说未验证"同时成立 —— 检查器看错地方。
   //
   // 值只用于这一次请求，**任何分支都不打印**；打印的只是"从哪儿找到的"。
-  const { layeredEnv } = await import('./lib/env.mjs');
-  const { liveDaemon } = await import('./lib/live-daemon.mjs');
-  const home =
-    process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
-  const tokens = layeredEnv({ home, homedir: homedir() });
-  const live = liveDaemon({ shellEnv: process.env });
   let key = null;
   let keySource = '';
   if (keyEnv !== null) {

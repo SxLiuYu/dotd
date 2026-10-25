@@ -110,6 +110,10 @@ function runProbe(env: Record<string, string>, home: string, configDir: string):
     USERPROFILE: home,
     DOTD_CONFIG_DIR: configDir,
     DOTD_MODEL_HOST: `http://127.0.0.1:${PORT}`,
+    // 默认给一个**不存在的** procRoot：这台机器（WSL / CI）上真的跑着 dotd 时，
+    // 不去扫 `/proc` 就能让结论与"恰好有没有 daemon"无关。要验运行期覆盖的那条
+    // 测试自己传一个假 /proc 进来。
+    DOTD_PROC_ROOT: join(home, 'no-such-proc'),
     ...env,
   };
   return new Promise((resolve) => {
@@ -226,5 +230,83 @@ describe('③ 三处都没有 → 说"未验证"，并列出查过哪三处', ()
     assert.match(text, /tokens\.env/);
     assert.match(text, /运行中 daemon 的进程环境/);
     assert.match(text, /"未验证"，不是"不可用"/);
+  });
+});
+
+/**
+ * ④ 端点地址也必须按 daemon 展开（第六例）。
+ *
+ * 现场（2026-10-26 live，§18.14 修完 key 查找之后）：
+ *
+ * ```
+ * doctor  ✅ openrouter-main http://172.17.48.1:13065/v1   TCP 可连（4ms）
+ * probe   ✗ connect ECONNREFUSED 127.0.0.1:3065
+ * ```
+ *
+ * `models.yml` 写的是 `${DOTD_MODEL_HOST:-http://127.0.0.1:3065}/v1`，
+ * 展开发生在 `loadModelsConfig()` 里、读的是 `process.env`。§18.14 只让 key
+ * 去 daemon 里找了，**地址没找** —— 于是脚本带着正确的 key 打到了另一个网关。
+ *
+ * 这条测试造一个"运行中的 daemon"，它的 `DOTD_MODEL_HOST` 指向本测试的假网关，
+ * 而脚本自己 shell 里的 `DOTD_MODEL_HOST` 指向一个死端口。若脚本不按 daemon
+ * 展开，就会连死端口并报"真故障"。
+ */
+describe('④ 端点地址按运行中 daemon 展开，不按自己的 shell', () => {
+  let server: Server;
+  let seen: string[];
+  let home: string;
+  let configDir: string;
+  let procRoot: string;
+
+  before(async () => {
+    ({ server, seen } = await startFakeGateway('daemon-side-key'));
+    home = mkdtempSync(join(tmpdir(), 'dotd-probe-rt-'));
+    configDir = mkdtempSync(join(tmpdir(), 'dotd-probe-cfg4-'));
+    makeWorld('export HY3_API_KEY=daemon-side-key\n', home, configDir);
+    // 假 /proc：一个 src/daemon.ts 进程，环境里把 MODEL_HOST 指到本测试的网关。
+    procRoot = mkdtempSync(join(tmpdir(), 'dotd-probe-proc-'));
+    mkdirSync(join(procRoot, '4242'), { recursive: true });
+    writeFileSync(
+      join(procRoot, '4242', 'cmdline'),
+      ['/usr/bin/node', '--import', 'tsx', '/root/dotd/src/daemon.ts'].join('\0') + '\0',
+      'utf8',
+    );
+    writeFileSync(
+      join(procRoot, '4242', 'environ'),
+      [
+        'DOTD_MODEL_HOST=http://127.0.0.1:' + PORT,
+        'DOTD_FLEET=docker',
+        // 这里放 key 只是让假 daemon 的环境更接近真实（daemon 里确实有）。
+        // 注意查找顺序是 shell → tokens.env → daemon，所以本测试实际用的是
+        // tokens.env 里那份（同值），**这条测试验的是地址，不是 key 来源**。
+        'HY3_API_KEY=daemon-side-key',
+      ].join('\0') + '\0',
+      'utf8',
+    );
+  });
+
+  after(() => {
+    server.close();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(configDir, { recursive: true, force: true });
+    rmSync(procRoot, { recursive: true, force: true });
+  });
+
+  test('shell 的 DOTD_MODEL_HOST 指向死端口，daemon 指向假网关 → 走 daemon 的地址', async () => {
+    const r = await runProbe(
+      {
+        // 死端口：1 号端口在本机几乎不可能有服务；若被用到，会 ECONNREFUSED。
+        DOTD_MODEL_HOST: 'http://127.0.0.1:1',
+        DOTD_PROC_ROOT: procRoot,
+      },
+      home,
+      configDir,
+    );
+    const text = r.text;
+    assert.equal(r.status, 0, text);
+    assert.match(text, new RegExp(`base_url\\s+http://127\\.0\\.0\\.1:${PORT}/v1`), '地址要用 daemon 展开后的');
+    assert.match(text, /运行期\s+.*daemon pid 4242/, '要交代这个地址取自哪个进程');
+    assert.match(text, /connect:\s+成功/, '连的必须是假网关，不是 shell 里那个死端口');
+    assert.equal(seen.at(-1), 'Bearer daemon-side-key', 'key 也要按 daemon');
   });
 });
