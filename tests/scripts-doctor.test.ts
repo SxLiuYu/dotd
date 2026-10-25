@@ -139,6 +139,19 @@ test('expandWithDefault：${VAR:-默认} 在缺席时用默认值，不算缺', 
     value: 'http://127.0.0.1:7863/v1',
     resolved: true,
   });
+  // 占位符嵌在值中间（models.yml 的真实写法）：旧实现只认"整值即占位符"，
+  // 会把这行判成"不是合法 URL"，体检红一片（2026-10-25 修）。
+  assert.deepEqual(expandWithDefault('${A:-http://127.0.0.1:3065}/v1', {}), {
+    value: 'http://127.0.0.1:3065/v1',
+    resolved: true,
+  });
+  assert.deepEqual(expandWithDefault('${A:-http://127.0.0.1:3065}/v1', { A: 'http://gw:13065' }), {
+    value: 'http://gw:13065/v1',
+    resolved: true,
+  });
+  const partial = expandWithDefault('${A}/v1', {});
+  assert.equal(partial.resolved, false);
+  assert.equal(partial.missing, 'A');
 });
 
 test('STRICT_ENV_KEYS：严格展开的只有四处；FEISHU_* 等缺席是合法的', () => {

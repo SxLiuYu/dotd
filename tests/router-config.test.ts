@@ -74,8 +74,9 @@ describe('真实 models.yml：续行 models 映射（MR §2.1）', () => {
     const colibri = cfg.endpoints.find((e) => e.id === 'colibri-olmoe');
     assert.ok(colibri !== undefined);
     assert.equal(colibri.tier, 2);
-    // 2026-10-17：health_url 走 DOTD_TIER2_HOST 环境变量（默认 WSL 网关 + 中继端口）
-    assert.equal(colibri.local?.health_url, 'http://172.17.48.1:18001/health');
+    // health_url 走 DOTD_TIER2_HOST 环境变量；仓库默认值是**本机**回环地址
+    // （2026-10-25 起不再写死 WSL 网关，见 tests/config-no-env-leaks.test.ts）。
+    assert.equal(colibri.local?.health_url, 'http://127.0.0.1:18001/health');
     assert.equal(colibri.local?.max_concurrency, 1);
     assert.equal(colibri.local?.queue_reject_ms, 8000);
     assert.equal(colibri.local?.warm_grace_ms, 150000);
@@ -148,7 +149,7 @@ describe('真实 models.yml：warm_check 嵌套路径判据（MR §2.1）', () =
     const ep = cfg.endpoints.find((e) => e.id === 'colibri-olmoe');
     assert.ok(ep !== undefined);
     assert.deepEqual(ep.local?.warm_check, {
-      url: 'http://172.17.48.1:18001/profile',
+      url: 'http://127.0.0.1:18001/profile',
       json_max: { 'turns.last.expert_disk_s': 0.1 },
     });
   });

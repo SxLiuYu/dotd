@@ -29,7 +29,13 @@ endpoints:
     # 主循环每轮都带 tools + tool_choice:auto，所以 primary 必须是真能调工具的模型，
     # 否则工具永远不执行（任务看起来"做完"了但什么都没干）。light 轨只做事件匹配/摘要，
     # 用便宜快的 flash 即可。
-    base_url: http://172.17.48.1:13065/v1
+    # 2026-10-25 修：这行原来是写死的 `http://172.17.48.1:13065/v1`（WSL 网关地址）。
+    # 那是**部署环境**的事实，不是仓库的事实：提交进 git 后，Windows 原生跑会连不上、
+    # 换台机器也会连不上，而且看配置的人无从知道该改哪。
+    # 现在改成环境占位：默认 127.0.0.1:3065（Windows 侧 a2a 网关，见上一条），
+    # WSL 部署由 scripts/wsl-daemon.sh 导出 DOTD_MODEL_HOST=http://<网关>:13065。
+    # 判据：tests/config-no-env-leaks.test.ts 禁止把非回环地址写死在这里。
+    base_url: ${DOTD_MODEL_HOST:-http://127.0.0.1:3065}/v1
     api_key_env: HY3_API_KEY
     models:
       # ── 2026-10-24 延迟重测（选型依据，脚本与原始样本见 docs/acceptance/model-latency/）──
@@ -128,12 +134,14 @@ endpoints:
     # 通路 = WSL 默认网关 + Windows 侧 win-relay.mts（0.0.0.0:18001 → 127.0.0.1:8001，
     # 带 Host 重写）。网关 IP 会随 WSL 重启漂移，故留 DOTD_TIER2_HOST 环境变量口子
     # （setup-dev-env.sh 自动算当前网关写进 tokens.env；未设则用下面的默认值）。
-    base_url: ${DOTD_TIER2_HOST:-http://172.17.48.1:18001}/v1
+    # 2026-10-25：默认值从写死的 172.17.48.1 改成 127.0.0.1 —— 仓库默认只承诺
+    # "本机"，跨命名空间的那一跳是部署事实，由 DOTD_TIER2_HOST 提供。
+    base_url: ${DOTD_TIER2_HOST:-http://127.0.0.1:18001}/v1
     models: { light: olmoe-colibri }          # 2026-10-16 实测：coli serve --model-id olmoe-colibri（原稿 olmoe-1b-7b-instruct 会 404）。7B 无（已证实的）工具调用能力，默认只挂 light；主人显式加 primary 行即授权降格（§4.3）
     style: openai
     timeouts: { connect_ms: 1000, idle_ms: 15000, total_ms: 45000 }
     local:                                    # queue_reject_ms 等参数一律挂在端点.local 下；调用方不得覆盖（§4.2）
-      health_url: ${DOTD_TIER2_HOST:-http://172.17.48.1:18001}/health
+      health_url: ${DOTD_TIER2_HOST:-http://127.0.0.1:18001}/health
       # 2026-10-17 修（同一次测试的判据层）：Colibrì /profile 把 expert_disk_s 嵌在
       # turns[] 里（{"seq":8,"turns":[{…,"expert_disk_s":10.01},…]}），且冷启动序列是
       # 10.0/1.0/0.9/0.47… 驻留后跌到 0.02 以下——故判据写"末条 turn 不超过 0.1s"：
@@ -141,7 +149,7 @@ endpoints:
       # turns 还是空数组（引擎刚起、一条没跑）时判过：无磁盘 I/O 样本即无违背，
       # 否则永远等不到第一条 turn，闸门会把 tier2 永久锁死。
       warm_check:
-        url: ${DOTD_TIER2_HOST:-http://172.17.48.1:18001}/profile
+        url: ${DOTD_TIER2_HOST:-http://127.0.0.1:18001}/profile
         json_max: { 'turns.last.expert_disk_s': 0.1 }
       warm_grace_ms: 150000                   # /health 通过≠全量驻留，宽限期外不判 warm
       max_concurrency: 1                      # 无 batching 实测结论：并发只排队，超 1 直接快速失败

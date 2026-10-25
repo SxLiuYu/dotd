@@ -144,16 +144,29 @@ export function parseTier1Endpoint(text) {
   return out.filter((e) => e.tier === 1);
 }
 
-/** 默认值写法的占位符（`${VAR:-default}`）在变量缺席时用的默认值。 */
+/**
+ * 展开 `${VAR}` / `${VAR:-默认}`。**占位符可以嵌在值中间**（2026-10-25 修）：
+ * models.yml 现在写的是 `${DOTD_MODEL_HOST:-http://127.0.0.1:3065}/v1`，
+ * 旧实现只认"整个值恰好是一个占位符"，于是把带后缀的合法写法判成"不是合法 URL"，
+ * 体检直接红 —— 那是体检脚本没跟上配置写法，不是配置有问题。
+ * 与 src/router/config.ts 的 expandEnvText 同语义（同一份文件，两边都得认）。
+ */
 export function expandWithDefault(value, env) {
-  const m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}$/.exec(String(value).trim());
-  if (m === null) return { value, resolved: true };
-  const name = m[1];
-  const fallback = m[2];
-  const actual = env[name];
-  if (actual !== undefined && actual !== '') return { value: actual, resolved: true };
-  if (fallback !== undefined) return { value: fallback, resolved: true };
-  return { value: '', resolved: false, missing: name };
+  const raw = String(value);
+  if (!raw.includes('${')) return { value, resolved: true };
+  const missing = [];
+  const out = raw.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}\n]*))?\}/g,
+    (_whole, name, fallback) => {
+      const actual = env[name];
+      if (actual !== undefined && actual !== '') return actual;
+      if (fallback !== undefined) return fallback;
+      missing.push(name);
+      return '';
+    },
+  );
+  if (missing.length > 0) return { value: out, resolved: false, missing: missing.join(', ') };
+  return { value: out, resolved: true };
 }
 
 /** TCP 连通性探测（不握手、不发请求）：连上即通。 */

@@ -27,11 +27,19 @@ set -a; . ./_tokens_src.env; set +a
 echo "凭据: master=${#DOTD_MASTER_TOKEN} wb2=${#WB2API_KEY} owner=${FEISHU_OWNER_CHAT_ID}"
 
 # 2. 模型端点改走 relay
+#
+# 2026-10-25 改：以前是 sed 直接改写 config/models.yml 的 base_url —— 那会把
+# **部署环境**（网关 IP）写进磁盘上的仓库文件，一次 cp 回 Windows 就提交进 git了
+# （config/models.yml 里的 172.17.48.1 就是这么来的）。
+# 现在 models.yml 用 `${DOTD_MODEL_HOST:-http://127.0.0.1:3065}` 占位，这里只导出
+# 环境变量：同一份仓库文件，在 Windows 原生跑用默认值，在 WSL 跑用网关地址，
+# 文件本身永远不含环境事实。
 GW=$(ip route | sed -n 's/^default via \([0-9.]*\).*/\1/p' | head -1)
 echo "网关: $GW"
-sed -i "s#base_url: http://127.0.0.1:3065/v1#base_url: http://${GW}:13065/v1#" config/models.yml
-sed -i "s#base_url: http://127.0.0.1:7863/v1#base_url: http://${GW}:13065/v1#" config/models.yml
-grep -n "base_url: http://" config/models.yml | head -1
+export DOTD_MODEL_HOST="http://${GW}:13065"
+# Colibrì 的 tier2 通路同理（win-relay 在 Windows 侧 0.0.0.0:18001）。
+export DOTD_TIER2_HOST="${DOTD_TIER2_HOST:-http://${GW}:18001}"
+echo "模型端点: ${DOTD_MODEL_HOST}/v1（tier2: ${DOTD_TIER2_HOST}）"
 
 # 3. surfaces 配置（Windows 侧那份，含 feishu 节与 owner 占位）
 cp _config_src.yml "$HOME/.dotd/config.yml"
