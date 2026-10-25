@@ -37,6 +37,18 @@ log() { echo "[deploy] $*"; }
 [ -f "$SRC/src/daemon.ts" ] || { echo "源仓库不像仓库：$SRC/src/daemon.ts 不在" >&2; exit 3; }
 [ -f "$DST/package.json" ] || { echo "目标 $DST 没有 package.json（首次部署请先手工 clone/拷贝一次）" >&2; exit 3; }
 
+# 源=目标就是一个**静默空转**的部署（2026-10-25 踩到）：在部署副本里跑本脚本时，
+# rsync 自己拷自己，类型检查和测试在"新代码"上通过，重启后跑的却还是旧代码 ——
+# 日志里一路绿，事实是这次改动根本没上线。宁可直接拒绝。
+if [ "$(cd "$SRC" && pwd -P)" = "$(cd "$DST" && pwd -P)" ]; then
+  cat >&2 <<EOF
+[deploy] 源和目标是同一个目录：$SRC
+         这样 rsync 是空转，部署等于没做。请从开发副本执行：
+           cd /mnt/d/dotd && bash scripts/wsl-deploy.sh
+EOF
+  exit 6
+fi
+
 # ── 0. 记录现状（重启前的 PID、库版本），便于出问题回溯 ─────────────────
 # 现在的 daemon 由 one_system 托管（2026-10-25 起）：要抓的是 supervisor（python）
 # 和它手里的 dotd 子进程（node）两族 —— 只杀 node 会被 supervisor 自动重启，
@@ -50,6 +62,11 @@ log "当前 daemon PID=${OLD_PID:-（未运行）}"
 # `_*` 必须排除：WSL 运行副本里有 `_tokens_src.env` / `_config_src.yml` 和一批
 # 临时排障脚本，它们**不在仓库里**。`--delete` 会把它们删掉，下一次重启
 # 就变成"source 不到凭据、daemon 带空 token 起来"——同步脚本亲手拆掉部署。
+#
+# `voice/charlie/models`（SenseVoice 237MB 权重）同理必须排除：那份文件只在部署机
+# 上由 scripts/download-models.sh 下载，仓库里没有、也不该有。不排除的话每次部署
+# 都会把刚下好的模型删掉，本地 ASR 永远起不来（2026-10-25 实测：TTS 通了、
+# ASR 整条链返回空，设备等于聋的）。
 rsync -a --delete \
   --exclude 'node_modules' \
   --exclude '.git' \
@@ -65,6 +82,7 @@ rsync -a --delete \
   --exclude '.tmp-*' \
   --exclude 'tmp-*' \
   --exclude '*.log' \
+  --exclude 'voice/charlie/models' \
   "$SRC/" "$DST/"
 log "同步完成"
 
@@ -166,7 +184,20 @@ NEW_PID="$(pgrep -f 'voice\.integration\.one_system' | head -1 || true)"
 log "完成：supervisor PID=${NEW_PID:-?}（dotd 由其托管）在 127.0.0.1:$PORT（旧 PID=${OLD_PID:-无}）"
 # 8000 是合并后的统一入口（Charlie /console + /api 反代）；起不来要说出来，
 # 不能只验 7788 就宣布成功 —— 那正是"说上线了而实际没上线"的老路。
-V="$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)"
+#
+# 必须**轮询**，不能只探一次（2026-10-25）：Charlie 侧要 import 完上游、跑
+# preflight、起预热线程才 bind 8000，实测比 dotd 的 7788 晚 3~8 秒。原来这里
+# 一次 curl 拿到 000 就打印"⚠️ 8000 未就绪"，于是**每次正常部署都报一次红**，
+# 而人肉复核又总是绿的 —— 狼来了几次之后，真起不来也会被当成常态忽略。
+V=000
+for _ in $(seq 1 30); do
+  V="$(curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/health || true)"
+  [ "$V" = "200" ] && break
+  sleep 1
+done
 log "GET :8000/health（charlie+dotd 统一入口）→ $V"
-[ "$V" = "200" ] || log "⚠️ 8000 未就绪（charlie 侧没起来）；看 /tmp/dotd-wsl.log"
+if [ "$V" != "200" ]; then
+  log "⚠️ 8000 30s 内没起来（charlie 侧失败）；看 /tmp/dotd-wsl.log 尾部："
+  tail -15 /tmp/dotd-wsl.log 2>/dev/null || true
+fi
 log "飞书长连接/模型热备由 daemon 自行恢复；可用 \`dotd sos-test\` 与 /api/status 复核。"

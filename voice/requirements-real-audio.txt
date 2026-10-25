@@ -16,6 +16,20 @@ faster-whisper>=1.0
 sherpa-onnx>=1.10
 # 声学闭环录音（Windows/Linux 均可；PortAudio 随 wheel 提供）
 sounddevice>=0.4
+# 音频文件读写。**2026-10-25 补**：它原本只写在 Charlie 的
+# requirements-optional.txt（"可选"），但真依赖其实在上游 qwen_agent 的 import
+# 链上 —— qwen_agent/llm/azure.py 一路 `import soundfile`，缺了就让
+# `_get_brain()` 直接抛 ModuleNotFoundError。日志只显示
+# `[warmup] brain(none) 预热失败: No module named 'soundfile'`，看起来像
+# "音频可选件缺失不影响"，实际是**大脑根本建不起来**（连带 amap/agnes 预热全废）。
+soundfile>=0.12
 scipy>=1.11
 # 仅 Windows：解除扬声器静音/设置音量
 pycaw>=20240210; sys_platform == "win32"
+
+# 刻意**不装**的：silero-vad（语音端点检测）。
+# 它会把整个 torch 拖进来（数 GB），而缺失时的降级是设计内的：
+# 上游 `app/xiaozhi_ws.py` 会打印 `Silero VAD load fail, fallback to RMS
+# endpointing`，改用能量阈值的 RMS 端点检测（20 帧 = 1.2s 尾静音，Silero 是
+# 6 帧 = 0.36s）。也就是说：换来的是"尾静音短 0.84s"，代价是几 GB 镜像和内存。
+# 要做声学验收/追这 0.84s 的机器上再单独 `pip install silero-vad`。

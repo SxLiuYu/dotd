@@ -147,6 +147,11 @@ if (CHECK_ONLY) {
 
 // ── 3. 体检 ─────────────────────────────────────────────────────────
 
+// 推荐项（例如"没有 ASR 模型 → 设备听不见"）不阻塞退出码 —— CI 的干净机器上
+// 本来就没有 237MB 模型。但如果一声不响，"装完就绪、设备聋了"就会再次发生
+// （2026-10-25 就是这么发生的）。所以收下来，在末尾单独提示。
+const warnings = [];
+
 if (!DRY) {
   const r = run(process.execPath, [join(REPO, 'scripts', 'onboard.mjs'), '--json']);
   let report = null;
@@ -162,6 +167,9 @@ if (!DRY) {
     r.ok,
     report === null ? r.out || 'onboard 输出无法解析' : failed.length === 0 ? '必需项全过' : `缺：${failed.map((c) => c.label).join('、')}`,
   );
+  for (const c of report?.checks ?? []) {
+    if (c.level !== 'required' && !c.ok) warnings.push(c);
+  }
 }
 
 // ── 输出 ────────────────────────────────────────────────────────────
@@ -176,6 +184,15 @@ if (JSON_OUT) {
     if (!s.ok && s.hint) console.log(`   → ${s.hint}`);
   }
   console.log('');
+  if (warnings.length > 0) {
+    // 不阻塞，但必须说出来 —— 这些项不会让进程起不来，却会让功能静默残缺。
+    console.log('还需要你知道（不阻塞启动）：');
+    for (const w of warnings) {
+      console.log(`  ⚠️  ${w.label}: ${w.detail}`);
+      if (w.fix) console.log(`     → ${w.fix.split('\n').join('\n       ')}`);
+    }
+    console.log('');
+  }
   if (ok) {
     console.log(INSTALL ? '两边都装好了。下一步：npm run up' : '就绪。');
   } else {

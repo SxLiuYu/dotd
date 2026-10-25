@@ -786,6 +786,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:  # 闸门是安全项，装不上要说出来
         print(f"[one-system] 飞书闸门未装上：{exc}", file=sys.stderr)
 
+    # 日志降噪（2026-10-25）：合并后大脑是 dotd，Charlie 本地大脑缺 LLM key 是
+    # 预期状态；但上游在 import 期就起线程预热并打一屏 WARNING + 配置指引，
+    # 每次重启都像出了故障。这里先装 Filter：只降「架构上必然失败」的几类
+    # （缺 LLM key / 百度预热 400 / demo 三连 / 可选 preflight 项 / Silero 缺失），
+    # 其余原样告警。必须在 import voice_server 之前装 —— 那些日志就是 import 期打的。
+    try:
+        from voice.integration import log_triage
+
+        log_triage.install()
+    except Exception as exc:
+        print(f"[one-system] 日志降噪未装上：{exc}", file=sys.stderr)
+
     # 设备播报链的免费兜底（2026-10-25）：`app.xiaozhi_ws._synth_mp3` 自带一套
     # baidu → finna → stepfun → macOS `say`，既不看 TTS_PRIORITY 也不含 edge。
     # 没配 key 的机器上设备一句都说不出话，而 [tts-warm] 却是 3/3 —— 两道门

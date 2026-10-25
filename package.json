@@ -24,7 +24,7 @@
     "setup:check": "node scripts/setup.mjs --check",
     "voice:check": "node scripts/voice-check.mjs",
     "voice:bridge": "python -m voice.integration.dotd_bridge",
-    "voice:test": "node --import tsx --test tests/voice-bridge.test.ts tests/voice-mcp-seam.test.ts tests/cortex-router.test.ts tests/voice-memory-push.test.ts tests/voice-audio-chain.test.ts tests/voice-tts-warm.test.ts tests/voice-feishu-gate.test.ts tests/voice-tts-edge-fallback.test.ts",
+    "voice:test": "node --import tsx --test tests/voice-bridge.test.ts tests/voice-mcp-seam.test.ts tests/cortex-router.test.ts tests/voice-memory-push.test.ts tests/voice-audio-chain.test.ts tests/voice-tts-warm.test.ts tests/voice-feishu-gate.test.ts tests/voice-tts-edge-fallback.test.ts tests/voice-log-triage.test.ts",
     "charlie:check": "python -m voice.integration.one_system --check",
     "charlie:start": "python -m voice.integration.one_system",
     "charlie:test": "node --import tsx --test tests/one-system.test.ts tests/one-system-supervisor.test.ts tests/voice-bridge.test.ts tests/voice-mcp-seam.test.ts tests/cortex-router.test.ts tests/voice-memory-push.test.ts tests/voice-audio-chain.test.ts",
