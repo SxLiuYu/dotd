@@ -19,6 +19,13 @@
  *   - **必须 3 秒内响应**，否则飞书会重试 —— 所以先回 200 再干活
  */
 import type { ApprovalView } from '../shared/contracts.ts';
+import { LARGE_SPEND_WARN_CENTS, formatMoney, isLargeSpend } from '../shared/money.ts';
+import { describeOperation, redact } from '../shared/operation.ts';
+
+// 金额格式化/大额判定已上移到 shared/money.ts（审批摘要与卡片共用同一实现）。
+// 这里保留再导出：既有调用方与测试从本模块导入，行为不变。
+export { LARGE_SPEND_WARN_CENTS, formatMoney, isLargeSpend };
+
 
 /** 卡片按钮的 value 结构。用驼峰是为了和飞书示例一致，减少对接摩擦。 */
 export interface CardAction {
@@ -117,43 +124,68 @@ export function buildApprovalCard(v: ApprovalView): Record<string, unknown> {
   // question 是**问答题**，不是许可题：单独渲染，否则选项无处可点。
   if (v.kind === 'question') return buildQuestionCard(v);
 
-  const risk = extractRisk(v);
+  const rawRisk = extractRisk(v);
   const keyParams = extractKeyParams(v);
   const toolName = extractToolName(v);
+  // 业务级解读（2026-10-25）：主人批的是"给王小明充 50 块话费"，
+  // 不是 "shell.run + 42 行 heredoc"。这层只改呈现，不改许可语义。
+  const op = describeOperation({
+    taskTitle: v.taskTitle ?? null,
+    tool: toolName,
+    tier: v.tier,
+    params: v.fullParams,
+    reason: v.reason,
+  });
 
   // 头部颜色：dangerous 红、spend 橙、其他蓝。视觉上先分级。
   const template = v.tier === 'dangerous' ? 'red' : v.tier === 'spend' ? 'orange' : 'blue';
   const tierLabel =
     v.tier === 'dangerous' ? '危险操作' : v.tier === 'spend' ? '花钱' : String(v.tier);
 
-  const elements: unknown[] = [
-    {
-      tag: 'div',
-      fields: [
-        { is_short: true, text: { tag: 'lark_md', content: '**操作**\n' + toolName } },
-        { is_short: true, text: { tag: 'lark_md', content: '**档位**\n' + tierLabel } },
-      ],
-    },
-  ];
+  const fields: unknown[] = [];
+  if (op.title !== op.action) {
+    fields.push({ is_short: false, text: { tag: 'lark_md', content: '**业务动作**\n' + op.title } });
+  }
+  fields.push({ is_short: true, text: { tag: 'lark_md', content: '**具体操作**\n' + op.action } });
+  fields.push({ is_short: true, text: { tag: 'lark_md', content: '**档位**\n' + tierLabel } });
+  // 工具名降级成一行小字：它仍然是审计事实，但不是主人做决定的主要依据。
+  fields.push({ is_short: false, text: { tag: 'lark_md', content: '工具：`' + toolName + '`' } });
 
-  if (keyParams.length > 0) {
+  const elements: unknown[] = [{ tag: 'div', fields }];
+
+  // 业务解读没覆盖到的关键参数（邮件四字段、spend 金额）仍补在下面。
+  const detailLines = op.details.map((d) => '· ' + d.label + '：' + d.value);
+  const extra = keyParams.filter(
+    ([k]) => !op.details.some((d) => d.label === k) && !['要执行的命令', '目标地址', '金额'].includes(k),
+  );
+  for (const [k, val] of extra.slice(0, 3)) detailLines.push('· ' + k + '：' + val);
+  if (detailLines.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: '**要做什么**\n' + detailLines.join('\n') },
+    });
+  }
+
+  const risks = [...op.risks];
+  if (rawRisk !== null) risks.push(rawRisk);
+  if (risks.length > 0) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: '**风险**\n' + risks.map((r) => '· ' + r).slice(0, 4).join('\n') },
+    });
+  }
+
+  // 原始参数：完整保留、脱敏、截断。审计要能对得上，主人也应该能看到原文。
+  if (op.rawParams !== '' && op.rawParams !== '{}') {
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
       text: {
         tag: 'lark_md',
-        content:
-          '**要做什么**\n' +
-          keyParams.map(([k, val]) => '· ' + k + '：' + val).join('\n'),
+        content: '**原始参数**\n<font color=\'grey\'>' + redact(op.rawParams, 320) + '</font>',
       },
-    });
-  }
-
-  if (risk !== null) {
-    elements.push({ tag: 'hr' });
-    elements.push({
-      tag: 'div',
-      text: { tag: 'lark_md', content: '**风险**\n' + risk },
     });
   }
 
@@ -197,7 +229,7 @@ export function buildApprovalCard(v: ApprovalView): Record<string, unknown> {
     config: { wide_screen_mode: true, update_multi: true },
     header: {
       template,
-      title: { tag: 'plain_text', content: '需要你决定 · 审批 #' + v.id },
+      title: { tag: 'plain_text', content: '需要你决定 · ' + op.title + '（审批 #' + v.id + '）' },
     },
     elements,
   };
@@ -238,51 +270,14 @@ function extractRisk(v: ApprovalView): string | null {
   return null;
 }
 
-/** 大额提示阈值：50000 分 = 500 元。只影响卡片上的提示，不改变审批与否。 */
-export const LARGE_SPEND_WARN_CENTS = 50_000;
-
-/**
- * 分 → 人话金额（2026-10-21，9.2）。
- *
- * 为什么需要这个函数：`amountCents` 里存的是**分**（spend 契约、spend_ledger.amount_cents
- * 都是分），但卡片原来直接 `String(amt)` 打出来。于是 12500 分被显示成
- * "12500 CNY" —— 主人会以为要花一万二，实际是 125 元。**差 100 倍，且在花钱的卡上。**
- *
- * 小币种零位（JPY/KRW 等）不分转元，直接显示整数 —— 它们的"分"没有意义。
- *
- * @param cents 金额，单位分（整数）
- * @param currency ISO4217 三字母
- */
-export function formatMoney(cents: number, currency: string): string {
-  const zeroDecimal = new Set(['JPY', 'KRW', 'VND', 'CLP', 'ISK', 'HUF']);
-  const cur = currency !== '' ? currency : 'CNY';
-  if (zeroDecimal.has(cur)) return cur + ' ' + String(cents);
-  const sign = cents < 0 ? '-' : '';
-  const abs = Math.abs(cents);
-  const yuan = Math.floor(abs / 100);
-  const fen = abs % 100;
-  return sign + cur + ' ' + String(yuan) + '.' + String(fen).padStart(2, '0');
-}
-
-/**
- * 金额是否超过预设的"多看一眼"阈值（9.2，2026-10-21）。
- *
- * ⚠️ 这**不是**用来"低于阈值就自动放行"的 —— spend 档一律人工审批是
- * GOV §4.1/§4.5 的硬边界（记忆规则对其永不生效），不做数值放宽。
- * 它只决定两件事：
- *   ① 卡片上要不要加一行明显提示（"金额较大，请确认"）
- *   ② 排序/视觉上要不要标红
- * 即：只加严可见性，不减审批。
- *
- * 默认阈值 50000 分 = 500 元。可由 govConfig.spendWarnCents 覆盖。
- */
-export function isLargeSpend(cents: number, warnCents: number): boolean {
-  return Math.abs(cents) >= warnCents;
-}
 
 /**
  * 从 params 里挑出"主人做决定必须知道的"字段。
  * 刻意只挑有限的几个：卡片上信息太多等于没信息。
+ *
+ * 2026-10-25：主路径改为 shared/operation.ts 的业务解读（金额/对象/地址/风险）；
+ * 这里保留为**补充**——它认得 spend 契约的 amountCents 与邮件四字段，
+ * 业务解读没覆盖到的工具仍能显示关键参数。
  */
 function extractKeyParams(v: ApprovalView): Array<[string, string]> {
   const p = v.fullParams as unknown;
@@ -296,7 +291,8 @@ function extractKeyParams(v: ApprovalView): Array<[string, string]> {
     if (val === undefined || val === null) return;
     const s = Array.isArray(val) ? val.join(', ') : String(val);
     if (s === '') return;
-    out.push([label, s.slice(0, max) + (s.length > max ? '…' : '')]);
+    // 关键参数同样要脱敏：net.post 的 body 里常带 API key（2026-10-25 加）。
+    out.push([label, redact(s, max)]);
   };
 
   pick('to', '收件人');

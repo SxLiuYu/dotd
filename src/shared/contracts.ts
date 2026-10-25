@@ -712,6 +712,11 @@ export interface ApprovalView {
   remindedAt?: string;
   taskRef: GovCtx['taskRef'];
   subject?: SyntheticSubject;
+  /**
+   * 任务标题（"我在替你做什么"）。卡片用它把审批从"shell.run"翻译成业务动作。
+   * 追加字段：老调用方不传 = 卡片退回按工具+参数描述，行为不变。
+   */
+  taskTitle?: string;
 }
 
 export interface PrecheckBrief {
@@ -1151,7 +1156,17 @@ export interface GovernanceApi {
    */
   resolveExecution(
     approvalId: number,
-    outcome: { ok: boolean; resultDigest?: string },
+    outcome: {
+      ok: boolean;
+      /** 成功时的结果摘要（后审用）。 */
+      resultDigest?: string;
+      /**
+       * 失败时执行面的真实错误（如 `container_not_ready: 容器状态 quarantined`）。
+       * 2026-10-25 加：原来失败只写 `执行失败：no digest`（把 resultDigest 当错误文案），
+       * 审计里看不出为什么没跑成，主人只看到"批了又没反应"。
+       */
+      errorText?: string;
+    },
   ): Promise<{ ok: boolean; status?: ApprovalStatus; reason?: string }>;
 }
 

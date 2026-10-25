@@ -32,6 +32,7 @@ import type {
 } from '../shared/contracts.ts';
 import { isLoginSensitive } from '../shared/contracts.ts';
 import { ConfigError } from '../shared/errors.ts';
+import { describeOperation, operationSummary } from '../shared/operation.ts';
 import { sanitizeText } from './config.ts';
 import { govDefaults } from './config.ts';
 import type { GovDefaults } from './config.ts';
@@ -580,6 +581,17 @@ export async function evaluate(
 
   // —— 9. base 策略（emergency 覆盖只严不宽）——
   const base: Decision0 = baseDecisionFor(tier, ctx.emergency);
+  // 重复审批收敛（2026-10-25）：同一任务把同一个动作再发一次时，不要重复打扰主人。
+  //   ① 同参数已有 pending 单 → 复用同一张（不再开票、不再发卡）；
+  //   ② 同参数 30 分钟内批过但执行因**基础设施**失败（容器未就绪/传输错误）→ 直接放行。
+  // 只作用于需要人工的出口（review/approve），read/allow 不经过这里。
+  const reuse =
+    base === 'review' || base === 'approve'
+      ? findReusableApproval(db, ctx.taskRef.taskId, call.tool, paramsJson)
+      : null;
+  if (reuse !== null && base === 'approve') {
+    return reuseDecision(db, ctx, call, tier, paramsJson, reuse);
+  }
   switch (base) {
     case 'allow': {
       const decisionId = insertDecision(db, {
@@ -597,6 +609,8 @@ export async function evaluate(
       return { kind: 'allow', decisionId, brief: null };
     }
     case 'review': {
+      // 同参数已批过/仍在待批：不重复打扰，也不重复跑审查模型。
+      if (reuse !== null) return reuseDecision(db, ctx, call, tier, paramsJson, reuse);
       const pre = await precheckModel(
         rt.deps!.router,
         rt.breaker,
@@ -707,6 +721,137 @@ export async function evaluate(
     default:
       return deny(`默认策略 ${tier}=deny`);
   }
+}
+
+/**
+ * 基础设施类执行失败：动作**根本没跑起来**，不是业务结果不理想。
+ * 同参数重试这类失败不需要再问主人一次（2026-10-25 现场：容器 quarantined 时
+ * 主人连点两次同意，每次都被 `container_not_ready` 打回，任务再开一张新单 ——
+ * 主人看到的就是"批了又重置"）。
+ */
+const INFRA_RETRY_CODES = new Set([
+  'container_not_ready',
+  'container_busy',
+  'container_unreachable',
+  'transport_error',
+]);
+
+const REUSE_WINDOW_MS = 30 * 60_000;
+
+interface ReuseHit {
+  approvalId: number;
+  kind: 'pending_same' | 'after_infra_failure';
+  code?: string;
+}
+
+/**
+ * 找可以复用的既有审批单（同任务 + 同工具 + **逐字相同**的参数）。
+ *
+ * 只做两件事：
+ *   ① 同参数还有 pending 单 → 复用它（不重复开票/发卡）；
+ *   ② 同参数在 30 分钟内批过、但执行因基础设施失败 → 视为"上一次同意仍然有效"。
+ *
+ * 刻意不做的：spend 档不复用（花钱必须每次点头）、参数不同不复用、
+ * 业务失败（模型自己写错命令）不复用 —— 那些应该让主人重新判断。
+ */
+function findReusableApproval(
+  db: DatabaseSync,
+  taskId: string,
+  tool: string,
+  paramsJson: string,
+): ReuseHit | null {
+  const pending = db
+    .prepare(
+      `SELECT id FROM approvals
+        WHERE task_id=$taskId AND tool=$tool AND params_json=$params
+          AND kind='tool_call' AND status='pending'
+        ORDER BY id DESC LIMIT 1`,
+    )
+    .get({ taskId, tool, params: paramsJson }) as { id: number } | undefined;
+  if (pending !== undefined) return { approvalId: Number(pending.id), kind: 'pending_same' };
+
+  const cutoff = new Date(Date.now() - REUSE_WINDOW_MS).toISOString();
+  const last = db
+    .prepare(
+      `SELECT id, journal_step FROM approvals
+        WHERE task_id=$taskId AND tool=$tool AND params_json=$params
+          AND kind='tool_call' AND status='failed' AND tier!='spend'
+          AND decided_at IS NOT NULL AND decided_at > $cutoff
+        ORDER BY id DESC LIMIT 1`,
+    )
+    .get({ taskId, tool, params: paramsJson, cutoff }) as
+    | { id: number; journal_step: string | null }
+    | undefined;
+  if (last === undefined || last.journal_step === null) return null;
+
+  const step = db
+    .prepare('SELECT result_json FROM steps WHERE task_id=$taskId AND call_id=$callId')
+    .get({ taskId, callId: last.journal_step }) as { result_json: string | null } | undefined;
+  if (step?.result_json === null || step?.result_json === undefined) return null;
+  let code = '';
+  try {
+    const parsed = JSON.parse(step.result_json) as { code?: unknown; retryable?: unknown };
+    if (parsed.retryable === false) return null;
+    if (typeof parsed.code === 'string') code = parsed.code;
+  } catch {
+    return null;
+  }
+  if (!INFRA_RETRY_CODES.has(code)) return null;
+  return { approvalId: Number(last.id), kind: 'after_infra_failure', code };
+}
+
+/** 复用既有单时的出口：pending 单 → approve 指向同一张；基础设施重试 → allow。 */
+function reuseDecision(
+  db: DatabaseSync,
+  ctx: GovCtx,
+  call: ToolCall,
+  tier: ToolTier,
+  paramsJson: string,
+  reuse: ReuseHit,
+): Decision {
+  const reason =
+    reuse.kind === 'pending_same'
+      ? `复用待批单 #${reuse.approvalId}（同参数，不重复开票）`
+      : `复用已批单 #${reuse.approvalId}（同参数，上次执行仅因 ${reuse.code ?? '基础设施'} 失败）`;
+
+  if (reuse.kind === 'pending_same') {
+    const decisionId = insertDecision(db, {
+      decisionId: newDecisionId(),
+      dotId: ctx.dotId,
+      taskId: ctx.taskRef.taskId,
+      journalStep: call.callId,
+      kind: 'approve',
+      tier,
+      tool: call.tool,
+      paramsJson,
+      reason,
+      approvalId: reuse.approvalId,
+    });
+    appendAudit(db, {
+      ...auditOf(ctx, call, decisionId, 'approve', tier, reason),
+      action: 'approval_reused',
+      details: { approvalId: reuse.approvalId, mode: reuse.kind },
+    });
+    return { kind: 'approve', approvalId: reuse.approvalId };
+  }
+
+  const decisionId = insertDecision(db, {
+    decisionId: newDecisionId(),
+    dotId: ctx.dotId,
+    taskId: ctx.taskRef.taskId,
+    journalStep: call.callId,
+    kind: 'allow',
+    tier,
+    tool: call.tool,
+    paramsJson,
+    reason,
+  });
+  appendAudit(db, {
+    ...auditOf(ctx, call, decisionId, 'allow', tier, reason),
+    action: 'approval_reused',
+    details: { approvalId: reuse.approvalId, mode: reuse.kind, code: reuse.code },
+  });
+  return { kind: 'allow', decisionId, brief: { verdict: 'safe', reason } };
 }
 
 function auditOf(
@@ -878,11 +1023,31 @@ interface InsertApprovalOpts {
   ttlMs?: number;
 }
 
-/** 生成 ≤120 字卡片文案（§7 approvals.summary）。 */
-function makeSummary(call: ToolCall, tier: ToolTier | null, reason: string): string {
-  const params = sanitizeText(safeJson(call.params));
-  const raw = `${call.tool} ${params}｜${reason}`;
-  return raw.length <= 120 ? raw : raw.slice(0, 117) + '…';
+/** 生成 ≤120 字审批摘要（§7 approvals.summary）：业务动作｜具体操作。 */
+function makeSummary(
+  db: DatabaseSync,
+  taskId: string,
+  call: ToolCall,
+  tier: ToolTier | null,
+  reason: string,
+): string {
+  const op = describeOperation({
+    taskTitle: taskTitleOf(db, taskId),
+    tool: call.tool,
+    tier,
+    params: call.params,
+    reason,
+  });
+  return operationSummary(op);
+}
+
+/** 任务标题（卡片/摘要的业务上下文）。查不到就返回 null，不编。 */
+function taskTitleOf(db: DatabaseSync, taskId: string): string | null {
+  const row = db.prepare('SELECT title FROM tasks WHERE id=$id').get({ id: taskId }) as
+    | { title: string | null }
+    | undefined;
+  const t = row?.title ?? '';
+  return t.trim() === '' ? null : t;
 }
 
 /**
@@ -933,7 +1098,7 @@ export function insertApproval(
         tool: o.kind === 'tool_call' ? call.tool : null,
         tier: o.tier,
         paramsJson: o.paramsJson,
-        summary: makeSummary(call, o.tier, o.reason),
+        summary: makeSummary(db, ctx.taskRef.taskId, call, o.tier, o.reason),
         reason: o.reason,
         riskBrief: o.precheck === undefined || o.precheck === null ? null : JSON.stringify(o.precheck),
         pendingUntil,
@@ -960,7 +1125,8 @@ export function insertApproval(
     const row = getRow(db, id)!;
 
     // 事件（§8 表）：approval:created 载荷 = ApprovalView（Web UI、Telegram 通知）。
-    deps?.bus.publish('approval:created', toView(row), { dotId: ctx.dotId });
+    // 带上任务标题：飞书卡片据此把"shell.run"翻译成业务动作（2026-10-25）。
+    deps?.bus.publish('approval:created', toView(row, db), { dotId: ctx.dotId });
     return row;
   } catch (cause) {
     try {
@@ -1011,7 +1177,10 @@ function newBatchRef(): string {
 
 // ── ApprovalView（§3.5：Web/TG 卡片唯一数据源）────────────────────────────────
 
-export function toView(row: ApprovalRow): import('../shared/contracts.ts').ApprovalView {
+export function toView(
+  row: ApprovalRow,
+  db?: DatabaseSync,
+): import('../shared/contracts.ts').ApprovalView {
   let fullParams: unknown = null;
   try {
     fullParams = JSON.parse(row.paramsJson);
@@ -1052,7 +1221,14 @@ export function toView(row: ApprovalRow): import('../shared/contracts.ts').Appro
       journalStepId: row.journalStep ?? row.taskId,
     },
     subject,
+    ...(db !== undefined ? withTaskTitle(db, row.taskId) : {}),
   };
+}
+
+/** 卡片要的"业务上下文"：任务标题。查不到就不加键（老调用方逐字不变）。 */
+function withTaskTitle(db: DatabaseSync, taskId: string): { taskTitle?: string } {
+  const t = taskTitleOf(db, taskId);
+  return t === null ? {} : { taskTitle: t };
 }
 
 /** §3.5 listPending(limit=50)。 */
@@ -1065,7 +1241,7 @@ export function listPending(
       `SELECT * FROM approvals WHERE status='pending' ORDER BY seq ASC LIMIT $limit`,
     )
     .all({ limit: Math.max(1, Math.floor(limit)) }) as unknown as Record<string, unknown>[];
-  return rows.map((r) => toView(toRow(r)));
+  return rows.map((r) => toView(toRow(r), rt.db));
 }
 
 /** §3.5 getApproval(idOrSeq)：id 命中优先，其次 seq（`AP-#<seq>` 反查）。 */
@@ -1074,11 +1250,11 @@ export async function getApproval(
   rt: GovernanceRuntime = gov(),
 ): Promise<import('../shared/contracts.ts').ApprovalView | null> {
   const byId = getRow(rt.db, idOrSeq);
-  if (byId !== null) return toView(byId);
+  if (byId !== null) return toView(byId, rt.db);
   const r = rt.db
     .prepare('SELECT * FROM approvals WHERE seq=$seq ORDER BY id DESC LIMIT 1')
     .get({ seq: idOrSeq }) as Record<string, unknown> | undefined;
-  return r === undefined ? null : toView(toRow(r));
+  return r === undefined ? null : toView(toRow(r), rt.db);
 }
 
 // ── §3.3 decide：先到先得 ─────────────────────────────────────────────────────
@@ -1571,7 +1747,7 @@ export interface ResolveExecResult {
  */
 export async function resolveExecution(
   approvalId: number,
-  outcome: { ok: boolean; resultDigest?: string },
+  outcome: { ok: boolean; resultDigest?: string; errorText?: string },
   rt: GovernanceRuntime = gov(),
 ): Promise<ResolveExecResult> {
   const { db, deps } = rt;
@@ -1643,7 +1819,9 @@ export async function resolveExecution(
     tier: after.tier,
     tool: after.tool,
     decision: to,
-    reason: outcome.ok ? '执行成功' : `执行失败：${outcome.resultDigest ?? 'no digest'}`,
+    reason: outcome.ok
+      ? '执行成功'
+      : `执行失败：${outcome.errorText !== undefined && outcome.errorText !== '' ? outcome.errorText.slice(0, 200) : '执行面未给出原因'}`,
   });
 
   // §5.2 执行后审查：触发条件满足才跑（非每步全审，吞吐现实）。

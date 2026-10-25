@@ -332,6 +332,19 @@ export interface TaskRunOutcome {
 
 // ── 2. RunContext：CP §12 伪码 `ctx` 的仓库落地 ───────────────────────────
 
+/**
+ * 审批执行失败时写给治理的**真实原因**（2026-10-25）。
+ *
+ * 原来 resolveExecution 只收到 `ok:false`，gate 用 `resultDigest ?? 'no digest'`
+ * 当失败文案 —— 审计里全是「执行失败：no digest」，看不出是容器没就绪还是命令写错。
+ */
+function describeExecError(error: unknown): string {
+  const e = error as { code?: unknown; message?: unknown } | null | undefined;
+  const code = typeof e?.code === 'string' ? e.code : '';
+  const msg = typeof e?.message === 'string' ? e.message : '';
+  return [code, msg].filter((s) => s !== '').join(': ') || '执行面未给出错误';
+}
+
 /** digest+200 字预览（接缝 S6 / memory.md:214：mem_messages 同 kind 只存预览）。 */
 function digestPreview(value: unknown, limit = 200): string {
   let text: string;
@@ -2825,7 +2838,9 @@ export class DotRunner {
       try {
         await this.governance.resolveExecution(target.approvalId, {
           ok,
-          ...(ok ? { resultDigest: digestPreview(JSON.stringify(result ?? null)) } : {}),
+          ...(ok
+            ? { resultDigest: digestPreview(JSON.stringify(result ?? null)) }
+            : { errorText: describeExecError(res.error) }),
         });
       } catch (err) {
         this.log(`runner: resolveExecution 失败 approval#${target.approvalId}：${errText(err)}`);

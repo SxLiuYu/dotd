@@ -32,6 +32,12 @@ export type AuditAction =
   | 'decision'
   | 'approval_created'
   | 'approval_decided'
+  /**
+   * 复用既有审批单，没有新开票（2026-10-25）。
+   * 两种情形：同参数仍在 pending（复用同一张）；同参数批过但执行因基础设施失败
+   * （动作没跑起来，上一次同意仍然有效）。
+   */
+  | 'approval_reused'
   | 'late_decision'
   | 'approval_expired'
   | 'approval_revoked'
