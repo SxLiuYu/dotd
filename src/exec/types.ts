@@ -493,6 +493,14 @@ export interface ContainerBackend {
   serverApiVersion(): Promise<string>;
   /** `docker images` 是否含 tag。 */
   hasImage(tag: string): Promise<boolean>;
+  /**
+   * tag 此刻指向的镜像 id（`docker inspect` 的 Id，自带 `sha256:`）。
+   *
+   * 存在理由（2026-10-25）：tag 与 `image_builds.digest` 是两份可能脱钩的账 ——
+   * 宿主侧重构建脚本用同一个 tag 重建后，账上还是旧 digest。`ensureImage()` 需要
+   * 用实况校正缓存，否则重建"构建成功但容器还用旧镜像"。取不到返回 null（不判）。
+   */
+  imageId(tag: string): Promise<string | null>;
   /** `docker buildImage`（内存 tar 流）。返回日志行序列。 */
   buildImage(tag: string, baseImageTag: string, onLine?: (line: string) => void): Promise<{ digest: string }>;
   /** `docker create`。返回 64 位容器 id。 */

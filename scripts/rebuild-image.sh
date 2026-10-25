@@ -70,17 +70,29 @@ echo "新镜像 id: ${NEW_ID:0:12}  大小: $(docker images --format '{{.Size}}'
 
 # ---------- 3. 换容器（只在 --swap 时做）----------
 if [ "$SWAP" = "1" ]; then
-  echo "=== --swap：删容器，让 daemon 的 reconcile 用新镜像重建（F9 漂移检测会接手）==="
+  echo "=== --swap：删容器 + 重启 daemon，让它用新镜像重建 ==="
+  # 2026-10-25：以前这里只删容器，期望"daemon 的 reconcile 接手"——但 reconcile
+  # 只在 boot 里跑，没有周期性重跑。daemon 明明活着的时候，删掉容器后它会一直
+  # 显示一个 lost 的账，直到下次重启。也就是说 --swap 对"正在跑的 daemon"是空操作。
+  # （同一轮还发现 ensureImage 拿账上旧 digest 秒回，重建本身也不生效，两处一起修。）
   CID=$(docker ps -aq --filter name=dotd-dot-dot1 | head -1)
   if [ -n "$CID" ]; then
     docker rm -f "$CID" >/dev/null 2>&1 && echo "  已删旧容器 $CID"
   else
     echo "  无旧容器"
   fi
-  if ! curl -s -m 3 -o /dev/null http://127.0.0.1:7788/api/health; then
-    echo "  daemon 没在跑，拉起…"
-    setsid bash scripts/wsl-daemon.sh >/tmp/dotd-wsl.log 2>&1 < /dev/null &
+  # daemon 在跑就先优雅停掉：boot 才会重新 ensureImage + reconcile。
+  DPID=$(pgrep -f 'node .*src/daemon\.ts' | head -1)
+  if [ -n "$DPID" ]; then
+    echo "  停止 daemon (pid $DPID)…"
+    kill -TERM "$DPID" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      sleep 1
+      pgrep -f 'node .*src/daemon\.ts' >/dev/null 2>&1 || break
+    done
   fi
+  echo "  拉起 daemon…"
+  setsid bash scripts/wsl-daemon.sh >/tmp/dotd-wsl.log 2>&1 < /dev/null &
   for i in $(seq 1 60); do
     sleep 5
     if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; then

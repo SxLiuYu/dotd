@@ -1582,6 +1582,14 @@ export function createStubBackend(o: StubBackendOptions): StubBackend {
       return images.has(tag);
     },
 
+    // stub 没有真实镜像 id（构建出来的 digest 是全零占位，见 isPlaceholderDigest）。
+    // 返回 null = "取不到实况"，ensureImage 会保持账上的 digest、不做校正。
+    // 不能返回全零占位：那会把一条本来是真实 digest 的 ready 行改写成占位，
+    // 下一轮 readyBuild() 就会把它过滤掉、反复触发构建。
+    async imageId(): Promise<string | null> {
+      return null;
+    },
+
     async buildImage(tag: string): Promise<{ digest: string }> {
       images.add(tag);
       return { digest: `sha256:${'0'.repeat(64)}` };
@@ -1923,6 +1931,15 @@ export function createDockerBackend(cfg: ExecConfig): ContainerBackend {
       const imgs = (await client.listImages()) as Array<{ RepoTags?: string[] }>;
       return imgs.some((i) => (i.RepoTags ?? []).includes(tag));
     },
+    async imageId(tag: string): Promise<string | null> {
+      try {
+        const info = (await client.inspectImage(tag)) as { Id?: string };
+        return typeof info.Id === 'string' && info.Id.length > 0 ? info.Id : null;
+      } catch {
+        // 404 / docker 抖动一律"取不到"，不据此改账（宁可保守）。
+        return null;
+      }
+    },
     async buildImage(tag: string, baseImageTag: string, onLine?: (line: string) => void): Promise<{ digest: string }> {
       // §3.2：ctxTar = tar(exec-image/Dockerfile → Dockerfile, agent-runtime/**) 内存流，不落盘。
       // 上下文根 = cfg.repoRoot（DOTD_REPO_ROOT 可覆盖；WSL 部署时指向 ~/dotd）。
@@ -2130,7 +2147,7 @@ type DockerContainerHandle = {
 };
 type DockerNetworkHandle = { inspect(): Promise<unknown>; remove(): Promise<unknown> };
 type DockerVolumeHandle = { inspect(): Promise<unknown>; remove(): Promise<unknown> };
-type DockerImageHandle = { remove(): Promise<unknown> };
+type DockerImageHandle = { remove(): Promise<unknown>; inspect(): Promise<unknown> };
 type DockerCtor = new (opts: unknown) => {
   ping(): Promise<unknown>;
   version(): Promise<unknown>;
@@ -2278,6 +2295,11 @@ class DockerLike {
   async removeImage(tag: string): Promise<void> {
     const d = await this.load();
     await d.getImage(tag).remove();
+  }
+  /** `docker image inspect <tag>`（ImageManager 用它核对 tag 实况，见 imageId()）。 */
+  async inspectImage(tag: string): Promise<unknown> {
+    const d = await this.load();
+    return d.getImage(tag).inspect();
   }
   async removeVolume(name: string): Promise<void> {
     const d = await this.load();

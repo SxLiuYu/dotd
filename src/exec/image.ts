@@ -88,11 +88,34 @@ export class ImageManager {
   /**
    * ensureImage()（§3.2 逐行落地）。
    * 已 ready 且镜像在 → 秒回；否则持锁构建（并发调用共享同一次构建）。
+   *
+   * **docker 是镜像的真相，image_builds 只是缓存**（2026-10-25）：
+   * 宿主侧 `scripts/rebuild-image.sh` 用 `docker build -t <同一个 tag>` 重建后，
+   * 账上那条 ready 行的 digest 仍是旧镜像。此前这里直接把账上的 digest 交出去，
+   * 而 `buildSpec()` 又是 `digest ?? tag` 建容器 —— 于是重建脚本"构建成功、
+   * 容器却还在用旧镜像"，并且因为容器 ImageID 与账上 digest 恰好一致，连漂移
+   * 检测都不会触发。现象就是"重建永远不生效"，只能靠手工改库。
+   *
+   * 现在秒回前先问 docker：tag 此刻指向哪个镜像？与账上不符就以 docker 为准
+   * 回写（tag 被外部重贴本来就该以实况为准）。取不到（stub/旧 API）则不判、
+   * 不写库，保持原来的保守行为。
    */
   async ensureImage(): Promise<EnsureImageResult> {
     const tag = this.currentTag();
     const ready = this.readyBuild(tag);
     if (ready !== null && (await this.deps.backend.hasImage(tag))) {
+      const actual = await Promise.resolve()
+        .then(() => this.deps.backend.imageId(tag))
+        .catch(() => null);
+      if (actual !== null && actual !== ready.digest) {
+        this.deps.db.prepare('UPDATE image_builds SET digest = ? WHERE id = ?').run(actual, ready.id);
+        const brief = (s: string | null): string => (s === null ? '∅' : s.length > 19 ? `${s.slice(0, 19)}…` : s);
+        this.deps.bus.publish('exec.image.build', {
+          tag,
+          line: `账上 digest ${brief(ready.digest)} 与 tag 实况 ${brief(actual)} 不一致，以 docker 为准回写`,
+        });
+        return { tag, digest: actual, ready: true, built: false };
+      }
       return { tag, digest: ready.digest, ready: true, built: false };
     }
     if (this.building !== null) return this.building;
