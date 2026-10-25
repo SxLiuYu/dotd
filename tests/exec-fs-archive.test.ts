@@ -75,7 +75,9 @@ test('多次覆盖 → 每次都留一份，且能被 FIFO 修剪', () => {
   tools.write('a5', { path: 'log.md', content: 'v2' });
   tools.write('a6', { path: 'log.md', content: 'v3' });
   const arch = readdirSync(join(home, '.archive'));
-  assert.ok(arch.length >= 2, `多次覆盖应留多份，实际 ${arch.length}`);
+  // 三写三档：同一毫秒内连续覆盖也必须各留一份（2026-10-25 修：同毫秒撞名只留 1 份）
+  assert.equal(arch.length, 3, `三次覆盖应留三份，实际 ${arch.length}`);
+  assert.equal(new Set(arch).size, 3, '归档文件名必须互不相同');
 });
 
 test('隐藏目录里的文件不归档（.archive/.tmp 自身不能被递归归档）', () => {

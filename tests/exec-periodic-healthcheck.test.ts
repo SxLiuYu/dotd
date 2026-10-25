@@ -70,6 +70,9 @@ test('探活成功会刷新 last_health_at（行为级，不只是源码里有�
       .get() as { last_health_at: string | null } | undefined;
     assert.ok(before !== undefined, 'stub boot 后应有容器行');
 
+    // 时间戳是毫秒级 ISO：同一毫秒内探活会写出与 boot 相同的值（CI 实测过），
+    // 先让时钟走一格再断言"真的刷新了"。
+    await new Promise((r) => setTimeout(r, 10));
     const r = await exec.periodicHealthCheck('dot1');
     assert.equal(r.ok, true, 'stub backend 下探活应成功');
 

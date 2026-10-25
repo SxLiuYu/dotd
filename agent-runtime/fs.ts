@@ -347,7 +347,12 @@ export class FsTools {
       mkdirSync(archiveDirAbs, { recursive: true });
       const stamp = this.now().replace(/[:.]/g, '-');
       const base = safe.rel.replace(/\//g, '_');
-      const name = `${stamp}__${base}`;
+      // 同一毫秒内的多次覆盖会撞名（2026-10-25 CI 实测：三次连续写只留下 1 份归档）。
+      // 加 `.<n>` 后缀保证每份都留得下；名字仍以时间戳开头，FIFO 修剪的字典序不受影响。
+      let name = `${stamp}__${base}`;
+      for (let n = 1; existsSync(join(archiveDirAbs, name)); n += 1) {
+        name = `${stamp}__${base}.${n}`;
+      }
       this.writeFile(join(archiveDirAbs, name), old);
       this.pruneArchive(archiveDirAbs);
       return `${ARCHIVE_DIR}/${name}`;
