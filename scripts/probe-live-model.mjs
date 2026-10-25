@@ -10,10 +10,13 @@
  * 做法（**只读真配置、打真网关、不碰真 ~/.dotd**）：
  *   1. 用 loadModelsConfig 读 `<DOTD_CONFIG_DIR>/models.yml`（缺省仓库 config/），
  *      取 tier1 且 enabled 的首个端点；
- *   2. 从端点声明的 api_key_env 读 key（**不从别处偷**：不读 .env、不翻进程环境、
- *      不猜文件名）；
- *   3. key 缺失 → 打印清晰结论并 exit 0（"没配凭据"不是失败，是未验证）；
- *   4. key 在 → 经真 HttpTransport 发一次带 tool_calls 的最小请求，打印 4 行结论。
+ *   2. 从端点声明的 api_key_env 取 key，按 daemon 的眼光找（2026-10-26 修）：
+ *      进程环境 → `<home>/tokens.env` → 运行中 daemon 的进程环境。**只用于这一次
+ *      请求，绝不打印**，并把"从哪找到的"写进结论。原来的纪律是"只读环境变量"，
+ *      于是 live 上 key 明明在 tokens.env 与 daemon 里、模型正正常出字，本脚本
+ *      却报"未验证"——检查器看错地方，结论却指向被检查对象；
+ *   3. 三处都没有 → 打印清晰结论并 exit 0（"没配凭据"不是失败，是未验证）；
+ *   4. 找到 → 经真 HttpTransport 发一次带 tool_calls 的最小请求，打印 4 行结论。
  *
  * 跑法：
  *   node --import tsx scripts/probe-live-model.mjs
@@ -89,16 +92,46 @@ async function main() {
   out(`凭据变量  ${keyEnv === null ? '（该端点免鉴权）' : keyEnv}`);
   out('');
 
-  // ── 2. 凭据检查（缺就如实说缺，不失败、不偷）──────────────────────────
-  const key = keyEnv === null ? null : process.env[keyEnv];
-  if (keyEnv !== null && (key === undefined || key.length === 0)) {
-    out(`connect:  未验证 — 环境变量 ${keyEnv} 不存在或为空`);
+  // ── 2. 凭据检查（与 daemon 同眼光；缺就如实说缺，不失败）──────────────
+  //
+  // 顺序与 daemon 启动时一致：进程环境 → `<home>/tokens.env` → 运行中 daemon 的
+  // 进程环境。**最后一条是 2026-10-26 加的**：live 上 key 都在 tokens.env 里，
+  // 一键启动会 source 它，daemon 里也有；而人手动跑本脚本时那个 shell 里没有，
+  // 于是"模型正正常出字"和"本脚本说未验证"同时成立 —— 检查器看错地方。
+  //
+  // 值只用于这一次请求，**任何分支都不打印**；打印的只是"从哪儿找到的"。
+  const { layeredEnv } = await import('./lib/env.mjs');
+  const { liveDaemon } = await import('./lib/live-daemon.mjs');
+  const home =
+    process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
+  const tokens = layeredEnv({ home, homedir: homedir() });
+  const live = liveDaemon({ shellEnv: process.env });
+  let key = null;
+  let keySource = '';
+  if (keyEnv !== null) {
+    if (process.env[keyEnv] !== undefined && process.env[keyEnv] !== '') {
+      key = process.env[keyEnv];
+      keySource = '当前 shell 的环境变量';
+    } else if (tokens.has(keyEnv)) {
+      key = tokens.get(keyEnv);
+      keySource = `${tokens.sources[keyEnv] ?? 'tokens.env'}（值不打印）`;
+    } else if (live !== null && !('ambiguous' in live) && (live.env[keyEnv] ?? '') !== '') {
+      key = live.env[keyEnv];
+      keySource = `运行中的 daemon pid ${live.pid} 的环境（值不打印）`;
+    }
+  }
+  if (keyEnv !== null && keySource !== '') {
+    out(`凭据来源  ${keySource}`);
+    out('');
+  }
+  if (keyEnv !== null && key === null) {
+    out(`connect:  未验证 — ${keyEnv} 在 shell / tokens.env / 运行中 daemon 里都没有`);
     // 这条提示很关键：主人已经把 key 写进 ~/.dotd/tokens.env 之后，裸 shell 里跑本脚本
-    // 仍然会看到"未验证"——因为脚本按纪律**只读环境变量**（不翻 tokens.env、不读 .env）。
-    // 不说清就会让人误判成"key 没配好"。
-    out(`           提示：key 可能已在 ~/.dotd/tokens.env 里。本脚本按纪律只读环境变量，`);
-    out(`           请先 source 它（PowerShell：按行解析后 Set-Item env:）再重跑，例如：`);
-    out(`           bash -lc 'set -a; . ~/.dotd/tokens.env; set +a; node --import tsx scripts/probe-live-model.mjs'`);
+    // 仍然会看到"未验证"——现在脚本会自己去找 tokens.env 与运行中的 daemon，
+    // 三处都没有才是真的没有。
+    out(`           已经查过：当前 shell 环境变量、${home}/tokens.env、运行中 daemon 的进程环境。`);
+    out(`           要让本脚本也带上，先 source 它：`);
+    out(`           bash -lc 'set -a; . ${home}/tokens.env; set +a; node --import tsx scripts/probe-live-model.mjs'`);
     out(`model:    ${model}`);
     out('tool_calls: 未验证（没有发出任何请求）');
     out('latency:  n/a');
@@ -124,6 +157,13 @@ async function main() {
   }
 
   // ── 3. 真往返：带 tool_calls 的最小请求 ──────────────────────────────
+  //
+  // 凭据必须落进 process.env 才有效：`HttpTransport` 在发请求时才调 `apiKeyFor()`，
+  // 它只读 `process.env[apiKeyEnv]`（见 src/router/transport.ts:545）。上面那三处
+  // 查找只是"把这个 key 找出来"，真正用它得放回环境里。这是本进程内的临时赋值，
+  // 不写文件、不打印，进程退出即消失。
+  if (keyEnv !== null && key !== null) process.env[keyEnv] = key;
+
   // 工具名用点分契约名，验证 transport 的消毒/还原在真网关上也成立。
   const TOOL_NAME = 'fs.read';
   const call = {

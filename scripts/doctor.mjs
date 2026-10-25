@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { configDirIsHostedGuess, layeredEnv, resolveConfigDir as resolveConfigDirShared } from './lib/env.mjs';
+import { liveDaemon } from './lib/live-daemon.mjs';
 import { looksLikePath, resolveCommand as resolveCommandShared } from './lib/command.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -269,10 +270,53 @@ function probeTcp(host, port, timeoutMs = 1_500) {
  * @param {string} [opts.home]                          用户 home（缺省 os.homedir()）
  * @param {string} [opts.repoRoot]                      仓库根
  * @param {(host:string, port:number, ms:number)=>Promise<{ok:boolean,detail:string,latencyMs:number}>} [opts.probe]
+ * @param {()=>({pid:number,env:Record<string,string|undefined>,overlaid:string[]}|null)} [opts.live]
+ *        在跑的 daemon（缺省读 /proc）。**有它就以它的环境为准**：`DOTD_FLEET` 之类的
+ *        旋钮是启动器导出给子进程的，人手动跑 doctor 的 shell 里根本没有 —— 原来 doctor
+ *        把这句"我没有"报成"实际生效 stub"（2026-10-26 live 现场）。
  * @returns {Promise<Array<{name:string,status:string,title:string,detail:string,next:string|null}>>}
  */
 export async function runChecks(opts = {}) {
-  const env = opts.env ?? process.env;
+  // 运行期环境覆盖（见 live-daemon.mjs）。看不见 daemon 时 overlaid 为空，
+  // 下面所有判据退回"按这个 shell 判断"——并且会用措辞说明这一点。
+  const shellEnv = opts.env ?? process.env;
+  // 显式传了 env 的调用（测试 / 嵌入）默认**不**去扫 /proc：否则结论会随
+  // "这台机器上恰好有没有 daemon 在跑"变化，测试就成了环境的函数。
+  // 想验运行期覆盖的测试显式传 `live`。
+  const resolveLive =
+    opts.live ?? (opts.env === undefined ? () => liveDaemon({ shellEnv }) : () => null);
+  const live = resolveLive();
+  /**
+   * 「运行中的 daemon 实际生效的环境」= 运行期环境叠在这个 shell 上（白名单键）。
+   * 用于**关于运行系统**的判据：fleet / model-transport / configDir / dbPath /
+   * 端点地址展开。这些问题的答案在 daemon 的进程环境里，不在 doctor 的 shell 里。
+   */
+  const runtimeEnv = live !== null && !('ambiguous' in live) ? live.env : shellEnv;
+  /**
+   * 两套环境，用途必须分清（2026-10-26 live 上就是因为混用才误报）：
+   *
+   * | 判据 | 用哪套 | 为什么 |
+   * |---|---|---|
+   * | fleet / model-transport / 端点地址展开 / configDir / db 路径 / MCP 路径 | `runtimeEnv` | 问的是"**跑着的系统**实际用什么"；这些变量由启动器导出给 daemon 子进程，人手动跑 doctor 的 shell 里没有 |
+   * | 严格占位符 / 直接 `npm run serve` 能不能起 | `shellEnv` | 问的是"**从这个 shell 启动**会不会拒启动"；tokens.env 不会被交互式 shell 自动 source |
+   *
+   * 判据放错一边的后果：把 shell 的缺席报成"实际生效 stub"（本行），或把
+   * daemon 有 key 报成"这个 shell 起不来却当成机器没配"。
+   */
+  /**
+   * 这几条判据的取值**来源**，必须写进每一行的说明里。
+   *
+   * 为什么非要写：`DOTD_FLEET` 之类的"实际生效值"不是机器事实，而是**某个进程**
+   * 的环境事实。同一个 shell 里 `DOTD_FLEET=<unset>`、daemon 里 `=docker`，
+   * 两个都对，但含义完全相反。不写来源，读报告的人无法判断这句"实际生效 stub"
+   * 说的是 daemon 还是 doctor 自己 —— 2026-10-26 live 上就是这么被误读的。
+   */
+  const liveNote =
+    live === null
+      ? '（没找到运行中的 daemon，按当前 shell 判断）'
+      : 'ambiguous' in live
+        ? `（发现 ${live.ambiguous.length} 个 daemon 进程，无法确定哪个在服务，按当前 shell 判断）`
+        : `（取值来自运行中的 daemon pid ${live.pid}）`;
   const home = opts.home ?? homedir();
   const repoRoot = opts.repoRoot ?? REPO_ROOT;
   const probe = opts.probe ?? probeTcp;
@@ -321,13 +365,13 @@ export async function runChecks(opts = {}) {
   }
 
   // 3. surfaces 配置：daemon 只读 ~/.dotd/config.yml，仓库里的 config/dotd.yml 只是模板
-  const cfgPath = env.DOTD_CONFIG !== undefined && env.DOTD_CONFIG !== ''
-    ? env.DOTD_CONFIG
+  const cfgPath = runtimeEnv.DOTD_CONFIG !== undefined && runtimeEnv.DOTD_CONFIG !== ''
+    ? runtimeEnv.DOTD_CONFIG
     : join(home, '.dotd', 'config.yml');
   // tokens.env 的 key 集合（只看键名/有没有值，不打印值）。用途见第 4 项：
   // 一键启动（charlie:start / wsl-daemon.sh）会 source 它，裸 `npm run serve` 不会。
   const tokens = layeredEnv({
-    home: env.DOTD_HOME !== undefined && env.DOTD_HOME !== '' ? env.DOTD_HOME : join(home, '.dotd'),
+    home: runtimeEnv.DOTD_HOME !== undefined && runtimeEnv.DOTD_HOME !== '' ? runtimeEnv.DOTD_HOME : join(home, '.dotd'),
     homedir: home,
     processEnv: {},
   });
@@ -371,7 +415,9 @@ export async function runChecks(opts = {}) {
     //
     // 所以：环境里有 → OK；只在文件里 → WARN（当前 shell 起不来，但一键启动没问题）；
     // 两处都没有 → FAIL（怎么办都不行）。
-    const fromEnv = (n) => env[n] !== undefined && env[n] !== '';
+    // 这里问的是"**从这个 shell 启动**能不能展开"，所以用 `shellEnv` 而不是
+    // `runtimeEnv`：交互式 shell 不 source tokens.env，这一点与 daemon 有没有 key 无关。
+    const fromEnv = (n) => shellEnv[n] !== undefined && shellEnv[n] !== '';
     const missingHere = strict.map((m) => m[1]).filter((n) => !fromEnv(n));
     const uniqueMissing = [...new Set(missingHere)];
     const onlyInFile = uniqueMissing.filter((n) => tokens.has(n));
@@ -405,20 +451,33 @@ export async function runChecks(opts = {}) {
   }
 
   // 5. DOTD_FLEET：最容易静默出错的一项
-  const fleet = resolveFleet(env.DOTD_FLEET);
+  const fleet = resolveFleet(runtimeEnv.DOTD_FLEET);
   if (fleet.warn === null) {
-    add('fleet', STATUS.OK, `DOTD_FLEET=${fleet.raw} → ${fleet.effective}`, fleet.effective === 'docker' ? '真容器路径（需要 docker daemon 可达）' : '不起容器');
+    add(
+      'fleet',
+      STATUS.OK,
+      `DOTD_FLEET=${fleet.raw} → ${fleet.effective}`,
+      `${fleet.effective === 'docker' ? '真容器路径（需要 docker daemon 可达）' : '不起容器'}${liveNote}`,
+    );
   } else {
-    add('fleet', STATUS.WARN, 'DOTD_FLEET 实际生效值让人意外', fleet.warn, 'export DOTD_FLEET=docker（或明确留空表示就用 stub）后再起 daemon');
+    // 看不见运行中的 daemon 时，这句"未设置"只是**这个 shell** 的事实。
+    // 原来它被当成"实际生效值"报出来 —— live 上 daemon 明明是 docker。
+    add(
+      'fleet',
+      STATUS.WARN,
+      'DOTD_FLEET 实际生效值让人意外',
+      `${fleet.warn}${liveNote}`,
+      'export DOTD_FLEET=docker（或明确留空表示就用 stub）后再起 daemon',
+    );
   }
 
   // 6. DOTD_MODEL_TRANSPORT：缺省是"真 HTTP"，与 fleet 相反
-  const mt = resolveModelTransport(env.DOTD_MODEL_TRANSPORT);
+  const mt = resolveModelTransport(runtimeEnv.DOTD_MODEL_TRANSPORT);
   add(
     'model-transport',
     STATUS.OK,
     `DOTD_MODEL_TRANSPORT=${mt.raw === '' ? '（未设）' : mt.raw} → ${mt.effective}`,
-    mt.effective === 'stub' ? '模型走内存 stub，零网络请求（门禁/演示用）' : '真 HTTP（会打 models.yml 里的端点）',
+    `${mt.effective === 'stub' ? '模型走内存 stub，零网络请求（门禁/演示用）' : '真 HTTP（会打 models.yml 里的端点）'}${liveNote}`,
   );
 
   // 7/8. tier1 端点：这是唯一能承载 primary 轨的端点，断了所有交互任务都挂起
@@ -432,11 +491,11 @@ export async function runChecks(opts = {}) {
   // doctor 这边还报 ok —— 体检看的是一份没人读的文件。
   let tier1 = null;
   let tier1Disabled = null;
-  const configDir = resolveConfigDir(env, repoRoot, home);
+  const configDir = resolveConfigDir(runtimeEnv, repoRoot, home);
   // 这句话是给"我到底在看哪一份"这个问题一个可核对的答案：托管布局是**推断**出来的
   // （两个环境变量都没设，但 `<home>/.dotd/models.yml` 在）。运维看到它就知道
   // "这条结论来自推断的路径"，而不是来自显式配置。
-  const guessNote = configDirIsHostedGuess({ env, home })
+  const guessNote = configDirIsHostedGuess({ env: runtimeEnv, home })
     ? `（DOTD_CONFIG_DIR 未设，按 ${join(home, '.dotd', 'models.yml')} 存在推断为托管布局）`
     : '';
   const modelsPath = join(configDir, 'models.yml');
@@ -472,7 +531,7 @@ export async function runChecks(opts = {}) {
       `检查 ${modelsPath} 的 endpoints[].tier: 1`,
     );
   } else {
-    const expanded = expandWithDefault(tier1.baseUrl, env);
+    const expanded = expandWithDefault(tier1.baseUrl, runtimeEnv);
     if (!expanded.resolved) {
       add('tier1-endpoint', STATUS.FAIL, `tier1 base_url 的占位符 ${expanded.missing} 没有值`, tier1.baseUrl, `export ${expanded.missing}=...`);
     } else {
@@ -517,8 +576,8 @@ export async function runChecks(opts = {}) {
     const keyEnv = tier1.apiKeyEnv;
     if (keyEnv === null || keyEnv === undefined) {
       add('tier1-key', STATUS.OK, 'tier1 端点未声明 api_key_env', '免 key 端点（本地引擎）');
-    } else if (env[keyEnv] !== undefined && env[keyEnv] !== '') {
-      add('tier1-key', STATUS.OK, `${keyEnv} 已设置`, `长度 ${String(env[keyEnv]).length}（值不打印）`);
+    } else if (runtimeEnv[keyEnv] !== undefined && runtimeEnv[keyEnv] !== '') {
+      add('tier1-key', STATUS.OK, `${keyEnv} 已设置`, `长度 ${String(runtimeEnv[keyEnv]).length}（值不打印）${liveNote}`);
     } else if (tokens.has(keyEnv)) {
       // 同一类"看错地方"（2026-10-26）：live 上 HY3_API_KEY 在 tokens.env 里，
       // 一键启动会 source 它，模型一路正常；裸 shell 里跑 doctor 却说"环境里没有"。
@@ -542,8 +601,8 @@ export async function runChecks(opts = {}) {
   }
 
   // 9. 数据库：迁移版本是否跟上（落后 → daemon 拒启动；这是 fail-closed，但报错很难懂）
-  const dbPath = env.DOTD_DB_PATH !== undefined && env.DOTD_DB_PATH !== ''
-    ? env.DOTD_DB_PATH
+  const dbPath = runtimeEnv.DOTD_DB_PATH !== undefined && runtimeEnv.DOTD_DB_PATH !== ''
+    ? runtimeEnv.DOTD_DB_PATH
     : join(home, '.dotd', 'dotd.db');
   if (!existsSync(dbPath)) {
     add('db', STATUS.WARN, `库文件还不存在：${dbPath}`, '首次启动会自动建库并迁移', '直接 npm run serve 即可');
@@ -574,7 +633,7 @@ export async function runChecks(opts = {}) {
   }
 
   // 10. 数据目录可写性（不写，只看权限位/存在性）
-  const dotdHome = env.DOTD_HOME !== undefined && env.DOTD_HOME !== '' ? env.DOTD_HOME : join(home, '.dotd');
+  const dotdHome = runtimeEnv.DOTD_HOME !== undefined && runtimeEnv.DOTD_HOME !== '' ? runtimeEnv.DOTD_HOME : join(home, '.dotd');
   if (existsSync(dotdHome)) {
     add('home-dir', STATUS.OK, dotdHome, '数据目录存在（OUTBOX/journal-blobs/tokens 都在这下面）');
   } else {
@@ -595,10 +654,10 @@ export async function runChecks(opts = {}) {
   //     doctor 说"未启用"；用户把仓库模板改坏了，doctor 报 fail 而那文件没人读。
   //     两份都在时以 daemon 会读的那份为准，并顺带提示另一份是模板。
   const mcpPath =
-    env.DOTD_MCP_CONFIG !== undefined && env.DOTD_MCP_CONFIG !== ''
-      ? env.DOTD_MCP_CONFIG
+    runtimeEnv.DOTD_MCP_CONFIG !== undefined && runtimeEnv.DOTD_MCP_CONFIG !== ''
+      ? runtimeEnv.DOTD_MCP_CONFIG
       : join(configDir, 'mcp-servers.yml');
-  const mcpGuessNote = configDirIsHostedGuess({ env, home })
+  const mcpGuessNote = configDirIsHostedGuess({ env: runtimeEnv, home })
     ? `（DOTD_CONFIG_DIR 未设，按 ${join(home, '.dotd', 'models.yml')} 存在推断为托管布局）`
     : '';
   const repoMcp = join(repoRoot, 'config', 'mcp-servers.yml');
@@ -626,7 +685,7 @@ export async function runChecks(opts = {}) {
       // 逐个核对：command 能否解析到 + args 里的脚本路径是否存在
       const bad = [];
       for (const s of parsed.servers) {
-        const cmd = resolveCommand(s.command, { env, repoRoot });
+        const cmd = resolveCommand(s.command, { env: runtimeEnv, repoRoot });
         if (cmd === null) {
           bad.push({ server: s.name, why: `command 找不到：${s.command}` });
           continue;

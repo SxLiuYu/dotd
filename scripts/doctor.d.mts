@@ -31,11 +31,22 @@ export interface ProbeOutcome {
   latencyMs: number;
 }
 
+import type { LiveDaemonAmbiguous, LiveDaemonRuntime } from './lib/live-daemon.d.mts';
+
 export interface RunChecksOptions {
   env?: Record<string, string | undefined>;
   home?: string;
   repoRoot?: string;
   probe?: (host: string, port: number, timeoutMs: number) => Promise<ProbeOutcome>;
+  /**
+   * 运行中 daemon 的取值（`scripts/lib/live-daemon.mjs::liveDaemon`）。
+   *
+   * 不传时的默认：**只有调用方没给 `env`** 才扫 `/proc`。给了 `env` 说明调用方
+   * 自带一份确定性环境（测试、脚本），这时再去扫本机 daemon 会让结论取决于
+   * "跑测试的这台机器上恰好有没有 dotd" —— 那种测试比没有更糟。
+   * 传 `() => null` 表示"明确不扫描"。
+   */
+  live?: () => LiveDaemonRuntime | LiveDaemonAmbiguous | null;
 }
 
 export const REPO_ROOT: string;
