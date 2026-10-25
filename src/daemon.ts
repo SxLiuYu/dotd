@@ -138,6 +138,7 @@ import { fetchFeed } from './connectors/rss.ts';
 import { legacyBrowser, webAct, webRead, webSnapshot } from './exec/webtools.ts';
 import { searchFetch, searchWeb } from './exec/searchtools.ts';
 import { fetchDay, weekdayOf } from './connectors/holiday.ts';
+import { payConfigFromEnv, payCharge, type PayReceipt } from './connectors/pay.ts';
 import { restPlan } from './connectors/rest-plan.ts';
 import { DotRunner } from './runner/dot.ts';
 import { loadEventRules } from './event-rules.ts';
@@ -1369,6 +1370,67 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     }
   } else {
     log('[mail] 未配置 DOTD_MAIL_KEY，邮件工具不注册（这是预期行为，配了密钥才启用）');
+  }
+
+  // ── 支付工具 `pay.charge`（2026-10-25）─────────────────────────────────────
+  //
+  // 为什么单独一个 spend 档工具：主人要批的是"支付 ¥35 给美团"，不是一段 shell。
+  // 结构化参数让审批卡、spend 台账、幂等单号都成立；`shell.run` 只负责挡，
+  // 挡不住"钱扣了但台账没记"。
+  //
+  // 配置（二者至少一个）：
+  //   DOTD_PAY_ENDPOINT  真实网关（POST，见 src/connectors/pay.ts 顶部协议）
+  //   DOTD_PAY_DRY_RUN=1 沙箱：不联网、返回合成回执（用来跑通审批链）
+  // 可选：DOTD_PAY_TOKEN / DOTD_PAY_MAX_CENTS（默认 100000=¥1000）/
+  //       DOTD_PAY_DAILY_CENTS（默认 200000=¥2000）/ DOTD_PAY_TIMEOUT_MS
+  //
+  // 没配置 = 不注册 = 模型看不到这个工具（ExecService.visibleCaps 会过滤），
+  // 而不是让它为一个永远失败的动作去打扰主人审批。
+  try {
+    const payCfg = payConfigFromEnv();
+    if (payCfg !== null) {
+      const spentTodayCents = (): number => {
+        const row = db
+          .prepare(
+            `SELECT COALESCE(SUM(amount_cents), 0) AS n FROM spend_ledger
+              WHERE kind='charge' AND date(ts, 'localtime') = date('now', 'localtime')`,
+          )
+          .get() as { n: number } | undefined;
+        return Number(row?.n ?? 0);
+      };
+      exec.registerHostTool('pay.charge', async (args, taskId) =>
+        payCharge(payCfg, args, {
+          ...(taskId !== undefined ? { taskId } : {}),
+          spentTodayCents,
+          getReceipt: (orderId) => {
+            const r = db
+              .prepare('SELECT value FROM surf_kv WHERE key = ?')
+              .get(`pay:receipt:${orderId}`) as { value: string } | undefined;
+            if (r === undefined) return null;
+            try {
+              return JSON.parse(r.value) as PayReceipt;
+            } catch {
+              return null;
+            }
+          },
+          putReceipt: (receipt) => {
+            db.prepare(
+              `INSERT INTO surf_kv (key, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+            ).run(`pay:receipt:${receipt.orderId}`, JSON.stringify(receipt), Date.now());
+          },
+        }),
+      );
+      log(
+        `[pay] 支付工具已注册（${payCfg.dryRun ? 'DRY-RUN' : payCfg.endpoint}；` +
+          `单笔上限 ${payCfg.maxCents / 100} 元，当日上限 ${payCfg.dailyCents / 100} 元）`,
+      );
+    } else {
+      log('[pay] 未配置 DOTD_PAY_ENDPOINT / DOTD_PAY_DRY_RUN=1，支付工具不注册');
+    }
+  } catch (e) {
+    // 配置非法必须吼出来：静默不注册会让"我明明配了"变成最难查的坑。
+    log(`[pay] 支付工具未启用：${(e as Error).message}`);
   }
 
   // ── 日历工具（T6 只读订阅，2026-10-20；T7 本地写回，2026-10-21）─────────────────

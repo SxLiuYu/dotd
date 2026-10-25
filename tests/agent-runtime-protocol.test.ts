@@ -128,6 +128,8 @@ test('防漂移: 词表与宿主 CAPABILITY_CATALOG 逐个同形（name/mode/sid
     'memory.search',
     // 2026-10-22 第 7 轮：ask 由 gate 签 question 单、daemon 执行，同样不进容器
     'ask',
+    // 2026-10-25：pay.charge 由宿主直接调支付渠道，容器里没有网络与凭证
+    'pay.charge',
   ]);
   assert.deepEqual(
     CAPABILITIES.map((c) => c.name),

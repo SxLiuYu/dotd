@@ -137,14 +137,26 @@ tools:
 
 # ── spend 档条目（结构定型，§9.3：花钱一律人工审批）──────────────────────────
 # GOV §2.3 校验细则：tier == "spend" 的条目必须带 spendParams（缺则加载失败）。
-# 阶段一工具词表（§9.1/M5）无 spend 档工具；购物走 browser.act 由 review 承接。
-# 阶段二接入支付/下单类工具时按此形状补条目（含 spendParams.required）：
 #
-#   - name: shop.checkout
+# 2026-10-25：`pay.charge` 已落地（主人要求"审批得是具体操作，比如点外卖支付"）。
+#   - 参数：amountCents（分）/ currency / category / payee（必填）+ memo / orderId；
+#   - 执行体：src/connectors/pay.ts（宿主侧；dry-run 或真实网关）；
+#   - 可见性：未配置 DOTD_PAY_ENDPOINT / DOTD_PAY_DRY_RUN=1 时工具不注册，
+#     模型根本看不到它（ExecService.visibleCaps 过滤）；
+#   - 台账：spend 档执行成功后由治理自动写 spend_ledger（成功 charge / 失败 void）。
+#
+# 其它下单类工具按同一形状补条目（required 必须含 amountCents/currency/category）：
+#
+#   - name: shop.order
 #     tier: spend
 #     spendParams:
 #       required: [amountCents, currency, category]
 # ─────────────────────────────────────────────────────────────────────────────
+
+  - name: pay.charge
+    tier: spend
+    spendParams:
+      required: [amountCents, currency, category]
 
 # ── 邮件（2026-10-20，T1/T2：对标 Meta Muse 的「跟进邮件」场景）──────────────
 #

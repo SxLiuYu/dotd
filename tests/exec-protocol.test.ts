@@ -102,8 +102,8 @@ test('端点表：八个 RUNTIME_PATHS 与契约逐字对应', () => {
   assert.equal(endpointUrl('172.18.0.3', 9223), 'http://172.18.0.3:9223');
 });
 
-test('能力目录：46 名工具（20 容器 + 1 记忆 + 8 宿主 mail + 7 日历（写 3 + 读 4）+ 4 连接器 + 1 保险库 + 3 浏览器 web.* + 2 搜索 search.*）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
-  assert.equal(CAPABILITY_CATALOG.length, 47); // 42 + fs.grep + memory.search + calendar.list + calendar.conflicts + ask（2026-10-22）
+test('能力目录：47 名工具（20 容器 + 1 记忆 + 8 宿主 mail + 7 日历（写 3 + 读 4）+ 4 连接器 + 1 保险库 + 3 浏览器 web.* + 2 搜索 search.* + 1 支付 pay.charge）、mode/max_deadline/sideEffect 逐条与契约 J2 一致', () => {
+  assert.equal(CAPABILITY_CATALOG.length, 48); // 47 + pay.charge（2026-10-25）
   const by = new Map(CAPABILITY_CATALOG.map((c) => [c.name, c]));
   const expect: Record<string, [string, number, string]> = {
     'fs.read': ['sync', 60_000, 'safe'],
@@ -140,6 +140,8 @@ test('能力目录：46 名工具（20 容器 + 1 记忆 + 8 宿主 mail + 7 日
   'github.pulls': ['sync', 60_000, 'safe'],
   'rss.read': ['sync', 60_000, 'safe'],
   'vault.sites': ['sync', 60_000, 'safe'],
+  // 支付（2026-10-25）：sync + unknown —— 钱动了就回不来，崩溃恢复不能自动重放
+  'pay.charge': ['sync', 120_000, 'unknown'],
   };
   for (const [name, [mode, max, se]] of Object.entries(expect)) {
     const c = by.get(name);

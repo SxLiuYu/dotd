@@ -218,6 +218,33 @@ function describeFs(rec: Record<string, unknown>, tool: string): ShellView {
 }
 
 /**
+ * 一等支付动作（pay.charge）：卡片上必须能直接念出来"付多少、付给谁、为什么"。
+ *
+ * 与 shell 里的"看起来像支付"不同：这里的金额/收款方是**结构化参数**，
+ * 不靠正则从命令文本里猜，所以可以当作事实展示。
+ */
+function describePay(rec: Record<string, unknown>): ShellView {
+  const cents = typeof rec.amountCents === 'number' && Number.isFinite(rec.amountCents) ? rec.amountCents : null;
+  const cur = typeof rec.currency === 'string' && rec.currency !== '' ? rec.currency : 'CNY';
+  const payee = str(rec, ['payee', 'merchant', 'to']);
+  const category = str(rec, ['category']);
+  const memo = str(rec, ['memo', 'purpose']);
+  const amount = cents !== null ? formatMoney(cents, cur) : '（金额缺失）';
+  const details: OperationDetail[] = [];
+  if (payee !== '') details.push({ label: '收款方', value: clip(payee, 80) });
+  details.push({ label: '金额', value: amount });
+  if (category !== '') details.push({ label: '类别', value: clip(category, 40) });
+  if (memo !== '') details.push({ label: '备注', value: clip(memo, 100) });
+  const risks = ['支付成功后不可撤销：请核对收款方与金额'];
+  if (cents !== null && isLargeSpend(cents, LARGE_SPEND_WARN_CENTS)) risks.push('金额较大，建议先确认');
+  return {
+    action: '支付 ' + amount + (payee !== '' ? ' 给 ' + clip(payee, 40) : ''),
+    details,
+    risks,
+  };
+}
+
+/**
  * 把一次工具调用翻译成"主人能判断的具体操作"。
  * 纯函数：不读库、不联网、不改状态。
  */
@@ -227,7 +254,8 @@ export function describeOperation(input: DescribeOperationInput): OperationView 
   const intent = str(rec, ['intent', 'purpose', 'description', 'why']).slice(0, 120);
 
   let view: ShellView;
-  if (tool === 'shell.run') view = describeShell(rec);
+  if (tool === 'pay.charge') view = describePay(rec);
+  else if (tool === 'shell.run') view = describeShell(rec);
   else if (tool.startsWith('browser.')) view = describeBrowser(rec, tool);
   else if (tool === 'net.get' || tool === 'net.post') view = describeNet(rec, tool);
   else if (tool === 'mail.send' || tool === 'mail.draft') view = describeMail(rec, tool);
@@ -245,8 +273,16 @@ export function describeOperation(input: DescribeOperationInput): OperationView 
   }
 
   // 金额与任何工具都相关（spend 契约的 amountCents 不在工具名里）。
-  const details = [...moneyDetails(rec, ''), ...view.details];
-  if (Object.keys(rec).length > 0) {
+  // 去重：pay.charge 自己已经给了金额，别在卡片上写两遍。
+  const details: OperationDetail[] = [];
+  // pay.charge 的金额是结构化参数，describePay 已经按业务顺序放过；
+  // 其余工具才用通用金额探测（从 params/cmd 里找）。
+  const genericMoney = tool === 'pay.charge' ? [] : moneyDetails(rec, '');
+  for (const d of [...genericMoney, ...view.details]) {
+    if (!details.some((x) => x.label === d.label)) details.push(d);
+  }
+  // pay.charge 的每个参数都已在上面逐项列出，"参数项 N 项"只是噪音。
+  if (tool !== 'pay.charge' && Object.keys(rec).length > 0) {
     const keys = Object.keys(rec);
     const shown = new Set(details.map((d) => d.label));
     if (!shown.has('参数')) {

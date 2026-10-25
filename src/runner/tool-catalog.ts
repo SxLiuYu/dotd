@@ -829,6 +829,33 @@ export const TOOL_DOCS: readonly ToolDoc[] = [
       'search_tool_error：抓取失败或页面是空响应 —— JS 重的站改走 web.snapshot；' +
       '非 http(s)：只支持 http/https。',
   },
+  {
+    name: 'pay.charge',
+    description:
+      '真的付钱（spend 档，**必审批**）：把一个订单的金额付给指定收款方，成功后写进消费台账。' +
+      '只有主人明确让"付/买/下单/充值"时才用；金额单位是**分**（35 元要填 3500，别填 35）。' +
+      '支付渠道没配置时你根本看不到这个工具 —— 看得到就说明可用。' +
+      '不要把 shell.run 包一层当作付款，也不要自己编收款方：payee 写不清就先 ask。' +
+      '同一笔订单重复调用不会重复扣款（orderId 幂等），但**失败不要自动重试**——' +
+      '超时或返回含糊时钱可能已经出去了，先查当日台账再问主人。',
+    params: {
+      amountCents: '金额，单位**分**（35.00 元 = 3500）；正整数，超单笔上限会被拒。',
+      currency: 'ISO4217 三字母币种，如 CNY。',
+      category: '消费类别，用于台账汇总：food / topup / shopping / transport 等。',
+      payee: '收款方/商户名（必填）。审批卡上要写清付给谁，写不清就先 ask。',
+      memo: '用途备注，可选（如"给 138xxxx 充话费"），会显示在审批卡上。',
+      orderId: '幂等单号，可选；缺省按"任务 + 参数"确定性生成，同一笔重复调用只扣一次。',
+    },
+    notes: [
+      '金额与限额（单笔 / 当日累计）由宿主配置决定，超限时返回 PAY_LIMIT / PAY_DAILY_LIMIT，改小金额或等次日，不要拆单绕过。',
+    ],
+    returns:
+      '{ receiptId, orderId, amountCents, currency, payee, paidAt }：回执即扣款成功凭证；台账同步写入一条 charge。',
+    failures:
+      'BAD_ARG（参数缺失/非法，改正后重试）、PAY_LIMIT / PAY_DAILY_LIMIT（超限，重试无用）、' +
+      'PAY_UNREACHABLE（渠道连不上，结果未知 —— 先查台账，别自动重发）、' +
+      'PAY_REJECTED（渠道明确拒绝，原因见 message）、PAY_AMBIGUOUS（返回 2xx 但没回执号，钱可能已扣 —— 必须问主人）。',
+  },
 ];
 
 /** 工具名 → 说明书（未知工具返回 null，调用方退回最小描述）。 */
@@ -978,6 +1005,7 @@ export const TOOLS_GUIDE = `工具按"先便宜后昂贵"选（主人可能额�
       没对口但以后会重复 → tool.create 造一个。
 12. 提问：缺关键信息、自己又查不到时，用 ask 停下來问主人（如「帮我寄个快递」但没给地址）。
    问的是「缺什么」不是「可以吗」——审批那次卡片是系统拦下来问的，不用你操心。能自己查的先自己查。
+13. 付款：pay.charge（必审批，单位分；别用 shell.run 包装）。
 通用约定：
 - 路径一律写成 home 内相对路径（MEMORY.md、notes/x.md）或 /dot/home/... 绝对路径，别写宿主机路径、别写 /tmp。
 - 一次只发一类动作。需要先看结果才知道下一步的，就分开两次调用；只有互不依赖的读操作才可以合并成一轮。

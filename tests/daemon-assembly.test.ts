@@ -222,3 +222,31 @@ test('装配：库里迁移到位（user_version = db/migrations 最大 NNN）',
   assert.equal(v, latestMigrationVersion(), `user_version 应等于最大迁移号 ${latestMigrationVersion()}`);
   void close;
 });
+
+test('装配：pay.charge 只在配了支付渠道时进入工具面', async () => {
+  // 默认（既没 endpoint 也没 dry-run）→ 不注册，模型看不到一个永远失败的付款口。
+  delete process.env.DOTD_PAY_DRY_RUN;
+  delete process.env.DOTD_PAY_ENDPOINT;
+  {
+    const { daemon, close } = await boot();
+    const caps = await daemon.exec.getCapabilities('dot1');
+    assert.ok(
+      !caps.some((c) => c.name === 'pay.charge'),
+      '未配置支付渠道时 pay.charge 不得出现在工具面',
+    );
+    await close();
+  }
+
+  // DRY-RUN=1 → 注册（宿主侧直连渠道），工具面必须能看见；否则模型不知道自己能付款。
+  process.env.DOTD_PAY_DRY_RUN = '1';
+  try {
+    const { daemon, close } = await boot();
+    const caps = await daemon.exec.getCapabilities('dot1');
+    const pay = caps.find((c) => c.name === 'pay.charge');
+    assert.ok(pay !== undefined, 'DRY-RUN 下 pay.charge 应可见');
+    assert.equal(pay.sideEffect, 'unknown', '钱的动作不能标 replayable');
+    await close();
+  } finally {
+    delete process.env.DOTD_PAY_DRY_RUN;
+  }
+});

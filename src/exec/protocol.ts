@@ -789,6 +789,39 @@ export const CAPABILITY_CATALOG: readonly Capability[] = [
     ),
     sideEffect: 'unknown',
   },
+  {
+    /**
+     * 一等支付动作（2026-10-25）。宿主侧执行，**永远走 spend 档人工审批**。
+     *
+     * 为什么要有它：让模型用 shell.run + curl 调支付接口，审批卡上只能显示一段脚本，
+     * 台账里也没有金额。支付是有结构的动作（金额/币种/类别/收款方/幂等单号），
+     * 做成 spend 档工具后：卡片写"支付 CNY 35.00 给 美团"，治理按 spend 契约校验，
+     * 成功后自动记 spend_ledger。
+     *
+     * 可见性：只有装配层注册了处理器（配了 DOTD_PAY_ENDPOINT 或 DRY_RUN=1）时，
+     * ExecService.visibleCaps 才会把这条给模型 —— 否则模型看不到一个永远失败的口子。
+     */
+    name: 'pay.charge',
+    mode: 'sync',
+    max_deadline_ms: 120_000,
+    args_schema: obj(
+      {
+        amountCents: {
+          type: 'integer',
+          minimum: 1,
+          description: '金额，单位**分**（35.00 元 = 3500）；必须是正整数',
+        },
+        currency: str('ISO4217 三字母，如 CNY'),
+        category: str('消费类别：food / topup / shopping / transport …（台账按它汇总）'),
+        payee: str('收款方/商户名（必填：审批卡上要写清付给谁）'),
+        memo: str('用途备注（可选，如"给 138xxxx 充话费"）'),
+        orderId: str('幂等单号（可选；缺省按"任务+参数"确定性生成）'),
+      },
+      ['amountCents', 'currency', 'category', 'payee'],
+    ),
+    // 钱动了就回不来：崩溃后必须人工核对，不能自动重放（契约 J2 的 unknown）。
+    sideEffect: 'unknown',
+  },
 ];
 
 /**

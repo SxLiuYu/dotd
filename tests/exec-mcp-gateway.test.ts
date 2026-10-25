@@ -95,7 +95,11 @@ function mcpCall(id: string, server: string, tool: string, args: Record<string, 
 // （2026-10-18 加 schedule.* 时就撞到了）。
 // 注意：宿主侧工具（schedule.*）**对模型可见**（getCapabilities 会列出来），
 // 只是执行时不进容器。所以基线必须包含它们。
-const ELEVEN = [...TOOL_NAMES].sort();
+//
+// 例外：pay.charge（2026-10-25）是**条件可见**的宿主工具 —— 只有装配层真的注册了
+// 支付处理器（配了 DOTD_PAY_ENDPOINT / DOTD_PAY_DRY_RUN=1）才出现在清单里。
+// 本文件的 fixture 不注册，所以基线要减掉它（与 mcp.call 同一个理由）。
+const ELEVEN = [...TOOL_NAMES].filter((n) => (n as string) !== 'pay.charge').sort();
 
 test('默认关闭：未声明任何 MCP server → getCapabilities 里没有 mcp.call（工具面不变）', async () => {
   const { exec } = makeExec(new McpClient([]));

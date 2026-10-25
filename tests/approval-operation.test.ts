@@ -134,3 +134,26 @@ test('没有任务标题时，标题退回具体操作；summary ≤120 字', ()
   const s = operationSummary(op);
   assert.ok(s.length <= 120, `summary 超长：${s.length}`);
 });
+
+test('pay.charge：卡片直接念出"付多少、付给谁、为什么"', () => {
+  const op = describeOperation({
+    taskTitle: '点一份午饭',
+    tool: 'pay.charge',
+    tier: 'spend',
+    params: {
+      amountCents: 3500,
+      currency: 'CNY',
+      category: 'food',
+      payee: '美团外卖',
+      memo: '牛肉面加蛋',
+    },
+  });
+  assert.equal(op.title, '点一份午饭');
+  assert.equal(op.action, '支付 CNY 35.00 给 美团外卖');
+  assert.deepEqual(
+    op.details.map((d) => d.label),
+    ['收款方', '金额', '类别', '备注'],
+    '金额不能重复出现两次',
+  );
+  assert.ok(op.risks.some((r) => /不可撤销/.test(r)));
+});

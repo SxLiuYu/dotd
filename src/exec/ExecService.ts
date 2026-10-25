@@ -260,7 +260,7 @@ export interface ExecServiceDeps {
  * 所以容器返回的能力目录里天然没有它们 —— getCapabilities 必须把它们合并进去，
  * 否则模型根本看不见（2026-10-18 实测：主人让设提醒，模型答"schedule.create 不在列表里"）。
  */
-const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'calendar.list', 'calendar.conflicts', 'calendar.day', 'calendar.rest', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read', 'vault.sites', 'web.snapshot', 'web.read', 'web.act', 'search.web', 'search.fetch', 'memory.search', 'ask']);
+const HOST_SIDE_TOOLS = new Set(['schedule.create', 'schedule.list', 'schedule.remove', 'mail.account.add', 'mail.account.list', 'mail.account.remove', 'mail.list', 'mail.read', 'mail.search', 'mail.draft', 'mail.send', 'calendar.add', 'calendar.edit', 'calendar.delete', 'calendar.list', 'calendar.conflicts', 'calendar.day', 'calendar.rest', 'github.notifications', 'github.issues', 'github.pulls', 'rss.read', 'vault.sites', 'web.snapshot', 'web.read', 'web.act', 'search.web', 'search.fetch', 'memory.search', 'ask', 'pay.charge']);
 
 /**
  * A1（2026-10-21）：`args.identity` 是给**宿主侧** browser.* 读的，不是给容器读的。
@@ -1167,6 +1167,13 @@ export class ExecServiceImpl implements ExecService {
    */
   private visibleCaps(base: readonly Capability[]): Capability[] {
     const out = base.filter((c) => c.name !== 'mcp.call');
+    // pay.charge 只在装配层真的注册了处理器时可见（2026-10-25）。
+    // 与 mcp.call 同一个理由：没配置的支付渠道不该出现在模型的工具清单里 ——
+    // 否则它会为一个永远返回"未配置"的动作去打扰主人审批。
+    if (!this.hostTools.has('pay.charge')) {
+      const i = out.findIndex((c) => c.name === 'pay.charge');
+      if (i >= 0) out.splice(i, 1);
+    }
     if (this.mcp.enabled) {
       const gw = base.find((c) => c.name === 'mcp.call') ?? MCP_CALL_CAPABILITY;
       // 网关工具的 sideEffect 恒为 'unknown'：外部工具做什么我们不知道（治理据此给最严档）

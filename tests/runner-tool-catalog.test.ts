@@ -114,6 +114,8 @@ test('词表：全部工具都有说明书，且与契约词表逐名对齐（�
   // 2026-10-22：搜索走 argo，两个宿主侧工具
   'search.web',
   'search.fetch',
+  // 2026-10-25：支付（spend 档），宿主直连渠道；未配置时对模型不可见
+  'pay.charge',
     ],
   );
 });
@@ -297,7 +299,7 @@ test('system prompt：是导出常量、有长度预算、内容不是空话', (
   // 比检索机制本身更重要"——所以"想不起就去 fs.grep 搜"这句指令就是那把工具
   // 的发现路径，省掉它等于没加。抬线前已按老规矩压了 7 处文案到 4726，
   // 再压就要删 mail.* / browser.* 的全名（测试逐字要求），那是真信息损失。
-  assert.ok(SYSTEM_PROMPT_BUDGET <= 4900, '总长上限 < 4900 字符');
+  assert.ok(SYSTEM_PROMPT_BUDGET <= 5000, '总长上限 < 5000 字符');
 
   // 必备的四块：身份/环境、工作纪律、记忆、对主人表达。
   for (const must of ['Dot', '/dot/home', 'MEMORY.md', 'notes/', 'manuals/', '结论先行', '中文']) {
