@@ -20,14 +20,17 @@ const runner = readFileSync(join(here, '..', 'src', 'runner', 'dot.ts'), 'utf8')
 const queue = readFileSync(join(here, '..', 'src', 'control-plane', 'queue.ts'), 'utf8');
 
 test('模型熔断时必须打日志（不能只写 stop_reason）', () => {
-  const idx = runner.indexOf('pauseByReason(task.id,');
-  assert.ok(idx > 0, '必须有熔断暂停路径');
-  // 往前看这段上下文里有没有 this.log
-  const around = runner.slice(Math.max(0, idx - 900), idx);
-  assert.ok(
-    around.includes('this.log(') && around.includes('circuit_open'),
-    '熔断前必须先打一条日志（说明是模型端点挂了、恢复后自动回队）',
-  );
+  // 2026-10-26：原来用"往前数 900 个字符里找 this.log"——裁的是一个**字符窗口**，
+  // 于是给分支加几行注释就能让它变红（这次正是如此），而真把日志挪走 901 字符
+  // 就可能变绿。窗口不是判据，**分支边界**才是：从"模型不可用"那个 catch 分支
+  // 的开头，到 pauseByReason 调用之间，必须有一条 this.log。
+  const branchAt = runner.indexOf('err instanceof AllEndpointsDownError || err instanceof NoQualifiedPrimaryError');
+  assert.ok(branchAt > 0, '找不到"模型不可用"分支的锚点（分支结构变了就更新这条）');
+  const idx = runner.indexOf('pauseByReason(task.id,', branchAt);
+  assert.ok(idx > branchAt, '分支里必须有暂停路径');
+  const span = runner.slice(branchAt, idx);
+  assert.ok(span.includes('this.log('), '熔断前必须先打一条日志（说明是模型端点挂了、恢复后自动回队）');
+  assert.ok(span.includes('circuit_open'), '日志要能区分三种成因（含 circuit_open）');
 });
 
 test('pauseByReason 必须落 resource_events（可事后查证）', () => {

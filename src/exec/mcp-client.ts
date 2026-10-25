@@ -99,9 +99,12 @@ export const MCP_MAX_OUTPUT_BYTES = 64 * 1024;
 export class McpClient {
   private readonly servers: Map<string, McpServerConfig>;
   private readonly conns = new Map<string, Conn>();
+  /** 声明来自哪个文件（只用于诊断文案；缺省说"未配置"）。 */
+  private readonly source: string | null;
 
-  constructor(servers: readonly McpServerConfig[]) {
+  constructor(servers: readonly McpServerConfig[], opts: { source?: string } = {}) {
     this.servers = new Map(servers.map((s) => [s.name, s]));
+    this.source = opts.source ?? null;
   }
 
   /** 已声明的 server 名（供工具描述/诊断用）。 */
@@ -148,10 +151,18 @@ export class McpClient {
    */
   async call(serverName: string, tool: string, args: Record<string, unknown>): Promise<McpCallResult> {
     if (!this.enabled) {
+      // 2026-10-26：原来写「config/tools.yml 的 mcp_servers 为空」——**那份文件里
+      // 没有这个段**（tools.yml 只登记档位）。声明在 mcp-servers.yml，路径是
+      // `DOTD_MCP_CONFIG ?? <configDir>/mcp-servers.yml`，托管部署里通常是
+      // `~/.dotd/mcp-servers.yml`。模型/人照着旧文案会去改一个没人读的键。
+      const where =
+        this.source !== null ? `（${this.source} 里没有声明任何 server）` : '';
       return {
         ok: false,
         errorCode: 'mcp_not_configured',
-        errorMessage: '未声明任何 MCP server（config/tools.yml 的 mcp_servers 为空）',
+        errorMessage:
+          `MCP 未启用：没有声明任何 server${where}。` +
+          '声明放在 mcp-servers.yml（DOTD_MCP_CONFIG 指定的那份，或 <configDir>/mcp-servers.yml）',
       };
     }
     const cfg = this.servers.get(serverName);

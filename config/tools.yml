@@ -113,8 +113,11 @@ tools:
   # 读环境变量、写任意文件。给它 write_file/read 档等于让用户无感地执行第三方代码。
   #
   # 默认**不启用**：本条目只声明"如果 mcp.call 出现，按最严档管"。
-  # 是否真的出现，取决于 config/tools.yml 的 mcp_servers 段是否声明了 server
-  # （空 = 完全不启用，模型看不到这个工具）。
+  # 是否真的出现取决于 **mcp-servers.yml**（daemon 读 `DOTD_MCP_CONFIG ??
+  # <configDir>/mcp-servers.yml`，托管部署里 configDir 是 `~/.dotd`），
+  # 不是本文件 —— 这里只管档位，不管声明。
+  # （2026-10-26 修正：原来写"config/tools.yml 的 mcp_servers 段"，可 tools.yml
+  #  里从来没有也不想有这一段；照着改的人会在这份文件里加一个没人读的键。）
   - name: mcp.call
     tier: dangerous
 

@@ -2,7 +2,10 @@
  * src/exec/mcp-config.ts —— MCP server 声明的加载（P2-1）。
  *
  * ## 文件
- * `config/mcp-servers.yml`（可用 `DOTD_MCP_CONFIG` 覆盖路径）。
+ * `<configDir>/mcp-servers.yml`（可用 `DOTD_MCP_CONFIG` 覆盖路径）。
+ * `configDir` = `DOTD_CONFIG_DIR` 或仓库 `config/`；托管部署里是 `~/.dotd/`，
+ * 也就是**仓库 `config/` 下那份只是模板**。`config/tools.yml` 只管 `mcp.call`
+ * 的档位（dangerous），不负责声明 server。
  *
  * ## 形状（刻意极简，只认这几样东西）
  * ```yaml

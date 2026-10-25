@@ -118,6 +118,17 @@ test('默认关闭：未声明 server 时调 mcp.call 会明确报 mcp_not_confi
   assert.equal(r.status, 'error');
   assert.equal(r.error?.code, 'mcp_not_configured');
   assert.equal(r.error?.retryable, false, '配置问题不是可重试错误');
+  // 2026-10-26：旧文案说「config/tools.yml 的 mcp_servers 为空」——那份文件里
+  // 从来没有这个段。声明在 mcp-servers.yml，照着旧文案改会改一个没人读的键。
+  assert.doesNotMatch(r.error?.message ?? '', /tools\.yml/, '不许把人指向 tools.yml');
+  assert.match(r.error?.message ?? '', /mcp-servers\.yml/, '要说出真正的文件名');
+});
+
+test('默认关闭：报错能说出"查的是哪个文件"（DOTD_MCP_CONFIG 生效与否一眼可见）', async () => {
+  const client = new McpClient([], { source: '/root/.dotd/mcp-servers.yml' });
+  const r = await client.call('echo', 'echo', {});
+  assert.equal(r.errorCode, 'mcp_not_configured');
+  assert.match(r.errorMessage ?? '', /\/root\/\.dotd\/mcp-servers\.yml/, '要带上实际路径');
 });
 
 test('默认关闭：config/mcp-servers.yml 就是空的（servers: []）', () => {

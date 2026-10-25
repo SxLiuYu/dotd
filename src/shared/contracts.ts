@@ -788,7 +788,8 @@ export type ToolName =
  *
  * 刻意不并进 `ToolName`：那 11 个名字是 AGENT↔容器 的逐字契约（两份 protocol.ts
  * 同形，有防漂移测试）。`mcp.call` 是**宿主侧**的扩展点网关——它不进容器、
- * 目录由 `mcp_servers` 配置决定是否出现，因此单独成类型。
+ * 目录由 `mcp-servers.yml` 里的声明决定是否出现（`tools.yml` 只登记它的档位），
+ * 因此单独成类型。
  */
 export type GatewayToolName = 'mcp.call';
 

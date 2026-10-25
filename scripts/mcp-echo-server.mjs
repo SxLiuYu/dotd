@@ -31,7 +31,7 @@
  *
  * 用法：
  *   node scripts/mcp-echo-server.mjs
- *   （dotd 侧配置见 config/tools.yml 的 mcp_servers 段）
+ *   （dotd 侧声明见 config/mcp-servers.yml；运行期那份通常在 ~/.dotd/）
  */
 
 import { createInterface } from 'node:readline';

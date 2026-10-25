@@ -1133,11 +1133,15 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
         cp.heartbeat(taskId, epoch, undefined, { live: { at: now } });
       },
     },
-    // P2-1：MCP 外部工具通道。**默认关闭**——config/mcp-servers.yml 未声明 server 时
+    // P2-1：MCP 外部工具通道。**默认关闭**——mcp-servers.yml 未声明 server 时
     // 这里是空列表，`mcp.call` 不会出现在模型工具面里（见 getCapabilities 的过滤）。
     // 配置解析失败会抛错 → 拒启动（静默忽略一份写错的安全配置最危险）。
+    //
+    // `source` 只用于报错文案：没启用时要能说出"查的是哪个文件"，否则只报一句
+    // "未声明"，人还得猜 DOTD_MCP_CONFIG 到底有没有生效。
     mcp: new McpClient(
       loadMcpServers(process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')),
+      { source: process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml') },
     ),
   });
 

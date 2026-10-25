@@ -1753,7 +1753,10 @@ export class DotRunner {
         const hint =
           pauseReason === 'endpoints_unreachable'
             ? '所有模型端点都连不上 —— 先检查模型网关（relay / gpt-load）是否在跑；网关恢复后任务会自动回队。'
-            : '没有合格的主端点 —— 这是配置问题（config/models.yml 的 primary 端点/凭据），改好配置后手动 resume。';
+            // 2026-10-26：原来写死 `config/models.yml`。daemon 读的是
+            // `<configDir>/models.yml`（托管部署 = `~/.dotd/models.yml`，且热加载），
+            // 仓库 `config/` 下那份只是模板 —— 照着日志改模板等于改了个没人读的文件。
+            : '没有合格的主端点 —— 这是配置问题（运行期 models.yml 的 primary 端点/凭据，通常 ~/.dotd/models.yml；仓库 config/ 下那份只是模板），改好配置后手动 resume。';
         // **必须留日志**（2026-10-18 实测）：关键故障必须能在日志里看见，
         // 否则主人只看到"不回话"，无从判断是端点挂了还是 dotd 坏了。
         this.log(
