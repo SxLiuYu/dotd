@@ -45,6 +45,18 @@ echo "模型端点: ${DOTD_MODEL_HOST}/v1（tier2: ${DOTD_TIER2_HOST}）"
 # 3. surfaces 配置（Windows 侧那份，含 feishu 节与 owner 占位）
 cp _config_src.yml "$HOME/.dotd/config.yml"
 
+# 3.5 配置目录对齐到 ~/.dotd（2026-10-25 one_system 托管后必须）
+#
+# one_system 的 _spawn 会给子进程设 DOTD_CONFIG_DIR=$HOME/.dotd（init-config 的
+# 标准布局：config.yml / models.yml / tools.yml … 全在 home）。以前直接 node 起
+# daemon 时没人设这个变量，configDir 落在仓库 config/，所以这里从没拷过这些文件 ——
+# 切到托管后第一次启动就 `ConfigError: 读不到 models.yml：/root/.dotd/models.yml`。
+# 每次启动都照仓库刷新（这些文件本就是 ${ENV} 占位驱动，不含环境事实）。
+for f in config/*.yml; do
+  case "$(basename "$f")" in dotd.yml) continue ;; esac   # init-config 模板，运行期用不到
+  cp -f "$f" "$HOME/.dotd/$(basename "$f")"
+done
+
 # 4. 内存门槛：容器 + chromium 需要余量，否则水位 guard 会把容器 pause
 AVAIL=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 echo "MemAvailable: ${AVAIL}MB"
