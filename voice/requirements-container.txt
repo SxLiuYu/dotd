@@ -1,0 +1,30 @@
+# 容器/常驻部署的语音运行期依赖 —— Dockerfile.voice 装的就是这一份。
+#
+# 为什么不直接装 requirements-core.txt：那份是上游 Charlie 的**全量**锁单，
+# 里面既没有 edge-tts（默认 TTS 兜底）也没有 sherpa-onnx / opuslib / av
+# （本地 ASR 与 ESP32 Opus 编解码）。2026-10-25 实测查已构建的镜像：
+#
+#   edge_tts NO   sherpa_onnx NO   lark_oapi NO   opuslib NO   av NO   soundfile NO
+#
+# 也就是 `docker compose -f docker/compose.voice.yml up -d` 起出来的容器
+# **既不能说话也不能听**，而 README / quickstart 都把它当作可用路径。
+#
+# 与 requirements-real-audio.txt 的区别：那份是"验收用"，会带 faster-whisper
+# （拖 ctranslate2）和 scipy；容器只装**跑起来必需**的，不做验收。
+#
+# 系统依赖（Dockerfile 里 apt 装）：ffmpeg 提供可执行文件，libopus0 给 opuslib 用。
+# SenseVoice 的模型权重（237MB）不在这里 —— 它由 entrypoint 在首次启动时下到
+# 数据卷（见 docker/entrypoint.sh），和仓库解耦。
+
+-r requirements-voice.txt
+
+# 本地 ASR（SenseVoice，26ms）。缺模型文件时上游会降级到云端，不走这里。
+sherpa-onnx>=1.10
+
+# ESP32 双向音频：opuslib 是 Python 绑定（要系统 libopus0），av 自带 libopus/FFmpeg。
+opuslib>=3.0
+av>=12.0
+
+# qwen_agent 的 import 链上有 `import soundfile`（azure.py），缺了会让
+# `_get_brain()` 直接抛 ModuleNotFoundError —— 容器里表现为"预热失败"而非缺包。
+soundfile>=0.12

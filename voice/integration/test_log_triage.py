@@ -109,6 +109,29 @@ class LogTriageTest(unittest.TestCase):
         self.logger.warning("[preflight] ❌ ffmpeg 未安装 — apt install ffmpeg (音频转码（ASR/TTS 必需）)")
         self.assertEqual(self._levels(), ["WARNING"], "必需项不能降噪")
 
+    def test_local_wake_missing_dep_downgraded(self):
+        # 2026-10-25 部署后实测的两条：openwakeword 不在任何 requirements 里，
+        # 服务器也没有麦克风。第一层是细节，直接丢；第二层换成一句人话。
+        self.logger.warning("[wake] openwakeword 未安装，运行 pip install openwakeword")
+        self.logger.warning("[wake] 无可用唤醒词模型 (openWakeWord/sherpa)，本地唤醒词不可用")
+        self.assertEqual(self._levels(), ["INFO"], "第一条直接丢，只留一条解释")
+        self.assertIn("ESP32", self.records[0].getMessage())
+        self.assertIn("正常", self.records[0].getMessage())
+
+    def test_local_wake_explained_even_if_dep_warning_absent(self):
+        # 装上了 openwakeword 但模型加载失败时只会出现第二条 —— 不能被第一条的
+        # once 标记挡住（两条故意用了不同的 kind）。
+        self.logger.warning("[wake] openwakeword 未安装，运行 pip install openwakeword")
+        self.logger.warning("[wake] 无可用唤醒词模型 (openWakeWord/sherpa)，本地唤醒词不可用")
+        self.logger.warning("[wake] 无可用唤醒词模型 (openWakeWord/sherpa)，本地唤醒词不可用")
+        self.assertEqual(self._levels(), ["INFO"], "只解释一次，不重复刷屏")
+
+    def test_wake_runtime_failure_stays_warning(self):
+        # 真在用唤醒词时的问题（麦克风打不开、回调炸了）必须保留。
+        self.logger.warning("[wake] 音频播放失败: PortAudioError: Device unavailable")
+        self.logger.warning("[wake] 回调失败: boom")
+        self.assertEqual(self._levels(), ["WARNING", "WARNING"])
+
     def test_missing_env_keys_and_sensevoice_stay_warning(self):
         # 这两条是"真该有人去处理"的信息：缺哪个 key 点名了、模型缺失会让设备听不见。
         self.logger.warning(

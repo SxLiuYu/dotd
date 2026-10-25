@@ -16,6 +16,8 @@ Charlie 自己的 `_get_brain()`（qwen_agent + 一堆云端 LLM key）只是 do
     [WARNING] 未配置 ARK_KEY / GLM_KEY，大脑将使用 Ollama 本地模型。
     [WARNING] [intent] 本地分类失败,默认none: err=Invalid URL '/chat/completions'
     [WARNING] [xiaozhi] Silero VAD load fail, fallback to RMS endpointing
+    [WARNING] [wake] openwakeword 未安装，运行 pip install openwakeword
+    [WARNING] [wake] 无可用唤醒词模型 (openWakeWord/sherpa)，本地唤醒词不可用
     [WARNING] [preflight] ❌ ncm 未安装 …（可选）
 
 结果是每次重启都有一屏红字，指向**合并架构里不需要你来配**的东西。真出问题时
@@ -117,6 +119,31 @@ _RULES: tuple[_Rule, ...] = (
     # 6. preflight 的可选项（ollama/ncm/ego-browser/esptool）：缺了就是缺了，
     #    但它们是**可选**功能，不该和 ffmpeg 这种必需项一样报红。保留原文降为 INFO。
     _Rule("preflight_optional", ("[preflight] ❌", "（可选"), None, keep_text=True),
+    # 7. 本地唤醒词（桌面麦克风）。`start_wake_listener()` 里无条件起线程，20s 后
+    #    `_listen_loop` 先打"openwakeword 未安装"，紧接着因为没有模型再打一条
+    #    "无可用唤醒词模型"。openwakeword 不在任何 requirements 里，也**不该**装到
+    #    服务器上：ESP32 的唤醒词跑在固件里，服务器没有麦克风。
+    #    两条说的是同一件事 —— 前一条是细节（直接丢），后一条换成一句人话。
+    #    故意不共用 once 标记：万一哪天 openwakeword 装上了却加载失败，只会出现
+    #    后一条；共用会让它的解释被前面那条的 kind 提前吃掉。
+    _Rule("local_wake_dep", ("[wake] openwakeword 未安装",), None),
+    _Rule(
+        "local_wake",
+        ("[wake] 无可用唤醒词模型",),
+        "[wake] 本地唤醒词不可用（正常）：这是桌面麦克风的功能，openwakeword 不在依赖里；"
+        "ESP32 的唤醒在设备固件里做，服务器没有麦克风也不需要。要开桌面唤醒再 "
+        "pip install openwakeword，或配 KWS_MODEL 用 sherpa KeywordSpotter。",
+        once=True,
+    ),
+    # 8. 同一个 silero-vad 在 local_wake 里还有一份加载器（`_load_silero_vad`），
+    #    用的是"能量阈值"降级。现在没有唤醒词模型所以走不到；一旦装了
+    #    openwakeword 就会冒出来，和上一条同源，一并解释掉。
+    _Rule(
+        "silero_vad_wake",
+        ("[wake] Silero VAD 加载失败",),
+        "[wake] 未装 Silero VAD，唤醒词监听里的断句用能量阈值（同上，故意的）。",
+        once=True,
+    ),
 )
 
 

@@ -40,7 +40,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CHARLIE_CORTEX=auto
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg curl ca-certificates gnupg \
+      ffmpeg curl ca-certificates gnupg libopus0 \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -51,14 +51,22 @@ WORKDIR /app
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod 0755 /app/entrypoint.sh
 
-# Python 侧：只装核心依赖（本地 ASR/可选件缺失时 Charlie 会降级，不阻塞启动）
+# Python 侧：上游核心依赖 + 语音运行期依赖
+#
+# 只装 requirements-core.txt 会得到一个**又聋又哑**的容器（2026-10-25 实测：
+# edge_tts / sherpa_onnx / lark_oapi / opuslib / av / soundfile 全部缺席）——
+# 能响应 /health，但说不出话也听不见。所以再装 voice/requirements-container.txt
+# （它 `-r` 引 voice 层那份：edge-tts + lark-oapi）。
 #
 # PIP_INDEX_URL 做成构建参数，不写死镜像源：官方 pypi 在部分网络下不可达
 # （实测直连超时），但硬编码国内的镜像源会影响其他地区。默认官方，需要时：
 #   DOTD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose ... up -d --build
 ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY voice/charlie/requirements-core.txt /tmp/charlie-requirements.txt
-RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /tmp/charlie-requirements.txt
+# 三份一起拷：container `-r` voice、voice `-r` integration，相对路径要在同目录里解析。
+COPY voice/requirements-integration.txt voice/requirements-voice.txt voice/requirements-container.txt /tmp/
+RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /tmp/charlie-requirements.txt \
+    && pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r /tmp/requirements-container.txt
 
 # Node 侧：依赖 + 源码 + 控制台
 COPY --from=node-deps /src/node_modules /app/node_modules

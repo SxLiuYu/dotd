@@ -93,6 +93,19 @@ if (check.status === 0) {
       info.consoleBuilt ? 'ok' : 'skip',
       info.consoleBuilt ? 'web-ui/dist/index.html' : '未构建：npm run build:web',
     );
+    // 8443：手机浏览器只在 HTTPS 下给麦克风权限，这条不通 = 手机上不能说话。
+    // `--check` 只报"会不会起"，这里补一句"证书在不在"——证书是首启自动生成的，
+    // 缺失通常意味着上一次启动根本没走到 sidecar。
+    add(
+      '8443 HTTPS（手机麦克风前置）',
+      info.httpsEnabled && info.httpsCert ? 'ok' : 'skip',
+      info.httpsEnabled
+        ? `port=${info.httpsPort} cert=${info.httpsCert ? '已生成' : '未生成（首次启动会生成）'}`
+        : '已关闭（CHARLIE_HTTPS=0）',
+      info.httpsEnabled && !info.httpsCert
+        ? '首次 `npm run charlie:start` 会自动生成自签证书到 <home>/voice/cert/'
+        : '',
+    );
   } catch {
     add('一套系统配置', 'fail', '--check 输出不是 JSON', '检查 voice/integration/one_system.py');
   }

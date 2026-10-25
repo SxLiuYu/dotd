@@ -34,5 +34,33 @@ for f in models.yml tools.yml rules.yml event-rules.yml free-models.yml mcp-serv
   fi
 done
 
-# 3) 交回 CMD（one_system: 拉起 dotd + Charlie）
+# 3) SenseVoice 本地 ASR 模型（237MB，不随镜像打包、不入库）
+#
+# 没有它容器**听不见**：ASR_PRIORITY 是 sensevoice,baidu,stepfun,vosk，
+# 本地模型缺席、云端 key 默认没配 → 四个全灭。2026-10-25 实测这个盘：
+# 镜像能起、/health 全绿，只有一行 "SenseVoice 模型不存在" 就过去了。
+#
+# 后台下载，不阻塞启动（237MB 比 healthcheck 的 start_period 长）。关闭：
+# DOTD_DOWNLOAD_ASR_MODEL=0。
+#
+# 用 voice/integration/asr_model.py 而不是上游的 scripts/download-models.py：
+# 上游只有 GitHub release 一个源，2026-10-25 在国内网络实测 20s 超时 0 字节，
+# 而 hf-mirror 有 1.2MB/s。多源 + 原子落盘 + 重试都在那边的模块里。
+#
+# 模型放**数据卷**而不是镜像：镜像 1.59GB 已经不小，且模型与代码版本无关；
+# 卷里一份、重建容器不重下。
+MODEL_DIR="$DATA/voice/models/sense-voice"
+if [ "${DOTD_DOWNLOAD_ASR_MODEL:-1}" != "0" ] && [ ! -f "$MODEL_DIR/model.int8.onnx" ]; then
+  echo "[entrypoint] SenseVoice 模型缺失：后台下载 237MB → $MODEL_DIR"
+  echo "[entrypoint]   （下载完成前设备听不见；设 DOTD_DOWNLOAD_ASR_MODEL=0 可关闭）"
+  (
+    cd "$APP" 2>/dev/null || exit 1
+    python -m voice.integration.asr_model "$MODEL_DIR" \
+      >>"$DATA/voice/asr-model-download.log" 2>&1 \
+      && echo "[entrypoint] SenseVoice 模型就绪：$MODEL_DIR" \
+      || echo "[entrypoint] ⚠️ SenseVoice 下载失败，详见 $DATA/voice/asr-model-download.log" >&2
+  ) &
+fi
+
+# 4) 交回 CMD（one_system: 拉起 dotd + Charlie）
 exec "$@"

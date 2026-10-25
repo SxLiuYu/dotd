@@ -152,6 +152,35 @@ class OneSystemTest(unittest.TestCase):
         apply_env(paths, env)
         self.assertEqual(env["TTS_PRIORITY"], "audio8")
 
+    def test_apply_env_points_at_data_volume_model_when_present(self) -> None:
+        """数据卷里有 SenseVoice 模型时必须指过去（Docker 的模型不在源码目录）。"""
+        paths = self._paths()
+        model_dir = paths.home / "voice" / "models" / "sense-voice"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "model.int8.onnx").write_bytes(b"stub")
+
+        env: dict[str, str] = {}
+        apply_env(paths, env)
+        self.assertEqual(env["SENSE_VOICE_MODEL"], str(model_dir))
+
+    def test_apply_env_leaves_default_model_path_when_volume_empty(self) -> None:
+        """卷里没有模型时不要动 —— 宿主机部署的模型在源码目录，覆盖就找不到。"""
+        paths = self._paths()
+        env: dict[str, str] = {}
+        apply_env(paths, env)
+        self.assertNotIn("SENSE_VOICE_MODEL", env)
+
+    def test_apply_env_respects_explicit_sense_voice_model(self) -> None:
+        """主人显式设了模型路径，不许被卷里的默认位置顶掉。"""
+        paths = self._paths()
+        model_dir = paths.home / "voice" / "models" / "sense-voice"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "model.int8.onnx").write_bytes(b"stub")
+
+        env = {"SENSE_VOICE_MODEL": "/custom/place"}
+        apply_env(paths, env)
+        self.assertEqual(env["SENSE_VOICE_MODEL"], "/custom/place")
+
 
 if __name__ == "__main__":
     unittest.main()

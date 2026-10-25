@@ -9,6 +9,21 @@
 #
 # 只暴露 Charlie 的 8000/8443；dotd 只监听容器内回环，外部拿不到管理面。
 # 数据只有 /data 一个卷：dotd 的库/记忆 + Charlie 的 voice 子目录都在里面。
+#
+# **只有一个进程**：容器里跑 `python -m voice.integration.one_system`，它自己
+# spawn 一个 dotd 子进程（127.0.0.1:7788）并当它的监督者。所以：
+#   - 没有"charlie 服务 + dotd 服务"两个 compose service，也不该拆（拆了要重写
+#     重启编排/健康依赖，行为就和本地 `npm run charlie:start` 不一致了）；
+#   - 8000 是 Charlie（Web / ESP32 WS / `/console` 静态 / `/console/api/*` 反代）；
+#   - 8443 是**同一个进程里**的 HTTPS sidecar（`voice/integration/https_sidecar.py`，
+#     证书自动生成在 `/data/voice/cert/`）。它特意用 `lifespan="off"` 起第二个
+#     uvicorn，否则定时提醒/进化/主动建议这些后台线程会各跑一遍；
+#   - dotd 的 7788 只监听容器内回环，外部拿不到管理面。
+#
+# 首次启动 entrypoint 会补 config.yml，并在**后台**下载 SenseVoice ASR 模型
+# （237MB → /data/voice/models/sense-voice）。下载完之前"听不见"是正常的：
+# healthcheck 的 start_period=40s 只保证 Web 起来，不代表 ASR 就绪。看进度：
+#   docker logs charlie | grep -E 'SenseVoice|asr-model'
 
 services:
   charlie:
@@ -35,7 +50,10 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "8000:8000"       # Charlie（Web / ESP32 WS / 反向代理的 /console）
-      - "8443:8443"       # Charlie HTTPS
+      # 8443 = HTTPS sidecar。**改端口要改两处**：下面的映射，以及 .env 里的
+      # ASSISTANT_KID_HTTPS_PORT / CHARLIE_HTTPS_PORT（sidecar 读的是后者）。
+      # 只改一处会出现"TCP 通但没人应答"——最难查的一类。
+      - "8443:8443"
     volumes:
       - voice-data:/data
       # cloud 档位才需要：让 dotd 的 docker 工具能起兄弟容器

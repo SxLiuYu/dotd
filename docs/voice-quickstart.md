@@ -76,12 +76,26 @@ curl http://127.0.0.1:8000/health
 
 - 只暴露 8000/8443；dotd 只在容器内回环，设备拿不到管理面。
 - 数据只有一个卷 `/data`：dotd 的库/记忆 + Charlie 的 `voice/`。
+- **一个进程**：`one_system` 当 PID 1，自己 spawn dotd（7788）。8443 是同一进程里的
+  HTTPS sidecar（证书自动生成在 `/data/voice/cert/`，`lifespan` 关掉所以后台定时器
+  不重复）。手机浏览器只在 HTTPS 下给麦克风权限，所以 8443 不是可选项。
+- **首次启动会后台下 237MB 的 SenseVoice 模型**到 `/data/voice/models/sense-voice`。
+  `/health` 变绿 ≠ 能听：模型下完之前 ASR 整条链返回空。看进度：
+  `docker logs charlie | grep -E 'SenseVoice|asr-model'`。离线环境自备模型或设
+  `DOTD_DOWNLOAD_ASR_MODEL=0` 关掉下载。
 - `cloud` 档位要用 docker 工具时，取消 compose 里 `docker.sock` 那行注释；
   `box` 档位保持 `DOTD_FLEET=stub`，工具走宿主 MCP。
 
 **已验证**（2026-10-23，WSL2 + Docker 29.1.3）：冷构建 238 s、镜像 1.59 GB、空卷首启
 自动生成 `/data/config.yml` 并注册本机设备、容器 healthy（证据：
 `docs/acceptance/voice-docker/`）。
+
+**但 2026-10-25 复查发现镜像又聋又哑**：Dockerfile 只装了 `requirements-core.txt`，
+`edge_tts / sherpa_onnx / lark_oapi / opuslib / av / soundfile` 六个**全部缺席**
+（`docker run --rm --entrypoint python charlie-dotd:latest -c 'import …'` 实测）。
+healthcheck 只看 `/health`，所以"容器 healthy"这个结论当时是假的。现在改为再装
+`voice/requirements-container.txt`、apt 补 `libopus0`、entrypoint 后台下模型；
+门禁 `tests/voice-container-image.test.ts` 盯住这三件事，防止再次退化成"只会回 health"。
 
 构建失败优先看两件事：
 

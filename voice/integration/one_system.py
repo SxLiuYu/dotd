@@ -220,6 +220,18 @@ def apply_env(paths: Paths, env: Optional[dict[str, str]] = None) -> None:
     # 的主人，显式设 TTS_PRIORITY 覆盖即可（setdefault 完全尊重已有值）。
     target.setdefault("TTS_PRIORITY", "edge,audio8,baidu,stepfun,finna")
 
+    # SenseVoice 模型位置（2026-10-25）。上游默认取 `voice/charlie/models/sense-voice`
+    # （相对源码目录），但：
+    #   - Docker 里源码在镜像层（只读、重建即丢），模型由 entrypoint 下到**数据卷**
+    #     `<home>/voice/models/sense-voice`；
+    #   - 宿主机部署则相反，模型就在源码目录里（`wsl-deploy.sh` 已排除它不被删）。
+    # 所以这里只做一件事：数据卷里**有**模型就指过去，没有就不动（沿用上游默认）。
+    # 无条件覆盖会让宿主机部署找不到模型（这正是"设备聋"的一个变体）。
+    if not (target.get("SENSE_VOICE_MODEL") or "").strip():
+        candidate = paths.home / "voice" / "models" / "sense-voice"
+        if (candidate / "model.int8.onnx").is_file():
+            target["SENSE_VOICE_MODEL"] = str(candidate)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # dotd 子进程
@@ -391,6 +403,14 @@ class KernelSupervisor:
             status = "incompatible"
         else:
             status = "offline"
+        # 8443 是"手机端能不能说话"的前置条件（浏览器只在 HTTPS 下给麦克风），
+        # 所以它必须出现在 /health 里，而不是只在日志里。
+        try:
+            from voice.integration import https_sidecar
+
+            https = https_sidecar.snapshot()
+        except Exception:
+            https = {"state": "unknown"}
         return {
             "ok": status in ("ok", "disabled"),
             "service": "charlie",
@@ -398,6 +418,7 @@ class KernelSupervisor:
             "voice": "ok",
             "kernel": status,
             "kernelDetail": snap.as_dict(),
+            "https": https,
             "apiVersion": KERNEL_API_VERSION,
             "at": int(time.time() * 1000),
         }
@@ -680,6 +701,17 @@ def create_proxy_app(token: str, dotd_port: int, supervisor: Optional[KernelSupe
 def _check(paths: Paths, token: Optional[str], port: int) -> dict[str, Any]:
     node = shutil.which("node")
     console = (DOTD_DIST / "index.html").is_file()
+    # 8443：手机端麦克风的前置条件（浏览器只在 HTTPS 下给录音权限）。
+    # 这里只报"会不会起"，不在这里真起 —— --check 不该占端口。
+    try:
+        from voice.integration import https_sidecar
+
+        https_enabled = https_sidecar.enabled()
+        https_port = https_sidecar.https_port()
+        cert = https_sidecar.cert_dir(paths.home)
+        https_cert = (cert / "cert.pem").is_file() and (cert / "key.pem").is_file()
+    except Exception:
+        https_enabled, https_port, https_cert = False, None, False
     return {
         "ok": paths.config_file.is_file() and token is not None and node is not None,
         "home": str(paths.home),
@@ -690,6 +722,9 @@ def _check(paths: Paths, token: Optional[str], port: int) -> dict[str, Any]:
         "dotdPort": port,
         "node": node or "missing",
         "consoleBuilt": console,
+        "httpsEnabled": https_enabled,
+        "httpsPort": https_port if https_enabled else None,
+        "httpsCert": https_cert,
         "dotdCommand": dotd_command(),
         "apiVersion": KERNEL_API_VERSION,
     }
@@ -827,6 +862,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"[one-system] TTS 预热未启动：{exc}", file=sys.stderr)
 
     install_one_system(voice_server.app, sup, token, dotd_port)
+
+    # SenseVoice 模型"后到也能听"（2026-10-25）。Docker 首启时 237MB 权重是后台
+    # 下载的，而 SENSE_VOICE_MODEL 在 apply_env() 里只在**启动那一刻**看文件在不在；
+    # 于是下载完成后不重启就永远是聋的（实测 asr_race → ('', 'legacy')）。
+    # 这个轻量线程每 15s 看一次，模型出现即接管（设环境变量 + 清上游缓存）。
+    try:
+        from voice.integration import asr_watch
+
+        asr_watch.watch_async(paths.home)
+    except Exception as exc:
+        print(f"[one-system] ASR 模型监视未启动：{exc}", file=sys.stderr)
+
+    # 8443 HTTPS 副本（2026-10-25）。compose 映射了它、文档承诺了它，但合并后
+    # 没有任何东西监听它 —— 上游是靠 watchdog 再拉一个 https_server.py 进程。
+    # 手机浏览器只在 HTTPS 下才给麦克风权限，所以这条不是装饰。
+    #
+    # 用 lifespan="off" 起第二个 uvicorn（见 https_sidecar 头注）：后台调度器只跑一次。
+    # 证书放数据目录，不放仓库（否则 wsl-deploy 的 rsync --delete 会删掉）。
+    try:
+        from voice.integration import https_sidecar
+
+        https_sidecar.start(voice_server.app, paths.home)
+    except Exception as exc:
+        print(f"[one-system] 8443 HTTPS 未启动：{exc}", file=sys.stderr)
 
     port = args.port or voice_server.http_port()
     try:
