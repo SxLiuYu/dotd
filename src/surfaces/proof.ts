@@ -23,6 +23,8 @@ import type { DatabaseSync } from 'node:sqlite';
 
 import { argsHash, resultHash, stableStringify } from '../exec/protocol.ts';
 import type { Step, Task } from '../shared/contracts.ts';
+import { computeTimeline } from '../shared/timeline.ts';
+import type { ProofTimeline } from '../shared/timeline.ts';
 
 export interface ProofStep {
   seq: number;
@@ -129,6 +131,13 @@ export interface ProofBundle {
    * 其他任务**逐字不加这个键**，保证老凭证的 bundleHash 不变。
    */
   device?: ProofDevice;
+  /**
+   * 分段时间线（2026-10-24）：回答"这轮为什么慢"。
+   *
+   * **没有步骤时不出现这个键**（与 device 同一套兼容口径）：老凭证形状不变。
+   * 口径见 src/shared/timeline.ts 的文件头。
+   */
+  timeline?: ProofTimeline;
   result: { ok: boolean | null; summary: string | null };
   steps: ProofStep[];
   approvals: ProofApproval[];
@@ -378,16 +387,38 @@ export function buildProof(input: ProofInput): ProofBundle {
           channel: input.device.channel,
         };
   // 只有语音任务才带 device 键：不加就不会改变非语音凭证的 bundleHash。
-  const payload =
-    device === undefined
-      ? { version: 1 as const, task, result, steps, approvals, modelCalls, audit, counts }
-      : { version: 1 as const, task, result, device, steps, approvals, modelCalls, audit, counts };
+  // 时间线同理：没有步骤时为 undefined，老凭证形状不变。
+  const timeline =
+    computeTimeline({
+      createdAt: input.task.createdAt,
+      updatedAt: input.task.updatedAt,
+      steps: input.steps.map((s) => ({
+        seq: s.seq,
+        kind: s.kind,
+        argsJson: s.argsJson,
+        startedAt: s.startedAt,
+        finishedAt: s.finishedAt,
+      })),
+    }) ?? undefined;
+  const payload = {
+    version: 1 as const,
+    task,
+    result,
+    ...(device === undefined ? {} : { device }),
+    ...(timeline === undefined ? {} : { timeline }),
+    steps,
+    approvals,
+    modelCalls,
+    audit,
+    counts,
+  };
   const bundleHash = sha256(stableStringify(payload));
   return {
     version: 1,
     generatedAt: input.generatedAt,
     task,
     ...(device === undefined ? {} : { device }),
+    ...(timeline === undefined ? {} : { timeline }),
     result,
     steps,
     approvals,

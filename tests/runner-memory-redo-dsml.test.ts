@@ -136,7 +136,7 @@ test('补写轮：正文里的 DSML 调用必须被捞回并真的派发', async
         } as unknown as GovernanceApi,
       },
       // memoryRedoEnabled 默认值取决于装配层；这里显式打开，确保这条测试测的是补写轮本身
-      { idlePollMs: 5, log: (m: string) => notes.push(m), memoryRedo: true } as never,
+      { idlePollMs: 5, log: (m: string) => notes.push(m), memoryRedo: true, memoryRedoGate: false } as never,
     );
 
     const out = await (
@@ -255,7 +255,7 @@ test('补写轮：提示词说「用 fs.write 写」，请求体就必须真的�
           forceApproval: async () => ({ approvalId: 0 }),
         } as unknown as GovernanceApi,
       },
-      { idlePollMs: 5, log: (m: string) => notes.push(m), memoryRedo: true } as never,
+      { idlePollMs: 5, log: (m: string) => notes.push(m), memoryRedo: true, memoryRedoGate: false } as never,
     );
 
     await (runner as unknown as { runTask: (t: unknown) => Promise<{ status: string }> }).runTask(task);

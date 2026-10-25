@@ -254,7 +254,17 @@ export class Queue {
   pop(dotId?: string): Task | null {
     const dot = dotId ?? 'dot1';
     const level = this.deps.guardLevel();
-    if (level === 'throttled' || level === 'halted') return null;
+    // 严格保护（默认）：throttled/halted 一律停 pop（CP §4.2）。
+    // 唯一的例外是显式打开的 `allowInteractiveWhenThrottled`：只放交互任务、
+    // 且只在 throttled（不是 halted）、且当前没有在跑的任务时放行一条。
+    // 目的：机器长期低于基线时，至少还能回主人一句话；代价是容器已被 pause，
+    // 动作型工具会失败 —— 所以默认关，由运维显式承担。
+    const pressureBypass =
+      (level === 'throttled' || level === 'halted') &&
+      level === 'throttled' &&
+      this.cfg.allowInteractiveWhenThrottled &&
+      this.runningCount(dot) === 0;
+    if ((level === 'throttled' || level === 'halted') && !pressureBypass) return null;
     return tx(this.db, () => {
       const now = Date.now();
       const running = this.runningCount(dot);
@@ -274,7 +284,7 @@ export class Queue {
        * 默认配置（reserve=0, preemptible=0）下 2、3 都不成立 → 与改动前逐字一致。
        */
       let preemptVictim: string | null = null;
-      if (running >= this.cfg.maxRunningTasks) {
+      if (!pressureBypass && running >= this.cfg.maxRunningTasks) {
         const level = this.deps.guardLevel();
         if (level !== 'normal' && level !== 'guarded') return null;
         const hasInteractive =
@@ -298,6 +308,7 @@ export class Queue {
         .prepare(
           `SELECT id FROM tasks
            WHERE dot_id=? AND status='queued' AND (run_at IS NULL OR run_at<=?)
+             ${pressureBypass ? 'AND priority=1' : ''}
            ORDER BY priority ASC,
                     COALESCE(run_at, created_at) ASC,
                     resume_from_seq IS NOT NULL DESC

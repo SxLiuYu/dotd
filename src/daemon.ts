@@ -505,6 +505,39 @@ export function cpConcurrencyFromEnv(): Partial<{
 }
 
 /**
+ * 低水位行为的环境覆盖（2026-10-24）。
+ *
+ * 两个键都**只在显式设置时**覆盖默认值，未设置时完全走 DEFAULT_CP_CONFIG
+ * （与改动前逐字相同）：
+ *   - `DOTD_INTERACTIVE_UNDER_PRESSURE=1` → throttled 时仍放行一条交互任务
+ *     （默认关：容器已被 pause，动作型工具会失败）；
+ *   - `DOTD_WATERMARK_STUCK_ALERT_MS` → 队列被水位钉住多久记一次
+ *     `resource_events(kind='watermark', detail.stuck=true)`。
+ */
+export function cpPressureFromEnv(): Partial<{
+  allowInteractiveWhenThrottled: boolean;
+  watermarkStuckAlertMs: number;
+}> {
+  const out: Partial<{
+    allowInteractiveWhenThrottled: boolean;
+    watermarkStuckAlertMs: number;
+  }> = {};
+  const flag = process.env.DOTD_INTERACTIVE_UNDER_PRESSURE;
+  if (flag !== undefined && flag.length > 0) {
+    out.allowInteractiveWhenThrottled = flag === '1' || flag.toLowerCase() === 'true' || flag.toLowerCase() === 'on';
+  }
+  const raw = process.env.DOTD_WATERMARK_STUCK_ALERT_MS;
+  if (raw !== undefined && raw.length > 0) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new Error(`DOTD_WATERMARK_STUCK_ALERT_MS 非法：${raw}（要求正数毫秒）`);
+    }
+    out.watermarkStuckAlertMs = Math.round(n);
+  }
+  return out;
+}
+
+/**
  * P1-1 容器内工具并发闸的取值（**只在 `DOTD_MAX_RUNNING > 1` 时被调用**）。
  *
  * 分档依据（Lead 批准）：
@@ -892,6 +925,8 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
 
   // P1-1 并发：**显式声明才开**（默认值纪律：默认 1 = 与既有行为逐字相同）。
   const concurrencyCfg = cpConcurrencyFromEnv();
+  // 低水位行为：同样只在显式声明时覆盖（默认 = 严格保护 + 5 分钟卡住告警）。
+  const pressureCfg = cpPressureFromEnv();
 
   const cp = createControlPlane({
     db,
@@ -901,7 +936,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     blobDirAbs: blobDir,
     ...(reserveMbOverride === null ? {} : { cfg: { dotdReserveMb: reserveMbOverride } }),
     // P1-1：并发相关键只在**显式声明**时覆盖（否则完全走 DEFAULT_CP_CONFIG，行为不变）。
-    ...(Object.keys(concurrencyCfg).length === 0 ? {} : { cfg: concurrencyCfg }),
+    ...(Object.keys({ ...concurrencyCfg, ...pressureCfg }).length === 0
+      ? {}
+      : { cfg: { ...concurrencyCfg, ...pressureCfg } }),
     // 模型层（契约 T1 / CP §6.1）：事件→目标匹配的 LLM 分流走 light 轨。
     // MR 在 CP 之后 init（它要 cp 的 taskImpact/registerInternalJob），故经 holder
     // 惰性取——matcher 只在事件匹配运行期调 lowBrain.complete。
@@ -2270,6 +2307,13 @@ log(
       // 多加一轮模型调用）；这里显式打开，才让"任务 done 但没写记忆"时真的再问一轮。
       // 关掉它 = 回到老行为：sealTask 记 missed，但不会再提醒（也就不会补写）。
       memoryRedo: true,
+      // P0-1（2026-10-24）补写轮的前置闸门：**默认开**，`DOTD_MEMORY_REDO_GATE=0` 关闭。
+      //
+      // 不设闸门时，任何"没写过记忆文件"的任务（包括「3+5 等于几」）都会在收口前
+      // 多跑一轮模型（实测 1.5–1.9 s，结果全是 SKIP），而这一轮发生在 cp.finish()
+      // 之前 —— 设备一直 device_busy，连续对话每句都要多等。
+      // 关掉 = 逐字回到 2026-10-24 之前的行为（也用于 A/B 对照）。
+      memoryRedoGate: process.env.DOTD_MEMORY_REDO_GATE !== '0',
       // P2-2 显式计划：**与 memoryRedo 相反——默认关闭**，由 `DOTD_PLAN=on` 显式开启。
       // 打开后每个任务多一次模型调用（写一份 3–7 条的计划），之后每轮把它作为一条
       // system 注记带上（抗跑偏 + 可在 `dotd task --verbose` 看到）。

@@ -225,6 +225,24 @@ export interface ControlPlaneConfig {
   gcDailyAt: string;
   /** daemon 自身 RSS 软上限 MB（CP §6.3：daemonRssMaxMb=1024）。 */
   daemonRssMaxMb: number;
+  /**
+   * 低水位把队列钉住多久算"异常"（毫秒，默认 5 分钟）。
+   *
+   * 只影响**观测**：连续这么久处于 throttled/halted 且队列非空时，Guard 记一条
+   * `resource_events(kind='watermark_stuck')`（每窗口最多一次）。默认值让
+   * "真内存紧张"和"阈值配错"都能在日志/Web 上直接看见，不用再靠人守着 queue 快照
+   * （2026-10-24 真机踩过 30 分钟静默卡死）。
+   */
+  watermarkStuckAlertMs: number;
+  /**
+   * 水位 throttled 时是否仍放行**一条交互任务**（默认 false = 严格保护）。
+   *
+   * 为什么默认关：throttled 会 `pause` 容器（CP §6.3），放行的任务照样调不动工具，
+   * 只会多一条失败记录；而且标定修好之后 throttled 是**真**内存紧张，不该硬跑。
+   * 它存在是为了"机器长期低于基线、但主人仍想让它答一句"的场景，
+   * 由 `DOTD_INTERACTIVE_UNDER_PRESSURE=1` 显式打开。
+   */
+  allowInteractiveWhenThrottled: boolean;
 }
 
 /** 默认值逐条对应 config/dotd.yml 的键与 CP 正文数值。 */
@@ -251,6 +269,8 @@ export const DEFAULT_CP_CONFIG: ControlPlaneConfig = {
   gcTaskDays: 180,
   gcDailyAt: '04:00',
   daemonRssMaxMb: 1024,
+  watermarkStuckAlertMs: 5 * 60_000,
+  allowInteractiveWhenThrottled: false,
 };
 
 /** CP §5.4：args/result >32KB 时的 blob 引用前缀（契约 D6 目录树）。 */

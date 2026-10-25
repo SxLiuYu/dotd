@@ -1,0 +1,131 @@
+{
+  "ok": true,
+  "device": {
+    "id": "dev_5526897e8c47c76b",
+    "name": "fake-dev-daa6"
+  },
+  "runs": 5,
+  "passed": 5,
+  "firstDeltaP50Ms": 2263,
+  "endToEndP50Ms": 3659,
+  "endToEndP95Ms": 4749,
+  "proofSteps": 2,
+  "bundleHash": "a690375cf1292da3f577f91243584b4d525436a423bcaf8bc1ad295b01433cdb",
+  "results": [
+    {
+      "index": 0,
+      "ok": true,
+      "taskId": "tk_mvmpifxc0fyz13",
+      "threadId": "thr_01M5QH8RGTATD5G06ZP5FHEV58",
+      "deviceId": "dev_5526897e8c47c76b",
+      "status": "done",
+      "firstDeltaMs": 2905,
+      "endToEndMs": 4749,
+      "reply": "3+5 等于 8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "a690375cf1292da3f577f91243584b4d525436a423bcaf8bc1ad295b01433cdb",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_5526897e8c47c76b",
+          "name": "fake-dev-daa6",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 1,
+      "ok": true,
+      "taskId": "tk_mvmpik4tr34bb2",
+      "threadId": "thr_01M5QH8RGTATD5G06ZP5FHEV58",
+      "deviceId": "dev_5526897e8c47c76b",
+      "status": "done",
+      "firstDeltaMs": 2263,
+      "endToEndMs": 3657,
+      "reply": "8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "1bf87961c810c43e6e07c9b6a3812e52f12dba14bb0ecbd2ce976f7401fc34a3",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_5526897e8c47c76b",
+          "name": "fake-dev-daa6",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 2,
+      "ok": true,
+      "taskId": "tk_mvmpini6500s48",
+      "threadId": "thr_01M5QH8RGTATD5G06ZP5FHEV58",
+      "deviceId": "dev_5526897e8c47c76b",
+      "status": "done",
+      "firstDeltaMs": 1806,
+      "endToEndMs": 3654,
+      "reply": "8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "c710213f6906b65939f01ad176b9f7e3f4ceb541002312e8ee1ab202da71a5be",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_5526897e8c47c76b",
+          "name": "fake-dev-daa6",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 3,
+      "ok": true,
+      "taskId": "tk_mvmpiqvjoaiz6l",
+      "threadId": "thr_01M5QH8RGTATD5G06ZP5FHEV58",
+      "deviceId": "dev_5526897e8c47c76b",
+      "status": "done",
+      "firstDeltaMs": 3222,
+      "endToEndMs": 4389,
+      "reply": "8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "7aa5aeccadb07ee050d8cf9edd570ba700a0866692da478114b93491d3ca2077",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_5526897e8c47c76b",
+          "name": "fake-dev-daa6",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    },
+    {
+      "index": 4,
+      "ok": true,
+      "taskId": "tk_mvmpiutaema5go",
+      "threadId": "thr_01M5QH8RGTATD5G06ZP5FHEV58",
+      "deviceId": "dev_5526897e8c47c76b",
+      "status": "done",
+      "firstDeltaMs": 1970,
+      "endToEndMs": 3659,
+      "reply": "8。",
+      "streamReason": "stream closed",
+      "proof": {
+        "bundleHash": "9b19835b0cb5883b20da5909fe38fdf4b2fc9fe233bc6eb5bcb9992b194f74a8",
+        "steps": 2,
+        "approvals": 0,
+        "device": {
+          "id": "dev_5526897e8c47c76b",
+          "name": "fake-dev-daa6",
+          "status": "active",
+          "channel": "voice"
+        }
+      }
+    }
+  ]
+}

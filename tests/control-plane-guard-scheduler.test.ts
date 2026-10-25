@@ -53,7 +53,7 @@ function fixture(
     memMb?: number;
     /** 物理内存总量（MB）。默认 64GB，避免 CI 小内存机器触发阈值夹取。 */
     totalMb?: number;
-    cfg?: Record<string, number>;
+    cfg?: Partial<typeof DEFAULT_CP_CONFIG>;
     rules?: EventRule[];
     lowBrain?: LowBrain;
   } = {},
@@ -172,23 +172,65 @@ test('§6.3 阈值滞回与跃迁记账：每次跃迁写 resource_events(kind=w
   assert.ok(marks.length >= 2, `两次跃迁各记一条 watermark，实际 ${marks.length}`);
 });
 
-test('§6.3 calibrateOrUseFallback：未标定 → 采样 p50 成 base，阈值改为相对基线', () => {
+test('§6.3 calibrateOrUseFallback：base = 采样 p50 − 预留，稳态不得被判成 throttled', () => {
+  // 2026-10-24 修：旧实现把 p50(MemAvailable) 直接当 base，而 throttled 线 = base，
+  // 等于"回到常态就算内存紧张"——真机上任务永远 queued（queue {queued:1, running:0}）。
   const f = fixture({ memMb: 8_000 });
   f.setMem(8_000);
   f.guard.calibrateOrUseFallback();
   const st = f.guard.status();
-  assert.equal(st.baseMb, 8_000, 'base = 采样 p50');
-  // 标定后：normal≥base+6144(14144) / guarded≥base+3072(11072) / throttled≥base(8000)
+  assert.equal(st.baseMb, 1_856, 'base = 8000 − 6144（dotdReserveMb）');
+
+  // 标定后的三条线：normal=8000 / guarded=4928 / throttled=1856
   f.setMem(8_000);
   f.guard.tick();
-  assert.equal(f.guard.tick().level, 'throttled', '=base 连续两次 → throttled 档');
-  f.setMem(12_000);
+  assert.equal(f.guard.tick().level, 'normal', '稳态（= 标定中位数）必须是 normal');
+
+  f.setMem(6_000);
   f.guard.tick();
-  assert.equal(f.guard.tick().level, 'guarded', 'base+4GB 连续两次 → guarded 档');
-  f.setMem(20_000);
+  assert.equal(f.guard.tick().level, 'guarded', '低于常态 2GB → guarded');
+
+  f.setMem(4_000);
   f.guard.tick();
-  assert.equal(f.guard.tick().level, 'normal', '≥normal 线连续两次 → normal');
+  assert.equal(f.guard.tick().level, 'throttled', '低于常态 4GB（< guarded 线）→ throttled');
+
+  f.setMem(1_000);
+  f.guard.tick();
+  assert.equal(f.guard.tick().level, 'halted', '跌破 throttled 线 → halted');
 });
+
+test('§6.3 阈值顺序不变量：throttled ≤ guarded ≤ normal（配置写错也不得倒挂）', () => {
+  // 手改 fallbackThresholds 成倒挂值，不能被原样采纳
+  const f = fixture({
+    memMb: 8_000,
+    cfg: { fallbackThresholds: { normalMb: 3_000, guardedMb: 6_000, throttledMb: 9_000 } },
+  });
+  // status 里带 thresholds 的事件要等到跃迁才写；这里直接看档位判定：
+  // 8GB 可用 + 倒挂配置 → 保序后 throttled=3000/normal=3000… → 至少不能出现
+  // "available 变少反而档位更好"。用两次采样确认它落在 normal 而不是 halted。
+  f.guard.tick();
+  assert.equal(f.guard.tick().level, 'normal', '保序后 8GB 仍是正常档');
+});
+
+test('§6.3 低水位把队列钉住 → 记 watermark(stuck:true)（可观测，不静默卡死）', async () => {
+  const f = fixture({ memMb: 8_000, cfg: { watermarkStuckAlertMs: 1_000 } });
+  f.guard.calibrateOrUseFallback();
+  f.queue.submit({ title: 'queued', goal: 'g', priority: 1 });
+  // 压到 halted（连续两次）
+  f.setMem(500);
+  f.guard.tick();
+  f.guard.tick();
+  assert.equal(f.guard.currentLevel(), 'halted');
+  // 第一次 tick 只记起点；等过告警窗口后再 tick
+  await new Promise((r) => setTimeout(r, 1_100));
+  f.guard.tick();
+  f.guard.tick();
+  // kind 复用 watermark（CHECK 白名单不想为观测再重建表），靠 detail 里的 stuck 标记区分
+  const stuck = f.events.filter((e) => e.kind === 'watermark' && e.detail.includes('"stuck":true'));
+  assert.equal(stuck.length, 1, `应记且只记一条 stuck 事件，实际 ${stuck.length}`);
+  assert.match(stuck[0]!.detail, /"queued":1/, '事件里要有队列深度，方便直接看出"不是没人说话"');
+});
+
 
 test('§6.3 解冻：水位回升 → paused(watermark) 任务批量回 queued（保 priority）', () => {
   const f = fixture({ memMb: 20_000 });
@@ -674,4 +716,45 @@ test('CP §8-S8：仍在降级态（to=TOTAL_OUTAGE/EMERGENCY/RESTRICTED）不�
   } finally {
     cp.shutdown();
   }
+});
+
+test('§6.3 throttled 下的交互豁免：默认关；显式打开后只放一条交互任务、halted 仍不放', () => {
+  let level: 'normal' | 'guarded' | 'throttled' | 'halted' = 'normal';
+  const record = (): void => {};
+
+  // 默认（allowInteractiveWhenThrottled=false）：throttled 一律不放行 —— 与改动前逐字一致
+  const tmpStrict = makeTempDataDir();
+  tmps.push(tmpStrict);
+  const strict = new Queue({
+    db: tmpStrict.db,
+    cfg: DEFAULT_CP_CONFIG,
+    bus: tmpStrict.bus,
+    guardLevel: () => level,
+    record,
+  });
+  strict.submit({ title: 'bg', goal: 'g', priority: 3 });
+  strict.submit({ title: 'it', goal: 'g', priority: 1 });
+  level = 'throttled';
+  assert.equal(strict.pop(), null, '默认严格保护：throttled 不放任何任务');
+
+  // 显式打开：throttled 时只放交互任务（priority=1），且同一时刻只放一条
+  const tmpRelaxed = makeTempDataDir();
+  tmps.push(tmpRelaxed);
+  const cfg = { ...DEFAULT_CP_CONFIG, allowInteractiveWhenThrottled: true };
+  const relaxed = new Queue({
+    db: tmpRelaxed.db,
+    cfg,
+    bus: tmpRelaxed.bus,
+    guardLevel: () => level,
+    record,
+  });
+  relaxed.submit({ title: 'bg', goal: 'g', priority: 3 });
+  const it = relaxed.submit({ title: 'it', goal: 'g', priority: 1 });
+  const first = relaxed.pop();
+  assert.equal(first?.id, it.id, '只放交互任务，后台任务继续等');
+  assert.equal(relaxed.pop(), null, 'running=1 时不再放第二条（豁免也只放一条）');
+
+  level = 'halted';
+  relaxed.finish(it.id, first!.runEpoch, { ok: true, summary: 'x' });
+  assert.equal(relaxed.pop(), null, 'halted 是硬保护，豁免不生效');
 });

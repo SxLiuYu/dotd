@@ -80,6 +80,9 @@ export class Guard {
   /** 防抖状态：连续同向采样的目标档与计数（见 applyLevel）。 */
   private debounceTo: GuardLevel | null = null;
   private debounceCount = 0;
+  /** 低水位钉住队列的起点（见 checkStuckQueue）。 */
+  private stuckSince: number | null = null;
+  private lastStuckAlertAt = 0;
   private readonly deps: GuardDeps;
   private readonly cfg: ControlPlaneConfig;
 
@@ -106,13 +109,37 @@ export class Guard {
     }
     this.sample();
     if (this.samples.length === 0) return;
-    this.baseMb = percentile(this.samples, 0.5);
+    this.baseMb = this.baseFromSamples();
     this.calibrating = false;
     this.deps.record(
       'watermark',
       'normal',
-      JSON.stringify({ calibrated: true, baseMb: this.baseMb }),
+      JSON.stringify({
+        calibrated: true,
+        baseMb: this.baseMb,
+        sampledP50Mb: percentile(this.samples, 0.5),
+        reserveMb: this.cfg.dotdReserveMb,
+      }),
     );
+  }
+
+  /**
+   * 基线 = 「平常可用内存」减去预留（2026-10-24 修）。
+   *
+   * 旧实现把 p50(MemAvailable) **直接**当 base，而阈值是
+   * `normal = base + reserve / throttled = base` —— 等于把「内存紧张」的门槛
+   * 定在了平常值上：机器一回到常态，就有约一半采样落在 `< base`，
+   * 连续两次就进 throttled，`pop()` 返回 null，任务永远停在 queued
+   * （真机现场 `queue {queued:1, running:0}`，见
+   * docs/acceptance/voice-real-latency/REPORT.md）。
+   *
+   * 减去 reserve 之后三条线才落地：
+   *   normal = p50（平常可用）；throttled = p50 − reserve（比常态低 6GB 才算紧张）。
+   * 公式没动，只改 base 的语义：从「平常可用」改成「平常可用扣掉必须留的余量」。
+   */
+  private baseFromSamples(): number {
+    const p50 = percentile(this.samples, 0.5);
+    return Math.max(0, Math.round(p50 - this.cfg.dotdReserveMb));
   }
 
   /** 每 5s 的 memory guard 主循环（CP §6.3 / CP §2.1-④）。 */
@@ -122,18 +149,25 @@ export class Guard {
       this.sample(mem.availableMb);
       const elapsed = Date.now() - this.calibrateStartedAt;
       if (elapsed >= this.cfg.calibrateMs || this.samples.length >= 360) {
-        this.baseMb = percentile(this.samples, 0.5);
+        this.baseMb = this.baseFromSamples();
         this.calibrating = false;
         this.deps.record(
           'watermark',
           'normal',
-          JSON.stringify({ calibrated: true, baseMb: this.baseMb, samples: this.samples.length }),
+          JSON.stringify({
+            calibrated: true,
+            baseMb: this.baseMb,
+            sampledP50Mb: percentile(this.samples, 0.5),
+            reserveMb: this.cfg.dotdReserveMb,
+            samples: this.samples.length,
+          }),
         );
       }
     }
     this.applyLevel(mem.availableMb);
     this.checkDaemonRss();
     this.unfreezeIfRecovered();
+    this.checkStuckQueue(mem.availableMb);
     return this.status(mem.availableMb);
   }
 
@@ -225,7 +259,9 @@ export class Guard {
    */
   private thresholds(): { normalMb: number; guardedMb: number; throttledMb: number } {
     if (this.baseMb === null) {
-      return { ...this.cfg.fallbackThresholds };
+      // 兜底阈值也要过同一套夹取/保序：手改 config 写出倒挂值时，
+      // 原样采纳会让档位判定自相矛盾（"越紧张越 normal"）。
+      return this.clampThresholdsToPhysical({ ...this.cfg.fallbackThresholds });
     }
     const base = this.baseMb;
     const raw = {
@@ -251,11 +287,15 @@ export class Guard {
     if (!Number.isFinite(totalMb) || totalMb <= 0) return t;
     const ceiling = Math.max(1, totalMb - this.cfg.dotdReserveMb);
     const clamp = (v: number): number => Math.max(0, Math.min(v, ceiling));
-    return {
-      normalMb: clamp(t.normalMb),
-      guardedMb: clamp(t.guardedMb),
-      throttledMb: clamp(t.throttledMb),
-    };
+    // 顺序不变量（2026-10-24 补）：throttled ≤ guarded ≤ normal。
+    // 单看每个 clamp 是单调的，但配置写错（比如 reserve 大于 3GB 时的相对关系、
+    // 或手改 fallbackThresholds）会得到"normal < throttled"这种自相矛盾的档位，
+    // 表现为永远进不去的档。这里显式取 min 保序，异常配置只会更难触发降档，
+    // 不会出现"越紧张越 normal"。
+    const normalMb = clamp(t.normalMb);
+    const guardedMb = Math.min(clamp(t.guardedMb), normalMb);
+    const throttledMb = Math.min(clamp(t.throttledMb), guardedMb);
+    return { normalMb, guardedMb, throttledMb };
   }
 
   private readTotalMb(): number {
@@ -295,6 +335,62 @@ export class Guard {
         }
       }
     }
+  }
+
+  /**
+   * 低水位把队列钉住了就说话（2026-10-24）。
+   *
+   * 只观测、不改调度：连续 `watermarkStuckAlertMs` 处于 throttled/halted 且队列里
+   * 还有 queued 任务时，记一条 `resource_events(kind='watermark', detail.stuck=true)`，每个窗口
+   * 最多一条。没有它，"任务永远 queued"在日志里是一片空白 —— 2026-10-24 真机
+   * 就是这样静默卡了半小时，只能靠人肉看 queue 快照才定位到。
+   *
+   * 为什么不在这里顺手"放行一条"：throttled 已按 §6.3 pause 了容器，硬放行只会
+   * 让任务在调工具时失败。需要这种行为时用 `allowInteractiveWhenThrottled`
+   * （在 Queue.pop 里实现，作用面明确）。
+   */
+  private checkStuckQueue(memAvailableMb: number): void {
+    if (this.level !== 'throttled' && this.level !== 'halted') {
+      this.stuckSince = null;
+      return;
+    }
+    let queued = 0;
+    try {
+      queued = this.deps.queue.list({ status: ['queued'], limit: 5 }).length;
+    } catch {
+      return;
+    }
+    if (queued === 0) {
+      this.stuckSince = null;
+      return;
+    }
+    const now = Date.now();
+    if (this.stuckSince === null) {
+      this.stuckSince = now;
+      return;
+    }
+    const windowMs = Math.max(1_000, this.cfg.watermarkStuckAlertMs);
+    if (now - this.stuckSince < windowMs) return;
+    if (now - this.lastStuckAlertAt < windowMs) return;
+    this.lastStuckAlertAt = now;
+    // 用既有的 `watermark` kind + `stuck: true` 标记，而不是新增一个 kind：
+    // resource_events.kind 有 CHECK 白名单（见默认 000/120），加值必须重建表，
+    // 而模板库回放会把两次重建的 `CREATE TABLE ..._new` 撞在一起（实测）。
+    // 观测语义不受影响：`kind='watermark' AND detail LIKE '%"stuck":true%'` 即可筛。
+    this.deps.record(
+      'watermark',
+      this.level,
+      JSON.stringify({
+        stuck: true,
+        level: this.level,
+        queued,
+        stuckMs: now - this.stuckSince,
+        memAvailableMb,
+        baseMb: this.baseMb,
+        thresholds: this.thresholds(),
+        hint: '水位把 pop 钉住了；若物理内存并不紧张，检查标定基线/DOTD_GUARD_BASE_MB',
+      }),
+    );
   }
 
   /** 解冻路径（CP §6.3 补 issue #4 缺口）：水位回升对本模块曾 pause 过的集合 unpause。 */

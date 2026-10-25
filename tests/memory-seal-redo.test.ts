@@ -257,7 +257,11 @@ async function makeRig(opts: {
       memory: memApi,
       governance,
     },
-    opts.defaultRedo === false ? { ...opts.runnerOpts } : { memoryRedo: true, ...opts.runnerOpts },
+    // 本组测的是补写轮**本身**的机制（是否触发、顺序、结果），所以显式关掉
+    // 2026-10-24 加的前置闸门；闸门自己的行为由 tests/runner-memory-redo-gate.test.ts 专测。
+    opts.defaultRedo === false
+      ? { ...opts.runnerOpts }
+      : { memoryRedo: true, memoryRedoGate: false, ...opts.runnerOpts },
   );
 
   return {

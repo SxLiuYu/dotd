@@ -5,6 +5,11 @@
 >
 > 所有数字都来自本机实测，时间线原始数据在
 > `docs/acceptance/model-latency/e2e-timeline.txt`。
+>
+> **落地状态（2026-10-24 晚）：P0-1 / P0-2 / P1-6 已实现并本机验证，P1-3 只落地了
+> 启动预热（未重测首包）；P2 三项未动，按计划需要先评审。** 每节末尾的
+> 「✅ 已落地」写的是**实际做法与计划不一致的地方**，验收证据在
+> `docs/acceptance/model-latency/e2e-gate-off.json` / `e2e-gate-on.json`。
 
 ---
 
@@ -33,15 +38,32 @@
 
 ## 1. 优化项总表
 
-| # | 项目 | 收益 | 工作量 | 风险 | 优先级 |
+| # | 项目 | 优先级 | 状态 | 本机实测 | 备注 |
 |---|---|---|---|---|---|
-| 1 | 补写轮的零成本前置判据 + 节流 | 每轮 −1.5~1.9 s（连续对话），−40% 任务时长 | 0.5 天 | 中（可能漏记口头偏好）| **P0** |
-| 2 | guard 基线取 p50 当门槛 | 消除"任务永久停在 queued" | 0.5 天 | 低（有测试）| **P0** |
-| 3 | TTS 首包：缓存 + 连接预热 | 首句 −0.6~1.0 s | 0.5–1 天 | 低 | **P1** |
-| 4 | 补写轮挪到 finish 之后（后台）| 设备立即解锁，再省 0.1–0.3 s | 1–2 天 | 高（动 §4.3 契约）| P2 |
-| 5 | 工具清单/记忆按需裁剪 | 每轮少 10–14 k 输入 tokens（成本，不是延迟）| 1–2 天 | 中（漏召回）| P2 |
-| 6 | 分段耗时入库 + 延迟回归门禁 | 以后不用再手工拆 | 0.5 天 | 低 | **P1** |
-| 7 | light 轨换本地/直连小模型 | light 调用 1.4 s → <0.3 s | 需外部条件 | 中 | P3 |
+| 1 | 补写轮的零成本前置判据 + 节流 | **P0** | ✅ 已落地，默认开 | 尾段中位 **1689 ms → 57 ms**；e2e P50 3.66 → 2.19 s | `DOTD_MEMORY_REDO_GATE=0` 回退 |
+| 2 | guard 基线取 p50 当门槛 | **P0** | ✅ 已落地 | 稳态不再进 throttled；顺序不变量有测试 | 告警复用 `watermark`，不加迁移 |
+| 3 | TTS 首包：缓存 + 连接预热 | **P1** | 🟡 只做了启动预热 | 无实测首包数字（见 §4） | 缓存是进程内 LRU，不是磁盘 |
+| 4 | 补写轮挪到 finish 之后（后台）| P2 | ⬜ 未做（需评审） | — | 动 §4.3 契约 |
+| 5 | 工具清单/记忆按需裁剪 | P2 | ⬜ 未做 | — | 只影响成本，不影响延迟 |
+| 6 | 分段耗时入库 + 延迟回归门禁 | **P1** | ✅ 时间线已落地；CI 门禁未加 | 示例：setup 700 / llm 1540 / tail 8 ms | 不入库的原因见 §5 |
+| 7 | light 轨换本地/直连小模型 | P3 | ⬜ 未做 | — | 需新增依赖 |
+| 8 | setup 段 0.3–1.0 s | P2 候选 | 🆕 被 P1-6 量出来 | 单轮 700 ms | 闸门生效后占一轮 1/3 |
+
+---
+
+## 1.1 当场能看到的收益（gate 关/开各 5 轮，同批）
+
+| 指标 | gate 关（改前行为）| gate 开（默认）|
+|---|---|---|
+| 通过率 | 5/5 | 5/5 |
+| 首增量 P50 | 2263 ms | 2003 ms |
+| 端到端 P50 | 3659 ms | **2186 ms** |
+| 端到端 P95 | 4749 ms | **2563 ms** |
+| 尾段（e2e − 首增量）中位 | **1689 ms** | **57 ms** |
+
+尾段才是补写轮的成本：改前每一轮都多 1.2–1.8 s，改后中位 57 ms。
+验收线「`endToEnd − firstDelta < 300 ms`」按**同一任务**的差算中位，达标。
+
 
 ---
 
@@ -95,10 +117,35 @@ return paths.filter(isMemoryWritePathLoose).length === 0;   // 没写过记忆�
   （改前差 1.5–1.9 s，改后应 < 0.3 s）。
 - 反向验证：让一个任务真的写 `notes/2026-10-24-x.md`，确认不会被跳过、也不会重复写。
 
+### ✅ 已落地（2026-10-24）：与计划不一致的四处
+
+实现：`Runner.shouldAskMemoryRedo()`（`src/runner/dot.ts`），在
+`memoryWriteRedo` 调模型之前执行；判据顺序 = 偏好词 → 零工具+短答 → 同 thread 节流。
+
+1. **开关不在 `config/dotd.yml`，而是 `RunnerOptions.memoryRedoGate` +
+   `DOTD_MEMORY_REDO_GATE=0`**。`memoryRedo` 本身就是在装配层显式声明的，闸门跟着
+   同一个位置走，避免为 runner 再引一条配置读取路径。
+2. **节流只作用于"零工具"任务**；派发过工具的任务永不节流。有工具的那批才是真正
+   可能留经验的任务，数量又远少于闲聊；对它们节流省不了多少，却直接漏记。
+3. **补写轮没有切到 light 轨**（计划 §2 改法 B）。闸门已经消掉绝大多数轮次，剩下的
+   是"确实值得判断一次"的；此时换轨只改变少数调用，而当前 light 与 primary 同模型
+   （零即时收益），却多一处行为差异。等 light 真换成更快模型时再做。
+4. **偏好词是子串命中 goal 或 summary**，所以「不要」这类宽词会误触发补写。
+   这是刻意的保守方向：宁可多花 1.5 s，也不漏记一句口头偏好。
+
+验证：
+- `tests/runner-memory-redo-gate.test.ts` 6 条：零工具短答跳过 / goal 或回复命中偏好词
+  仍补写 / 同 thread 30 分钟内第二次跳过 / 有工具的任务不被节流 / 闸门关 = 老行为。
+- 真 daemon A/B（临时 home + 7799 + fake-device，不碰 7788）：见 §1.1；
+  gate-on 那批日志里 5 条 `补写轮跳过`，`/api/tasks/:id/proof` 的
+  `timeline.memoryRedoMs` 为 `null`。
+- `tests/memory-seal-redo.test.ts` / `runner-memory-redo-dsml.test.ts` 显式传
+  `memoryRedoGate: false`，保证补写机制本身仍被覆盖。
+
 ### 回退
 
-判据全部走一个配置开关（`config/dotd.yml` 的 memory 段，默认开）；
-关掉即逐字回到当前行为。
+`DOTD_MEMORY_REDO_GATE=0`（或 `RunnerOptions.memoryRedoGate: false`）= 逐字回到
+2026-10-24 之前的行为（每个 done 任务都问一轮）。
 
 ---
 
@@ -140,6 +187,30 @@ throttled = base           halted  < base
   - 阈值顺序不变量（含 total 很小的机器）。
 - 本机跑一天，确认 `resource_events` 里不再出现"常态即 throttled"。
 
+### ✅ 已落地（2026-10-24）：三处与计划不一致
+
+1. **兜底放行默认关**（计划写"默认开"）。`throttled` 时容器已按 §6.3 pause，
+   硬放行会让动作型工具执行到一半失败——比排队更糟。所以默认只**告警**
+   （5 分钟一条），需要放行时显式 `DOTD_INTERACTIVE_UNDER_PRESSURE=1`
+   （只放行 `priority=1` 的交互任务，且 `running=0`，`halted` 不受影响）。
+2. **没有新增 `resource_events.kind`**。该列有 CHECK 白名单，加值要重建表；实测重建
+   会和模板库回放撞车（`table resource_events_new already exists`）。改成复用
+   `kind='watermark'` + `detail.stuck=true`，筛选语义等价：
+   `kind='watermark' AND detail LIKE '%"stuck":true%'`。
+3. **测试按新的相对语义写，没按"低 5 GB / 低 7 GB"的字面**。阈值本来就相对 `base`，
+   写死 GB 差会把 3072 的预留一起算进去。断言改为：`available = base` → throttled；
+   `base+4 G` → guarded；`≥ base+6 G` → normal，且"稳态 = 标定中位数"必须 normal。
+
+实现位置：`baseFromSamples()`（p50 − `dotdReserveMb`）、`clampThresholdsToPhysical()`
+（三条线顺序 + 物理上限，兜底路径也走它）、`Guard.checkStuckQueue()`。
+
+验证：`tests/control-plane-guard-scheduler.test.ts` —— 标定后稳态 normal、逐级降档、
+倒置兜底阈值仍得出 normal、卡住 1 s 窗口内恰好 1 条告警、严格/宽松两组 DB 对比
+节流放行只挑交互任务且 `halted` 不受影响。全量 `npm test` 2007/2007。
+
+**未完成**：真机 7788 按约束没有重启，所以"跑一天不再出现常态 throttled"这条
+只是单测 + 标定路径的结论，需要下次重启后看 `resource_events` 确认。
+
 ---
 
 ## 4. P1-3：TTS 首包 1.1 s
@@ -172,6 +243,26 @@ for sentence, full_reply in brain_stream_sentences(text):
 - 复用 `voice/integration/test_real_audio.py` 的测法，量
   "文本出第一句 → 首个 Opus 帧"的时间；目标 < 400 ms（缓存命中）/ < 800 ms（预热后）。
 
+### ✅ 已落地（部分，2026-10-24）
+
+实现：`voice/integration/tts_warm.py`（启动后在守护线程里合成 3 句固定话术，
+写入进程内缓存；`DOTD_TTS_WARM=0` 关，`DOTD_TTS_WARM_PHRASES="a|b"` 换话术），
+由 `one_system.py` 在 `import voice_server` 之后触发。失败只打日志、不阻塞启动。
+测试：`voice/integration/test_tts_warm.py`（5 条，假 `agent.asr_tts`）+
+`tests/voice-tts-warm.test.ts` 包装成 `npm test` 的一部分。
+
+三件必须说清楚的事：
+
+1. **计划里"复用磁盘缓存"是错的**。实际缓存是**进程内 LRU**（`asr_tts.py:86`），
+   不是磁盘。所以预热只在本进程生命周期内有效；重启后第一次仍要付 1.1 s。
+   要做跨重启，得给上游加磁盘层（改 Charlie 的缓存实现），本次没动。
+2. **没有重测"文本首句 → 首个 Opus 帧"**。真音频测量要 Whisper/SenseVoice 模型和
+   真设备音频通路，临时环境只能证明预热调用成功、第二次调用命中缓存；
+   所以这一项的收益**没有实测数字**，只有机制。
+3. **预期收益比计划低**。`stream_voice_pipeline` 已经是按句合成，切句在第一个逗号
+   就 flush，所以那 1.1 s 主要是供应商建连 + 首包；预热只能摊掉建连那一段。
+   下一个数量级要换引擎（本地 SAPI / 本地 TTS），会改变音色——产品决策，没做。
+
 ---
 
 ## 5. P1-6：把分段耗时留下来
@@ -184,6 +275,30 @@ for sentence, full_reply in brain_stream_sentences(text):
 - `/api/tasks/:id/proof` 返回这条时间线；`--verbose` 直接打印。
 - CI 里加**不联网**的回归门禁：stub 传输下 e2e P50 超过基线 20% 就红
   （防止以后某次改动悄悄给每轮加了 1 s）。
+
+### ✅ 已落地（2026-10-24）：入库 → 进 proof，CI 门禁刻意没加
+
+实现：`src/shared/timeline.ts` 的 `computeTimeline()`，`buildProof()` 把它写进
+`/api/tasks/:id/proof` 的 `timeline`（**只在有 steps 时出现**，没 steps 的老任务
+proof hash 逐字不变）：
+
+```json
+{"totalMs":2248,"setupMs":700,"llmMs":[1540],"toolMs":[],
+ "llmTotalMs":1540,"toolTotalMs":0,"memoryRedoMs":null,"tailMs":8}
+```
+
+- **没有入库新列/新表**：`steps` 已经是事实来源，另存一份会漂移；而且迁移有模板库
+  回放冲突风险（同 §3）。代价是只能查仍保留 steps 的任务，不能跨任务 SQL 聚合。
+- **没有加 CI 延迟门禁**：网关延迟同一天不同时段能差 10 倍（§9），绝对阈值必然
+  flaky。现在给的是"每个任务可回看时间线"；要做趋势得先有离线上报，不在本次范围。
+- 补写轮的识别靠 `argsJson` 里的 `MEMORY_REDO_MARK`（`src/shared/timeline.ts`），
+  和 runner 用的是同一个常量，改提示词不会悄悄让时间线失效。
+- 测试：`tests/proof-timeline.test.ts` 6 条（四段拆分、redo 标记、无 steps 返回
+  null、脏数据不抛、proof 与 timeline 一致、无 steps 时不出现 `timeline` 键）。
+
+**🆕 这条时间线第一次量出的新问题**：`setupMs ≈ 700 ms`（建 session、拼上下文、
+取工具清单）。闸门生效后一轮约 2.2 s，setup 已占三分之一。列成 P2 候选（#8），
+本次没做。
 
 ---
 
@@ -223,14 +338,15 @@ for sentence, full_reply in brain_stream_sentences(text):
 
 ---
 
-## 8. 落地顺序
+## 8. 落地顺序（含完成状态）
 
-1. **第一批（P0，1 天）**：guard 基线修 + 补写轮闸门。
-   验收：本机连续跑 20 轮语音，无 `queued` 卡死；`endToEnd − firstDelta < 300 ms`；
-   `npm test` 全绿。
-2. **第二批（P1，1–2 天）**：TTS 缓存/预热 + 分段耗时入库。
-   验收：首句 < 800 ms；`/api/tasks/:id/proof` 能看到分段。
-3. **第三批（P2，需评审）**：补写轮异步化、prompt 裁剪、light 轨本地化。
+1. ✅ **第一批（P0）**：guard 基线修 + 补写轮闸门。
+   验收：`endToEnd − firstDelta` 中位 57 ms（线 < 300 ms）✅；`npm test` 2007/2007 ✅；
+   "连续 20 轮无 `queued` 卡死" ⏳ —— 真机 7788 未重启，等下次重启后观察。
+2. 🟡 **第二批（P1）**：分段耗时入库 ✅（进 proof）；TTS 缓存/预热 🟡（只做启动预热，
+   首包未重测）。验收"首句 < 800 ms"**未验证**。
+3. ⬜ **第三批（P2，需评审）**：补写轮异步化、prompt 裁剪、light 轨本地化，
+   以及新量的 #8（setup 段 700 ms）。一项都没开始。
 
 ---
 
@@ -241,3 +357,11 @@ for sentence, full_reply in brain_stream_sentences(text):
 - 网关延迟随负载漂移：同一天不同时段同一个模型能差 10 倍（见
   `voice-real-latency/REPORT.md` 的补充段）。**方案里的绝对值只在同一批测量内可比**，
   验收要以"同批 A/B 的差"为准，不要拿绝对值卡门禁。
+- gate A/B 只有 5 轮、单 thread、fake-device：覆盖了 HTTP 设备协议，不覆盖 ESP32
+  固件与真麦克风。
+- "闸门不会漏记"只在偏好词和工具路径上做了推理与单测，没有跑一周真实语音语料。
+  如果发现漏记，第一手证据是 `memory_redo` 的 `SKIP` 与后续"忘了我说过"的抱怨，
+  回退开关是一条环境变量。
+- TTS 预热只对固定话术有效，且只在本进程生命周期内（缓存是进程内 LRU）；
+  跨重启要改上游缓存实现。
+- guard 的新基线在**单测与标定路径**上验证过，真机 7788 未重启，实际水位表现待观察。

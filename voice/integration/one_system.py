@@ -762,6 +762,16 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     import voice_server  # noqa: E402
 
+    # 固定话术的 TTS 预热（2026-10-24）：让「嗯嗯，我在。」这类每次重复的短句
+    # 在启动阶段就进缓存，避免第一句话多等 1.1 s 的 Edge TTS 首包。
+    # 守护线程，失败只记日志；DOTD_TTS_WARM=0 可关。
+    try:
+        from voice.integration.tts_warm import warm_async
+
+        warm_async()
+    except Exception as exc:  # 预热是增强项，绝不能影响启动
+        print(f"[one-system] TTS 预热未启动：{exc}", file=sys.stderr)
+
     install_one_system(voice_server.app, sup, token, dotd_port)
 
     port = args.port or voice_server.http_port()

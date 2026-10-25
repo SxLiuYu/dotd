@@ -63,6 +63,7 @@ import type {
 import { AllEndpointsDownError, DotdError, NoQualifiedPrimaryError, StepLimitError, StreamInterruptedError } from '../shared/errors.ts';
 import { recoverTextToolCalls, stripTextToolCalls } from '../shared/recover-text-calls.ts';
 import { newNonJournalAttemptId } from '../shared/ids.ts';
+import { MEMORY_REDO_MARK } from '../shared/timeline.ts';
 import { composeSystemPrompt } from './system-prompt.ts';
 import { buildToolSpecs } from './tool-catalog.ts';
 import {
@@ -160,6 +161,38 @@ const SAME_PATH_REWRITE_LIMIT = 3;
  */
 const REPEAT_MAX_SKIPS = 2;
 
+/**
+ * 补写轮闸门的"偏好词"（2026-10-24）。
+ *
+ * 为什么单列一张词表而不是只看工具有没有派发：主人可能**一句工具都没用**，
+ * 但说了"以后都用中文回我""别在周末提醒我" —— 这正是最该进长期记忆的东西。
+ * 漏掉它的代价（下次还犯）比多问一轮模型（1.5 s）大得多，所以命中就照常问。
+ *
+ * 只做子串匹配、不做语义判断：误判的代价是多跑一轮，代价可接受；
+ * 反过来漏判会静默丢偏好，那才是真损失。
+ */
+const MEMORY_PREFERENCE_HINTS = [
+  '记住',
+  '以后',
+  '今后',
+  '往后',
+  '每次都',
+  '一直',
+  '默认',
+  '我喜欢',
+  '我讨厌',
+  '我不喜欢',
+  '不要',
+  '别再',
+  '叫我',
+  '我的偏好',
+  'remember',
+  'from now on',
+  'always ',
+  'never ',
+] as const;
+
+
 // ── 1. 依赖面 ────────────────────────────────────────────────────────────
 
 export interface RunnerDeps {
@@ -227,6 +260,29 @@ export interface RunnerOptions {
    * 关着 = 老行为：sealTask 记 missed，但不会再提醒（也就不会补写）。
    */
   memoryRedo?: boolean;
+  /**
+   * 补写轮的**零成本前置闸门**（2026-10-24，默认 true；`memoryRedo` 关着时无意义）。
+   *
+   * 为什么要有：`needsMemoryRedo` 的判据是"这次没写过记忆文件"，对任何没写 notes 的
+   * 任务都成立，于是「3+5 等于几」也会在收口前多跑一轮模型。实测那一轮 1.5–1.9 s、
+   * 9 次全回 SKIP；而它发生在 `cp.finish()` **之前** —— 设备在这段时间里一直
+   * `device_busy`，连续对话每句都要多等这么久。
+   * （证据：docs/acceptance/model-latency/e2e-timeline.txt）
+   *
+   * 闸门只做本地判断，不调模型：
+   *   1. 目标或回答命中偏好词（记住/以后/不要…）→ **照常补写**（纯口头偏好也可能值得记）；
+   *   2. 本任务一个工具都没派发过、且回答短于 `memoryRedoSkipReplyChars` → 跳过；
+   *   3. 同一 thread 在 `memoryRedoThrottleMs` 内已问过一轮、且本任务没派发工具 → 跳过。
+   *
+   * 关掉（false）= 逐字回到 2026-10-24 之前的行为（每个 done 任务都问一轮）。
+   */
+  memoryRedoGate?: boolean;
+  /** 闸门 2 的"短回答"阈值（默认 120 字）。 */
+  memoryRedoSkipReplyChars?: number;
+  /** 闸门 3 的同 thread 节流窗口（默认 30 分钟）。 */
+  memoryRedoThrottleMs?: number;
+  /** 可注入时钟（测试用；缺省 Date.now）。 */
+  now?: () => number;
   /**
    * P2-2 显式计划开关。
    *
@@ -1042,6 +1098,14 @@ export class DotRunner {
   private readonly streamFlushChars: number;
   /** P1-4：收口前"补写一轮"开关（RunnerOptions.memoryRedo，默认开）。 */
   private readonly memoryRedoEnabled: boolean;
+  /** P1-4 闸门：零成本前置判断（默认开；关掉回到"每个 done 任务都问一轮"）。 */
+  private readonly memoryRedoGate: boolean;
+  private readonly memoryRedoSkipReplyChars: number;
+  private readonly memoryRedoThrottleMs: number;
+  /** 每个 thread 上一次真正发出补写轮的时刻（进程内即可：节流丢掉一条不致命）。 */
+  private readonly memoryRedoAt = new Map<string, number>();
+  /** 可注入时钟（测试确定性；缺省 Date.now）。 */
+  private readonly clock: () => number;
   /** P2-2：显式计划开关（RunnerOptions.plan，**默认关** —— 见 RunnerOptions 注释）。 */
   private readonly planEnabled: boolean;
   /** P2-2：每 N 轮提示模型"要不要修订计划"（0 = 不主动提示，只靠模型自发）。 */
@@ -1158,6 +1222,10 @@ export class DotRunner {
     this.streamFlushMs = opts.streamFlushMs ?? STREAM_FLUSH_MS;
     this.streamFlushChars = opts.streamFlushChars ?? STREAM_FLUSH_CHARS;
     this.memoryRedoEnabled = opts.memoryRedo ?? false;
+    this.memoryRedoGate = opts.memoryRedoGate ?? true;
+    this.memoryRedoSkipReplyChars = opts.memoryRedoSkipReplyChars ?? 120;
+    this.memoryRedoThrottleMs = opts.memoryRedoThrottleMs ?? 30 * 60_000;
+    this.clock = opts.now ?? (() => Date.now());
     this.planEnabled = opts.plan ?? false;
     this.planRefreshEvery = opts.planRefreshEvery ?? 0;
   }
@@ -2951,7 +3019,7 @@ export class DotRunner {
     // 该补就真跑一轮（memoryWriteRedo），然后才 finish —— 这样补写轮里的
     // fs.write 落在**任务仍 running** 的时间窗内，journal/心跳/围栏全部照常成立。
     if (r.ok) {
-      await this.memoryWriteRedo(task, epoch);
+      await this.memoryWriteRedo(task, epoch, r.summary);
     }
     // P1-2：会话摘要也在收口前触发（同样因为 finish 之后主循环已退出）。
     // 与补写轮的顺序：先补写（可能产生新的 notes），再摘要（把本轮的对话压进去）。
@@ -3012,10 +3080,59 @@ export class DotRunner {
    * 任何异常都吞掉并记日志：记忆问题不炸主循环（memory.md §8 软线），
    * 补写失败绝不能把一个本来成功的任务拖成失败。
    */
-  private async memoryWriteRedo(task: Task, epoch: number): Promise<void> {
+  /**
+   * 补写轮该不该问（纯本地判断，不调模型）。
+   *
+   * 三条规则（顺序即优先级），任何一条命中"跳过"就省掉一次 1.5 s 级模型往返：
+   *   1. 偏好词命中 → **必须问**（纯口头偏好没有工具，但最值得记）；
+   *   2. 零工具 + 短回答 → 跳过（"3+5 等于几"这类，没有任何可沉淀的做法）；
+   *   3. 同 thread 节流窗口内已问过 + 本任务零工具 → 跳过（连续对话只问一次）。
+   *
+   * 有工具的任务**不受节流限制**：动作型任务才是记忆的主要来源。
+   * 注：`toolCallCounts` 在 `resetRepeatGuard` 之前仍是本任务的账本
+   * （finishTask 之后才清），所以这里读到的是真实调用次数。
+   */
+  private shouldAskMemoryRedo(task: Task, summary: string): boolean {
+    if (!this.memoryRedoGate) return true;
+
+    const text = `${task.goal}\n${summary}`.toLowerCase();
+    const prefers = MEMORY_PREFERENCE_HINTS.some((h) => text.includes(h.toLowerCase()));
+    if (prefers) return true;
+
+    const perTool = this.toolCallCounts.get(task.id);
+    let toolCalls = 0;
+    if (perTool !== undefined) {
+      for (const n of perTool.values()) toolCalls += n;
+    }
+
+    if (toolCalls === 0 && summary.trim().length < this.memoryRedoSkipReplyChars) {
+      this.log(
+        `runner: 补写轮跳过（零工具 + 短回答 ${summary.trim().length} 字，无可沉淀内容）${task.id}`,
+      );
+      return false;
+    }
+
+    if (toolCalls === 0) {
+      const threadId = this.threadIdOf(task);
+      const last = threadId === null ? undefined : this.memoryRedoAt.get(threadId);
+      if (last !== undefined && this.clock() - last < this.memoryRedoThrottleMs) {
+        this.log(
+          `runner: 补写轮跳过（同 thread ${Math.round((this.clock() - last) / 1000)}s 内已问过）${task.id}`,
+        );
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async memoryWriteRedo(task: Task, epoch: number, summary: string): Promise<void> {
     if (!this.memoryRedoEnabled) return;
     // 任务可能已被看门狗/背压改道：不再替它跑任何回合（epoch 围栏由 CP 兜底，这里先省掉调用）
     if (this.cp.getTask(task.id)?.status !== 'running') return;
+
+    // 零成本闸门（见 RunnerOptions.memoryRedoGate）：绝大多数短问答在这里就结束，
+    // 不产生任何模型调用，也不让设备多等 1.5 s。
+    if (!this.shouldAskMemoryRedo(task, summary)) return;
 
     let need = false;
     try {
@@ -3028,6 +3145,11 @@ export class DotRunner {
       return;
     }
     if (!need) return;
+
+    // 节流记账：无论这一轮结果是不是 SKIP，都算"刚问过"——
+    // 否则连续短对话会每句都完整跑一遍判定，节流等于没做。
+    const redoThreadId = this.threadIdOf(task);
+    if (redoThreadId !== null) this.memoryRedoAt.set(redoThreadId, this.clock());
 
     // injectOnce：先记账再问——即使这一轮模型崩溃/超时，也不会在下一 attempt 里重复提醒
     try {
@@ -3257,8 +3379,7 @@ export function memoryRedoPrompt(toolsUsed: string): string {
     //
     // 工具清单的形状在暗示任务（见 redoToolSpecs 注释），但工具少不等于能力少；
     // 不把账摆出来，模型会把「这轮没给」读成「我从来没有」。
-    '任务已经结束。现在做最后一件收尾动作：判断本次工作有没有值得长期保留的经验。',
-    toolsUsed,
+    `${MEMORY_REDO_MARK}：判断本次工作有没有值得长期保留的经验。`,    toolsUsed,
     '如果有：用 fs.write 把它写进 notes/（过程与结论）或 manuals/（可复用的操作手册），',
     '写法要能让以后的自己直接照着做；没有值得沉淀的内容时，只回复一个词：SKIP。',
     '不要重复任务已经完成的内容，也不要执行任何与写记忆无关的动作。',
