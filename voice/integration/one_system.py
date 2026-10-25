@@ -721,13 +721,26 @@ def create_proxy_app(token: str, dotd_port: int, supervisor: Optional[KernelSupe
 def _check(paths: Paths, token: Optional[str], port: int) -> dict[str, Any]:
     node = shutil.which("node")
     console = (DOTD_DIST / "index.html").is_file()
+    # 体检必须用**启动时会生效的那套环境**，不是这个 shell 的（2026-10-26 修）。
+    #
+    # `main()` 里 `apply_env(paths)` 发生在 `--check` 返回**之后**，只有真启动才调。
+    # 于是 `--check` 用的是裸 shell 的 os.environ：
+    #   · tokens.env 里的 BAIDU_APP_ID / STEPFUN_KEY 看不见 → 报「既没有本地模型
+    #     也没有云端 key —— 设备会"听不见"」，而一键启动起来的进程里 ASR 是好的；
+    #   · CHARLIE_HTTPS / CHARLIE_HTTPS_PORT 同理 → 8443 那一行报错。
+    # 这正是 §18.11–18.14 那条主线：**检查器看的是自己那个 shell**。
+    # 这里按启动时同样的顺序叠一遍（tokens.env 用 setdefault，不覆盖显式导出的）。
+    env = dict(os.environ)
+    for key, value in load_env_file(paths.home / "tokens.env").items():
+        env.setdefault(key, value)
+
     # 8443：手机端麦克风的前置条件（浏览器只在 HTTPS 下给录音权限）。
     # 这里只报"会不会起"，不在这里真起 —— --check 不该占端口。
     try:
         from voice.integration import https_sidecar
 
-        https_enabled = https_sidecar.enabled()
-        https_port = https_sidecar.https_port()
+        https_enabled = https_sidecar.enabled(env)
+        https_port = https_sidecar.https_port(env)
         cert = https_sidecar.cert_dir(paths.home)
         https_cert = (cert / "cert.pem").is_file() and (cert / "key.pem").is_file()
     except Exception:
@@ -747,7 +760,8 @@ def _check(paths: Paths, token: Optional[str], port: int) -> dict[str, Any]:
         "httpsCert": https_cert,
         # "能不能听"：模型在不在 / 云端 key 配了没。放进 --check 是因为
         # 2026-10-25 那次"体检全绿、设备是聋的"教训（见 asr_state 注释）。
-        "asr": asr_state(paths),
+        # 传 env 而不是让它默认读 os.environ：上面那一层就是为这个准备的。
+        "asr": asr_state(paths, env),
         "dotdCommand": dotd_command(),
         "apiVersion": KERNEL_API_VERSION,
     }

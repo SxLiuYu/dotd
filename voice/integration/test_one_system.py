@@ -21,6 +21,7 @@ from pathlib import Path
 
 from voice.integration.one_system import (
     KernelSupervisor,
+    _check,
     apply_env,
     backoff_for,
     load_env_file,
@@ -180,6 +181,73 @@ class OneSystemTest(unittest.TestCase):
         env = {"SENSE_VOICE_MODEL": "/custom/place"}
         apply_env(paths, env)
         self.assertEqual(env["SENSE_VOICE_MODEL"], "/custom/place")
+
+
+class CheckSeesTokensEnvTest(unittest.TestCase):
+    """`--check` 必须看到**启动时会生效**的环境，不是裸 shell 的（2026-10-26）。
+
+    现场（live）：
+
+        $ python -m voice.integration.one_system --check
+        "asr": {"mode": "none"}          ← 报"设备会听不见"
+        $ npm run charlie:start          ← 同一个 home、同一个进程环境
+        [asr] SenseVoice 模型已就位，后续识别走本地
+
+    差别只在于：`main()` 里 `apply_env(paths)` 在 `--check` **返回之后**才调，
+    所以 `--check` 看到的是裸 shell 的 os.environ —— tokens.env 里的云端 key
+    与 CHARLIE_HTTPS_PORT 全都看不见。检查器又看错了地方。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "config.yml").write_text(
+            "surfaces:\n  http:\n    port: 7790\n", encoding="utf-8"
+        )
+        self.paths = resolve_paths({"CHARLIE_HOME": str(self.root)})
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _set_env(self, **kw: str) -> "dict[str, str]":
+        """临时改 os.environ（--check 读的就是它）。"""
+        saved = {k: os.environ.get(k) for k in kw}
+        os.environ.update(kw)
+        self.addCleanup(
+            lambda: [
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+                for k, v in saved.items()
+            ]
+        )
+        return kw
+
+    def test_tokens_env_cloud_asr_key_is_visible(self) -> None:
+        """tokens.env 里配了百度三件套 → 报 cloud，而不是"设备听不见"。"""
+        (self.root / "tokens.env").write_text(
+            "export BAIDU_APP_ID=a\n"
+            "export BAIDU_API_KEY=b\n"
+            "export BAIDU_SECRET_KEY=c\n",
+            encoding="utf-8",
+        )
+        self._set_env(SENSE_VOICE_DISABLED="0")
+        info = _check(self.paths, "tok", 7790)
+        self.assertEqual(info["asr"]["mode"], "cloud", f"应看到 tokens.env 里的 key：{info['asr']}")
+        self.assertIn("baidu", info["asr"]["cloud"])
+
+    def test_tokens_env_https_port_is_visible(self) -> None:
+        """tokens.env 里写 CHARLIE_HTTPS_PORT=9443 → 体检报 9443，不是默认 8443。"""
+        (self.root / "tokens.env").write_text("CHARLIE_HTTPS_PORT=9443\n", encoding="utf-8")
+        self._set_env(CHARLIE_HTTPS="1")
+        info = _check(self.paths, "tok", 7790)
+        self.assertTrue(info["httpsEnabled"])
+        self.assertEqual(info["httpsPort"], 9443, "env 文件里的端口要生效（与启动时一致）")
+
+    def test_explicit_shell_env_still_wins(self) -> None:
+        """显式导出的值优先于文件（与 apply_env 的 setdefault 语义一致）。"""
+        (self.root / "tokens.env").write_text("CHARLIE_HTTPS_PORT=9443\n", encoding="utf-8")
+        self._set_env(CHARLIE_HTTPS="1", CHARLIE_HTTPS_PORT="10443")
+        info = _check(self.paths, "tok", 7790)
+        self.assertEqual(info["httpsPort"], 10443)
 
 
 if __name__ == "__main__":
