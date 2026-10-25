@@ -76,8 +76,14 @@ endpoints:
     # 端点与凭据不换、熔断不结算。**只用实测能调工具的模型**，别把 hy3 放进 primary 链。
     # 顺序按 2026-10-24 实测的第二/第三快且通过率高者排：
     #   一号备份 DeepSeek-Flash（两轮 4.2s，5/5）
-    #   二号备份 GLM-5.3-Flash（两轮 7.4s，4/5；尾延迟差但正确率高，作最后兜底）
-    fallback_models: { primary: [DeepSeek-Flash, GLM-5.3-Flash], light: [DeepSeek-Flash] }
+    #   二号备份 deepseek-v4-1-flash-1017（两轮 11.4s 但 7/8 通过；换下它是因为慢）
+    #   三号备份 GLM-5.3-Flash（两轮 7.4s，4/5；尾延迟差但正确率高，作最后兜底）
+    #
+    # 2026-10-25 现场：primary 在 10 分钟内连续 9 次 bad_protocol（200 但 tool_call
+    # arguments 不是合法 JSON），每次都要走完 fallback 才成功，任务从 3s 拖到 2-3 分钟。
+    # -1017 在前 21 小时是 34/34 ok，故把它补进链里（放二号：它慢，但比
+    # "先撞 60s 超时再换"快）。这是**兜底**，不是把 primary 换回去。
+    fallback_models: { primary: [DeepSeek-Flash, deepseek-v4-1-flash-1017, GLM-5.3-Flash], light: [DeepSeek-Flash] }
     # 2026-10-17：模型级 fallback 链（迁移自 PilotDeck runFallbackChain / RouterFallbackConfig）。
     #
     # 是什么：同一端点内再分一层——models[track] 先试，失败且故障是"模型级"
