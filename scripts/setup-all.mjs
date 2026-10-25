@@ -9,8 +9,9 @@
  *
  * 它做的事：
  *   1. Node 依赖：node_modules 不存在才跑 `npm install`；
- *   2. Python 依赖：建 `.venv` 并装 `voice/requirements-integration.txt`
- *      （只装集成层必需的包；opuslib/torch 这类音频可选项在 quickstart 里单列）；
+ *   2. Python 依赖：建 `.venv` 并装 `voice/requirements-voice.txt`
+ *      （集成层 + 语音层：edge-tts 兜底 TTS、lark-oapi 飞书 SDK；
+ *       opuslib/torch 这类真音频验收依赖仍在 quickstart 里单列）；
  *   3. 体检：调 `npm run onboard`，必需项不过就以非零退出。
  *
  * 它不写任何密钥、不动 ~/.dotd 的配置、不改系统 Python。
@@ -99,12 +100,15 @@ function venvPython() {
 if (CHECK_ONLY) {
   const vp = venvPython();
   const pyForDeps = vp ?? python;
+  // 体检也要查"能出声"这一层：只查 fastapi/httpx 的话，缺 edge-tts 照样报绿，
+  // 然后启动时 TTS 预热 0/3 —— 这正是 2026-10-25 新机器上的表现。
   const depsOk =
-    pyForDeps !== null && run(pyForDeps, ['-c', 'import fastapi, uvicorn, requests, httpx, mcp']).ok;
+    pyForDeps !== null &&
+    run(pyForDeps, ['-c', 'import fastapi, uvicorn, requests, httpx, mcp, edge_tts, lark_oapi']).ok;
   record(
     'python-deps',
     depsOk,
-    vp ?? (depsOk ? '系统 Python 已装集成依赖（无 .venv）' : '没有 .venv，系统 Python 也缺依赖'),
+    vp ?? (depsOk ? '系统 Python 已装语音层依赖（无 .venv）' : '没有 .venv，系统 Python 也缺依赖'),
     depsOk ? undefined : 'npm run setup:all',
   );
 } else {
@@ -124,9 +128,20 @@ if (CHECK_ONLY) {
 
   if (vp !== null || DRY) {
     const target = vp ?? (process.platform === 'win32' ? '.venv\\Scripts\\python.exe' : '.venv/bin/python');
-    const req = join(REPO, 'voice', 'requirements-integration.txt');
+    // 装 voice 层，而不是只装集成层（2026-10-25）：
+    // requirements-integration.txt 只保证"进程能起"，不保证"能出声" —— 里面的
+    // TTS 链路 audio8/baidu/stepfun/finna 全要额外 key 或本地服务，而免费免 key 的
+    // edge-tts 和飞书 SDK（lark-oapi）此前没有任何 requirements 文件声明过。
+    // 现场表现：装完就绪、启动 `[tts-warm] 完成 0/3 条`、`No module named 'lark_oapi'`。
+    // requirements-voice.txt 用 `-r` 引集成层那份，所以这里只装一份。
+    const req = join(REPO, 'voice', 'requirements-voice.txt');
     const r = run(target, ['-m', 'pip', 'install', '--disable-pip-version-check', '-r', req]);
-    record('python-deps', r.ok, r.ok ? '集成层依赖已就绪' : r.out, r.ok ? undefined : '看 pip 输出；国内可加 -i https://pypi.tuna.tsinghua.edu.cn/simple');
+    record(
+      'python-deps',
+      r.ok,
+      r.ok ? '语音层依赖已就绪（含 edge-tts / lark-oapi）' : r.out,
+      r.ok ? undefined : '看 pip 输出；国内可加 -i https://pypi.tuna.tsinghua.edu.cn/simple',
+    );
   }
 }
 

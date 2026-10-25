@@ -204,6 +204,21 @@ def apply_env(paths: Paths, env: Optional[dict[str, str]] = None) -> None:
     target.setdefault("DOTD_CONFIG", str(paths.config_file))
     target.setdefault("ASSISTANT_KID_DATA_DIR", str(paths.voice_data))
     target.setdefault("CHARLIE_HOME", str(paths.home))
+    # TTS 供应商顺序（2026-10-25）。
+    #
+    # 上游默认是 "audio8,baidu,stepfun,finna"，四个**全都**需要额外前提：
+    #   - audio8：本地 8024 的 ONNX 服务（要单独起，还要先注册声音）
+    #   - baidu：BAIDU_APP_ID/KEY/SECRET
+    #   - stepfun：STEPFUN_KEY
+    #   - finna：FINNA_API_KEY
+    # 新机器上四个全灭 → 每句都先把四个试一遍（audio8 三次重连约 4s）再抛
+    # TTSUnavailableError，然后 120s 全局熔断。启动时的 `[tts-warm]` 就是这么
+    # 0/3 的。而上游注册表里其实有 **edge**（微软免费接口，无需任何 key，
+    # 首包约 0.5s），只是没排进默认链路 —— 这是"能出声却不出声"的根因。
+    #
+    # 所以把 edge 排第一做兜底：开箱即有声。想要 audio8 的音色克隆或付费音色
+    # 的主人，显式设 TTS_PRIORITY 覆盖即可（setdefault 完全尊重已有值）。
+    target.setdefault("TTS_PRIORITY", "edge,audio8,baidu,stepfun,finna")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -759,6 +774,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     from voice.integration.opus_runtime import ensure_opus_library
 
     ensure_opus_library()
+
+    # 飞书事件订阅归 dotd（`src/surfaces/feishu-ws.ts` 用同一个应用建长连接）。
+    # Charlie 自带一份 `feishu_ws.start()`，一份应用两条长连接会让同一条消息事件
+    # 被处理两次；且上游 `_started` 在线程死后不复位，watchdog 每 60s 空喊"重启"。
+    # 这里在 import Charlie 之前打补丁：默认关，`CHARLIE_FEISHU_WS=1` 才开。
+    try:
+        from voice.integration import feishu_gate
+
+        feishu_gate.install()
+    except Exception as exc:  # 闸门是安全项，装不上要说出来
+        print(f"[one-system] 飞书闸门未装上：{exc}", file=sys.stderr)
+
+    # 设备播报链的免费兜底（2026-10-25）：`app.xiaozhi_ws._synth_mp3` 自带一套
+    # baidu → finna → stepfun → macOS `say`，既不看 TTS_PRIORITY 也不含 edge。
+    # 没配 key 的机器上设备一句都说不出话，而 [tts-warm] 却是 3/3 —— 两道门
+    # 各查各的。这里给它补上"上游全灭 → Edge"，不改上游文件。
+    #
+    # 必须在 `import voice_server` **之前**装：voice_server 在 import 期就调
+    # `register_xiaozhi_routes(app)`，那里会立刻起 `_prewarm_hints` 线程去合成
+    # 第一条话术。补丁晚一步，那条就必然落到"没 key 的四连败"上
+    # （实测首句仍报 `no TTS available`，后面三句才走 Edge）。
+    try:
+        from voice.integration import tts_edge_fallback
+
+        tts_edge_fallback.install()
+    except Exception as exc:
+        print(f"[one-system] Edge 兜底未装上：{exc}", file=sys.stderr)
 
     import voice_server  # noqa: E402
 

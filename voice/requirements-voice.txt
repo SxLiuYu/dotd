@@ -1,0 +1,26 @@
+# 语音产品「开箱能用」的最小依赖 —— `npm run setup:all` 装的就是这一份。
+#
+# 和 requirements-integration.txt 的区别：那份只保证**进程能起来**（FastAPI/uvicorn/
+# httpx/mcp），这份还要保证**能出声**。2026-10-25 在新机器上踩到：setup-all 装完
+# 集成层就宣布就绪，结果启动预热 `[tts-warm] 完成 0/3 条` —— 因为 edge-tts 没装、
+# 默认 TTS 链路里的 audio8/baidu/stepfun/finna 又全都要额外 key 或本地服务。
+#
+# 另外 lark-oapi 从来没有被任何 requirements 文件声明过：Charlie 的 feishu_ws 用它，
+# 而 `pip install -r requirements-core.txt` 不会带进来（上游 requirements.txt 里也
+# 只有 qwen-agent 那一批）。结果就是 `[feishu-ws] 启动失败: No module named
+# 'lark_oapi'` —— 一个"装完就是坏的"依赖。
+#
+# 不在这里的：
+#   - qwen-agent（Charlie 自己的 LLM 循环）：合并后的主路径是 Charlie → dotd，
+#     本地大脑只在"dotd 不在线"时兜底；要它请装 voice/charlie/requirements-core.txt；
+#   - opuslib/av/sherpa-onnx 等真音频验收依赖：见 voice/requirements-real-audio.txt。
+
+-r requirements-integration.txt
+
+# TTS 兜底：微软免费接口，无需任何 key / 本地服务，首包约 0.5s。
+# voice/integration/one_system.py 的 apply_env 把 edge 排在 TTS_PRIORITY 第一位。
+edge-tts>=6.1
+
+# 飞书长连接 SDK。Charlie 侧默认关（事件订阅归 dotd），但模块能被 import
+# 才谈得上"打开就能用"；dotd 侧用的是它自己的实现，不依赖这个包。
+lark-oapi>=1.4,<2

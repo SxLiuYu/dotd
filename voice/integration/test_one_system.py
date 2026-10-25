@@ -21,6 +21,7 @@ from pathlib import Path
 
 from voice.integration.one_system import (
     KernelSupervisor,
+    apply_env,
     backoff_for,
     load_env_file,
     resolve_paths,
@@ -130,6 +131,26 @@ class OneSystemTest(unittest.TestCase):
             self.assertIn("apiVersion", str(health["kernelDetail"].get("lastError")))
         finally:
             sup.stop()
+
+    def test_apply_env_puts_edge_first_in_tts_chain(self) -> None:
+        """默认 TTS 链路必须包含 edge：免费、免 key，是"开箱能出声"的唯一保证。
+
+        上游默认链路 audio8/baidu/stepfun/finna 四个都要额外前提，新机器上全灭，
+        结果是启动预热 0/3、每句话都要先空转 8s 再熔断 120s。
+        """
+        paths = self._paths()
+        env: dict[str, str] = {}
+        apply_env(paths, env)
+        chain = env["TTS_PRIORITY"].split(",")
+        self.assertEqual(chain[0], "edge", f"edge 应排第一：{chain}")
+        self.assertIn("audio8", chain, "原来的本地音色克隆不能被删掉")
+
+    def test_apply_env_respects_explicit_tts_priority(self) -> None:
+        """显式配置优先：setdefault 不能覆盖主人自己写的 TTS_PRIORITY。"""
+        paths = self._paths()
+        env = {"TTS_PRIORITY": "audio8"}
+        apply_env(paths, env)
+        self.assertEqual(env["TTS_PRIORITY"], "audio8")
 
 
 if __name__ == "__main__":

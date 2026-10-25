@@ -36,8 +36,8 @@ jobs:
       - name: Build web console
         run: npm run build:web
 
-      - name: Install Python deps (integration layer)
-        run: python -m pip install --disable-pip-version-check -r voice/requirements-integration.txt
+      - name: Install Python deps (voice layer: integration + edge-tts + lark-oapi)
+        run: python -m pip install --disable-pip-version-check -r voice/requirements-voice.txt
 
       - name: Typecheck
         run: npm run typecheck
@@ -68,7 +68,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: npm ci --no-audit --no-fund
-      - run: python -m pip install --disable-pip-version-check -r voice/requirements-integration.txt
+      # smoke 跑的是 `setup:all:check`，它现在验的是"能出声"那一层（edge-tts /
+      # lark-oapi），所以装语音层那份（它 `-r` 引着集成层，一份就够）。
+      - run: python -m pip install --disable-pip-version-check -r voice/requirements-voice.txt
       - name: Clean-machine onboard
         run: |
           export DOTD_HOME="$RUNNER_TEMP/dotd-home"
