@@ -1,0 +1,6 @@
+{"model": "deepseek-v4.1-flash", "ok": true, "ttft": 1148, "ttft_any": 1148, "total": 1766, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4.1-flash", "ok": true, "ttft": 964, "ttft_any": 964, "total": 1281, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4.1-flash", "ok": true, "ttft": 1466, "ttft_any": 1466, "total": 2209, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "ttft": 2795, "ttft_any": 2277, "total": 3059, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "ttft": 8843, "ttft_any": 8816, "total": 12994, "tool": false, "finish": "stop"}
+{"model": "deepseek-v4-1-flash-1017", "ok": true, "ttft": 2387, "ttft_any": 1609, "total": 2474, "tool": false, "finish": "stop"}

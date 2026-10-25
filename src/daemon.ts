@@ -90,6 +90,7 @@ import {
   claim as govClaim,
   decide as govDecide,
   evaluate as govEvaluate,
+  expirePending as govExpirePending,
   forceApproval as govForceApproval,
   getApproval as govGetApproval,
   listPending as govListPending,
@@ -2374,6 +2375,22 @@ log(
         await exec.periodicHealthCheck('dot1');
       } catch (err) {
         log(`[exec] 探活异常（忽略）：${String(err)}`);
+      }
+    },
+  });
+
+  // 审批到期扫描（GOV §3.4 写的是"cron 每 5 分钟"），但 `expirePending` 此前只有
+  // 测试在调、生产装配里没有挂点。2026-10-25 现场：一条审批 `pending_until` 过后
+  // 仍是 `pending`，`/api/status` 持续报 `approvalsPending=1`，宿主任务永远停在
+  // `awaiting_approval`。挂成 light job：水位紧张时跳轮，只推迟收敛、不影响正确性。
+  cp.scheduler.registerInternalJob({
+    name: 'gov.approval-expiry',
+    kind: 'light',
+    everyMs: 5 * 60_000,
+    run: async () => {
+      const r = await govExpirePending();
+      if (r.expired > 0 || r.reminded > 0) {
+        log(`[gov] 审批扫描：到期 ${r.expired} 条、提醒 ${r.reminded} 条`);
       }
     },
   });
