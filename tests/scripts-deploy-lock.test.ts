@@ -337,6 +337,27 @@ describe('④b 配置对齐必须改「源」，不是改产物', () => {
       '少了这条，部署会删掉 _tokens_src.env / _config_src.yml',
     );
   });
+
+  // 同一次部署踩到的第二层：`node --import tsx` 按 **cwd** 解析 tsx。
+  // 部署是从 /mnt/d/dotd 跑的，那里 node_modules 是 Windows 装的 → esbuild 加载
+  // win32 二进制 → TransformError。后面挂着 `|| true`，于是失败**一行日志都没有**，
+  // 部署继续，而"对齐"从来没跑过。（当时的现象：日志里有 [align] 已写入，
+  // 那是上一版留下的；这一版连那行都没有。）
+  test('对齐必须在 $DST 里跑（cwd 决定 tsx/esbuild 用哪套二进制）', () => {
+    const code = stripComments(DEPLOY);
+    assert.match(
+      code,
+      /\(cd "\$DST" && node --import tsx \.\/scripts\/align-live-config\.mts/,
+      '必须 cd 到 Linux 那份部署目录再跑',
+    );
+  });
+
+  test('对齐失败不许静默：要打出来并以非零退出', () => {
+    const code = stripComments(DEPLOY);
+    const alignBlock = code.slice(code.indexOf('align-live-config.mts') - 400, code.indexOf('align-live-config.mts') + 400);
+    assert.doesNotMatch(alignBlock, /\|\| true/, '`|| true` 会把配置漂移藏起来');
+    assert.match(alignBlock, /exit 7/, '对齐失败要拦住重启');
+  });
 });
 
 describe('⑤ 语法闸门：三个脚本必须能被 bash 解析', () => {

@@ -122,11 +122,22 @@ fi
 # 而且日志一路说"已写入"，人只会以为配置是对的。
 #
 # 两处都对齐：源（下次启动就不会被抹掉）+ 产物（本次启动前要生效）。
+#
+# 另一个坑（2026-10-26 同一次部署踩到）：`node --import tsx` 按 **cwd** 解析 tsx，
+# 而部署是从 `/mnt/d/dotd` 跑的 —— 那里 `node_modules` 是 **Windows** 装的，
+# esbuild 会加载 win32 的二进制，然后 TransformError 退出。原来这条命令后面挂了
+# `|| true`，于是：
+#   失败 → 日志里连一行都没有 → 部署继续 → "对齐"从未真正跑过。
+# 现在改为在 `$DST`（Linux 那份 node_modules）里跑，并且**不许静默失败**：
+# 对齐失败要打出来、并让部署以非零退出（配置漂移是炸弹，不能带着它重启）。
 if [ "$DO_RESTART" = "1" ] && [ "$DO_ALIGN" = "1" ]; then
   for cfg in "$DST/_config_src.yml" "$HOME/.dotd/config.yml"; do
     if [ -f "$cfg" ]; then
       log "对齐 $cfg"
-      node --import tsx "$DST/scripts/align-live-config.mts" --config "$cfg" || true
+      if ! (cd "$DST" && node --import tsx ./scripts/align-live-config.mts --config "$cfg"); then
+        log "❌ 对齐失败：$cfg（配置漂移，拒绝带着它重启）"
+        exit 7
+      fi
     else
       log "$cfg 不存在，跳过（首次部署请先跑 init-config，并放好 _config_src.yml）"
     fi
