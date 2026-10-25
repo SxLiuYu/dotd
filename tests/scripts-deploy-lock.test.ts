@@ -405,6 +405,90 @@ exit 0
   });
 });
 
+describe('④d 运行期 mcp-servers.yml 是主人的声明，重启不许静默改回模板', () => {
+  // 现场（2026-10-26）：`wsl-daemon.sh` 每次启动都 `cp -f config/*.yml ~/.dotd/`，
+  // 注释理由是"这些文件本就是 ${ENV} 占位驱动，不含环境事实"。
+  // 但 mcp-servers.yml **不成立**：它写的是主人决定接哪些外部程序。而文档教人的
+  // 启用方式正是"把 voice 示例放到 ~/.dotd/mcp-servers.yml" —— 无脑覆盖会在下一次
+  // 重启把这份决定静默改回 `servers: []`，日志里一个字都没有。
+  const loop = (() => {
+    const code = stripComments(DAEMON);
+    const start = code.indexOf('for f in config/*.yml; do');
+    assert.ok(start > 0, '找不到"逐个刷新配置"的循环（锚点变了就更新这条测试）');
+    const end = code.indexOf('\ndone', start);
+    assert.ok(end > start, '循环没有收尾');
+    return code.slice(start, end + '\ndone'.length);
+  })();
+
+  test('mcp-servers.yml 只在缺失时播种（不是每次 cp -f）', () => {
+    assert.match(loop, /mcp-servers\.yml\)/, '循环里要有针对它的分支');
+    const branch = loop.slice(loop.indexOf('mcp-servers.yml)'));
+    assert.match(branch, /\[\s*!?\s*-f\s+"\$HOME\/\.dotd\/\$base"\s*\]/i, '要先判存在');
+  });
+
+  test('真跑：已有运行期声明 → 不覆盖；缺失 → 播种；其余文件照常刷新', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dotd-daemon-cfg-'));
+    try {
+      const repo = join(dir, 'repo');
+      const home = join(dir, 'home');
+      mkdirSync(join(repo, 'config'), { recursive: true });
+      mkdirSync(join(home, '.dotd'), { recursive: true });
+      writeFileSync(join(repo, 'config', 'models.yml'), 'endpoints: []\n');
+      writeFileSync(join(repo, 'config', 'mcp-servers.yml'), 'servers: []\n');
+      writeFileSync(join(repo, 'config', 'mcp-servers.voice.yml'), 'servers: []\n');
+      writeFileSync(join(repo, 'config', 'dotd.yml'), '# init-config 模板\n');
+      // 运行期那份是主人写好的
+      writeFileSync(join(home, '.dotd', 'mcp-servers.yml'), 'servers:\n  - name: mine\n    command: node\n');
+      // models.yml 是旧内容 → 必须被刷新
+      writeFileSync(join(home, '.dotd', 'models.yml'), 'stale\n');
+
+      writeFileSync(join(dir, 'snippet.sh'), `${loop}\n`, 'utf8');
+      const r = spawnSync('bash', [join(dir, 'snippet.sh')], {
+        encoding: 'utf8',
+        cwd: repo,
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home },
+      });
+      if (r.error !== undefined) return; // 没有 bash：跳过
+      assert.equal(r.status, 0, `片段失败：${r.stderr}`);
+
+      assert.equal(
+        readFileSync(join(home, '.dotd', 'mcp-servers.yml'), 'utf8'),
+        'servers:\n  - name: mine\n    command: node\n',
+        '主人声明的 MCP server 不能被重启抹掉',
+      );
+      assert.equal(readFileSync(join(home, '.dotd', 'models.yml'), 'utf8'), 'endpoints: []\n', '其余配置照常刷新');
+      assert.ok(existsSync(join(home, '.dotd', 'mcp-servers.voice.yml')), '缺失的要播种');
+      assert.ok(!existsSync(join(home, '.dotd', 'dotd.yml')), 'init-config 模板不该进运行期目录');
+      assert.match(r.stdout, /保留运行期/, '漂移要被说出来，不能无声');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('缺失时播种，并且日志说清"从模板来的"', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dotd-daemon-cfg2-'));
+    try {
+      const repo = join(dir, 'repo');
+      const home = join(dir, 'home');
+      mkdirSync(join(repo, 'config'), { recursive: true });
+      mkdirSync(join(home, '.dotd'), { recursive: true });
+      writeFileSync(join(repo, 'config', 'mcp-servers.yml'), 'servers: []\n');
+      writeFileSync(join(dir, 'snippet.sh'), `${loop}\n`, 'utf8');
+      const r = spawnSync('bash', [join(dir, 'snippet.sh')], {
+        encoding: 'utf8',
+        cwd: repo,
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home },
+      });
+      if (r.error !== undefined) return;
+      assert.equal(r.status, 0, `片段失败：${r.stderr}`);
+      assert.equal(readFileSync(join(home, '.dotd', 'mcp-servers.yml'), 'utf8'), 'servers: []\n');
+      assert.match(r.stdout, /首次播种/, '要说清这次是从模板来的');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('⑤ 语法闸门：三个脚本必须能被 bash 解析', () => {
   const bash = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' });
   const hasBash = bash.status === 0;

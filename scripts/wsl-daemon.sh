@@ -78,9 +78,28 @@ cp _config_src.yml "$HOME/.dotd/config.yml"
 # daemon 时没人设这个变量，configDir 落在仓库 config/，所以这里从没拷过这些文件 ——
 # 切到托管后第一次启动就 `ConfigError: 读不到 models.yml：/root/.dotd/models.yml`。
 # 每次启动都照仓库刷新（这些文件本就是 ${ENV} 占位驱动，不含环境事实）。
+#
+# **但 `mcp-servers.yml` 是例外：只在缺失时播种**（2026-10-26 修）。
+# 上面那句"不含环境事实"对它不成立：MCP 声明写的是**主人决定接哪些外部程序**，
+# 不是 `${VAR}` 占位。而文档教人的启用方式正是"把 voice 示例放到
+# `~/.dotd/mcp-servers.yml`" —— 无脑 `cp -f` 会在下一次重启把这份决定**静默改回
+# `servers: []`**：用户配好了、发现 MCP 又没了、日志里一个字都没有。
+# 与模板不同就**说一声**（不覆盖，但别让漂移隐形）。
 for f in config/*.yml; do
-  case "$(basename "$f")" in dotd.yml) continue ;; esac   # init-config 模板，运行期用不到
-  cp -f "$f" "$HOME/.dotd/$(basename "$f")"
+  base="$(basename "$f")"
+  case "$base" in
+    dotd.yml) continue ;;   # init-config 模板，运行期用不到
+    mcp-servers.yml)
+      if [ ! -f "$HOME/.dotd/$base" ]; then
+        cp -f "$f" "$HOME/.dotd/$base"
+        echo "MCP: 首次播种 $HOME/.dotd/$base（来自仓库模板）"
+      elif ! cmp -s "$f" "$HOME/.dotd/$base"; then
+        echo "MCP: 保留运行期 $HOME/.dotd/$base（与仓库模板不同 —— 这是主人的声明，不覆盖）"
+      fi
+      continue
+      ;;
+  esac
+  cp -f "$f" "$HOME/.dotd/$base"
 done
 
 # 4. 内存门槛：容器 + chromium 需要余量，否则水位 guard 会把容器 pause

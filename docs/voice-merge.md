@@ -170,8 +170,13 @@ DOTD_TOKEN=<master> \
 npm run voice:bridge -- "把今天的报价单核对一下"
 
 # 3) 把 Charlie 的宿主工具接进 dotd
-cp config/mcp-servers.voice.yml config/mcp-servers.yml   # 或 DOTD_MCP_CONFIG=...
+#    注意目标路径：托管启动（one_system）会把 DOTD_CONFIG_DIR 设成 ~/.dotd，
+#    daemon 读的是 **那一份** —— 仓库 config/ 下那份只是模板。
+cp config/mcp-servers.voice.yml "$HOME/.dotd/mcp-servers.yml"
+# （不用托管、或显式设了 DOTD_MCP_CONFIG 时，才按该变量的路径放。）
 # 重启 daemon 后，模型工具面出现 mcp.call（dangerous 档，每次审批）
+# 先跑 `npm run doctor` 确认 MCP 项不是 ❌：示例里的 command 是 `node scripts/py.mjs`，
+# 由它去解析 Python（.venv → python3 → python），而不是写死的 `python`。
 
 # 4) 跑接缝测试
 npm run voice:test
@@ -253,7 +258,7 @@ npm run setup:all:check   # 只体检（CI 用）
 | 检查 | 命令 | 结果 |
 |---|---|---|
 | 桥接缝 | `node --import tsx --test tests/voice-bridge.test.ts` | **5 / 5** |
-| MCP 接缝 | `node --import tsx --test tests/voice-mcp-seam.test.ts` | **1 / 1** |
+| MCP 接缝 | `node --import tsx --test tests/voice-mcp-seam.test.ts` | **1 / 1**（直接用 `config/mcp-servers.voice.yml` 那份声明起 server，不是测试自己另拼一份） |
 | 反射/皮层 | `tests/cortex-router.test.ts`（Python unittest 17 项） | **17 / 17** |
 | 设备面 | `node --import tsx --test tests/surfaces-device.test.ts` | **18 / 18** |
 | 记忆源 / 推送决策（HTTP） | `node --import tsx --test tests/surfaces-voice-memory.test.ts` | **5 / 5** |
@@ -262,7 +267,8 @@ npm run setup:all:check   # 只体检（CI 用）
 | 音频链路（合成 PCM） | `python -m unittest voice.integration.test_audio_chain` | **2 / 2** |
 | 全套 | `npm test` | **1990 / 1990**（阶段 5 新增 5 条 HTTP 用例 + 2 条 Python 包装） |
 | 类型检查 | `npx tsc --noEmit -p .` | 0 错误 |
-| 体检 | `npm run voice:check` | 必需 6 项全过；ffmpeg 标 skip（本机未装） |
+| 体检 | `npm run voice:check` | 必需项全过；ffmpeg 标 skip（本机未装）；「MCP 声明示例可解析」单列一行 |
+| MCP 声明示例可用 | `node --import tsx --test tests/scripts-mcp-example.test.ts` | **10 / 10**（解析 + command 可解析 + args 文件存在） |
 | 真模型延迟 | `node scripts/fake-device.mjs --runs 5` | 首条 P50 **4.80 s** / 端到端 P50 **10.98 s** / P95 **23.46 s**；**未达 2.5 s 目标** |
 | 真音频闭环 | `DOTD_REAL_AUDIO=1 DOTD_REAL_MIC=1 python -m unittest voice.integration.test_real_audio` | **2 / 2**：TTS → 扬声器 → 空气 → 麦克风 → Opus → SenseVoice，识别原文一致 |
 | 安装入口 | `npm run setup:all` | Node + `.venv` + 依赖 + 体检全过 |

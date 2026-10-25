@@ -5,9 +5,20 @@
 #   B. 启动 daemon 时指定：DOTD_MCP_CONFIG=config/mcp-servers.voice.yml
 #
 # 前置条件：
-#   - Python 3.11+，且装了 Charlie 的 requirements-core（至少 `mcp`、`requests`）；
-#   - 从**仓库根目录**启动 daemon（下面的 args 是相对路径）；
-#     如果你的 cwd 不是仓库根，把 args 改成绝对路径。
+#   - Python 3.10+，且装了 Charlie 的依赖（至少 `mcp`、`requests`）：
+#       npm run setup:all      # 建 .venv 并装 voice/requirements-voice.txt
+#   - **不要写 `command: python`**（2026-10-26 现场教训）：Debian/Ubuntu/WSL 默认
+#     只提供 `python3`，没有 `python`；而系统 `python3` 里通常没有 `mcp` 包
+#     （`ModuleNotFoundError`），依赖只装在仓库的 `.venv` 里。
+#     所以这里用 `node scripts/py.mjs` —— 它就是仓库里所有 Python 入口用的那个
+#     解析器（显式 DOTD_PYTHON → 当前平台 .venv → python3 → python），
+#     并把 stdio 原样透传，MCP 的 JSON-RPC 帧不受影响。
+#
+# 路径口径（两种都行，别混着理解）：
+#   - `scripts/py.mjs` 由 **daemon 的 cwd** 解析 —— 仍要求从仓库根启动 daemon
+#     （`wsl-daemon.sh` 和 `one_system` 都是这么做的）；换 cwd 就写绝对路径。
+#   - 后面那个 `.py` 由 **py.mjs** 解析，它自己 `cwd=仓库根` 再 spawn python，
+#     所以 `voice/charlie/...` 与 daemon 的 cwd 无关。
 #
 # 安全语义（不要放宽）：
 #   - mcp.call 在 dotd 里是 dangerous 档，每次调用都要主人审批；
@@ -16,8 +27,8 @@
 
 servers:
   - name: charlie-scenes
-    command: python
-    args: ["voice/charlie/magic-scenes.py"]
+    command: node
+    args: ["scripts/py.mjs", "voice/charlie/magic-scenes.py"]
     timeout_ms: 60000
     allow_tools:
       - goodnight
@@ -28,8 +39,8 @@ servers:
       - list_protocols
 
   - name: charlie-reminders
-    command: python
-    args: ["voice/charlie/magic-reminder.py"]
+    command: node
+    args: ["scripts/py.mjs", "voice/charlie/magic-reminder.py"]
     timeout_ms: 30000
     allow_tools:
       - add_reminder

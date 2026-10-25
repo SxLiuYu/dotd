@@ -11,15 +11,18 @@
  *   3. Python 依赖：mcp / requests（Charlie 的 requirements-core 必需项）；
  *   4. ffmpeg（ASR/TTS 音频链路；没有就明确降级为文本）；
  *   5. dotd：DOTD_BASE_URL + DOTD_TOKEN 都在时，探一次 /api/health；
- *   6. 接缝：config/mcp-servers.voice.yml 是否存在。
+ *   6. 接缝：`config/mcp-servers.voice.yml` 存在，**而且照着它配能起来**
+ *      （解析 + command/args 可解析；只判存在会漏掉"示例本身是坏的"）。
  *
  * 退出码：0 = 必需项全过；1 = 有必需项失败。
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseMcpServers } from './doctor.mjs';
+import { inspectMcpServers } from './lib/mcp-example.mjs';
 import { resolvePython, pythonAtLeast } from './lib/python.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -38,7 +41,6 @@ const need = [
   ['voice/integration/one_system.py', '一套系统壳（托管/健康/控制台）'],
   ['voice/integration/dotd_memory.py', '记忆源桥（dotd 是唯一事实源）'],
   ['voice/integration/push_gate.py', '主动推送决策桥（dotd 决定该不该说）'],
-  ['config/mcp-servers.voice.yml', 'MCP 声明示例'],
 ];
 for (const [rel, label] of need) {
   const ok = existsSync(join(REPO, rel));
@@ -84,6 +86,42 @@ add(
   `memory=${(process.env.CHARLIE_MEMORY_SYNC ?? 'on')} push=${(process.env.CHARLIE_PUSH_DECIDER ?? 'dotd')}`,
   '默认都是 dotd；设 CHARLIE_MEMORY_SYNC=off / CHARLIE_PUSH_DECIDER=local 可退回本地',
 );
+
+// 3c. MCP 声明示例：不只是"文件在"，而是**照着它配能起来**
+//
+// 2026-10-26 之前这里只 `existsSync` —— 于是示例里写着 `command: python`
+// （Debian/Ubuntu/WSL 上没有这个命令）、`allow_tools` 用块列表（旧解析器读成
+// "某个 server 缺 name"，daemon 直接拒启动）时，体检一路 ✅。
+// 现在把示例当成真配置解析一遍，并把 command/args 按 daemon 的口径核对。
+const examplePath = join(REPO, 'config', 'mcp-servers.voice.yml');
+if (!existsSync(examplePath)) {
+  add(
+    'MCP 声明示例可解析',
+    'fail',
+    examplePath,
+    '重新 clone/checkout 仓库，或确认合并时没有漏文件',
+  );
+} else {
+  const parsed = parseMcpServers(readFileSync(examplePath, 'utf8'));
+  if (parsed.error !== null) {
+    add(
+      'MCP 声明示例可解析',
+      'fail',
+      `config/mcp-servers.voice.yml：${parsed.error}`,
+      '这份示例是文档教人 cp 过去启用的；它解析不了 = 照文档做会让 daemon 拒启动',
+    );
+  } else {
+    const broken = inspectMcpServers(parsed.servers, { repoRoot: REPO });
+    add(
+      'MCP 声明示例可解析',
+      broken.length === 0 ? 'ok' : 'fail',
+      broken.length === 0
+        ? `${parsed.servers.length} 个 server（${parsed.servers.map((s) => s.name).join(', ')}）`
+        : broken.join('; '),
+      broken.length === 0 ? '' : '改 config/mcp-servers.voice.yml（它同时是文档里的启用模板）',
+    );
+  }
+}
 
 // 4. ffmpeg（可选）
 const ff = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' });

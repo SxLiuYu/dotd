@@ -70,6 +70,16 @@ function parseInlineList(raw: string): string[] {
  *
  * 只支持本模块文档里写明的形状。遇到不认识的键 → **忽略**（前向兼容：
  * 将来加字段不会让老版本拒启动）；但缺 `name`/`command` → 抛错（配置写错必须见光）。
+ *
+ * `args` / `allow_tools` 两种写法都认（2026-10-26）：行内 `[a, b]`，以及换行缩进的块列表
+ * ```
+ * allow_tools:
+ *   - echo
+ * ```
+ * 为什么必须认块列表：仓库自带的 `config/mcp-servers.voice.yml` 就是那么写的
+ * （29 行文件，8 个工具名），而文档让人 `cp` 它过来启用。旧解析器把 `- echo`
+ * 当成**下一个 server**，于是 `name` 为空 → 「某个 server 缺 name」→ **daemon 拒启动**。
+ * 一份"官方示例 + 官方命令"能直接把系统弄挂，这是最坏的一类缺陷。
  */
 export function parseMcpServersYaml(text: string): McpServerSpec[] {
   const out: McpServerSpec[] = [];
@@ -77,6 +87,15 @@ export function parseMcpServersYaml(text: string): McpServerSpec[] {
   let cur: (McpServerSpec & { _envOpen?: boolean }) | null = null;
   /** env 块内的缩进（用于判断后续行是否仍属 env）。 */
   let envIndent = -1;
+  /** 块列表（`allow_tools:` / `args:` 后换行写的那种）的键与 `:` 所在行的缩进。 */
+  let listKey: 'allow_tools' | 'args' | null = null;
+  let listIndent = -1;
+
+  const resetSubBlocks = (): void => {
+    envIndent = -1;
+    listKey = null;
+    listIndent = -1;
+  };
 
   const flush = (): void => {
     if (cur === null) return;
@@ -111,11 +130,26 @@ export function parseMcpServersYaml(text: string): McpServerSpec[] {
       continue;
     }
 
+    // 块列表项：**先于**"新 server"判断。否则 `- echo` 会被当成一个缺 name 的 server。
+    if (listKey !== null && cur !== null) {
+      if (indent > listIndent && trimmed.startsWith('-')) {
+        const item = cleanValue(trimmed.slice(1).trim());
+        if (item.length > 0) {
+          if (listKey === 'allow_tools') (cur.allowTools ??= []).push(item);
+          else cur.args.push(item);
+        }
+        continue;
+      }
+      // 缩进退回去了：块列表结束，落到下面的普通键值处理。
+      listKey = null;
+      listIndent = -1;
+    }
+
     // 列表项 `- name: x` 或 `-` 后接续行
     if (trimmed.startsWith('- ')) {
       flush();
       cur = { name: '', command: '', args: [] };
-      envIndent = -1;
+      resetSubBlocks();
       const rest = trimmed.slice(2).trim();
       applyKeyValue(cur, rest);
       continue;
@@ -123,7 +157,7 @@ export function parseMcpServersYaml(text: string): McpServerSpec[] {
     if (trimmed === '-') {
       flush();
       cur = { name: '', command: '', args: [] };
-      envIndent = -1;
+      resetSubBlocks();
       continue;
     }
     if (cur === null) continue;
@@ -142,42 +176,58 @@ export function parseMcpServersYaml(text: string): McpServerSpec[] {
     envIndent = -1;
 
     // 普通键值
-    if (applyKeyValue(cur, trimmed, () => indent)) {
-      if (/^env\s*:/.test(trimmed)) envIndent = indent;
+    const block = applyKeyValue(cur, trimmed, () => indent);
+    if (block === 'env') envIndent = indent;
+    else if (block !== null) {
+      listKey = block;
+      listIndent = indent;
     }
   }
   flush();
   return out;
 }
 
-/** 把一个 `key: value` 应用到 spec；返回是否命中 env 键（用于跟踪缩进）。 */
+/**
+ * 把一个 `key: value` 应用到 spec。
+ *
+ * @returns 该键开启的**块**（`env` / `allow_tools` / `args`）或 null。调用方据此记录缩进，
+ *   后续更深缩进的行才知道自己属于这个块，而不是下一项配置。
+ */
 function applyKeyValue(
   spec: McpServerSpec & { _envOpen?: boolean },
   line: string,
   indentOf?: () => number,
-): boolean {
+): 'env' | 'allow_tools' | 'args' | null {
   const colon = line.indexOf(':');
-  if (colon <= 0) return false;
+  if (colon <= 0) return null;
   const key = line.slice(0, colon).trim();
   const rawVal = line.slice(colon + 1).trim();
   switch (key) {
     case 'name':
       spec.name = cleanValue(rawVal);
-      return false;
+      return null;
     case 'command':
       spec.command = cleanValue(rawVal);
-      return false;
+      return null;
     case 'args':
+      if (rawVal.length === 0) {
+        spec.args = [];
+        return 'args'; // 块列表开始
+      }
       spec.args = parseInlineList(rawVal);
-      return false;
+      return null;
     case 'timeout_ms': {
       const n = Number(cleanValue(rawVal));
       if (Number.isFinite(n) && n > 0) spec.timeoutMs = Math.floor(n);
-      return false;
+      return null;
     }
     case 'allow_tools':
+      if (rawVal.length === 0) {
+        spec.allowTools = [];
+        return 'allow_tools'; // 块列表开始
+      }
       spec.allowTools = parseInlineList(rawVal);
-      return false;
+      return null;
     case 'env': {
       if (rawVal.length > 0) {
         // 行内映射 `{ KEY: value }`
@@ -192,10 +242,10 @@ function applyKeyValue(
         }
       }
       void indentOf;
-      return true; // env 块开始
+      return 'env'; // env 块开始
     }
     default:
-      return false; // 未知键：前向兼容忽略
+      return null; // 未知键：前向兼容忽略
   }
 }
 

@@ -16,6 +16,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
@@ -241,6 +242,72 @@ servers:
   assert.deepEqual(specs[0]!.allowTools, ['echo', 'add']);
   assert.deepEqual(specs[0]!.env, { FOO: 'bar' });
   assert.equal(specs[1]!.name, 'other');
+});
+
+test('配置：块列表（allow_tools: 换行写 - xxx）必须认，且不能当成下一个 server', () => {
+  // 2026-10-26：仓库自带的 config/mcp-servers.voice.yml 就是块列表写法，
+  // 文档让人 `cp` 它过来启用。旧解析器把 `- goodnight` 当成新 server 的起始行，
+  // 于是 name 为空 → 「某个 server 缺 name」→ daemon **拒启动**。
+  const specs = parseMcpServersYaml(`
+servers:
+  - name: scenes
+    command: node
+    args:
+      - scripts/py.mjs
+      - voice/charlie/magic-scenes.py
+    allow_tools:
+      - goodnight
+      - execute_scene
+  - name: next
+    command: node
+    args: []
+`);
+  assert.equal(specs.length, 2, '块列表项不能被当成 server');
+  assert.equal(specs[0]!.name, 'scenes');
+  assert.deepEqual(specs[0]!.args, ['scripts/py.mjs', 'voice/charlie/magic-scenes.py']);
+  assert.deepEqual(specs[0]!.allowTools, ['goodnight', 'execute_scene']);
+  assert.equal(specs[1]!.name, 'next', '块列表结束后，下一个 `- name:` 仍是新 server');
+  assert.deepEqual(specs[1]!.args, []);
+});
+
+test('配置：块列表结束后紧跟同级键，仍落在同一个 server 上', () => {
+  const specs = parseMcpServersYaml(`
+servers:
+  - name: s
+    command: node
+    allow_tools:
+      - a
+    timeout_ms: 1000
+    env:
+      K: v
+`);
+  assert.equal(specs.length, 1);
+  assert.deepEqual(specs[0]!.allowTools, ['a']);
+  assert.equal(specs[0]!.timeoutMs, 1000, '块列表之后的同级键不能被吞掉');
+  assert.deepEqual(specs[0]!.env, { K: 'v' });
+});
+
+test('配置：仓库自带的 config/mcp-servers.voice.yml 必须能解析（文档让人 cp 它）', () => {
+  // 这份文件是"官方示例 + 官方启用命令"的组合。它解析不了 = 用户照着文档做
+  // 就会让 daemon 拒启动 —— 那是最坏的一类缺陷，必须有门禁钉住。
+  const raw = readFileSync(join(REPO_ROOT, 'config', 'mcp-servers.voice.yml'), 'utf8');
+  const specs = parseMcpServersYaml(raw);
+  assert.equal(specs.length, 2, `示例里有 2 个 server，实际：${specs.map((s) => s.name).join(',')}`);
+  const scenes = specs.find((s) => s.name === 'charlie-scenes');
+  const reminders = specs.find((s) => s.name === 'charlie-reminders');
+  assert.ok(scenes !== undefined && reminders !== undefined);
+  assert.equal(scenes.allowTools?.length, 6);
+  assert.equal(reminders.allowTools?.length, 7);
+  // command 必须是这台机器上真的存在的东西：`python` 在 Debian/Ubuntu/WSL 上不存在，
+  // 而且系统 python3 通常没有 `mcp` 包（依赖只装在 .venv）。所以示例用 py.mjs 解析器。
+  assert.equal(scenes.command, 'node');
+  assert.equal(scenes.args[0], 'scripts/py.mjs');
+  assert.equal(reminders.args[0], 'scripts/py.mjs');
+  for (const a of [...scenes.args, ...reminders.args]) {
+    if (/\.(py|mjs)$/i.test(a)) {
+      assert.ok(existsSync(join(REPO_ROOT, a)), `示例引用的文件必须存在：${a}`);
+    }
+  }
 });
 
 test('配置：空表 = 关闭；缺 name/command 抛错（写错的配置必须见光）', () => {

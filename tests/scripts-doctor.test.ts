@@ -760,6 +760,50 @@ test('MCP parseMcpServers：与 src/exec/mcp-config.ts 同口径（空表/声明
   assert.equal(bad.error !== null, true, '缺 command 必须回报错误（不抛）');
 });
 
+test('MCP parseMcpServers：块列表必须认（与 daemon 同口径，不是"配置写错"）', async () => {
+  const { parseMcpServers } = await import('../scripts/doctor.mjs');
+  // 2026-10-26：仓库自带的 config/mcp-servers.voice.yml 用块列表写 allow_tools。
+  // 旧实现把 `- goodnight` 读成新 server → 「某个 server 缺 name」→ doctor 报"配置写错"，
+  // 而 daemon 那边更狠：拒启动。两份解析器的口径必须一致。
+  const block = parseMcpServers(
+    [
+      'servers:',
+      '  - name: scenes',
+      '    command: node',
+      '    args:',
+      '      - scripts/py.mjs',
+      '      - voice/charlie/magic-scenes.py',
+      '    allow_tools:',
+      '      - goodnight',
+      '      - execute_scene',
+      '  - name: next',
+      '    command: node',
+      '    args: []',
+    ].join('\n'),
+  );
+  assert.equal(block.error, null, `实际错误：${block.error}`);
+  assert.equal(block.servers.length, 2);
+  assert.deepEqual(block.servers[0]!.args, ['scripts/py.mjs', 'voice/charlie/magic-scenes.py']);
+  assert.equal(block.servers[1]!.name, 'next');
+
+  // 真实文件：doctor 与 daemon 的 TS 解析器必须得出同一个答案
+  const { readFileSync } = await import('node:fs');
+  const raw = readFileSync(join(repoRoot, 'config', 'mcp-servers.voice.yml'), 'utf8');
+  const fromDoctor = parseMcpServers(raw);
+  const { parseMcpServersYaml } = await import('../src/exec/mcp-config.ts');
+  const fromDaemon = parseMcpServersYaml(raw);
+  assert.equal(fromDoctor.error, null);
+  assert.deepEqual(
+    fromDoctor.servers.map((s: { name: string; command: string; args: string[] }) => ({
+      name: s.name,
+      command: s.command,
+      args: s.args,
+    })),
+    fromDaemon.map((s) => ({ name: s.name, command: s.command, args: s.args })),
+    '同一份文件，doctor 与 daemon 不能读出两种结构',
+  );
+});
+
 test('MCP：doctor 不打印 MCP 配置里的敏感值（env 段一律不进 detail）', async () => {
   const s = sandbox();
   try {

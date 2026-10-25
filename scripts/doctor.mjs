@@ -25,11 +25,12 @@
  */
 
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, isAbsolute, join, resolve, delimiter } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { layeredEnv, resolveConfigDir as resolveConfigDirShared } from './lib/env.mjs';
+import { looksLikePath, resolveCommand as resolveCommandShared } from './lib/command.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..');
@@ -657,6 +658,13 @@ export async function runChecks(opts = {}) {
 export function parseMcpServers(text) {
   const servers = [];
   let cur = null;
+  /** `args:` / `allow_tools:` 后换行写块列表时，记下键与 `:` 所在行的缩进。 */
+  let listKey = null;
+  let listIndent = -1;
+  const resetBlocks = () => {
+    listKey = null;
+    listIndent = -1;
+  };
   const clean = (raw) => {
     let v = String(raw).trim();
     if (!(v.startsWith('"') || v.startsWith("'"))) {
@@ -686,14 +694,40 @@ export function parseMcpServers(text) {
       if (trimmed.length === 0 || trimmed.startsWith('#')) continue;
       const indent = line.length - line.trimStart().length;
       if (indent === 0) continue; // 顶层键（servers:）
+
+      // 块列表项：**先于**"新 server"判断（2026-10-26 修）。
+      //
+      // 仓库自带的 config/mcp-servers.voice.yml 把 allow_tools 写成换行块列表，
+      // 而文档让人 `cp` 它过来启用。旧实现把 `- goodnight` 当成**下一个 server**，
+      // 于是 name 为空 → 「某个 server 缺 name」→ doctor 报"配置写错"，
+      // 真正的 daemon 更是**拒启动**。两份解析器必须同口径。
+      if (listKey !== null && cur !== null) {
+        if (indent > listIndent && trimmed.startsWith('-')) {
+          const item = clean(trimmed.slice(1).trim());
+          if (item.length > 0) {
+            if (listKey === 'args') cur.args.push(item);
+            // allow_tools：doctor 不检查工具名，但必须**吃掉**这些行，不能当成新 server
+          }
+          continue;
+        }
+        resetBlocks();
+      }
+
       if (trimmed.startsWith('- ')) {
         flush();
         cur = { name: '', command: '', args: [] };
-        applyMcpField(cur, trimmed.slice(2).trim(), clean, inlineList);
+        resetBlocks();
+        applyMcpField(cur, trimmed.slice(2).trim(), clean, inlineList, (k) => {
+          listKey = k;
+          listIndent = indent;
+        });
         continue;
       }
       if (cur === null) continue;
-      applyMcpField(cur, trimmed, clean, inlineList);
+      applyMcpField(cur, trimmed, clean, inlineList, (k) => {
+        listKey = k;
+        listIndent = indent;
+      });
     }
     flush();
     return { servers, error: null };
@@ -702,50 +736,35 @@ export function parseMcpServers(text) {
   }
 }
 
-function applyMcpField(spec, line, clean, inlineList) {
+/**
+ * 应用一个 `key: value`。遇到"键后面是空值"（`args:` / `allow_tools:`）时调用
+ * `openList(key)`，告诉调用方接下来更深缩进的 `- item` 属于这个键。
+ */
+function applyMcpField(spec, line, clean, inlineList, openList) {
   const colon = line.indexOf(':');
   if (colon <= 0) return;
   const key = line.slice(0, colon).trim();
   const val = line.slice(colon + 1).trim();
   if (key === 'name') spec.name = clean(val);
   else if (key === 'command') spec.command = clean(val);
-  else if (key === 'args') spec.args = inlineList(val);
-  // 其余（timeout_ms / allow_tools / env）doctor 不需要，忽略
-}
-
-/** args 里一项看起来像文件路径吗？（含分隔符或 .mjs/.js/.py 扩展名） */
-function looksLikePath(arg) {
-  return /[\\/]/.test(arg) || /\.(mjs|cjs|js|ts|py|sh)$/i.test(arg);
+  else if (key === 'args' || key === 'allow_tools') {
+    // 其余（timeout_ms / env）doctor 不需要，忽略；这两个必须认，因为它们的
+    // 块列表写法会把行喂进循环，认不出来就会把 `- xxx` 当成新 server。
+    if (val.length === 0) {
+      if (key === 'args') spec.args = [];
+      openList(key);
+      return;
+    }
+    if (key === 'args') spec.args = inlineList(val);
+  }
 }
 
 /**
- * 解析 command 到绝对路径；找不到返回 null。
- *
- * 与 spawn 的语义对齐：带路径分隔符的按路径查（相对路径按 repoRoot 解析），
- * 否则在 PATH 里找（Windows 还要试 .exe/.cmd/.bat——npm 全局装的命令常是 .cmd）。
+ * 解析 command 到绝对路径；找不到返回 null。实现见 `scripts/lib/command.mjs`
+ * （voice-check 也用同一份：同一条判据不许有两套答案）。
  */
-export function resolveCommand(command, { env, repoRoot }) {
-  const exts =
-    process.platform === 'win32'
-      ? (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter((x) => x.length > 0)
-      : [''];
-  const hasSep = /[\\/]/.test(command);
-  if (hasSep) {
-    const abs = isAbsolute(command) ? command : resolve(repoRoot, command);
-    if (existsSync(abs)) return abs;
-    // 无扩展名时按 PATHEXT 再试一遍（Windows）
-    for (const ext of exts) if (existsSync(abs + ext)) return abs + ext;
-    return null;
-  }
-  const pathVar = env.PATH ?? env.Path ?? '';
-  for (const dir of pathVar.split(delimiter).filter((d) => d.length > 0)) {
-    const base = join(dir, command);
-    if (existsSync(base)) return base;
-    for (const ext of exts) if (existsSync(base + ext)) return base + ext;
-  }
-  // 兜底：本进程的 node（node 通常总在 PATH 里，但 doctor 可能跑在裁剪过的环境里）
-  if (command === 'node' && existsSync(process.execPath)) return process.execPath;
-  return null;
+export function resolveCommand(command, opts) {
+  return resolveCommandShared(command, opts);
 }
 
 /** 从 db/migrations 的 NNN_ 前缀算期望 user_version；目录缺失返回 null。 */
