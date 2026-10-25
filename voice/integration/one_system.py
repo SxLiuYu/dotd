@@ -745,6 +745,9 @@ def _check(paths: Paths, token: Optional[str], port: int) -> dict[str, Any]:
         "httpsEnabled": https_enabled,
         "httpsPort": https_port if https_enabled else None,
         "httpsCert": https_cert,
+        # "能不能听"：模型在不在 / 云端 key 配了没。放进 --check 是因为
+        # 2026-10-25 那次"体检全绿、设备是聋的"教训（见 asr_state 注释）。
+        "asr": asr_state(paths),
         "dotdCommand": dotd_command(),
         "apiVersion": KERNEL_API_VERSION,
     }

@@ -109,7 +109,7 @@ SenseVoice 的声学闭环（2026-10-24，见 `docs/acceptance/voice-real-audio/
 | 跨设备共享记忆 | 同脚本 A/B | ✅ A 说「花生过敏」→ `fs.write` 落盘 → B 的 prompt 里注入 → B/C 都答出 |
 | 旧记忆导入 | `dotd import` / `POST /api/memory/import` | ✅ 提示词 + 16 KB 上限 + 只写 `notes/YYYY-MM-DD-import-<slug>.md` |
 | 上游许可 | `voice/NOTICE` | ⚠️ 上游 README 称 MIT 但无 LICENSE 文件；自用可以，对外发布前必须补齐 |
-| 一键起 | `docker/compose.voice.yml` | ✅ 冷构建 238 s、镜像 1.59 GB、容器 healthy、设备面一轮带凭证（`docs/acceptance/voice-docker/`） |
+| 一键起 | `docker/compose.voice.yml` | ✅ 冷构建 238 s、镜像 1.59 GB、容器 healthy、设备面一轮带凭证（`docs/acceptance/voice-docker/`）。⚠️ 2026-10-25：原镜像缺全部音频 SDK，已修并重建 1.96 GB，见 `docs/status-2026-10-25.md` §17 |
 | 上手体检 | `npm run onboard` | 必需项全绿；缺项逐条给命令 |
 | 一页上手 | `docs/voice-quickstart.md` | 云主机 / 盒子 / ESP32 / 排障 / 延迟旋钮 |
 

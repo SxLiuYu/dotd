@@ -34,6 +34,14 @@ DOTD_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 charlie-dotd:latest 89dacc35adb3 1.59GB 2026-10-24 03:01:32 +0800 CST
 ```
 
+> **2026-10-25 复查：这份验收的「healthy」是假结论。** 镜像只装了
+> `requirements-core.txt`，`edge_tts / sherpa_onnx / lark_oapi / opuslib / av /
+> soundfile` 六个**全部缺席** —— 容器能起、`/health` 全绿，但说不出话也听不见
+> （`docker run --rm --entrypoint python charlie-dotd:latest -c 'import …'` 实测）。
+> 修复见 `docs/status-2026-10-25.md` §17.2 / §17.6；重建后镜像 **1.96 GB**，
+> 六个包全在，空卷首启约 3 分钟自动下好 SenseVoice 并接管（无需重启）。
+> 本目录的日志与快照是 10-23/24 的**历史证据**，保留原样，不做改写。
+
 ### pypi 不可达这件事
 
 `Dockerfile.voice` 的 pip 步骤现在接受构建参数，默认仍是官方源：
@@ -70,6 +78,18 @@ charlie   charlie-dotd:latest   "/app/entrypoint.sh …"   charlie   15 seconds 
 ```
 
 容器健康检查本身也是 healthy（`health-inspect.json`）。
+
+> 上面的 JSON 是 10-24 的快照，没有 `asr` / `https` 两个字段（当时还没实现）。
+> 2026-10-25 起 `/health` 形如：
+>
+> ```json
+> {"ok":true,"voice":"ok",
+>  "asr":{"mode":"none|local|cloud|disabled","model":"…还是 null","cloud":[],"ok":false},
+>  "https":{"state":"running","port":8443,"error":null},"kernel":"ok", "…"}
+> ```
+>
+> 空卷首启、模型还在后台下载时 `asr.ok=false` —— 这是**如实**的，
+> 而旧的 `voice:"ok"` 在这种状态下也是 `ok`，等于把"聋"报成了"健康"。
 
 ## 空数据卷的首次启动
 
@@ -142,9 +162,15 @@ docker exec -i charlie python3 - < turn_check.py          # 写笔记的那一�
 
 ## 已知限制（不要当成通过）
 
+- **本轮（10-23/24）验的是「文本进 → 执行 → 凭证」，不是「音箱出声/麦克风听见」。**
+  2026-10-25 复查证明当时的镜像连 TTS/ASR 的 SDK 都没装（见文首提示），
+  "容器 healthy"与"语音可用"是两件事。语音侧的门禁现在是
+  `tests/voice-container-image.test.ts`、`tests/voice-asr-model.test.ts`
+  与 `/health` 的 `asr` 字段。
 - `DOTD_FLEET=stub`：容器里的 fs/shell 是**内存模拟**，日志自己会喊“重启即蒸发”。
   要验“真写文件/真起兄弟容器”，得 `DOTD_FLEET=docker` 且挂 `docker.sock`。
-- 没配 TTS key：日志里 `no TTS available` 是预期；本轮验的是「文本进 → 执行 → 凭证」，不是「音箱出声」。
+- 没配 TTS key：日志里 `no TTS available` 是预期（现在是降噪后的 INFO；
+  `TTS_PRIORITY` 第一位是 edge，不需要 key）。
 - 没有真实 ESP32 接入、没有 8000/8443 之外的端口验收（1883/8888 未测）。
 - **「干净云主机 30 分钟」仍不是整段实测**：本次只测到「构建 238 s + 首启 ≈ 40 s ≈ 4.5 分钟」，
   不包含装 Docker、拉代码、配模型 key、备案/安全组。要写成 30 分钟，得在真云主机上从

@@ -106,6 +106,23 @@ if (check.status === 0) {
         ? '首次 `npm run charlie:start` 会自动生成自签证书到 <home>/voice/cert/'
         : '',
     );
+    // 「能不能听」。`/health` 的 voice:"ok" 是硬编码的，缺模型/缺 key 时也 ok
+    // （2026-10-25 因此把"设备是聋的"报成了全绿），所以这里单独问一次。
+    const asr = info.asr ?? { mode: 'unknown', ok: null };
+    add(
+      '语音识别（能不能听）',
+      asr.mode === 'local' || asr.mode === 'cloud' ? 'ok' : asr.mode === 'disabled' ? 'skip' : 'fail',
+      asr.mode === 'local'
+        ? `本地 SenseVoice：${asr.model}`
+        : asr.mode === 'cloud'
+          ? `云端 ASR：${(asr.cloud ?? []).join(', ')}`
+          : asr.mode === 'disabled'
+            ? '已禁用（SENSE_VOICE_DISABLED=1）'
+            : '既没有本地模型也没有云端 key —— 设备会"听不见"',
+      asr.mode === 'none' || asr.mode === 'unknown'
+        ? 'python -m voice.integration.asr_model voice/charlie/models/sense-voice（Docker 会自动下）'
+        : '',
+    );
   } catch {
     add('一套系统配置', 'fail', '--check 输出不是 JSON', '检查 voice/integration/one_system.py');
   }

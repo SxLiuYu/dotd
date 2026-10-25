@@ -94,8 +94,18 @@ curl http://127.0.0.1:8000/health
 `edge_tts / sherpa_onnx / lark_oapi / opuslib / av / soundfile` 六个**全部缺席**
 （`docker run --rm --entrypoint python charlie-dotd:latest -c 'import …'` 实测）。
 healthcheck 只看 `/health`，所以"容器 healthy"这个结论当时是假的。现在改为再装
-`voice/requirements-container.txt`、apt 补 `libopus0`、entrypoint 后台下模型；
-门禁 `tests/voice-container-image.test.ts` 盯住这三件事，防止再次退化成"只会回 health"。
+`voice/requirements-container.txt`、apt 补 `libopus0`、entrypoint 后台下模型。
+
+修完后的实测（同一天，重建镜像 **1.96 GB**）：空卷首启 40 s healthy → 后台从
+hf-mirror 下 226 MB（约 3 分钟）→ `/health.asr.mode` 自动从 `none` 变 `local` →
+`POST /api/asr` 返回正确文本，**全程不用重启容器**。门禁：
+`tests/voice-container-image.test.ts`（装了哪些包 / 模型下到哪 / 必须先判文件存在）、
+`tests/voice-asr-model.test.ts`（多源下载、原子落盘、"后到即接管"）。
+
+一个必须知道的坑：**上游 `scripts/download-models.py` 只有 GitHub release 一个源**，
+在国内网络 20 s 超时 0 字节（hf-mirror 有 1.2 MB/s）。所以 entrypoint 用的是
+`voice/integration/asr_model.py`（三源）。要自建镜像源就设 `SENSE_VOICE_MIRROR`
+指向一个含 `model.int8.onnx` 与 `tokens.txt` 的目录 URL。
 
 构建失败优先看两件事：
 

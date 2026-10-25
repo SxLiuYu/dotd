@@ -100,19 +100,33 @@ add(
 // SenseVoice 模型文件没下载（237MB，不在仓库里），百度 key 没配，StepFun 没配，
 // ASR_PRIORITY 里四个 provider 全灭。而当时的体检（onboard / setup:all --check）
 // 只验了 Python 依赖"能 import"，完全看不出这台机器是聋的。这里补一条。
+//
+// 两个位置都要看：宿主机是 `voice/charlie/models/`（上游 PROJECT_DIR），
+// Docker 是数据卷 `<home>/voice/models/`（entrypoint 下到那儿）。只看前者会把
+// 容器部署误判成聋的。
 
-const senseModel = join(REPO, 'voice', 'charlie', 'models', 'sense-voice', 'model.int8.onnx');
-const cloudAsr = ['STEPFUN_KEY', 'BAIDU_APP_ID', 'BAIDU_API_KEY'].filter(
+const asrHome =
+  process.env.CHARLIE_HOME ?? process.env.DOTD_HOME ?? join(homedir(), '.dotd');
+const senseModels = [
+  join(asrHome, 'voice', 'models', 'sense-voice', 'model.int8.onnx'),
+  join(REPO, 'voice', 'charlie', 'models', 'sense-voice', 'model.int8.onnx'),
+].filter((p) => existsSync(p));
+// 百度要三个 key 齐全（上游判定如此），只算两个会给出"已配置"的假结论。
+const baiduReady = ['BAIDU_APP_ID', 'BAIDU_API_KEY', 'BAIDU_SECRET_KEY'].every(
   (k) => (process.env[k] ?? '').length > 0,
 );
-const localAsr = existsSync(senseModel);
+const cloudAsr = [
+  ...(baiduReady ? ['baidu'] : []),
+  ...((process.env.STEPFUN_KEY ?? '').length > 0 ? ['stepfun'] : []),
+];
+const localAsr = senseModels.length > 0;
 add(
   'asr',
   '语音识别（ASR）',
   'recommended',
   localAsr || cloudAsr.length > 0,
   localAsr
-    ? `SenseVoice 本地模型已就位（${senseModel}）`
+    ? `SenseVoice 本地模型已就位（${senseModels[0]}）`
     : cloudAsr.length > 0
       ? `云端 ASR 已配置：${cloudAsr.join(', ')}`
       : '没有任何可用的 ASR：本地模型没下载，云端 key 也没配（设备会"听不见"）',
@@ -120,9 +134,11 @@ add(
     ? undefined
     : [
         '二选一：',
-        '  1. 本地（免费、26ms，推荐）：bash voice/charlie/scripts/download-models.sh',
-        '     → 下到 voice/charlie/models/sense-voice/（237MB，不入库）',
+        '  1. 本地（免费、26ms，推荐）：python -m voice.integration.asr_model ' +
+          'voice/charlie/models/sense-voice',
+        '     直接跑上游脚本常常失败：它只有 GitHub release 一个源，国内会超时',
         '  2. 云端：在 tokens.env 里配 STEPFUN_KEY，或百度 BAIDU_APP_ID/API_KEY/SECRET_KEY',
+        'Docker 部署不用管这条：entrypoint 会自己下到 /data/voice/models/。',
       ].join('\n'),
 );
 

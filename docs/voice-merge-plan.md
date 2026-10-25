@@ -357,7 +357,7 @@ node scripts/fake-device.mjs --base http://127.0.0.1:7788 --master $DOTD_MASTER_
 | SSE 按设备过滤 + 断线重连 + 增量去重 | `SseDeviceCursorStore`（`surf_kv` 的 `device_sse:<id>`）+ `/api/device/stream` | ✅ 重连不带头从设备游标续读、已下发的帧不重发、超窗 resync；任务级流不发全局审批快照（4 单测 + 1 HTTP 用例） |
 | 吊销 1 秒内全部 `/api/device/*` 401 | `DELETE /api/devices/:id` 后逐个打 5 条路由 | ✅ 单测覆盖 turn/stream/events/tasks/approvals |
 | 配额耗尽明确回话 | `cortex_router._quota()` + `DeviceQuotaError` | ✅ 说「今天这台设备的额度用完了…」，不再说「大脑不在线」；`device_busy` 有独立话术（3 Python 用例） |
-| compose 一键起 | `docker/compose.voice.yml` + `docker/Dockerfile.voice` + `docker/entrypoint.sh` | ✅ 冷构建 238 s / 1.59 GB / 容器 healthy；空卷首启自动生成配置并注册设备（`docs/acceptance/voice-docker/`） |
+| compose 一键起 | `docker/compose.voice.yml` + `docker/Dockerfile.voice` + `docker/entrypoint.sh` | ✅ 冷构建 238 s / 1.59 GB / 容器 healthy；空卷首启自动生成配置并注册设备（`docs/acceptance/voice-docker/`）。⚠️ 2026-10-25 复查：当时镜像缺全部音频 SDK（`edge_tts/sherpa_onnx/opuslib/av/soundfile/lark_oapi`），"healthy" 不等于能听能说；已修，见 `docs/status-2026-10-25.md` §17 |
 
 **3 台模拟设备并发 + 跨设备共享记忆（`node scripts/.multi-device.mjs`，真模型 hy3，16/16 通过）**：
 
@@ -399,6 +399,11 @@ DOTD_SMOKE_TRACE=1 node scripts/.multi-device.mjs
 镜像已验证（2026-10-23，WSL2 Ubuntu-24.04 / Docker 29.1.3）：冷构建 238 s、镜像 1.59 GB、
 空卷首启自动生成 `/data/config.yml` 并注册设备、容器 healthy、设备面一轮带凭证。
 证据见 `docs/acceptance/voice-docker/`。
+
+**但 2026-10-25 复查推翻了「能用」这半句**：那个镜像里 `edge_tts / sherpa_onnx /
+lark_oapi / opuslib / av / soundfile` 六个全缺 —— 能起、能回 `/health`，但说不出话
+也听不见。已补 `voice/requirements-container.txt` + `libopus0`，重建后 1.96 GB；
+并加了 `/health.asr` 让"能不能听"可观测。详见 `docs/status-2026-10-25.md` §17。
 
 ### 阶段 4 完成报告（2026-10-23 交付，2026-10-24 补齐导入与许可说明）
 
