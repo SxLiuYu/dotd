@@ -40,26 +40,15 @@ _MODELS_BAK_SEED=""
 _MODELS_BAK_RUNTIME=""
 _MODELS_TRAP_ARMED=0
 
-# 种子 = 本脚本所在的仓库副本；运行期 = daemon 真读的那份（判据与
-# scripts/lib/env.mjs::resolveConfigDir 一致：DOTD_CONFIG_DIR → DOTD_CONFIG 目录 →
-# <home>/.dotd 有 models.yml → 仓库 config）。
-models_resolve() {
-  local repo_root
-  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-  _MODELS_SEED="$repo_root/config/models.yml"
+# 「运行期配置在哪」不再由本文件自己推断：与 verify-goal / 体检共用 scripts/lib/config-dir.sh
+# （同一判据两份拷贝，迟早不一致 —— 这正是本项目反复踩的形状）。
+. "$(dirname "${BASH_SOURCE[0]}")/config-dir.sh"
 
-  if [ -n "${DOTD_CONFIG_DIR:-}" ]; then
-    _MODELS_RUNTIME="$DOTD_CONFIG_DIR/models.yml"
-  elif [ -n "${DOTD_CONFIG:-}" ]; then
-    _MODELS_RUNTIME="$(dirname "$DOTD_CONFIG")/models.yml"
-  else
-    local home_dir="${DOTD_HOME:-$HOME/.dotd}"
-    if [ -f "$home_dir/models.yml" ]; then
-      _MODELS_RUNTIME="$home_dir/models.yml"
-    else
-      _MODELS_RUNTIME="$_MODELS_SEED"
-    fi
-  fi
+# 种子 = 本脚本所在的仓库副本；运行期 = daemon 真读的那份
+# （判据见 scripts/lib/config-dir.sh，对齐 src/surfaces/config.ts 与 env.mjs）。
+models_resolve() {
+  _MODELS_SEED="$(dotd_repo_root)/config/models.yml"
+  _MODELS_RUNTIME="$(dotd_config_file models.yml)"
 }
 
 models_begin() {

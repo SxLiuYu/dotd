@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # 真并发写测试：DOTD_MAX_RUNNING=2，让两个任务真正同时跑，看记忆写入是否冲突。
+#
+# 2026-10-26（同类缺陷第十一例）：原来这里是
+#     pkill -9 -f 'src/daemon.ts'; sleep 3
+#     DOTD_MAX_RUNNING=2 nohup setsid bash scripts/wsl-daemon.sh &   ← 锁被 supervisor 持着
+# 第二行一次都没启动过任何东西（wsl-daemon.sh 打印「已有实例持锁」后 exit 0），
+# 额度仍是启动 supervisor 时的旧值；更要命的是最后只**打印**观察到多少并发、从不断言，
+# 于是「额度=2 生效」这个结论从来没被检验过。
+# 现在：重启走 lib/daemon-restart.sh 并读回运行期环境，最后对 MAXRUN 断言。
 set -uo pipefail
 cd "$HOME/dotd" || exit 1
 set -a; . ./_tokens_src.env; set +a
 BASE=http://127.0.0.1:7788
 HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application/json; charset=utf-8")
 
-echo "=== 以 DOTD_MAX_RUNNING=2 重启 daemon ==="
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-DOTD_MAX_RUNNING=2 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do
-  sleep 2
-  curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break
-done
-echo "  daemon 已起（$((i*2))s）"
+WANT_MAX=2
+echo "=== 以 DOTD_MAX_RUNNING=$WANT_MAX 重启 daemon ==="
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart "DOTD_MAX_RUNNING=$WANT_MAX" || { echo "  ❌ 重启/环境验证失败，实验不成立"; exit 1; }
 echo "  并发配置:"
 curl -s -m 10 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" | head -c 250
 echo
@@ -85,3 +88,17 @@ done
 echo
 echo "======== 汇总 ========"
 echo "并发度=$MAXRUN  任务完成=$OK/4  文件正确=$CGOOD/4"
+
+# 断言（原来只打印，结论无人检验）：
+#   上限 —— 超过额度就是额度没生效，本实验的核心前提塌了；
+#   下限 —— 没到 2 说明根本没并发起来，"并发写不冲突"这句话也就没被验证过。
+FAIL=0
+if [ "$MAXRUN" -gt "$WANT_MAX" ]; then
+  echo "  ❌ 并发度 $MAXRUN 超过额度 $WANT_MAX（额度没生效）"; FAIL=1
+elif [ "$MAXRUN" -lt "$WANT_MAX" ]; then
+  echo "  ⚠️ 并发度只到 $MAXRUN（<$WANT_MAX）：没有真正并发，结论不成立"; FAIL=1
+fi
+[ "$OK" -eq 4 ] || { echo "  ❌ 完成任务 $OK/4"; FAIL=1; }
+[ "$CGOOD" -eq 4 ] || { echo "  ❌ 文件正确 $CGOOD/4"; FAIL=1; }
+[ "$FAIL" -eq 0 ] && echo "  ✅ 并发度恰好 $WANT_MAX，任务与文件全部正确"
+exit "$FAIL"

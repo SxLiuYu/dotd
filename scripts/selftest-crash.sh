@@ -32,8 +32,12 @@ process.stdout.write(String(r.c));db.close();' "$T1")
 done
 
 echo "=== 3. 强杀 daemon（kill -9，模拟崩溃）==="
-PID=$(ps aux | grep '[s]rc/daemon.ts' | awk '{print $2}' | head -1)
+# 用库的判据找 pid（不再 `ps aux | grep`）：顺带确认它到底有没有 supervisor 托管。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+PID="$(daemon_pids | head -1)"
 if [ -z "$PID" ]; then echo "  !! daemon 没找到"; exit 2; fi
+SUP="$(daemon_supervisor_pids | tr '\n' ' ')"
+echo "  daemon pid=$PID supervisor=${SUP:-（无）}"
 kill -9 "$PID"
 echo "  已 kill -9 $PID"
 
@@ -47,14 +51,37 @@ console.log("  任务状态:", t?t.status:"?");
 console.log("  步骤:", steps.map(function(s){return s.seq+":"+s.kind+(s.tool_name?":"+s.tool_name:"")+"="+s.status;}).join(" | "));
 db.close();' "$T1"
 
-echo "=== 5. 重启 daemon（应触发崩溃恢复对账）==="
+echo "=== 5. 等 supervisor 把 daemon 拉回来（应触发崩溃恢复对账）==="
+# 这里**故意**只 kill 子进程：本脚本要验的就是"崩溃后自动恢复"。
+# 托管模式下 supervisor 会按退避重启子进程 —— 所以原来那句
+# `nohup setsid bash scripts/wsl-daemon.sh &` 是多余的空操作
+# （锁在 supervisor 手上，wsl-daemon.sh 会打印「已有实例持锁」并 exit 0；
+#  见 scripts/lib/daemon-restart.sh 头部第十一例）。
+# 正确的等待条件是"出现了**新** pid，且端口通"。
 sleep 2
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 60); do
-  sleep 2
-  curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break
-done
-echo "  重启完成（$((i*2))s）"
+if [ -z "${SUP// /}" ]; then
+  # 没有 supervisor（裸跑 daemon）时没人替我们拉起来 —— 这时才需要自己起。
+  echo "  （无 supervisor，自己拉起）"
+  daemon_restart || { echo "  ❌ 重启失败"; exit 2; }
+  NEW_PID="$(daemon_pids | head -1)"
+else
+  NEW_PID=""
+  for i in $(seq 1 60); do
+    sleep 2
+    NEW_PID="$(daemon_pids | head -1)"
+    if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$PID" ] \
+       && curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1; then
+      break
+    fi
+    NEW_PID=""
+  done
+fi
+if [ -z "$NEW_PID" ]; then
+  echo "  ❌ 60×2s 内没有起来新的 daemon（旧 pid=$PID）"
+  tail -n 10 /tmp/dotd-wsl.log 2>/dev/null | sed 's/^/      /'
+  exit 2
+fi
+echo "  已恢复：新 pid=$NEW_PID（旧 $PID）"
 echo "  恢复日志:"
 grep -E '启动恢复|孤儿步|reconcile|对账' /tmp/dotd-wsl.log | tail -4
 

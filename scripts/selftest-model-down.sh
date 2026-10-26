@@ -44,11 +44,11 @@ echo "======== 场景 A：模型端点全挂 ========"
 models_set_base_url http://127.0.0.1:59999/v1
 models_verify_base_url http://127.0.0.1:59999/v1 || exit 1
 echo "  base_url → 127.0.0.1:59999（无人监听）"
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do sleep 2; curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break; done
-echo "  daemon 已起（$((i*2))s，模型不可达）"
+# 重启走 lib/daemon-restart.sh：托管部署里只杀 node 子进程会被 supervisor 用旧环境拉回来，
+# 直接起 wsl-daemon.sh 在锁被占时是静默 no-op（第十一例）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart || { echo "  ❌ 重启失败，实验不成立"; exit 1; }
+echo "  daemon 已起（模型不可达）"
 
 T1=$(submit "算一下 1+1")
 echo "  提交 task=$T1"
@@ -70,10 +70,7 @@ grep -iE 'circuit|熔断|AllEndpointsDown|paused' /tmp/dotd-wsl.log | tail -3 ||
 echo
 echo "======== 场景 B：恢复端点后能否继续干活 ========"
 models_restore
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do sleep 2; curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break; done
+daemon_restart || { echo "  ❌ 重启失败"; exit 1; }
 T2=$(submit "只回复 OK 两个字")
 for i in $(seq 1 90); do
   sleep 2
@@ -89,5 +86,7 @@ esac
 echo
 echo "======== 汇总 ========"
 echo "PASS=$PASS FAIL=$FAIL"
-cp /tmp/models.normal.bak config/models.yml
+# 恢复由 lib/model-switch.sh 的 EXIT trap 负责（两处都恢复）。
+# 原来这里 `cp /tmp/models.normal.bak config/models.yml`：那份备份的创建行早已删掉，
+# 于是这行 cp 成了脚本的退出码 —— 断言全过也可能 exit 1。
 [ "$FAIL" -eq 0 ]

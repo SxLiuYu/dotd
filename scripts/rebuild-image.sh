@@ -82,31 +82,17 @@ if [ "$SWAP" = "1" ]; then
     echo "  无旧容器"
   fi
   # daemon 在跑就先优雅停掉：boot 才会重新 ensureImage + reconcile。
-  # one_system 托管模式（2026-10-25 起）：TERM supervisor 才能带走 dotd 子进程，
-  # 只杀 node 会被 supervisor 自动重启，换镜像就成了空话。
-  DPIDS=$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)
-  if [ -n "$DPIDS" ]; then
-    echo "  停止 supervisor+daemon (pid $(echo $DPIDS | tr '\n' ' '))…"
-    for p in $DPIDS; do kill -TERM "$p" 2>/dev/null || true; done
-    for _ in $(seq 1 30); do
-      sleep 1
-      pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' >/dev/null 2>&1 || break
-    done
-    LEFT=$(pgrep -f 'voice\.integration\.one_system|src/daemon\.ts' || true)
-    if [ -n "$LEFT" ]; then
-      echo "  30s 未退，SIGKILL"
-      for p in $LEFT; do kill -KILL "$p" 2>/dev/null || true; done
-      sleep 1
-    fi
-  fi
+  # 托管模式（2026-10-25 起）：TERM supervisor 才能带走 dotd 子进程，
+  # 只杀 node 会被 supervisor **用旧环境**自动重启，换镜像就成了空话（第十一例）。
+  # 统一走 lib/daemon-restart.sh：停 supervisor → 等 flock 释放 → 起新实例；
+  # 而且不顺带截断 /tmp/dotd-wsl.log（原来那句 `> /tmp/dotd-wsl.log` 会把
+  # daemon 正在写的活日志清零，出事后现场就没了）。
+  . "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+  DAEMON_RESTART_LOCK_WAIT=30
+  # 新镜像首次起容器要拉/建，比平常慢得多：原来这里等 60×5s，保持同样的耐心。
+  DAEMON_RESTART_TIMEOUT=300
   echo "  拉起 daemon…"
-  setsid bash scripts/wsl-daemon.sh >/tmp/dotd-wsl.log 2>&1 < /dev/null &
-  for i in $(seq 1 60); do
-    sleep 5
-    if timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; then
-      echo "  daemon 就绪（$((i*5))s）"; break
-    fi
-  done
+  daemon_restart || { echo "  !! daemon 没起来：镜像已换但没生效"; exit 1; }
 fi
 
 # ---------- 4. 验证 + 才清理回滚 ----------

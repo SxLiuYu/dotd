@@ -30,6 +30,10 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
+# 「daemon 读哪份配置」的单一判据（与 lib/model-switch.sh、体检共用）。
+# S2(c) 原来固定数 `config/tools.yml`，而 daemon 读的是 <configDir>/tools.yml ——
+# 今天两边内容一样所以"看起来对"，但那是靠人工保持两份一致（同类缺陷第七例的形态）。
+. scripts/lib/config-dir.sh
 
 RUN=0; JSONOUT=0
 for a in "$@"; do
@@ -207,6 +211,7 @@ row "S1 修绿基线" "$S1_ST" "$S1_MSG" "npm test + git status"
 #      那只能证明"调用过"，证明不了"同类任务主动选了它、且没手写重来、且答案对"。
 #      目标是三选一里最严的那条，就必须用最严的证据。）
 # (c) 三工具六环：白名单条数
+TOOLS_YML="$(dotd_config_file tools.yml)"
 S2_OUT=$(node --disable-warning=ExperimentalWarning -e '
 const { DatabaseSync } = require("node:sqlite");
 const home = process.env.HOME || "/root";
@@ -216,15 +221,18 @@ catch (e) { console.log("ERR|0|0|0"); process.exit(0); }
 const one = (s, ...a) => { try { return db.prepare(s).get(...a); } catch (e) { return null; } };
 const created = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=?", "tool.create") || {}).c || 0;
 const invAll  = (one("SELECT COUNT(*) c FROM steps WHERE tool_name=?", "tool.invoke") || {}).c || 0;
-let wl = 0;
+let wl = 0, wlErr = "";
 try {
-  const y = require("fs").readFileSync("config/tools.yml", "utf8");
+  // 必须是 daemon 真读的那份（<configDir>/tools.yml），不是仓库副本。
+  const y = require("fs").readFileSync(process.argv[1], "utf8");
   wl = (y.match(/^\s*-\s*name:\s*\S+/gm) || []).length;
-} catch (e) {}
-console.log([created, invAll, wl].join("|"));
-db.close();' 2>/dev/null)
+} catch (e) { wlErr = String(e && e.code || e); }
+// 第 4 段是"读不到"的原因：读不到 ≠ 白名单是空的。混为一谈会把
+// "文件路径不对"报成"白名单只有 0 个"，然后有人去改配置。
+console.log([created, invAll, wl, wlErr].join("|"));
+db.close();' "$TOOLS_YML" 2>/dev/null)
 
-IFS='|' read -r S2_CREATED S2_INVALL S2_WL <<< "${S2_OUT:-ERR|0|0}"
+IFS='|' read -r S2_CREATED S2_INVALL S2_WL S2_WL_ERR <<< "${S2_OUT:-ERR|0|0|}"
 if [ "${S2_CREATED:-ERR}" = "ERR" ] || [ -z "${S2_CREATED:-}" ]; then
   row "S2 自己造工具" FAIL "读不到 steps 表（库路径或权限问题）" "sqlite + s2b-verify.sh --judge"
 else
@@ -240,9 +248,11 @@ else
     *) S2_D="$S2_D；(b) 复用未达标 ❌"; S2_ST=FAIL ;;
   esac
 
-  if [ "${S2_WL:-0}" -ge 3 ]; then S2_D="$S2_D；(c) 白名单 $S2_WL 个 ✅"
+  if [ -n "${S2_WL_ERR:-}" ]; then
+    S2_D="$S2_D；(c) 读不到 $TOOLS_YML（$S2_WL_ERR）❌"; S2_ST=FAIL
+  elif [ "${S2_WL:-0}" -ge 3 ]; then S2_D="$S2_D；(c) 白名单 $S2_WL 个 ✅"
   else S2_D="$S2_D；(c) 白名单仅 $S2_WL 个 ❌"; S2_ST=FAIL; fi
-  row "S2 自己造工具" "$S2_ST" "$S2_D" "sqlite steps + s2b-verify.sh --judge + config/tools.yml"
+  row "S2 自己造工具" "$S2_ST" "$S2_D" "sqlite steps + s2b-verify.sh --judge + $TOOLS_YML"
 fi
 
 # ─── S3 能力验收：20 条 ≥19 ───

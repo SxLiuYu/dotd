@@ -68,10 +68,9 @@ sleep 5
 CID2=$(timeout 40 docker ps -a --filter name=dotd-dot-dot1 --format '{{.ID}}|{{.Status}}' | head -1)
 echo "  容器现状: ${CID2:-（无）}"
 # 触发一次 daemon 重启（boot 会 reconcile）
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do sleep 2; curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break; done
+# 走 lib/daemon-restart.sh：托管部署里要停 supervisor，不是它的 node 子进程。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart || { echo "  ❌ 重启失败"; exit 1; }
 sleep 10
 CID3=$(timeout 40 docker ps --filter name=dotd-dot-dot1 --format '{{.Names}}|{{.Status}}' | head -1)
 echo "  重启后容器: ${CID3:-（无）}"

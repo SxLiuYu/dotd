@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 第二十一轮：真并发下的**资源竞争**。
 #
-# 上轮证明了额度生效（并发度=2）。但两个任务跑在**同一个容器**里，
-# 这才是真正要验证的：并发的 shell.run / fs.write 会不会互相干扰？
+# 前提：并发额度=2 必须真的生效（由 lib/daemon-restart.sh 重启后读回 /proc/<pid>/environ 保证；
+# 原来那句 `DOTD_MAX_RUNNING=2 nohup setsid bash scripts/wsl-daemon.sh &` 是静默 no-op）。
+# 两个任务跑在**同一个容器**里，要验证的是：并发的 shell.run / fs.write 会不会互相干扰？
 #
 # 场景：
 #   A. 两个任务同时写**同一个文件**（冲突必然发生）→ 结果应该是什么？不能损坏、不能假装成功
@@ -29,11 +30,10 @@ process.stdout.write(r ? r.status : ""); db.close();' "$1"
 }
 
 echo "=== 以并发 2 重启 ==="
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-DOTD_MAX_RUNNING=2 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do sleep 2; curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break; done
-echo "  已起（$((i*2))s）"
+# 原来这里是 pkill + `DOTD_MAX_RUNNING=2 nohup setsid bash scripts/wsl-daemon.sh &`：
+# 锁在 supervisor 手里 → 一次都没起；额度也没变（第十一例，见 lib/daemon-restart.sh）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart DOTD_MAX_RUNNING=2 || { echo "  ❌ 重启/环境验证失败，实验不成立"; exit 1; }
 
 echo
 echo "======== A. 两个任务同时写同一个文件 ========"

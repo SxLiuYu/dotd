@@ -24,15 +24,11 @@ models_set_primary "$MODEL"
 models_verify_primary "$MODEL" || exit 1
 grep -E '^\s+(primary|light):' "$_MODELS_RUNTIME" | head -2
 
-# 重启让它生效
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 45); do
-  sleep 2
-  if curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1; then break; fi
-done
-echo "daemon 就绪（$((i*2))s）"
+# 重启让它生效。走 lib/daemon-restart.sh：托管部署里要停 supervisor（one_system），
+# 只杀 node 子进程会被它用旧环境拉回来；直接起 wsl-daemon.sh 在锁被占时是静默 no-op。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart || { echo "❌ 重启失败，实验不成立"; exit 1; }
+echo "daemon 就绪"
 
 submit() {
   local body
@@ -87,4 +83,6 @@ run "S4 联网取数"   "用 net.get 访问 https://api.github.com/zen，把原�
 run "S5 确认型"     "创建 c1.txt 写 11，c2.txt 写 22，读回确认，最后回复两数之和。" "33"
 
 echo "  ---- 合计步数: $TOTAL ----"
-cp /tmp/models.yml.bak config/models.yml
+# 恢复由 lib/model-switch.sh 的 EXIT trap 负责（同时恢复种子与运行期）。
+# 原来这里 `cp /tmp/models.yml.bak config/models.yml`：那份备份早就没人创建了
+# （创建行在 6c55675 被删掉），于是这行成了脚本的退出码 —— 所有断言都通过也可能 exit 1。

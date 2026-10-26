@@ -18,13 +18,10 @@ models_verify_primary "$MODEL" || exit 1
 
 echo
 echo "=== 重启 daemon 加载新配置 ==="
-pkill -f 'src/daemon.ts' 2>/dev/null || true
-sleep 4
-DOTD_MAX_RUNNING=1 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do
-  sleep 2
-  timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null && { echo "  就绪（$((i*2))s）"; break; }
-done
+# 走 lib/daemon-restart.sh：托管部署里要停 supervisor，且 DOTD_MAX_RUNNING=1
+# 只有在它交给新 supervisor 并读回 /proc/<pid>/environ 后才算数（第十一例）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart DOTD_MAX_RUNNING=1 || { echo "  ❌ 重启/环境验证失败"; exit 1; }
 sleep 5
 
 run_one() {

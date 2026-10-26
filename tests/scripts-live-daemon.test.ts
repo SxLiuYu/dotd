@@ -56,7 +56,7 @@ describe('① parseProcEnv：/proc 的 NUL 分隔形态', () => {
   });
 });
 
-describe('② scanDaemons：只认 src/daemon.ts，不误伤别的进程', () => {
+describe('② scanDaemons：只认 daemon 入口（src/daemon.ts 或 dist/daemon.js），不误伤别的进程', () => {
   test('认出 daemon，且排除自己（selfPid）', () => {
     const p = fakeProc({
       101: { cmdline: ['/usr/bin/node', '--import', 'tsx', '/root/dotd/src/daemon.ts'], environ: { DOTD_FLEET: 'docker' } },
@@ -87,6 +87,26 @@ describe('② scanDaemons：只认 src/daemon.ts，不误伤别的进程', () =>
       assert.ok(pids.includes(1), 'Windows 反斜杠路径要认');
       assert.ok(!pids.includes(2), 'daemon.tsx 不是 daemon');
       assert.ok(!pids.includes(3), 'not-daemon.ts 不是 daemon');
+    } finally {
+      p.cleanup();
+    }
+  });
+
+  test('构建产物形态 `dist/daemon.js` 也认（one_system 优先起它）', () => {
+    // 托管部署里 dotd_command() 有 dist/daemon.js 就优先用它。只认 src/daemon.ts 的话，
+    // 一旦跑过构建，doctor / 重启库就"看不见 daemon" —— 于是把自己的盲区报成环境问题。
+    const p = fakeProc({
+      10: { cmdline: ['/usr/bin/node', '/root/dotd/dist/daemon.js'], environ: { DOTD_FLEET: 'docker' } },
+      11: { cmdline: ['node.exe', 'D:\\dotd\\dist\\daemon.js'] },
+      12: { cmdline: ['node', 'dist/daemon.jsx'] },
+    });
+    try {
+      const found = scanDaemons({ procRoot: p.root, selfPid: 0 });
+      const pids = found.map((d) => d.pid);
+      assert.ok(pids.includes(10), 'Linux 绝对路径要认');
+      assert.ok(pids.includes(11), 'Windows 反斜杠路径要认');
+      assert.ok(!pids.includes(12), 'daemon.jsx 不是 daemon');
+      assert.equal(found.find((d) => d.pid === 10)?.env.DOTD_FLEET, 'docker');
     } finally {
       p.cleanup();
     }

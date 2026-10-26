@@ -27,13 +27,21 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
- * daemon 进程的识别记号：cmdline 里有一个参数以 `/src/daemon.ts`、
- * `\src\daemon.ts` 或恰好 `src/daemon.ts` 结尾。
+ * daemon 进程的识别记号。
+ *
+ * 托管部署里 `one_system.dotd_command()` 优先用 **`<repo>/dist/daemon.js`**（有构建产物时），
+ * 否则才 `node --import tsx src/daemon.ts`。只认 `src/daemon.ts` 的话，一旦有人跑了
+ * 构建，体检就会报「看不见运行中的 daemon」，然后拿**自己 shell** 的环境当
+ * "实际生效值" —— 正是本模块存在的理由（同类缺陷第五例，2026-10-26）。
+ *
+ * 两种形态都认，但都必须**恰好是那个入口**：
+ *   · 某参数以 `/src/daemon.ts`、`\src\daemon.ts` 或 `src/daemon.ts` 结尾
+ *   · 某参数以 `/dist/daemon.js`、`\dist\daemon.js` 或 `dist/daemon.js` 结尾
  *
  * 刻意**不**用 `pgrep -f dotd` 这类模糊匹配：那会把 doctor 自己、
  * 部署脚本、`vim dotd` 都算进来（本项目被误杀的 shell 就是这么来的）。
  */
-const DAEMON_ARG = /(?:^|[\\/])src[\\/]daemon\.ts$/;
+const DAEMON_ARG = /(?:^|[\\/])(?:src[\\/]daemon\.ts|dist[\\/]daemon\.js)$/;
 
 function splitNul(text) {
   return text.split('\u0000').filter((x) => x.length > 0);

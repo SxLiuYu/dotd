@@ -7,11 +7,10 @@ BASE=http://127.0.0.1:7788
 HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application/json; charset=utf-8")
 
 echo "=== 1. 重启 daemon 加载新工具 ==="
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-DOTD_MAX_RUNNING=1 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do sleep 2; curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break; done
-echo "  已起（$((i*2))s）"
+# 走 lib/daemon-restart.sh：这里的 DOTD_MAX_RUNNING=1 原来根本落不到运行期进程上
+# （锁在 supervisor 手上 → wsl-daemon.sh 静默 exit 0），见 lib 头部第十一例。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart DOTD_MAX_RUNNING=1 || { echo "  ❌ 重启/环境验证失败"; exit 1; }
 
 echo
 echo "=== 2. 确认模型能看到 schedule 工具 ==="

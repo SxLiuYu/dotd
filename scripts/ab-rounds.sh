@@ -15,13 +15,9 @@ models_begin || exit 1
 models_set_primary "$MODEL"
 models_verify_primary "$MODEL" || exit 1
 
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 45); do
-  sleep 2
-  curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break
-done
+# 重启走 lib/daemon-restart.sh（原来只杀子进程 + 直接起 wsl-daemon.sh，后者是静默 no-op）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart || { echo "❌ 重启失败，实验不成立"; exit 1; }
 
 submit() {
   local body

@@ -7,11 +7,9 @@ BASE=http://127.0.0.1:7788
 HDR=(-H "Authorization: Bearer $DOTD_MASTER_TOKEN" -H "Content-Type: application/json; charset=utf-8")
 
 echo "=== 1. 重启 daemon 加载多模态改造 ==="
-pkill -9 -f 'src/daemon.ts' 2>/dev/null || true
-sleep 3
-DOTD_MAX_RUNNING=1 nohup setsid bash scripts/wsl-daemon.sh >/dev/null 2>&1 < /dev/null &
-for i in $(seq 1 40); do sleep 2; curl -sf -m 3 -H "Authorization: Bearer $DOTD_MASTER_TOKEN" "$BASE/api/status" >/dev/null 2>&1 && break; done
-echo "  已起（$((i*2))s）"
+# 走 lib/daemon-restart.sh（原来 DOTD_MAX_RUNNING=1 那句在锁被占时是静默 no-op）。
+. "$(dirname "${BASH_SOURCE[0]}")/lib/daemon-restart.sh"
+daemon_restart DOTD_MAX_RUNNING=1 || { echo "  ❌ 重启/环境验证失败"; exit 1; }
 
 CID=$(timeout 40 docker ps --filter name=dotd-dot-dot1 --format '{{.ID}}' | head -1)
 echo "  container=$CID"
