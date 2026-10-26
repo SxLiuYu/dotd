@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { resolveConfigDir } from '../scripts/lib/env.mjs';
 
@@ -62,6 +63,18 @@ function bashDir(w: ReturnType<typeof world>, env: Record<string, string>) {
 }
 
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '');
+
+/**
+ * Windows 路径 → WSL 路径（`D:\dotd` → `/mnt/d/dotd`）。
+ *
+ * 只有走 `wsl.exe` 跑 Python 时才需要。转错的代价是"在 WSL 里找不到仓库"，
+ * 那会表现为 `NO_PYTHON:*`，而上一版正是把这种失败当成了测试通过。
+ */
+function toWslPath(p: string): string {
+  const m = /^([A-Za-z]):[\\/]*(.*)$/.exec(p);
+  if (m === null) return norm(p);
+  return `/mnt/${m[1]!.toLowerCase()}/${m[2]!.replace(/\\/g, '/')}`;
+}
 
 /**
  * Git Bash 输出的是 MSYS 形态（`/c/Users/...`），Node 给的是 Windows 形态。
@@ -157,5 +170,172 @@ describe('② 调用方都走这份判据（不许再写死仓库 config/）', {
     const text = readFileSync(join(REPO, 'scripts', 'lib', 'model-switch.sh'), 'utf8');
     assert.match(text, /lib\/config-dir\.sh/);
     assert.match(text, /dotd_config_file models\.yml/);
+  });
+});
+
+describe('③ 「监听端口」也只有一个判据：环境变量 > 配置 > 7788', { skip: !bashOk }, () => {
+  // 现场（2026-10-26，同类缺陷第十四例）：
+  //
+  //   DOTD_HTTP_PORT=7799 node src/daemon.ts     ← 实测仍监听 7788（daemon 不读它）
+  //   one_system.resolve_http_port()             ← 却说 7799，反代发往 7799
+  //   scripts/soak.sh                            ← 也按 7799 探活
+  //
+  // 结果：8000 上的 /api 全 502，而三处各自的日志都正常。修的是 daemon 侧，
+  // 让它也认这个变量；这个测试钉住"两侧对同一组输入给同一个答案"。
+
+  /** 真跑 daemon 侧的解析（不 mock），拿最终 port。 */
+  function daemonPort(env: Record<string, string>, cfgPort = 7788): string {
+    const dir = mkdtempSync(join(tmpdir(), 'dotd-port-'));
+    try {
+      writeFileSync(
+        join(dir, 'config.yml'),
+        [
+          'version: 1',
+          'surfaces:',
+          '  http:',
+          '    host: 127.0.0.1',
+          `    port: ${cfgPort}`,
+          '    master_token: "t"',
+          '',
+        ].join('\n'),
+        'utf8',
+      );
+      writeFileSync(
+        join(dir, 'probe.mjs'),
+        [
+          `import { loadSurfacesConfig } from ${JSON.stringify(pathToFileURL(join(REPO, 'src', 'surfaces', 'config.ts')).href)};`,
+          'try { process.stdout.write(String(loadSurfacesConfig(process.argv[2]).http.port)); }',
+          'catch (e) { process.stdout.write("THROWN:" + e.message); }',
+        ].join('\n'),
+        'utf8',
+      );
+      const r = spawnSync(process.execPath, ['--import', 'tsx', join(dir, 'probe.mjs'), join(dir, 'config.yml')], {
+        encoding: 'utf8',
+        cwd: REPO,
+        env: {
+          ...Object.fromEntries(Object.entries(process.env).filter(([, v]) => typeof v === 'string')),
+          ...env,
+        },
+      });
+      if (r.error !== undefined) return 'NO_BASH';
+      return (r.stdout ?? '').trim();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /** 真跑 one_system 侧的解析。 */
+  function supervisorPort(env: Record<string, string>, cfgPort = 7788): string {
+    const dir = mkdtempSync(join(tmpdir(), 'dotd-port-py-'));
+    try {
+      writeFileSync(
+        join(dir, 'config.yml'),
+        ['version: 1', 'surfaces:', '  http:', `    port: ${cfgPort}`, '    master_token: "t"', ''].join('\n'),
+        'utf8',
+      );
+      // WSL 里跑时临时目录要换成它认得的路径（`C:/…` → `/mnt/c/…`）。
+      // 不转的话 `resolve_paths` 会在 WSL 里去找一个不存在的 `C:/…`，
+      // 于是一定 return 7788 —— 测试就变成"恒等"，测不出任何东西。
+      const wsl = PY_CMD !== null && PY_CMD[0] === 'wsl.exe';
+      const pyDir = wsl ? toWslPath(dir) : dir;
+      // 变量**当字面量传进脚本**，不靠进程环境：
+      // `wsl.exe` 不会把 Windows 侧的环境变量转进去，除非 key 列在 `WSLENV` 里
+      // （实测：不列 → Python 读到的 `DOTD_HTTP_PORT` 是 None）。
+      // 靠环境传就会得到"设了 7799、被测函数看见 None"，测试自己造了个假前提。
+      const envLit = `{${Object.entries(env).map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(', ')}}`;
+      const code = [
+        'from voice.integration.one_system import resolve_paths, resolve_http_port',
+        `paths = resolve_paths({"CHARLIE_HOME": ${JSON.stringify(pyDir)}})`,
+        `try: print(resolve_http_port(paths, ${envLit}))`,
+        'except Exception as e: print("THROWN:" + str(e))',
+      ].join('\n');
+      const r = spawnSync(PY_CMD![0]!, [...PY_CMD!.slice(1), '-c', code], {
+        encoding: 'utf8',
+        cwd: REPO,
+        env: {
+          ...Object.fromEntries(Object.entries(process.env).filter(([, v]) => typeof v === 'string')),
+          // `-c` 的 sys.path[0] 是 cwd，但 wsl.exe 把 Windows cwd 翻成什么路径
+          // 不值得赌；直接给 PYTHONPATH，导入失败就一定是代码问题而不是找路问题。
+          ...(wsl ? { PYTHONPATH: toWslPath(REPO) } : {}),
+        },
+      });
+      // 失败要把原因带回调用方 —— 上一版只返回 'NO_PYTHON'，测试就 `continue` 了，
+      // 于是"Python 跑不起来"被当成"这条测试通过"（同类缺陷）。
+      if (r.error !== undefined) return `NO_PYTHON:${r.error.message}`;
+      if (r.status !== 0) return `NO_PYTHON:status=${r.status} ${(r.stderr ?? '').trim()}`;
+      return (r.stdout ?? '').trim();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * 跑 Python 的方式。本机 `python3` 是 Windows 应用商店的转发器（status 9009、
+   * 无输出），所以优先尝试 WSL 里的真解释器 —— 仓库就在同一个 `/mnt/d/...` 下。
+   *
+   * 两个实测坑：
+   * - `wsl.exe … -- python3 -c '代码'` 会经中间那层 bash，引号被吃掉，
+   *   报 `syntax error near unexpected token '('`；`--exec` 是直接 exec，不经过 shell。
+   * - 判据是"能 `import voice.integration.one_system`"，不是"能 `print(1)`"：
+   *   后者只证明有解释器，不证明它找得到仓库（上一版因此静默跳过）。
+   */
+  const PY_CMD: string[] | null = (() => {
+    const probe = (cmd: string[]): boolean => {
+      const wsl = cmd[0] === 'wsl.exe';
+      const r = spawnSync(cmd[0]!, [...cmd.slice(1), '-c', 'import voice.integration.one_system as m; print(m.DEFAULT_HTTP_PORT)'], {
+        encoding: 'utf8',
+        env: {
+          ...Object.fromEntries(Object.entries(process.env).filter(([, v]) => typeof v === 'string')),
+          ...(wsl ? { PYTHONPATH: toWslPath(REPO) } : {}),
+        },
+      });
+      return r.status === 0 && (r.stdout ?? '').trim() === '7788';
+    };
+    const cands: string[][] = [[process.env['PYTHON'] ?? 'python3']];
+    if (process.platform === 'win32') {
+      cands.push(['wsl.exe', '-d', 'Ubuntu-24.04', '--exec', 'python3']);
+      cands.push(['wsl.exe', '-d', 'Ubuntu-24.04', '--', 'python3']);
+    }
+    for (const c of cands) if (probe(c)) return c;
+    return null;
+  })();
+
+  /** 本机（或 WSL）能不能**真的导入本仓库的** `voice.integration.one_system`。 */
+  function pythonWorks(): boolean {
+    return PY_CMD !== null;
+  }
+
+  /** 两侧对同一组输入必须给同一个答案。 */
+  test('两侧对同一组输入必须给同一个答案', { skip: !pythonWorks() ? '本机与 WSL 都没有能导入本仓库的 python3' : false }, () => {
+    const cases: Array<[Record<string, string>, number]> = [
+      [{}, 7788], // 都没设 → 配置的端口
+      [{ DOTD_HTTP_PORT: '7799' }, 7788], // 只设环境变量 → 两侧都该是 7799
+      [{ DOTD_HTTP_PORT: '9001' }, 8123], // 环境变量压过配置
+    ];
+    for (const [env, cfgPort] of cases) {
+      const d = daemonPort(env, cfgPort);
+      const s = supervisorPort(env, cfgPort);
+      // 前置条件已经证明两个运行时都能跑，所以这里的失败**不许**被跳过：
+      // 那就是被测代码/测试自己不干活。
+      assert.doesNotMatch(d, /^NO_/, `daemon 侧没跑起来：${d}`);
+      assert.doesNotMatch(s, /^NO_/, `supervisor 侧没跑起来：${s}`);
+      assert.equal(d, s, `daemon(${d}) 与 supervisor(${s}) 对 ${JSON.stringify(env)} 判得不一样`);
+    }
+  });
+
+  test('环境变量非法时两侧都拒绝启动（不静默回落到 7788）', { skip: !pythonWorks() ? '本机与 WSL 都没有能导入本仓库的 python3' : false }, () => {
+    for (const bad of ['abc', '0', '70000']) {
+      const d = daemonPort({ DOTD_HTTP_PORT: bad });
+      const s = supervisorPort({ DOTD_HTTP_PORT: bad });
+      assert.doesNotMatch(d, /^NO_/, `daemon 侧没跑起来（${bad}）：${d}`);
+      assert.doesNotMatch(s, /^NO_/, `supervisor 侧没跑起来（${bad}）：${s}`);
+      assert.match(d, /THROWN:.*DOTD_HTTP_PORT/, `daemon 侧对 ${bad} 没有拒绝：${d}`);
+      assert.match(s, /THROWN:.*DOTD_HTTP_PORT/, `supervisor 侧对 ${bad} 没有拒绝：${s}`);
+    }
+  });
+
+  test('soak.sh 探的端口也走同一个变量（别自己发明一个）', () => {
+    const text = readFileSync(join(REPO, 'scripts', 'soak.sh'), 'utf8');
+    assert.match(text, /DOTD_HTTP_PORT/, 'soak 探活必须认这个变量');
   });
 });

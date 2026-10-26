@@ -240,6 +240,52 @@ export const DEFAULT_HTTP_HOST = '127.0.0.1';
 /** 环境变量覆盖名：不改配置文件也能换 bind（容器/ systemd 场景更顺手）。 */
 export const HTTP_HOST_ENV = 'DOTD_HTTP_HOST';
 
+/** 默认监听端口（契约 H2）。zod .default 与它必须同值。 */
+export const DEFAULT_HTTP_PORT = 7788;
+
+/**
+ * 环境变量覆盖名：不改配置文件也能换端口。
+ *
+ * 为什么**必须**有这一条（2026-10-26，同类缺陷第十四例）：
+ * `DOTD_HTTP_PORT` 早就有人在读，但读它的不是 daemon：
+ *   - `voice/integration/one_system.py::resolve_http_port()` 用它决定**反代目标**；
+ *   - `scripts/soak.sh` 用它决定**探哪个端口**；
+ *   - 三个 `.mjs` 冒烟脚本把它交给子进程，自己也用它拼 URL。
+ * 而 `parseSurfacesSection()` 只认 config.yml 的 `surfaces.http.port`。于是：
+ *
+ *      DOTD_HTTP_PORT=7799 node src/daemon.ts     ← 仍然监听 7788
+ *      one_system 反代 → 127.0.0.1:7799          ← 没人监听
+ *
+ * 实测（本仓库，真跑 loadSurfacesConfig）：
+ *     不设           → host=127.0.0.1 port=7788
+ *     DOTD_HTTP_PORT → host=127.0.0.1 port=7788   ← 环境变量被无视
+ *     DOTD_HTTP_HOST → host=0.0.0.0   port=7788   ← host 认，port 不认
+ * 两个行为旋钮一个认一个不认，是这条主线的老形状：**同一件事两处判据**。
+ * 后果不是"端口不对"这么明显 —— 是 8000 的 /api 全 502，而两边日志都说自己正常。
+ */
+export const HTTP_PORT_ENV = 'DOTD_HTTP_PORT';
+
+/**
+ * 解析最终监听端口。优先级：`DOTD_HTTP_PORT` > 配置里的 `port:` > DEFAULT_HTTP_PORT。
+ *
+ * 非法值**不静默忽略**：设了 `DOTD_HTTP_PORT=abc` 却安静地监听 7788，
+ * 正是"配置了没生效、日志一路绿"。这里直接抛，让启动失败得明明白白。
+ */
+export function resolveHttpPort(
+  configured: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const fromEnv = (env[HTTP_PORT_ENV] ?? '').trim();
+  if (fromEnv.length > 0) {
+    const n = /^\d+$/.test(fromEnv) ? Number(fromEnv) : NaN;
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      throw new ConfigError(`${HTTP_PORT_ENV} 非法：${fromEnv}（要求 1-65535 的整数）`, null);
+    }
+    return n;
+  }
+  return configured ?? DEFAULT_HTTP_PORT;
+}
+
 /**
  * 解析最终监听地址。优先级：`DOTD_HTTP_HOST` > 配置里的 `host:` > DEFAULT_HTTP_HOST。
  *
@@ -280,7 +326,7 @@ export function isLoopbackBindHost(host: string): boolean {
 
 const httpSchema = z.object({
   host: z.string().min(1).default(DEFAULT_HTTP_HOST),
-  port: z.coerce.number().int().min(1).max(65535).default(7788),
+  port: z.coerce.number().int().min(1).max(65535).default(DEFAULT_HTTP_PORT),
   master_token: z.string().min(1),
   readonly_tokens: z.array(z.string()).default([]),
   allowed_origins: z.array(z.string()).default([]),
@@ -424,7 +470,7 @@ export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
   return {
     http: {
       host: resolveHttpHost(s.http.host),
-      port: s.http.port,
+      port: resolveHttpPort(s.http.port),
       masterToken: expandEnv(s.http.master_token),
       readonlyTokens: s.http.readonly_tokens.map((t) => expandEnv(t)),
       allowedOrigins: s.http.allowed_origins,

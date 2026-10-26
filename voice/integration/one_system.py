@@ -58,6 +58,10 @@ HEALTH_POLL_S = 2.0
 READY_TIMEOUT_S = 30.0
 STOP_TIMEOUT_S = 10.0
 
+# 与 `src/surfaces/config.ts::DEFAULT_HTTP_PORT` 同值。两处必须一致 ——
+# 不一致的后果见 resolve_http_port 的注释（第十四例）。
+DEFAULT_HTTP_PORT = 7788
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 路径 / 配置
@@ -160,14 +164,26 @@ def resolve_master_token(paths: Paths, env: Optional[dict[str, str]] = None) -> 
 
 
 def resolve_http_port(paths: Paths, env: Optional[dict[str, str]] = None) -> int:
+    """dotd 的监听端口。**判据必须与 `src/surfaces/config.ts::resolveHttpPort` 一致**。
+
+    2026-10-26（同类缺陷第十四例）：这里原来只有"`DOTD_HTTP_PORT` 或者 config 或者
+    7788"，而 daemon 侧**完全不读 `DOTD_HTTP_PORT`** —— 它只认 `surfaces.http.port`。
+    于是 `DOTD_HTTP_PORT=7799` 时：本函数说 7799（反代发往 7799），
+    daemon 仍然监听 7788。8000 上的 /api 全部 502，而两边的日志各自都很正常。
+
+    现在两侧都按 环境变量 > 配置 > 7788 解析；环境变量非法时**拒绝启动**，
+    不静默回落到 7788（静默回落就是"配了没生效、日志一路绿"）。
+    """
     e = env if env is not None else os.environ
     raw = (e.get("DOTD_HTTP_PORT") or "").strip()
-    if raw.isdigit():
+    if raw:
+        if not raw.isdigit() or not (1 <= int(raw) <= 65535):
+            raise ValueError(f"DOTD_HTTP_PORT 非法：{raw}（要求 1-65535 的整数）")
         return int(raw)
     try:
         text = paths.config_file.read_text(encoding="utf-8")
     except OSError:
-        return 7788
+        return DEFAULT_HTTP_PORT
     try:
         import yaml  # type: ignore
 
@@ -191,7 +207,7 @@ def resolve_http_port(paths: Paths, env: Optional[dict[str, str]] = None) -> int
             pm = re.search(r"(?m)^\s+port\s*:\s*(\d+)", hm.group(1))
             if pm is not None:
                 return int(pm.group(1))
-    return 7788
+    return DEFAULT_HTTP_PORT
 
 
 def apply_env(paths: Paths, env: Optional[dict[str, str]] = None) -> None:
