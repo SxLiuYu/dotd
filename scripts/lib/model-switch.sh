@@ -43,6 +43,9 @@ _MODELS_TRAP_ARMED=0
 # 「运行期配置在哪」不再由本文件自己推断：与 verify-goal / 体检共用 scripts/lib/config-dir.sh
 # （同一判据两份拷贝，迟早不一致 —— 这正是本项目反复踩的形状）。
 . "$(dirname "${BASH_SOURCE[0]}")/config-dir.sh"
+# EXIT 钩子表：daemon-restart 也要在退出时复原旋钮，两边都 `trap EXIT` 会**后者顶掉前者**。
+# 用钩子表之后，谁注册谁跑，互不覆盖（见 lib/exit-hooks.sh 头部）。
+. "$(dirname "${BASH_SOURCE[0]}")/exit-hooks.sh"
 
 # 种子 = 本脚本所在的仓库副本；运行期 = daemon 真读的那份
 # （判据见 scripts/lib/config-dir.sh，对齐 src/surfaces/config.ts 与 env.mjs）。
@@ -65,7 +68,9 @@ models_begin() {
     cp "$_MODELS_RUNTIME" "$_MODELS_BAK_RUNTIME"
   fi
   _MODELS_TRAP_ARMED=1
-  trap models_restore EXIT INT TERM
+  # 不再直接 `trap … EXIT`：daemon-restart 的钩子也要在此刻之后注册，
+  # 直接 trap 会把它顶掉（或反过来），而那是**静默**的。
+  dotd_on_exit models_restore
   echo "[models] 种子=$_MODELS_SEED"
   echo "[models] 运行期=$_MODELS_RUNTIME（daemon 实际读这份）"
 }

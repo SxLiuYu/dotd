@@ -76,13 +76,15 @@ function world(opts: { runtime?: string | null } = {}) {
 /** 在"临时仓库"里跑一段 bash（source 库 + 给定测试语句）。 */
 function runScript(w: ReturnType<typeof world>, body: string, env: Record<string, string> = {}) {
   // 把库放进临时仓库的 scripts/lib 下：库自己按 BASH_SOURCE 找种子，必须如此。
-  // config-dir.sh 是它的依赖（「运行期配置在哪」的单一判据），一起放。
-  writeFileSync(join(w.repo, 'scripts', 'lib', 'model-switch.sh'), readFileSync(LIB, 'utf8'), 'utf8');
-  writeFileSync(
-    join(w.repo, 'scripts', 'lib', 'config-dir.sh'),
-    readFileSync(join(REPO, 'scripts', 'lib', 'config-dir.sh'), 'utf8'),
-    'utf8',
-  );
+  // 依赖（config-dir.sh = 「运行期配置在哪」的单一判据、exit-hooks.sh = EXIT 钩子表）
+  // 一起放，否则 source 失败、函数全不存在，测试会"绿得莫名其妙"。
+  for (const dep of ['model-switch.sh', 'config-dir.sh', 'exit-hooks.sh']) {
+    writeFileSync(
+      join(w.repo, 'scripts', 'lib', dep),
+      readFileSync(join(REPO, 'scripts', 'lib', dep), 'utf8'),
+      'utf8',
+    );
+  }
   const script = `set -uo pipefail\ncd ${JSON.stringify(w.repo)}\n. scripts/lib/model-switch.sh\n${body}\n`;
   return spawnSync('bash', ['-c', script], {
     encoding: 'utf8',

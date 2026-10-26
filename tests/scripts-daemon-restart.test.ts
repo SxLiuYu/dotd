@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const REPO = join(import.meta.dirname, '..');
-const LIB_SRC = join(REPO, 'scripts', 'lib', 'daemon-restart.sh');
+const LIBDIR = join(REPO, 'scripts', 'lib');
 
 const BASH = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' });
 const bashOk = BASH.status === 0;
@@ -59,7 +59,11 @@ function world() {
   const proc = join(root, 'proc');
   mkdirSync(join(repo, 'scripts', 'lib'), { recursive: true });
   mkdirSync(proc, { recursive: true });
-  writeFileSync(join(repo, 'scripts', 'lib', 'daemon-restart.sh'), readFileSync(LIB_SRC, 'utf8'), 'utf8');
+  // exit-hooks.sh 是本库的依赖（退出时还原旋钮）。不复制的话 source 失败、
+  // dotd_on_exit 变成 command not found —— 而脚本仍然"跑完了"，测试会绿得莫名其妙。
+  for (const dep of ['daemon-restart.sh', 'exit-hooks.sh']) {
+    writeFileSync(join(repo, 'scripts', 'lib', dep), readFileSync(join(LIBDIR, dep), 'utf8'), 'utf8');
+  }
   return {
     root,
     repo,
@@ -322,6 +326,192 @@ describe('④ 读回：声明了但运行期没有 → 非零 + 报出变量名�
       assert.match(r.stdout, /V_OK/);
       assert.match(r.stderr, /✗ A 没生效：运行期=1（期望 9）/);
       assert.match(r.stdout, /V_BAD/);
+    } finally {
+      w.cleanup();
+    }
+  });
+});
+
+describe('④b 退出时还原：实验改过的旋钮必须自己收尾', { skip: !bashOk }, () => {
+  test('运行期原来是 3、实验改成 2 → 退出时重启回 3 并读回', () => {
+    const w = world();
+    try {
+      // 两次"启动"：第一次是实验那次（2），第二次是退出时还原（3）。
+      // 用**启动计数**区分，而不是靠时间 —— 否则顺序一变测试就假红。
+      const counter = join(w.root, 'boot.count');
+      const start = [
+        `n=${sh(JSON.stringify(counter))}`,
+        'c=$(cat "$n" 2>/dev/null || echo 0); c=$((c+1)); echo $c > "$n"',
+        `if [ "$c" -eq 1 ]; then ${fakeBoot(w.proc, 210, { DOTD_MAX_RUNNING: '2' })}`,
+        `else ${fakeBoot(w.proc, 211, { DOTD_MAX_RUNNING: '3' })} fi`,
+      ].join('\n');
+
+      const r = run(
+        w,
+        [fakeStop(join(w.root, 'kills.log')), 'daemon_restart DOTD_MAX_RUNNING=2 && echo EXPERIMENT_OK'].join('\n'),
+        {
+          fake: (p) => {
+            p.put(101, SUPERVISOR_ARGV);
+            p.put(102, DAEMON_ARGV, { DOTD_MAX_RUNNING: '3' }); // 原值
+          },
+          start,
+        },
+      );
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /EXPERIMENT_OK/, '实验本身要跑成');
+      assert.match(r.stdout, /退出前还原运行期旋钮：DOTD_MAX_RUNNING=3/, '必须说出来要还原成什么');
+      assert.match(r.stdout, /✓ DOTD_MAX_RUNNING=3（从 .*\/211\/environ 读回）/, '还原也要读回验证');
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  test('还原失败要大声说（不能静默留在实验值）', () => {
+    const w = world();
+    try {
+      // 第二次启动仍然是 2 —— 模拟"还原没生效"
+      const counter = join(w.root, 'boot.count');
+      const start = [
+        `n=${sh(JSON.stringify(counter))}`,
+        'c=$(cat "$n" 2>/dev/null || echo 0); c=$((c+1)); echo $c > "$n"',
+        `if [ "$c" -eq 1 ]; then ${fakeBoot(w.proc, 220, { DOTD_MAX_RUNNING: '2' })}`,
+        `else ${fakeBoot(w.proc, 221, { DOTD_MAX_RUNNING: '2' })} fi`,
+      ].join('\n');
+      const r = run(
+        w,
+        [fakeStop(join(w.root, 'kills.log')), 'daemon_restart DOTD_MAX_RUNNING=2'].join('\n'),
+        {
+          fake: (p) => {
+            p.put(101, SUPERVISOR_ARGV);
+            p.put(102, DAEMON_ARGV, { DOTD_MAX_RUNNING: '3' });
+          },
+          start,
+        },
+      );
+      assert.match(r.stderr, /还原失败/, '还原没成必须说，而不是留一个 1/2/3 的谜');
+      assert.match(r.stderr, /DOTD_MAX_RUNNING 没生效：运行期=2（期望 3）/);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  test('还原是幂等的：手工还过一次之后，EXIT 钩子不该再重启一次', () => {
+    const w = world();
+    try {
+      const counter = join(w.root, 'boot.count');
+      const start = [
+        `n=${sh(JSON.stringify(counter))}`,
+        'c=$(cat "$n" 2>/dev/null || echo 0); c=$((c+1)); echo $c > "$n"',
+        `if [ "$c" -eq 1 ]; then ${fakeBoot(w.proc, 250, { DOTD_MAX_RUNNING: '2' })}`,
+        `else ${fakeBoot(w.proc, 251, { DOTD_MAX_RUNNING: '3' })} fi`,
+      ].join('\n');
+      const r = run(
+        w,
+        [
+          fakeStop(join(w.root, 'kills.log')),
+          'daemon_restart DOTD_MAX_RUNNING=2',
+          'daemon_restore_knobs && echo MANUAL_RESTORE_OK',
+          'daemon_restore_knobs && echo SECOND_MANUAL_OK',
+        ].join('\n'),
+        {
+          fake: (p) => {
+            p.put(101, SUPERVISOR_ARGV);
+            p.put(102, DAEMON_ARGV, { DOTD_MAX_RUNNING: '3' });
+          },
+          start,
+        },
+      );
+      const all = r.stdout + r.stderr;
+      assert.match(all, /MANUAL_RESTORE_OK/);
+      assert.match(all, /SECOND_MANUAL_OK/, '第二次调用必须成功返回（只是什么都不做）');
+      assert.equal(
+        (all.match(/退出前还原运行期旋钮/g) ?? []).length,
+        1,
+        '还原过就清账：否则 EXIT 会再重启一次 daemon，把已经还原好的系统又抖一下',
+      );
+      assert.equal(readFileSync(counter, 'utf8').trim(), '2', '只该启动两次：实验 1 次 + 还原 1 次');
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  test('RESTORE=0 的那一次不记账：之后正常重启时，别人刻意保留的值不会被还原掉', () => {
+    const w = world();
+    try {
+      // 真实用法：某个脚本想**故意**把 DOTD_KEEP 留在 7（比如压测），
+      // 顺手用了 RESTORE=0；同一进程里后面又有一次普通重启。
+      // 如果 RESTORE=0 那次也记了账，EXIT 时会把 DOTD_KEEP 一并"还原"成 5 ——
+      // 于是"我明确要求保留"的决定被一个无关的清理动作偷偷推翻。
+      const counter = join(w.root, 'boot.count');
+      const start = [
+        `n=${sh(JSON.stringify(counter))}`,
+        'c=$(cat "$n" 2>/dev/null || echo 0); c=$((c+1)); echo $c > "$n"',
+        `if [ "$c" -eq 1 ]; then ${fakeBoot(w.proc, 260, { DOTD_KEEP: '7', DOTD_LATER: '5' })}`,
+        `elif [ "$c" -eq 2 ]; then ${fakeBoot(w.proc, 261, { DOTD_KEEP: '7', DOTD_LATER: '8' })}`,
+        `else ${fakeBoot(w.proc, 262, { DOTD_KEEP: '7', DOTD_LATER: '5' })} fi`,
+      ].join('\n');
+      const r = run(
+        w,
+        [
+          fakeStop(join(w.root, 'kills.log')),
+          'DAEMON_RESTART_RESTORE=0 daemon_restart DOTD_KEEP=7',
+          'daemon_restart DOTD_LATER=8',
+        ].join('\n'),
+        {
+          fake: (p) => {
+            p.put(101, SUPERVISOR_ARGV);
+            p.put(102, DAEMON_ARGV, { DOTD_KEEP: '5', DOTD_LATER: '5' });
+          },
+          start,
+        },
+      );
+      const all = r.stdout + r.stderr;
+      assert.doesNotMatch(all, /还原 DOTD_KEEP/, 'RESTORE=0 那一次不该记账');
+      assert.match(all, /退出前还原运行期旋钮：DOTD_LATER=5/);
+      assert.equal(readFileSync(counter, 'utf8').trim(), '3', '实验两次 + 还原一次');
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  test('DAEMON_RESTART_RESTORE=0 时不动（测试/刻意保留时用）', () => {
+    const w = world();
+    try {
+      const r = run(
+        w,
+        [fakeStop(join(w.root, 'kills.log')), 'daemon_restart DOTD_MAX_RUNNING=2'].join('\n'),
+        {
+          fake: (p) => {
+            p.put(101, SUPERVISOR_ARGV);
+            p.put(102, DAEMON_ARGV, { DOTD_MAX_RUNNING: '3' });
+          },
+          start: fakeBoot(w.proc, 230, { DOTD_MAX_RUNNING: '2' }),
+          extra: { DAEMON_RESTART_RESTORE: '0' },
+        },
+      );
+      assert.equal(r.status, 0, r.stderr);
+      assert.doesNotMatch(r.stdout, /退出前还原运行期旋钮/);
+    } finally {
+      w.cleanup();
+    }
+  });
+
+  test('原本没有这个旋钮 → 只说明，不假装 unset 掉了', () => {
+    const w = world();
+    try {
+      const r = run(
+        w,
+        [fakeStop(join(w.root, 'kills.log')), 'daemon_restart DOTD_FAKE_NEW=1'].join('\n'),
+        {
+          fake: (p) => {
+            p.put(101, SUPERVISOR_ARGV);
+            p.put(102, DAEMON_ARGV); // 原来没有 DOTD_FAKE_NEW
+          },
+          start: fakeBoot(w.proc, 240, { DOTD_FAKE_NEW: '1' }),
+        },
+      );
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /还原 DOTD_FAKE_NEW（原本没有值 → 从新进程里去掉）/);
     } finally {
       w.cleanup();
     }

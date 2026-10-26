@@ -45,16 +45,27 @@
 #   DAEMON_RESTART_TIMEOUT  等就绪的秒数（默认 90）
 #   DAEMON_RESTART_DRY_RUN  =1 只打印将要做的事、不杀不起（测试用）
 #   DAEMON_RESTART_LOCK     单实例锁路径（默认 /tmp/dotd-one-system.lock，与 wsl-daemon.sh 一致）
+#   DAEMON_RESTART_RESTORE  退出时把实验改过的旋钮还原（默认 1；测试里设 0）
 #   DAEMON_RESTART_START    启动命令（默认 nohup setsid bash scripts/wsl-daemon.sh；
 #                           Git Bash 上没有 setsid 时自动退化成 nohup bash scripts/wsl-daemon.sh）
 #   DAEMON_RESTART_PROBE_CMD  就绪探针（默认探 DAEMON_RESTART_PORT 的 TCP；设了就用 sh -c 跑它）
 #   DOTD_PROC_ROOT          进程表根（默认 /proc；测试注入假目录）
+#
+# 为什么要有 DAEMON_RESTART_RESTORE（2026-10-26，同一条线的第十二例）：
+# 这些实验脚本都以 `daemon_restart DOTD_MAX_RUNNING=1` 这类方式改**运行期**旋钮，
+# 跑完却谁也不改回来。实测：live daemon 本来是 3，跑一次 verify-vision-final.sh
+# 之后它就永久变成 1（串行），而脚本最后一行是"✅ 全部通过"——
+# 主人只看到"验证通过了"，看不到"你的系统从此串行执行"。
+# 与 model-switch 的 EXIT trap 同一条判据：**实验改动必须自己收尾**。
+
+. "$(dirname "${BASH_SOURCE[0]}")/exit-hooks.sh"
 
 DAEMON_RESTART_PORT="${DAEMON_RESTART_PORT:-7788}"
 DAEMON_RESTART_TIMEOUT="${DAEMON_RESTART_TIMEOUT:-90}"
 DAEMON_RESTART_DRY_RUN="${DAEMON_RESTART_DRY_RUN:-0}"
 DAEMON_RESTART_LOCK="${DAEMON_RESTART_LOCK:-/tmp/dotd-one-system.lock}"
 DAEMON_RESTART_LOCK_WAIT="${DAEMON_RESTART_LOCK_WAIT:-30}"
+DAEMON_RESTART_RESTORE="${DAEMON_RESTART_RESTORE:-1}"
 # setsid 只在 Linux 上有（Git Bash 没有），缺了就别写进命令行 —— 否则整行直接
 # command not found，而它又是 `&` + 重定向，失败完全看不见（正是本库要消灭的形状）。
 if [ -z "${DAEMON_RESTART_START+x}" ]; then
@@ -204,6 +215,7 @@ daemon_restart() {
   echo "[restart] 当前 daemon pid=${old_daemon:-（无）} supervisor=${sup_pids:-（无 —— 不是托管模式）}"
   if [ "${#envs[@]}" -gt 0 ]; then
     echo "[restart] 需要生效的环境：${envs[*]}"
+    _dr_remember_original "$old_daemon" "${envs[@]}"
   fi
 
   # ① 停：有 supervisor 就停 supervisor（它退出时会带走子进程），否则停 node 子进程。
@@ -260,4 +272,78 @@ daemon_restart() {
     daemon_verify_env "$new_pid" "${envs[@]}" || return 1
   fi
   return 0
+}
+
+# ── 退出时还原实验改过的旋钮 ─────────────────────────────────────────────
+#
+# `_DR_KNOB_KEYS`     本轮被改过的键（按出现顺序去重）
+# `_DR_KNOB_ORIG`     pid 未变时，从**旧进程**的 environ 读到的原值
+#
+# 为什么需要：这些脚本用 `daemon_restart DOTD_MAX_RUNNING=1` 改运行期旋钮，
+# 跑完谁都不改回来。实测 live 上本来是 3，跑一次 verify-vision-final.sh 之后
+# 就永久串行了，而脚本最后一行是"✅ 全部通过"—— 主人只看到通过，
+# 看不到"你的系统从此一次只跑一个任务"（第十二例）。
+_DR_KNOB_KEYS=""
+_DR_KNOB_ORIG=""
+
+_dr_remember_original() {  # $1=旧 daemon pid，其余是 KEY=VAL
+  local pid="$1" kv key val got
+  # RESTORE=0 = 本轮不记账。`daemon_restore_knobs` 自己那次重启就靠它。
+  # 说明（实测，别凭直觉）：在 `daemon_restore_knobs` 里，即使没有这道闸门，
+  # 记录也会被"先清空、失败再写回 saved"覆盖掉，所以**这一层看不出差别**；
+  # 这道闸门防的是别的调用路径 —— 例如脚本中途手工调 `daemon_restore_knobs`
+  # 失败之后继续 `daemon_restart`，那时"原值"会是没还原成功的那个值。
+  [ "$DAEMON_RESTART_RESTORE" = "1" ] || return 0
+  shift
+  for kv in "$@"; do
+    key="${kv%%=*}"
+    val="${kv#*=}"
+    case " $_DR_KNOB_KEYS " in *" $key "*) continue ;; esac
+    _DR_KNOB_KEYS="$_DR_KNOB_KEYS $key"
+    # 旧进程不存在（首次启动）→ 记成"原本没有"，还原时就是 unset。
+    got=""
+    if [ -n "$pid" ]; then got="$(daemon_env_get "$pid" "$key" || true)"; fi
+    _DR_KNOB_ORIG="$_DR_KNOB_ORIG $key=$got"
+  done
+  # 注册一次即可；重复注册幂等（见 exit-hooks.sh）。
+  dotd_on_exit daemon_restore_knobs
+}
+
+# 把本轮改过的键重启回原值并复核。由 EXIT 钩子调用，也可手工调。
+daemon_restore_knobs() {
+  [ "$DAEMON_RESTART_RESTORE" = "1" ] || return 0
+  [ -n "${_DR_KNOB_KEYS// /}" ] || return 0
+  local key got orig keys=() pairs=()
+  for key in $_DR_KNOB_KEYS; do
+    # 原值从 **_DR_KNOB_ORIG** 里取（KV 串，空格分隔；值为空时是 `KEY=`）
+    orig=""
+    for kv in $_DR_KNOB_ORIG; do
+      [ "${kv%%=*}" = "$key" ] && { orig="${kv#*=}"; break; }
+    done
+    if [ -z "$orig" ]; then
+      echo "[restart] 还原 $key（原本没有值 → 从新进程里去掉）"
+      continue   # unset 在纯 shell 里做不到：只能说明，不能假装做到了
+    fi
+    pairs+=("$key=$orig")
+    keys+=("$key")
+  done
+  [ "${#pairs[@]}" -gt 0 ] || { _DR_KNOB_KEYS=""; _DR_KNOB_ORIG=""; return 0; }
+
+  echo "[restart] 退出前还原运行期旋钮：${pairs[*]}"
+  # 清掉记录，避免这次重启又把"当前值"记成原值（否则还原会自我覆盖）。
+  local saved_keys="$_DR_KNOB_KEYS" saved_orig="$_DR_KNOB_ORIG"
+  _DR_KNOB_KEYS=""; _DR_KNOB_ORIG=""
+  # 关掉还原，否则这次重启会把"还原目标"当成新的"原值"再记一遍。
+  # 两种写法在这里**等价**（bash 的前缀赋值在整个动态作用域内都生效，实测过：
+  # `f(){ h; }; V=0 f` 里 `h` 读到 0）。用前缀写法是为了短，且不留下
+  # "忘了还回去"的可能 —— 这个库本身就在治"没有复原"的毛病。
+  DAEMON_RESTART_RESTORE=0 daemon_restart "${pairs[@]}"
+  local rc=$?
+  _DR_KNOB_KEYS="$saved_keys"; _DR_KNOB_ORIG="$saved_orig"
+  if [ "$rc" -ne 0 ]; then
+    echo "[restart] ✗ 还原失败 —— 运行期仍是被实验改过的值，请手动重启 daemon" >&2
+  else
+    _DR_KNOB_KEYS=""; _DR_KNOB_ORIG=""
+  fi
+  return "$rc"
 }
