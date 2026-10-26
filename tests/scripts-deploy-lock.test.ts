@@ -649,3 +649,101 @@ describe('⑥ 判据真跑：锁的状态 → 是否允许自愈', () => {
     }
   });
 });
+
+describe('⑤ 自愈只许恢复可用性，不许顺带改业务参数', () => {
+  // 这两个工具在别的作用域里（③ 的 describe 内），这里各自要一份。
+  const bashOk5 = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).status === 0;
+  const skip = bashOk5 ? false : '本机没有 bash';
+  const posix = (p: string): string => p.replace(/\\/g, '/');
+
+  // 现场（2026-10-26，同类缺陷第十三例）：
+  //
+  //     repair_daemon() { DOTD_MAX_RUNNING=1 setsid bash scripts/dotd-daemon-start.sh … }
+  //
+  // `dotd-daemon-start.sh` → `wsl-daemon.sh` 里是
+  //     export DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-3}"
+  // 所以传 1 就**保住 1**，不传才是 3。于是"daemon 挂了 → 看门狗修好"这件事
+  // 附带了另一个后果：系统从此一次只跑一个任务。而日志只有一行
+  // 「自愈:daemon 已恢复(6s)」—— 主人看到"修好了"，看不到"额度被降了"。
+  // 更糟的是 cron 每 2 分钟跑一跑，这个降档是永久的、没人会去复核。
+  //
+  // 判据：自愈是**恢复**，不是**调参**。启动时不许带任何决定行为的旋钮，
+  // 且成功那行要说清楚恢复成了什么，让降档无处可藏。
+
+  /**
+   * 找"启动 daemon 的那一行"（`… scripts/dotd-daemon-start.sh …`）以及**紧贴在它
+   * 前面的前缀赋值**。只看这一行，不看整个函数：函数体里允许出现
+   * `DOTD_MAX_RUNNING=$eff` 这种**读出来写日志**的用法 —— 第一版守卫扫整段，
+   * 把自己刚加的那行日志判成"写死额度"，是典型的"判据比事实宽"。
+   */
+  function launcherLine(fn: string): string {
+    const at = WATCHDOG.indexOf(`${fn}()`);
+    assert.ok(at > 0, `找不到 ${fn}`);
+    const end = WATCHDOG.indexOf('\n}', at);
+    const body = WATCHDOG.slice(at, end);
+    const line = body
+      .split('\n')
+      .find((l) => /dotd-daemon-start\.sh/.test(l) && !/^\s*#/.test(l));
+    assert.ok(line !== undefined, `${fn} 里要有启动 daemon 的那一行`);
+    return line;
+  }
+
+  test('repair_daemon 启动 daemon 时不带 DOTD_MAX_RUNNING', () => {
+    assert.doesNotMatch(
+      launcherLine('repair_daemon'),
+      /DOTD_MAX_RUNNING=/,
+      '自愈不许把并发额度改成某个值（启动器是 ${DOTD_MAX_RUNNING:-3}，传了就会保住）',
+    );
+  });
+
+  test('repair_container 的 fleet 重建同样不带（同一条判据）', () => {
+    assert.doesNotMatch(
+      launcherLine('repair_container'),
+      /DOTD_MAX_RUNNING=/,
+      '容器自愈同样不该改额度',
+    );
+  });
+
+  test('恢复成功那行要带上运行期实际额度（端口通 ≠ 参数对）', () => {
+    assert.match(WATCHDOG, /自愈:daemon 已恢复\(\$\(\(i\*2\)\)s\)\$\{eff:/, '要把读回的值写进日志');
+    assert.match(WATCHDOG, /live_max_running\(\)/, '需要这个读取函数');
+  });
+
+  test('读的是运行中进程的 environ，不是配置文件/自己的环境', () => {
+    const at = WATCHDOG.indexOf('live_max_running()');
+    const end = WATCHDOG.indexOf('\n}', at);
+    const body = WATCHDOG.slice(at, end);
+    assert.match(body, /environ/, '必须读 /proc/<pid>/environ');
+    assert.match(body, /src\/daemon\.ts/, '按 argv 认 daemon（src 形态）');
+    assert.match(body, /dist\/daemon\.js/, '也认 dist 形态（构建产物优先）');
+    assert.doesNotMatch(body, /config\.yml|models\.yml/, '别去读配置文件 —— 那不是实际生效值');
+  });
+
+  test('真跑：假 proc 根里两个进程，只认 daemon，取到它的值', { skip }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dotd-livemr-'));
+    try {
+      mkdirSync(join(dir, '1234'));
+      writeFileSync(join(dir, '1234', 'cmdline'), 'node\0--import\0tsx\0/root/dotd/src/daemon.ts\0');
+      writeFileSync(join(dir, '1234', 'environ'), 'DOTD_FLEET=docker\0DOTD_MAX_RUNNING=3\0');
+      // supervisor 也有这个变量，但它不是 daemon —— 取错就会把 9 当成额度
+      mkdirSync(join(dir, '555'));
+      writeFileSync(join(dir, '555', 'cmdline'), 'python\0-m\0voice.integration.one_system\0');
+      writeFileSync(join(dir, '555', 'environ'), 'DOTD_MAX_RUNNING=9\0');
+
+      const at = WATCHDOG.indexOf('live_max_running()');
+      const end = WATCHDOG.indexOf('\n}', at) + 2;
+      const snippet = `${WATCHDOG.slice(at, end)}\necho "eff=[$(live_max_running)]"\n`;
+      writeFileSync(join(dir, 'snippet.sh'), snippet, 'utf8');
+
+      const r = spawnSync('bash', [join(dir, 'snippet.sh')], {
+        encoding: 'utf8',
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', DOTD_PROC_ROOT: posix(dir) },
+      });
+      if (r.error !== undefined) return; // 没有 bash：跳过
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stdout, /eff=\[3\]/, '必须取 daemon 的 3，不是 supervisor 的 9');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -158,14 +158,57 @@ may_repair() {
 # 所有修复动作都**尽力而为**：失败只记日志，不中断后续检查。
 # ───────────────────────────────────────────────────────────────────────────
 
+# 读**运行中** daemon 的并发额度（`/proc/<pid>/environ`），读不到就返回空。
+#
+# 为什么不读配置文件、也不读自己的环境：那两处都不是"实际生效值"。
+# 与 scripts/lib/live-daemon.mjs 同一条判据（那边的 RUNTIME_KNOBS 白名单），
+# 这里只取一个键，用同一套 argv 识别规则找 daemon。
+# 进程表根可用 `DOTD_PROC_ROOT` 覆盖（与 scripts/lib/daemon-restart.sh 同名同义，
+# 测试注入假目录用）。
+live_max_running() {
+  local root="${DOTD_PROC_ROOT:-/proc}" d pid a
+  for d in "$root"/[0-9]*; do
+    pid="${d##*/}"
+    [ "$pid" = "$$" ] && continue
+    while IFS= read -r -d '' a; do
+      case "$a" in
+        */src/daemon.ts|*/dist/daemon.js|src/daemon.ts|dist/daemon.js)
+          tr '\0' '\n' 2>/dev/null < "$d/environ" \
+            | sed -n 's/^DOTD_MAX_RUNNING=//p' | head -1
+          return 0 ;;
+      esac
+    done 2>/dev/null < "$d/cmdline"
+  done
+  return 0
+}
+
 repair_daemon() {
   logline "自愈:尝试重启 daemon"
   cd /root/dotd || return 1
-  DOTD_MAX_RUNNING=1 setsid bash scripts/dotd-daemon-start.sh </dev/null >/dev/null 2>&1 &
+  # **不许在这里写死并发额度**（2026-10-26，同类缺陷第十三例）。
+  #
+  # 原来这行是 `DOTD_MAX_RUNNING=1 setsid bash scripts/dotd-daemon-start.sh`。
+  # `dotd-daemon-start.sh` → `wsl-daemon.sh` 里是
+  # `export DOTD_MAX_RUNNING="${DOTD_MAX_RUNNING:-3}"` —— 传 1 就**保住 1**，
+  # 不传才是 3。于是每次自愈都把系统从"3 并发"降成"永远串行"，而日志只写
+  # 「自愈:daemon 已恢复(6s)」：主人看到的是"修好了"，
+  # 看不到"修好之后你的系统一次只跑一个任务"。而且 cron 在跑，没人会重试第二次。
+  #
+  # 判据：自愈只该**恢复可用性**，不该顺带改业务参数。要调额度就显式传环境，
+  # 由人手做决定；看不出来源时，走启动器默认（3）。
+  setsid bash scripts/dotd-daemon-start.sh </dev/null >/dev/null 2>&1 &
   local i
   for i in $(seq 1 30); do
     sleep 2
-    timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null && { logline "自愈:daemon 已恢复($((i*2))s)"; return 0; }
+    if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7788' 2>/dev/null; then
+      # 「恢复了」要说清楚**恢复成什么**。只看端口通就宣布成功，正是这一例的病根：
+      # 端口通不等于参数对。把实际生效的并发额度读出来写进日志 —— 以后谁再
+      # 顺手改额度，日志里能对上，不用等人发现"怎么突然变慢了"。
+      local eff
+      eff="$(live_max_running)"
+      logline "自愈:daemon 已恢复($((i*2))s)${eff:+（DOTD_MAX_RUNNING=$eff）}"
+      return 0
+    fi
   done
   logline "自愈:daemon 重启失败"
   return 1
@@ -221,7 +264,11 @@ repair_container() {
     # 2026-10-26 修：这里原来调 `scripts/wsl-daemon-start.sh` —— **该文件不存在**
     # （仓库和部署副本里都没有），于是"重建"这一步永远 exit 127，容器自愈的第二条
     # 路径从来没生效过，只是日志里看着像试过。真正的启动器是 dotd-daemon-start.sh。
-    DOTD_FLEET=docker DOTD_MAX_RUNNING=1 timeout 180 bash scripts/dotd-daemon-start.sh >/dev/null 2>&1 || true
+    #
+    # `DOTD_MAX_RUNNING=1` 同时删掉（同类缺陷第十三例）：见 repair_daemon 的说明 ——
+    # 那会把系统的并发额度永久降成 1。`DOTD_FLEET=docker` 保留：wsl-daemon.sh 本来就
+    # 无条件导出 docker，这里显式写是为了让"重建容器"这段的意图不依赖别处的实现。
+    DOTD_FLEET=docker timeout 180 bash scripts/dotd-daemon-start.sh >/dev/null 2>&1 || true
   fi
   local i
   for i in $(seq 1 30); do
