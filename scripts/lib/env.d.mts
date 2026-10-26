@@ -63,3 +63,20 @@ export function configDirIsHostedGuess(opts?: {
   home?: string;
   exists?: (path: string) => boolean;
 }): boolean;
+
+export interface ResolveConfigFileOptions {
+  env?: Record<string, string | undefined>;
+  /** 用于展开 `~`（测试注入）。 */
+  home?: string;
+  /** 「这个文件在不在」——测试注入，缺省 `existsSync`。 */
+  exists?: (path: string) => boolean;
+}
+
+/**
+ * daemon 真正会读的那份 `config.yml`。
+ *
+ * 顺序：`DOTD_CONFIG` → `<DOTD_HOME>/config.yml`（**存在才用**）→ `~/.dotd/config.yml`。
+ * 与 `src/surfaces/config.ts::resolveConfigFile()` 同判据（2026-10-26 第十五例：
+ * 同一进程里两处读同一份文件、判据却不同，`DOTD_HOME` 一挪就分叉）。
+ */
+export function resolveConfigFile(opts?: ResolveConfigFileOptions): string;

@@ -103,6 +103,38 @@ export function configDirIsHostedGuess({
 }
 
 /**
+ * `config.yml` 到底在哪 —— 脚本侧的唯一实现，与
+ * `src/surfaces/config.ts::resolveConfigFile` **逐字一致**。
+ *
+ * 顺序：`DOTD_CONFIG` > `<DOTD_HOME>/config.yml`（**存在才用**）> `~/.dotd/config.yml`。
+ * "存在才用"是保守选择：`DOTD_HOME` 指到别处、配置仍在 `~/.dotd` 的老布局照样能起
+ * （那时两处读的都是 `~/.dotd` 那份，同判据）。不并进 `<configDir>`：
+ * 18.13 已定 config.yml 身份不同（它是指向某一份文件的路径，不是跟随目录的一类文件）。
+ *
+ * 为什么不能只看 `DOTD_CONFIG` 和 `~/.dotd`（2026-10-26 第十五例）：
+ * 那份文件在同一个 daemon 进程里被两处读，而两处判据不同 ——
+ * `loadSurfacesConfig()` 原来只认 `DOTD_CONFIG ?? ~/.dotd/config.yml`，
+ * `cpReserveMbFromEnvOrConfig()` 读 `<DOTD_HOME>/config.yml`。`DOTD_HOME` 一挪，
+ * 端口/token 来自 HOME，水位/其余键来自数据目录，实测就是这样分叉的。
+ * 写配置的有 `init-config.mjs` / `setup.mjs` / `one_system.py`，三者都用
+ * `<DOTD_HOME>/config.yml`，所以**写哪儿就该读哪儿**。
+ */
+export function resolveConfigFile({
+  env = process.env,
+  home = osHomedir(),
+  exists = existsSync,
+} = {}) {
+  const explicit = (env.DOTD_CONFIG ?? '').trim();
+  if (explicit.length > 0) return resolve(expandHomePath(explicit, home));
+  const homeEnv = (env.DOTD_HOME ?? '').trim();
+  if (homeEnv.length > 0) {
+    const hosted = join(resolve(expandHomePath(homeEnv, home)), 'config.yml');
+    if (exists(hosted)) return hosted;
+  }
+  return join(home, '.dotd', 'config.yml');
+}
+
+/**
  * 解析 `tokens.env` 文本为对象。
  *
  * 容忍：`export ` 前缀、单双引号、CRLF、BOM、注释、空行、`NAME = value` 空格。

@@ -110,7 +110,7 @@ import { createMemoryService } from './memory/MemoryService.ts';
 import { memoryWritePathsOfStep } from './memory/step-paths.ts';
 import type { MemoryServiceImpl } from './memory/MemoryService.ts';
 import { assertHttpConfig, startHttpServer } from './surfaces/http.ts';
-import { loadSurfacesConfig } from './surfaces/config.ts';
+import { loadSurfacesConfig, resolveConfigFile } from './surfaces/config.ts';
 import { SseBus } from './surfaces/sse.ts';
 import { accountDeviceTaskTokens } from './surfaces/device-usage.ts';
 import {
@@ -610,9 +610,14 @@ export function containerJailFromEnv(): { browser: number; shell: number; fs: nu
 }
 
 /**
- * 水位预留（MB）读取：DOTD_RESERVE_MB 环境变量优先，其次 ~/.dotd/config.yml 顶层
+ * 水位预留（MB）读取：DOTD_RESERVE_MB 环境变量优先，其次 config.yml 顶层
  * `dotdReserveMb:` 键（只按行匹配这一个标量，不引 YAML 库），都没有则返回 null 用默认。
  * 背景：装配层此前不读 dotd.yml 的 dotdReserveMb（接线缺口），本机内存紧张时无法调档。
+ *
+ * 读**哪个** config.yml 由 `resolveConfigFile()` 决定，与 `loadSurfacesConfig()` 同一份
+ * 判据（2026-10-26 第十五例）。这里原来写 `join(cfg.dataDir, 'config.yml')`，
+ * 而 surfaces 节读的是 `~/.dotd/config.yml` —— 同一个进程两处配置，`DOTD_HOME`
+ * 一挪就分叉。现在两边问同一个函数。
  */
 export function cpReserveMbFromEnvOrConfig(cfg: DaemonConfig): number | null {
   const envV = process.env.DOTD_RESERVE_MB;
@@ -622,7 +627,7 @@ export function cpReserveMbFromEnvOrConfig(cfg: DaemonConfig): number | null {
     throw new Error(`DOTD_RESERVE_MB 非法：${envV}`);
   }
   try {
-    const txt = readFileSync(join(cfg.dataDir, 'config.yml'), 'utf8');
+    const txt = readFileSync(resolveConfigFile(), 'utf8');
     const g = txt.match(/^dotdReserveMb:\s*([0-9_]+)\s*(?:#.*)?$/m)?.[1];
     if (g !== undefined) return Number(g.replace(/_/g, ''));
   } catch {

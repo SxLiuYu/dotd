@@ -197,7 +197,7 @@ process.stdout.write(`
 下一步：
   source ${TOKENS_PATH}          # Git Bash / WSL
   # PowerShell: Get-Content ${TOKENS_PATH} | ForEach-Object { ... } 或直接在 .env 里设
-  npm run serve                  # 起 daemon（默认读 ~/.dotd/config.yml）
+  npm run serve                  # 起 daemon（读 ${CONFIG_PATH}）
   npm run init-config -- --force # 想重新生成 config.yml 时
 `);
 process.exit(0);

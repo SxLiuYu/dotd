@@ -29,7 +29,12 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
-import { configDirIsHostedGuess, layeredEnv, resolveConfigDir as resolveConfigDirShared } from './lib/env.mjs';
+import {
+  configDirIsHostedGuess,
+  layeredEnv,
+  resolveConfigDir as resolveConfigDirShared,
+  resolveConfigFile,
+} from './lib/env.mjs';
 import { liveDaemon } from './lib/live-daemon.mjs';
 import { looksLikePath, resolveCommand as resolveCommandShared } from './lib/command.mjs';
 
@@ -364,10 +369,11 @@ export async function runChecks(opts = {}) {
     );
   }
 
-  // 3. surfaces 配置：daemon 只读 ~/.dotd/config.yml，仓库里的 config/dotd.yml 只是模板
-  const cfgPath = runtimeEnv.DOTD_CONFIG !== undefined && runtimeEnv.DOTD_CONFIG !== ''
-    ? runtimeEnv.DOTD_CONFIG
-    : join(home, '.dotd', 'config.yml');
+  // 3. surfaces 配置：daemon 读 `resolveConfigFile()` 那一份（DOTD_CONFIG >
+  //    <DOTD_HOME>/config.yml > ~/.dotd/config.yml），仓库里的 config/dotd.yml 只是模板。
+  //    2026-10-26 第十五例：这里原来写 `DOTD_CONFIG ?? ~/.dotd/config.yml`，与
+  //    daemon 里另一处读 `<DOTD_HOME>/config.yml` 的判据分叉 —— 现在统一问库。
+  const cfgPath = resolveConfigFile({ env: runtimeEnv, home });
   // tokens.env 的 key 集合（只看键名/有没有值，不打印值）。用途见第 4 项：
   // 一键启动（charlie:start / wsl-daemon.sh）会 source 它，裸 `npm run serve` 不会。
   const tokens = layeredEnv({

@@ -12,8 +12,9 @@
  *   引号字符串），足以解析 dotd.yml 全部六个配置节。未覆盖的 YAML 特性记 deviations。
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { z } from 'zod';
 import { ConfigError } from '../shared/errors.ts';
 import type { SurfacesConfig } from './types.ts';
@@ -220,6 +221,60 @@ export function expandHome(p: string): string {
   if (p === '~') return homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return homedir() + p.slice(1);
   return p;
+}
+
+/**
+ * `config.yml` 到底在哪 —— **唯一**判据。
+ *
+ * 为什么要单拎出来（2026-10-26，同类缺陷第十五例）：同一个 daemon 进程里有两处
+ * 在找这份文件，用的却不是同一条规则 ——
+ *
+ *     loadSurfacesConfig()            → DOTD_CONFIG ?? ~/.dotd/config.yml   （无视 DOTD_HOME）
+ *     cpReserveMbFromEnvOrConfig()    → join(cfg.dataDir, 'config.yml')     （= DOTD_HOME 下）
+ *
+ * 实测（`DOTD_HOME=/tmp/h17` 里 port=7001/token=dotdhome-token/reserve=2222，
+ * `HOME=/tmp/hh17/.dotd` 里 port=7000/token=home-token/reserve=1111）：
+ *
+ *     dataDir       = /tmp/h17
+ *     surfaces.port = 7000   token = home-token      ← 读的是 HOME 那份
+ *     dotdReserveMb = 2222                            ← 读的是 DOTD_HOME 那份
+ *
+ * 也就是说 `surfaces:` 节（端口、master_token、飞书密钥）来自**用户 HOME**，
+ * 而其余键来自**数据目录**。谁把 `DOTD_HOME` 指到别处（`CHARLIE_HOME=/data`
+ * 这类容器部署、临时实例、冒烟夹具），都会拿到"一半来自 A、一半来自 B"的配置，
+ * 而且两边日志都正常 —— 正是这条主线反复出现的形状：**同一件事两处判据**。
+ *
+ * 现在按 `DOTD_HOME`（数据目录根）来：它才是这个系统的"一个根"，
+ * 也与 `scripts/init-config.mjs` / `scripts/setup.mjs` / `voice/integration/one_system.py`
+ * 写配置时用的位置一致 —— 写哪儿就读哪儿。
+ *
+ * 顺序：`DOTD_CONFIG`（显式文件）> `<DOTD_HOME>/config.yml`（**存在才用**）
+ * > `~/.dotd/config.yml`。"存在才用"是为了不制造回归：`DOTD_HOME` 指到别处、
+ * 但配置仍放在 `~/.dotd` 的老布局照样能起（此时两处读的都是 `~/.dotd` 那份，
+ * 依旧同判据）。注意这里**不**走 `<configDir>`：18.13 已定 config.yml 身份不同 ——
+ * 它是"指向某一份文件的路径"，不是"跟着配置目录走的一类文件"。
+ */
+export function resolveConfigFile(
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    /** 用于展开 `~` / 回落的默认 home（测试注入；缺省 `homedir()`）。 */
+    home?: string;
+    exists?: (p: string) => boolean;
+  } = {},
+): string {
+  const env = opts.env ?? process.env;
+  const home = opts.home ?? homedir();
+  const exists = opts.exists ?? existsSync;
+  const expand = (p: string): string =>
+    p === '~' ? home : p.startsWith('~/') || p.startsWith('~\\') ? join(home, p.slice(2)) : p;
+  const explicit = (env.DOTD_CONFIG ?? '').trim();
+  if (explicit.length > 0) return resolve(expand(explicit));
+  const homeEnv = (env.DOTD_HOME ?? '').trim();
+  if (homeEnv.length > 0) {
+    const hosted = join(resolve(expand(homeEnv)), 'config.yml');
+    if (exists(hosted)) return hosted;
+  }
+  return join(home, '.dotd', 'config.yml');
 }
 
 // ── 监听地址（F6：可配置 bind，但默认必须是回环）─────────────────────────
@@ -526,10 +581,10 @@ export function parseSurfacesSection(root: YamlMap): SurfacesConfig {
 
 /**
  * 读 config.yml 并返回 surfaces 配置。
- * @param configPath 显式路径（测试传临时文件；缺省走 DOTD_CONFIG 或 ~/.dotd/config.yml）。
+ * @param configPath 显式路径（测试传临时文件；缺省走 `resolveConfigFile()`）。
  */
 export function loadSurfacesConfig(configPath?: string): SurfacesConfig {
-  const path = configPath ?? process.env.DOTD_CONFIG ?? expandHome('~/.dotd/config.yml');
+  const path = configPath ?? resolveConfigFile();
   let text: string;
   try {
     text = readFileSync(path, 'utf8');

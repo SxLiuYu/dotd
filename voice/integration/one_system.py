@@ -103,7 +103,19 @@ def resolve_paths(env: Optional[dict[str, str]] = None) -> Paths:
             home = dotd_home
         else:
             home = charlie_home
-    config_file = Path(e.get("DOTD_CONFIG") or (home / "config.yml")).expanduser().resolve()
+    explicit = (e.get("DOTD_CONFIG") or "").strip()
+    if explicit:
+        config_file = Path(explicit).expanduser().resolve()
+    else:
+        # 与 `src/surfaces/config.ts::resolveConfigFile` 同判据（2026-10-26 第十五例）：
+        # `<home>/config.yml` **存在才用**，否则回落 `~/.dotd/config.yml`。
+        # 不回落的话，`DOTD_HOME` 指到一个没有 config.yml 的目录时：
+        # 本函数认 `<home>/config.yml`（不存在 → 报缺令牌、拒起），
+        # 而 daemon 回落 `~/.dotd/config.yml`（能读、能起）—— 同一台机器两个结论。
+        candidate = home / "config.yml"
+        config_file = (
+            candidate if candidate.is_file() else (Path.home() / ".dotd" / "config.yml")
+        ).resolve()
     config_dir = Path(e.get("DOTD_CONFIG_DIR") or config_file.parent).expanduser().resolve()
     voice_data = Path(e.get("CHARLIE_DATA_DIR") or (home / "voice")).expanduser().resolve()
     return Paths(home=home, config_dir=config_dir, config_file=config_file, voice_data=voice_data)
