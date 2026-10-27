@@ -75,6 +75,7 @@ import type { DailyBrief } from './daily-brief.ts';
 import type { FeedSnapshot } from './feed.ts';
 import type { ProofBundle } from './proof.ts';
 import type { ConnectionRow } from './connections.ts';
+import type { MetricsView } from '../metrics/view.ts';
 import { connectionSummary, renderConnections } from './connections.ts';
 import {
   dashboardCsp,
@@ -138,6 +139,7 @@ export type Route =
   | 'activity'
   | 'brief'
   | 'feed'
+  | 'metrics'
   | 'connections'
   | 'logs'
   | 'memory_archive'
@@ -198,6 +200,9 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   // 出站审计（2026-10-19）：飞书回复有没有发出去、发到哪、失败原因。
   // 原来只写日志，而日志每次 daemon 重启都被清空 -> "我没收到回复"无从查证。
   if (m === 'GET' && p === '/api/outbound') return { route: 'outbound', params: {} };
+  // 指标（2026-10-27）：反应速度 / 执行质量 / 自我进化。
+  // 默认只读；`?sample=1` 才落库并设成新基线 —— 看指标这个动作不该改变指标。
+  if (m === 'GET' && p === '/api/metrics') return { route: 'metrics', params: {} };
   if (m === 'GET' && p === '/api/container') return { route: 'container', params: {} };
   if (m === 'POST' && p === '/api/container/reset') return { route: 'container', params: { action: 'reset' } };
 
@@ -668,7 +673,15 @@ export interface HttpDeps {
    */
   proof?: (taskId: string, opts?: { includeArgs?: boolean }) => ProofBundle | null;
   /** 已连接应用总览（D3）：同上，`insight.ts` 的 `buildConnectionsView`。 */
-  connections?: () => ConnectionRow[];  now?(): Date;
+  connections?: () => ConnectionRow[];
+  /**
+   * 指标采样（2026-10-27）：反应速度 / 执行质量 / 自我进化。
+   *
+   * 缺省 = `/api/metrics` 回 503（没装这条腿时明说，别回一屏 0 让人以为全绿）。
+   * `sample:true` 才落库；只读查询不写库 —— 看指标这个动作不该改变指标。
+   */
+  metrics?: (opts: { days?: number; sample?: boolean; detail?: boolean }) => MetricsView;
+  now?(): Date;
   /**
    * 列出 .archive/ 里的记忆备份（按时间倒序）。
    * 2026-10-18：归档能力做完后补的"入口"——之前只能手动 docker exec cp 恢复。
@@ -1364,6 +1377,36 @@ export function createHttpServer(deps: HttpDeps): Server {
           json(res, 200, provider(nowMs));
         } catch (cause) {
           json(res, 500, { error: 'brief', message: `生成简报失败：${String(cause)}` });
+        }
+        return;
+      }
+
+      // 指标（2026-10-27）：反应速度 / 执行质量 / 自我进化。
+      // 查询参数：days（窗口天数，默认 7）、sample=1（落库并设为新基线）、
+      // detail=0（不要按维度拆的明细）。
+      case 'metrics': {
+        const provider = deps.metrics;
+        if (provider === undefined) {
+          json(res, 503, { error: 'metrics', message: 'daemon 没装配指标能力（metrics 未传）' });
+          return;
+        }
+        try {
+          const q = url.searchParams;
+          const daysRaw = q.get('days');
+          const days = daysRaw === null || daysRaw === '' ? 7 : Number(daysRaw);
+          if (!Number.isFinite(days) || days <= 0 || days > 365) {
+            json(res, 400, { error: 'metrics', message: 'days 必须是 1..365 的整数' });
+            return;
+          }
+          const sampled = q.get('sample');
+          const detailRaw = q.get('detail');
+          json(res, 200, provider({
+            days: Math.floor(days),
+            sample: sampled === '1' || sampled === 'true',
+            detail: detailRaw === null ? true : !(detailRaw === '0' || detailRaw === 'false'),
+          }));
+        } catch (cause) {
+          json(res, 500, { error: 'metrics', message: `采样失败：${String(cause)}` });
         }
         return;
       }

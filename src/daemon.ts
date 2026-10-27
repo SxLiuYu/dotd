@@ -127,6 +127,7 @@ import { startConnectionWatch } from './surfaces/connection-watch-push.ts';
 import { buildBrief, buildConnectionsView, type InsightDeps } from './surfaces/insight.ts';
 import { collectFeed } from './surfaces/feed.ts';
 import { collectProof } from './surfaces/proof.ts';
+import { metricsView } from './metrics/view.ts';
 import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
 
 /** A2：保险库目录（DOTD_VAULT_DIR 可覆盖；缺省 /root/.dotd——钥匙也在那台机上）。 */
@@ -863,10 +864,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 212）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 214）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 212 });
+    const res = migrate(db, { expectedVersion: 214 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -2066,6 +2067,14 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   const proofOf = (taskId: string, opts: { includeArgs?: boolean } = {}) =>
     collectProof(db, cp, taskId, Date.now(), opts.includeArgs === true);
 
+  // 指标（2026-10-27）：反应速度 / 执行质量 / 自我进化。
+  //
+  // 口径全在 src/metrics/ —— CLI（`dotd metrics`）、HTTP（`/api/metrics`）、
+  // 将来的飞书推送共用同一份算与说，不会各写一套 SQL。
+  // 默认只读：看指标这个动作不该改变指标；`sample:true` 才落库并设为新基线。
+  const metricsOf = (opts: { days?: number; sample?: boolean; detail?: boolean } = {}) =>
+    metricsView({ db }, opts);
+
   const server = await startHttpServer({
     db,
     bus,
@@ -2103,6 +2112,8 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     // M1：动态页（只读投影；Web / `dotd feed` 共用一个入口）。
     feed: feedOf,
     proof: proofOf,
+    // 指标（2026-10-27）：只读；`?sample=1` 才落库并设为新基线。
+    metrics: metricsOf,
     webRoot: cfg.webRoot,
     // §5.7 求救自检要真值：顺序/兜底文件直接从 router 的 alerts 配置取，
     // 不让 /api/channels 与 `dotd sos-test` 拿编译期默认值猜（2026-10-17）。
@@ -2610,8 +2621,54 @@ log(
     },
   });
 
+  // **指标定时采样**（2026-10-27）。
+  //
+  // 只在有人跑 `dotd metrics --sample` 时落库，趋势就断在"想起来看一眼"的那一刻，
+  // 曲线中间全是空洞，事后无法回答「上周三之后到底变好没有」。
+  //
+  // 两条纪律：
+  //   · **不动基线**（setBaseline:false）。基线是主人刻意确认的「改之前长这样」，
+  //     被自动采样挪走就等于失去参照。
+  //   · **1 小时内不重复采**。部署会重启 daemon，重启即采样的话，一天里
+  //     改十次代码就堆十行几乎一样的数，趋势还是假的。
+  //
+  // 保留 180 天：更久的数据对"最近有没有变好"没有增量信息；
+  // 但被人工基线引用的行不删，否则基线会指向一个不存在的采样。
+  const sampleMetrics = (): void => {
+    try {
+      const last = db.prepare('SELECT MAX(at) AS t FROM metric_sample').get() as
+        | { t: number | null }
+        | undefined;
+      const lastAt = Number(last?.t ?? 0);
+      if (Number.isFinite(lastAt) && lastAt > 0 && Date.now() - lastAt < 3600_000) return;
+
+      const v = metricsView({ db }, { days: 7, sample: true, setBaseline: false, detail: false });
+      db.prepare(
+        `DELETE FROM metric_sample
+          WHERE at < ?
+            AND id NOT IN (SELECT sample_id FROM metric_baseline)`,
+      ).run(Date.now() - 180 * 86_400_000);
+      db.prepare('DELETE FROM metric_series WHERE sample_id NOT IN (SELECT id FROM metric_sample)').run();
+      log(`[metrics] 采样 #${v.sampleId ?? '?'}：${v.headline}`);
+    } catch (err) {
+      log(`[metrics] 采样失败（不影响主循环）：${String(err)}`);
+    }
+  };
+
+  cp.scheduler.registerInternalJob({
+    name: 'metrics.sample',
+    kind: 'light',
+    everyMs: 6 * 3600_000,
+    run: async () => sampleMetrics(),
+  });
+
   cp.scheduler.start();
-  log('scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention / exec.healthcheck）');
+  // 启动就采一次（有 1 小时护栏，部署重启不会堆重复行）。
+  // 这样"刚部署完长什么样"直接进曲线，不用等 6 小时后的第一跳。
+  sampleMetrics();
+  log(
+    'scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention / exec.healthcheck / metrics.sample）',
+  );
 
   // **FTS 全量对账放在启动期**（2026-10-19 实测改）。
   // 原来这一步藏在 MemoryService.ftsProbe() 里，由 appendMessage 首次触发 ——

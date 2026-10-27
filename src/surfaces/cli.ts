@@ -643,6 +643,40 @@ export function buildCli(opts: CliOptions = {}): Command {
     });
 
   program
+    .command('metrics')
+    .description('可观测指标（GET /api/metrics：反应速度 / 执行质量 / 自我进化）')
+    .option('--days <n>', '统计窗口天数（默认 7）', '7')
+    .option('--sample', '把这次采样落库，并设为新基线')
+    .option('--no-detail', '不附按维度拆的明细')
+    .action(async (opts: { days?: string; sample?: boolean; detail?: boolean }) => {
+      const o = merged();
+      const qs = new URLSearchParams();
+      if (opts.days !== undefined && opts.days !== '') qs.set('days', opts.days);
+      if (opts.sample === true) qs.set('sample', '1');
+      if (opts.detail === false) qs.set('detail', '0');
+      const q = qs.toString() === '' ? '' : '?' + qs.toString();
+      const r = await api<{
+        text: string;
+        headline: string;
+        sampleId: number | null;
+        hasBaseline: boolean;
+        sample: unknown;
+        series: unknown[];
+        history: unknown[];
+      }>('GET', '/api/metrics' + q, undefined, o);
+      if (!r.ok) return fail(o, r.message, r.kind === 'unreachable' ? EXIT_UNREACHABLE : 1);
+      if (o.json === true) {
+        emit(o, render(r.body, true));
+        return;
+      }
+      const tail =
+        r.body.sampleId === null
+          ? '\n\n（本次只读，未落库。要让这屏成为以后的对比基线：dotd metrics --sample）'
+          : `\n\n（已落库 sample#${r.body.sampleId}，后续采样会拿它当基线）`;
+      emit(o, r.body.text + (r.body.hasBaseline ? '' : '\n（还没有历史基线，所以没有对比箭头）') + tail);
+    });
+
+  program
     .command('brief')
     .description('今天的简报（GET /api/brief：日程 / 等你批的事 / 近 24 小时结果 / 定时任务）')
     .action(async () => {
