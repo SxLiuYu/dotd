@@ -49,6 +49,10 @@ def _discover_mcp_metas() -> list[dict]:
     # 3. 别名（无独立文件）
     result.append({"name": "filesystem", "tier": "core", "required_env": [], "label": "文件系统"})
     result.append({"name": "amap-maps", "tier": "core", "required_env": [], "label": "高德地图/天气"})
+    # 注意这里**故意不加 ac-control**：它是历史域名（`_classify_intent` /
+    # `_DECIDE_CTX` / `_LAYA_GROUPS` 都还这么叫），真实工具面是 magic-home.py。
+    # 只进 `_build_all_mcp` 的别名表（让 `resolve('ac-control')` 能起来），
+    # 不进 core/optional 分层 —— 否则 `MCP_PROFILE=all` 会把同一批工具挂两遍。
     return result
 
 
@@ -96,6 +100,8 @@ def _build_all_mcp() -> dict:
         result["filesystem"] = result["magic-notes"].copy()
     if "magic-info" in result:
         result["amap-maps"] = result["magic-info"].copy()
+    if "magic-home" in result:
+        result["ac-control"] = result["magic-home"].copy()
 
     # 4. 注入完整环境变量。MCP SDK stdio 默认只继承 HOME/PATH 等白名单，
     # 技能子进程依赖 ASSISTANT_KID_DATA_DIR/AMAP_KEY/FEISHU_APP_ID 等 .env 变量，

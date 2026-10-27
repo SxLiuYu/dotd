@@ -81,6 +81,12 @@ export interface ApprovalCardDeps {
  * 把一张审批单推到**每一个**主人会话。
  * 返回成功的那些 message_id（顺序与入参 chatIds 一致，失败的不在里面）。
  *
+ * ⚠️ 2026-10-27：**这不是线上路径。** 实际投递由 feishu-outbound.ts 的
+ * claimAndSend 驱动，它只投**一个**会话（来源会话优先，否则第一个主人会话）——
+ * 主人报「不要在私聊和群聊都问我」，广播等于同一件事问两遍。
+ * 本函数保留为「确实需要广播」的通用工具（例如未来做真正的多人共享场景），
+ * 接线前请先确认你要的语义是广播还是单投。
+ *
  * 为什么是广播而不是只投第一个：Muse 那条「人保留最后一击」的前提是
  * **主人在任何一端都能看到待批事项**。少一个会话看到，就多一个任务卡死的地方。
  * 广播不会导致重复裁决：裁决写路径是 gate.decide()，它对非 pending 的单
@@ -128,13 +134,20 @@ export async function pushApprovalCards(
  * 主人换个会话又点一次 —— 那是 late_decision 审计里一堆「已被抢先批准」的噪音，
  * 而且看起来像「我到底批了没有」。所以这里遍历，绝不 `for` 到第一个就 return。
  * 每条单独 catch：一条改不动（message_id 过期/被撤回）不影响其余。
+ *
+ * 2026-10-27：返回值带上构建出来的结果卡（`card`）。
+ * 为什么需要：PATCH 只对**没被点击**的那些卡片可靠；被点击的那张，
+ * 飞书会用「按钮回调的响应」决定最终状态 —— 回包里没有新卡，
+ * 就按点击时的版本落定，把 PATCH 冲掉（2026-10-27 实测：
+ * 日志「已改 2/2 张卡片」，半小时后 GET 服务端仍是按钮卡片）。
+ * 所以调用方要把这张卡放进回调响应。见 feishu-ws.ts 的 route()。
  */
 export async function resolveApprovalCards(
   deps: ApprovalCardDeps,
   cardMessageIds: readonly string[],
   approvalId: number,
   by: string,
-): Promise<{ updated: number; failed: number }> {
+): Promise<{ updated: number; failed: number; card?: Record<string, unknown> }> {
   if (deps.sender.updateCard === undefined) return { updated: 0, failed: 0 };
   let view: ApprovalView | null = null;
   if (deps.getApprovalView !== undefined) view = deps.getApprovalView(approvalId);
@@ -162,7 +175,7 @@ export async function resolveApprovalCards(
   if (cardMessageIds.length > 1) {
     deps.log?.(`[feishu-approval] 审批 #${approvalId} 落定，已改 ${updated}/${cardMessageIds.length} 张卡片`);
   }
-  return { updated, failed };
+  return { updated, failed, card };
 }
 
 /** 单张卡片的旧签名（装配层若只有一张时可用；内部就是遍历长度为 1 的列表）。 */

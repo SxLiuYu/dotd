@@ -62,3 +62,27 @@ export const MEMORY_TIERS: readonly ToolTier[] = ['read', 'write_file', 'browser
 export function memoryEligible(tier: ToolTier): boolean {
   return MEMORY_TIERS.includes(tier);
 }
+
+/**
+ * 审批总开关（2026-10-26，主人要求「dotd 的审批去掉」，选定「加一个总开关，默认全关」）。
+ *
+ *     DOTD_APPROVALS=off（默认）  所有档位直通 allow，不再弹审批卡、不再等主人点头。
+ *     DOTD_APPROVALS=on           恢复原五档裁决：browser→review，spend/dangerous→人工审批
+ *                                 + Web 二次确认。
+ *
+ * 默认 off 是主人明确定的口径：家居控制全是 dangerous/write 档，逐个点卡片等于不可用。
+ *
+ * ## 关掉审批之后**仍然生效**的三件事（不是审批，别一起关掉）
+ *
+ * 1. **白名单制**：未登记工具照样 deny —— 那是"这个工具不存在"，不是"要不要你批"；
+ * 2. **spend 参数契约**：金额算不清的调用照样 deny（§2.5）；开关不能替代算钱；
+ * 3. **应急模式冻结 dangerous**：EMERGENCY 是硬冻结（`deny`），不是"等人批"。
+ *
+ * 审计一条不少：每次直通都照旧写 `decisions` + `audit`，reason 带
+ * `approvals=off 直通`，事后能一眼看出"这次没有经过人"。
+ */
+export function approvalsDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env['DOTD_APPROVALS'] ?? '').trim().toLowerCase();
+  // 只有显式写 on/1/true/yes 才恢复审批；空值、未知值一律按主人的新口径直通。
+  return !(raw === 'on' || raw === '1' || raw === 'true' || raw === 'yes');
+}

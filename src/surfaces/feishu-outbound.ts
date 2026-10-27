@@ -419,15 +419,36 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
     try {
       const cards = deps.approvalCards;
       if (cardView !== undefined && cards !== undefined) {
-        // B1（F5）：审批卡片**逐个主人会话**投。卡片是幂等的（裁决先到先得），
-        // 所以每个会话各一张不是重复打扰，而是「在任何一端都能看到待批事项」。
-        // 全部会话都失败才退回纯文本 —— 只要有一个会话送达就算成功，
-        // 否则失败的那个会话会被文本再打扰一遍。
-        const targets = dedupeChatIds(cards.chatIds);
-        if (targets.length > 0) {
-          let okCount = 0;
+        // **审批卡片只投一个会话：来源会话优先，否则第一个主人会话。**
+        // （2026-10-27 主人报：「助手不要在私聊和群聊都问我，我都不知道怎么回复了」）
+        //
+        // 原来这里无条件广播到全部 owner_chat_id。理由是「任何一端都能看到待批
+        // 事项」，但那把「多个人」和「同一个人的多个窗口」混为一谈了：主人配了
+        // 两个会话（实测都是私聊型群，各 1 个成员，名字「议事堂」「助手」），
+        // 同一条问题两边各弹一张卡。他答了这边、那边还挂着；两边都点又变成
+        // 迟到裁决。清单是「多个入口」，问题却只需要回答一次。
+        //
+        // 判据分三层，越靠前越优先：
+        //   1. 任务有来源飞书会话 → 只问它（主人在哪问的就在哪答）；
+        //   2. 没有来源（定时/web 线程）→ 问第一个主人会话；
+        //   3. 第一个发不出去 → 依次试剩下的（宁可换个窗口问，也不能没有窗口问）。
+        //
+        // 为什么不用「广播后自己挑第一个成功的」：广播的代价是另一端的卡片永远
+        // 挂着按钮，那正是这次要消掉的东西。逐个试直到成功，只有一个窗口会看到。
+        //
+        // 与 taskStateText 的差别要说清：**任务回复**在无来源时仍广播（定时提醒
+        // 两个窗口都该收到）；**提问**只问一次。同一件事不需要两遍地征求同意。
+        const threadId = threadIdOfTask(deps.db, cardView.taskRef.taskId);
+        const threadChat = threadId === null ? null : feishuChatIdForThread(deps.db, threadId);
+        const allOwnerChats = dedupeChatIds(cards.chatIds);
+        const ordered: string[] =
+          threadChat !== null && threadChat.length > 0
+            ? [threadChat, ...allOwnerChats.filter((c) => c !== threadChat)]
+            : allOwnerChats;
+        if (ordered.length > 0) {
           let lastError = '?';
-          for (const chatId of targets) {
+          let sentTo: string | null = null;
+          for (const chatId of ordered) {
             const cr = await cards.send(cardView, chatId);
             recordOutbound(deps.db, {
               kind: 'approval_card',
@@ -438,16 +459,19 @@ export function startFeishuOutbound(deps: FeishuOutboundDeps): () => void {
               textPreview: `审批 #${cardView.id} 卡片`,
               at: new Date().toISOString(),
             });
-            if (cr.ok) okCount += 1;
-            else lastError = cr.error ?? '?';
+            if (cr.ok) {
+              sentTo = chatId;
+              break;
+            }
+            lastError = cr.error ?? '?';
           }
-          if (okCount > 0) {
+          if (sentTo !== null) {
             sent.set(key, Date.now());
             claimed = true;
             prune();
             deps.log(
-              `[feishu-outbound] 审批 #${cardView.id} 已发卡片 ${okCount}/${targets.length} 个主人会话` +
-                (okCount < targets.length ? `（${targets.length - okCount} 个失败：${lastError}）` : ''),
+              `[feishu-outbound] 审批 #${cardView.id} 已发卡片 1/1 个会话` +
+                (threadChat !== null ? '（来源会话）' : '（无来源会话，取第一个主人会话）'),
             );
             return;
           }

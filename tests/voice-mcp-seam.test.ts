@@ -20,7 +20,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -74,5 +75,54 @@ test('Charlie 的场景 server 能被 dotd 的 MCP 客户端直接调用', { ski
     assert.equal(denied.errorCode, 'mcp_tool_denied');
   } finally {
     client.dispose();
+  }
+});
+
+test('家居控制 server（magic-home）能被 dotd 调用，且与语音反射同源', { skip, timeout: 120_000 }, async () => {
+  const example = parseMcpServersYaml(readFileSync(join(REPO, 'config', 'mcp-servers.voice.yml'), 'utf8'));
+  const cfg = example.find((s) => s.name === 'charlie-home');
+  assert.ok(cfg !== undefined, '示例里应有 charlie-home');
+
+  // 临时清单 + 空调干跑：不碰真设备、不碰涂鸦云。
+  const dir = mkdtempSync(join(tmpdir(), 'dotd-home-'));
+  const manifest = join(dir, 'home-devices.yml');
+  writeFileSync(
+    manifest,
+    [
+      'devices:',
+      '  - id: ac1',
+      '    name: 空调',
+      '    kind: ac',
+      '    adapter: tuya_ir',
+      '    infrared_id: ir-test',
+      '    remote_id: ac-test',
+    ].join('\n'),
+  );
+
+  const client = new McpClient([
+    { ...cfg, timeoutMs: 30_000, env: { HOME_DEVICES_FILE: manifest, HOME_AC_DRY_RUN: '1' } },
+  ]);
+  try {
+    const tools = await client.listTools('charlie-home');
+    const names = tools.map((t) => t.name);
+    for (const w of ['home_list', 'home_control', 'home_status', 'home_reload']) {
+      assert.ok(names.includes(w), `tools/list 应有 ${w}，实际：${names.join(', ')}`);
+    }
+    assert.equal(names.length, cfg.allowTools?.length, '白名单必须生效');
+
+    const listed = await client.call('charlie-home', 'home_list', {});
+    assert.equal(listed.ok, true, JSON.stringify(listed));
+    assert.match(String(listed.result), /空调/);
+
+    const r = await client.call('charlie-home', 'home_control', {
+      device: '空调',
+      action: 'on',
+      params: '{"mode":0,"temp":26}',
+    });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.match(String(r.result), /联调模式/, 'HOME_AC_DRY_RUN=1 时不该真的发红外码');
+  } finally {
+    client.dispose();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

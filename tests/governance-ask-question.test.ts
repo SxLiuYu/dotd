@@ -126,3 +126,103 @@ test('question 为空要拒绝：问了个寂寞比不问更糟', async () => {
     fx.cleanup();
   }
 });
+
+// ── 同一个问题不许反复开单（2026-10-27 主人报「为什么一个问题要发很多选项卡」）──
+//
+// 现场 tk_mvq33ahrc52fo1：steps 是 ask → 回答 → ask → 回答，同一个题干同一组选项，
+// 17 秒一轮连问 5 次，每次都新签一张审批单（seq 174…178）并推一张卡片。
+// 主人那边看到的就是同一张选项卡反复冒出来。
+
+test('同一个问题已得到回答时不再开第二张单，且回答原文回喂给模型', async () => {
+  const fx = makeGovFixture();
+  try {
+    const d1 = await evaluate(ctxOf(), CALL as never, {}, fx.rt);
+    assert.equal(d1.kind, 'approve');
+    const id1 = (d1 as { approvalId: number }).approvalId;
+    await decide(id1, 'web', 'approve_once', 'owner', '公司前台', fx.rt);
+
+    // 模型又问一遍同样的问题（换了个 callId，参数一字不差）
+    const d2 = await evaluate(
+      ctxOf(),
+      { callId: 'call_ask_2', tool: 'ask', params: { question: '收件地址是哪里？', options: '公司|家里' } } as never,
+      {},
+      fx.rt,
+    );
+    assert.equal(d2.kind, 'deny', '已经答过就别再开单');
+    const reason = (d2 as { reason: string }).reason;
+    assert.match(reason, /已经问过并得到回答/, reason);
+    assert.ok(reason.includes('公司前台'), `回答原文必须回喂给模型：${reason}`);
+    assert.ok(reason.includes(String(id1)), '要写明是哪张单，便于事后核对');
+    const n = fx.db.prepare("SELECT COUNT(*) AS n FROM approvals WHERE kind='question'").get() as { n: number };
+    assert.equal(n.n, 1, '不能有第二张 question 单');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('上一张还在等答时不许再开单（否则同一问题挂两处）', async () => {
+  const fx = makeGovFixture();
+  try {
+    const d1 = await evaluate(ctxOf(), CALL as never, {}, fx.rt);
+    assert.equal(d1.kind, 'approve');
+    const id1 = (d1 as { approvalId: number }).approvalId;
+
+    const d2 = await evaluate(
+      ctxOf(),
+      { callId: 'call_ask_2', tool: 'ask', params: { question: '收件地址是哪里？', options: '公司|家里' } } as never,
+      {},
+      fx.rt,
+    );
+    assert.equal(d2.kind, 'deny');
+    assert.match((d2 as { reason: string }).reason, /已经在等回答/);
+    assert.ok((d2 as { reason: string }).reason.includes(String(id1)));
+    const n = fx.db.prepare("SELECT COUNT(*) AS n FROM approvals WHERE kind='question'").get() as { n: number };
+    assert.equal(n.n, 1, 'pending 的那张就是唯一一张');
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('同一任务里问不同的问题是允许的（拦的是重复，不是提问）', async () => {
+  const fx = makeGovFixture();
+  try {
+    const d1 = await evaluate(ctxOf(), CALL as never, {}, fx.rt);
+    const id1 = (d1 as { approvalId: number }).approvalId;
+    await decide(id1, 'web', 'approve_once', 'owner', '公司前台', fx.rt);
+
+    const d2 = await evaluate(
+      ctxOf(),
+      { callId: 'call_ask_2', tool: 'ask', params: { question: '收件人写谁？', options: '张三|李四' } } as never,
+      {},
+      fx.rt,
+    );
+    assert.equal(d2.kind, 'approve', '换个问题当然要继续问 —— 拦的是重复，不是提问本身');
+    const n = fx.db.prepare("SELECT COUNT(*) AS n FROM approvals WHERE kind='question'").get() as { n: number };
+    assert.equal(n.n, 2);
+  } finally {
+    fx.cleanup();
+  }
+});
+
+test('不同任务问同一个问题互不影响（去重范围是本任务）', async () => {
+  const fx = makeGovFixture();
+  try {
+    const d1 = await evaluate(ctxOf(), CALL as never, {}, fx.rt);
+    const id1 = (d1 as { approvalId: number }).approvalId;
+    await decide(id1, 'web', 'approve_once', 'owner', '公司前台', fx.rt);
+
+    const other = { ...ctxOf(), taskRef: { taskId: 'tk_other', journalStepId: 'st_other' } };
+    // 不同任务用不同 callId：subject_key 是 `ask:<callId>`，真实运行时 callId 是 ULID。
+    // 这里复用一个会撞 uniq_open_subject —— 那是索引在管「同一调用只开一张单」，
+    // 与「同任务重复提问」是两件事，别混在一起测。
+    const d2 = await evaluate(
+      other,
+      { callId: 'call_ask_other_task', tool: 'ask', params: { question: '收件地址是哪里？', options: '公司|家里' } } as never,
+      {},
+      fx.rt,
+    );
+    assert.equal(d2.kind, 'approve', '另一个任务的问题不该被这个任务的回答挡掉');
+  } finally {
+    fx.cleanup();
+  }
+});

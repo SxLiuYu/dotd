@@ -36,7 +36,7 @@ import { describeOperation, operationSummary } from '../shared/operation.ts';
 import { sanitizeText } from './config.ts';
 import { govDefaults } from './config.ts';
 import type { GovDefaults } from './config.ts';
-import { baseDecisionFor, stricterOrEqual } from './policy.ts';
+import { approvalsDisabled, baseDecisionFor, stricterOrEqual } from './policy.ts';
 import type { Decision0 } from './policy.ts';
 import { hostOfUrl, lookupTool, spendContractOk } from './catalog.ts';
 import type { Catalog, ToolDefT } from './catalog.ts';
@@ -342,13 +342,66 @@ export async function evaluate(
     if (question === '') return deny('ask：question 不能为空（要问什么，一句话）');
     const optionsRaw = typeof call.params.options === 'string' ? call.params.options : '';
     const options = optionsRaw.split('|').map((s) => s.trim()).filter((s) => s !== '');
+    const subject = { kind: 'question' as const, prompt: question, ...(options.length > 0 ? { options } : {}) };
+
+    // **同一任务里同一个问题只问一次**（2026-10-27 主人报「为什么一个问题要发很多选项卡」）。
+    //
+    // 现场（tk_mvq33ahrc52fo1）：steps 是
+    //   ask → 得到回答 → ask → 得到回答 → ask … 共 5 次，同一个题干、同一组选项，
+    // 17 秒一轮。每一次都会**新签一张审批单**（seq 174…178）并推一张卡片，
+    // 主人那边看到的就是同一张选项卡反复冒出来。
+    //
+    // 病根不在卡片，在这里：`ask` 走的是「签发 question 单 → 挂起」，
+    // 模型恢复后如果没把拿到的回答当结论，就会再问一遍；而治理层对重复提问
+    // 一句拦阻都没有 —— 每次调用都无条件开新单。审批单本身就是「问一次」的
+    // 载体，同一句话问第二次没有任何新信息，只会打扰主人并烧掉一轮模型调用。
+    //
+    // 拦法分三种情形，都**不新开单**：
+    //   1. 上一张还在等答（pending/approved/executing）→ 直接拒绝，别再开第二张；
+    //   2. 上一张已答且有内容 → 把**回答原文**放进拒绝理由里回喂给模型，让它接着做；
+    //   3. 上一张没拿到回答（超时/撤回）→ 如实说没答，不要重问。
+    //
+    // 为什么用 deny 而不是「静默 allow」：`allow` 会把模型原来的参数原样派发，
+    // 而 `ask` 的 handler 只认 `ownerNote`，那条路上模型拿到的永远是
+    // `{answered:false}`，等于把回答丢了 —— 比拒绝更糟。deny 的理由会作为
+    // 工具结果回喂给模型，回答原文因此实实在在到达模型手里。
+    // 顺带的好处：Runner 的 noteDeniedCall 会记「ask 被拒」，同一任务里
+    // 问第三次就会被该护栏直接停掉，不会无限循环。
+    const prior = db
+      .prepare(
+        `SELECT id, seq, status, note FROM approvals
+          WHERE task_id=$taskId AND kind='question' AND subject_json=$subject
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .get({ taskId: ctx.taskRef.taskId, subject: JSON.stringify(subject) }) as
+      | { id: number; seq: number; status: string; note: string | null }
+      | undefined;
+    if (prior !== undefined) {
+      const answered = prior.note === null ? '' : prior.note.trim();
+      if (answered !== '') {
+        return deny(
+          `这个问题你在本任务里已经问过并得到回答（审批 #${prior.id}）：${answered}。` +
+            '直接按这个回答继续，不要重复发问。',
+        );
+      }
+      if (prior.status === 'pending' || prior.status === 'approved' || prior.status === 'executing') {
+        return deny(
+          `同一个问题已经在等回答（审批 #${prior.id}，状态 ${prior.status}），不要再开一张新单。`,
+        );
+      }
+      return deny(
+        `ask 在本任务里已经问过同一个问题（审批 #${prior.id}，状态 ${prior.status}），没有拿到回答。` +
+          '不要重问；缺这条信息就在回复里如实说明。',
+      );
+    }
+
     const a = insertApproval(rt, ctx, call, {
       kind: 'question',
       tier: null,
       reason: question,
       paramsJson,
       subjectKey: `ask:${call.callId}`,
-      subject: { kind: 'question', prompt: question, ...(options.length > 0 ? { options } : {}) },
+      subject,
     });
     const decisionId = insertDecision(db, {
       decisionId: newDecisionId(),
@@ -453,6 +506,36 @@ export async function evaluate(
     });
     appendAudit(db, auditOf(ctx, call, decisionId, 'deny', tier, reason));
     return { kind: 'deny', decisionId, reason };
+  }
+
+  // —— 5.5 审批总开关（2026-10-26，主人要求「dotd 的审批去掉」）——
+  //
+  // 位置很重要：放在**白名单 / spend 契约 / emergency 冻结 / identity_missing** 之后，
+  // 放在**登录态审批 / read 快速路径 / 规则记忆 / base 策略**之前。
+  // 开关只跳过"要不要人点头"这一段，不跳过前面那四条硬判定：
+  //   · 未登记工具 → 已在 §1 deny（工具不存在，不是审批）；
+  //   · 金额算不清 → 已在 §2 deny（§2.5，钱不能靠开关绕过）；
+  //   · EMERGENCY → 已在 §5 deny（硬冻结，不是"等人批"）；
+  //   · 缺登录身份 → 已在 §6 deny（配置问题，批了执行面也照样拒绝）。
+  // 后面那些"需要人"的分支（login-sensitive / review 预审 / approve 开票）全部让位。
+  //
+  // 仍写 decisions + audit：开关关的是"等人"，不是"记账"。
+  // reason 带 `approvals=off`，事后能一眼筛出"这次没有经过人"。
+  if (approvalsDisabled()) {
+    const reason = `approvals=off 直通（${tier}）`;
+    const decisionId = insertDecision(db, {
+      decisionId: newDecisionId(),
+      dotId: ctx.dotId,
+      taskId: ctx.taskRef.taskId,
+      journalStep: call.callId,
+      kind: 'allow',
+      tier,
+      tool: call.tool,
+      paramsJson,
+      reason,
+    });
+    appendAudit(db, auditOf(ctx, call, decisionId, 'allow', tier, reason));
+    return { kind: 'allow', decisionId, brief: null };
   }
 
   // 2026-10-21（主人要求"浏览器控制不需要审批，重大决定才需要"）：

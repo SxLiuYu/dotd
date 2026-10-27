@@ -264,6 +264,13 @@ _SERVER_FILE_MAP = {
     "magic-taobao": "magic-taobao.py",
     "magic-tv": "magic-tv.py",
     "magic-dev": "magic-dev.py",
+    # 家居控制（2026-10-26）：真实工具面在 magic-home.py，工具本体是
+    # voice/integration/home_devices.py 的 HomeController（与语音反射同一份）。
+    # `ac-control` 是历史域名（`_classify_intent` 关键词表、`_DECIDE_CTX`、
+    # `_LAYA_GROUPS.device` 都还这么叫），合并后一直没有对应文件 —— 缺的正是
+    # 这条映射，说「开灯」才必然加载失败。现在两个名字指向同一个文件。
+    "magic-home": "magic-home.py",
+    "ac-control": "magic-home.py",  # 别名，兼容旧域名
 }
 
 

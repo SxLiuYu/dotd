@@ -13,6 +13,9 @@
  *   5. dotd：DOTD_BASE_URL + DOTD_TOKEN 都在时，探一次 /api/health；
  *   6. 接缝：`config/mcp-servers.voice.yml` 存在，**而且照着它配能起来**
  *      （解析 + command/args 可解析；只判存在会漏掉"示例本身是坏的"）。
+ *   7. 家居：设备清单在不在、登记了几台、每台的适配器缺哪个凭证
+ *      （2026-10-26 加：合并后家居控制三层全断，而体检一路 ✅ —— 因为没有一项
+ *      问过"灯到底能不能开"）。
  *
  * 退出码：0 = 必需项全过；1 = 有必需项失败。
  */
@@ -119,6 +122,80 @@ if (!existsSync(examplePath)) {
         ? `${parsed.servers.length} 个 server（${parsed.servers.map((s) => s.name).join(', ')}）`
         : broken.join('; '),
       broken.length === 0 ? '' : '改 config/mcp-servers.voice.yml（它同时是文档里的启用模板）',
+    );
+  }
+}
+
+// 3d. 家居控制：清单 + 凭证
+//
+// 2026-10-26 的现场：合并后家居控制三层全断（`ac-control` 没有文件、`direct_ac_control`
+// 没有调用点、MQTT 模块没登记），而语音体检一路 ✅ —— 因为**没有一项问"灯到底能不能开"**。
+// 这里补上：清单在不在、登记了几台、每台的适配器缺哪个凭证。
+// 缺清单不算 fail（没设备的机器也该能起），但会说清楚"说了开灯也只会交给模型"。
+const homeProbe = pyResolved
+  ? spawnSync(
+      py,
+      [
+        '-c',
+        [
+          'import json, os, sys',
+          'sys.path.insert(0, os.getcwd())',
+          'from voice.integration.home_devices import load_devices, default_manifest_path',
+          'devs = load_devices()',
+          'out = {"path": default_manifest_path(), "exists": os.path.isfile(default_manifest_path())}',
+          'out["devices"] = [{"name": d.name, "adapter": d.adapter, "kind": d.kind} for d in devs]',
+          'print(json.dumps(out, ensure_ascii=False))',
+        ].join('; '),
+      ],
+      { cwd: REPO, encoding: 'utf8', env: { ...process.env } },
+    )
+  : { status: 127, stdout: '', stderr: '没有可用的 Python 解释器（见上一条）' };
+{
+  let info = null;
+  try {
+    info = JSON.parse(homeProbe.stdout);
+  } catch {
+    info = null;
+  }
+  if (info === null) {
+    add(
+      '家居设备清单',
+      'skip',
+      (homeProbe.stderr || '').trim().split('\n').slice(-1)[0] || '读取失败',
+      '缺 PyYAML 时清单读不了：pip install -r voice/requirements-integration.txt',
+    );
+  } else if (info.devices.length === 0) {
+    add(
+      '家居设备清单',
+      'skip',
+      `没有登记设备（${info.path}）`,
+      '照 config/home-devices.yml 写一份，或设 TUYA_IR_DEVICE_ID + TUYA_AC_DEVICE_ID 兜底空调',
+    );
+  } else {
+    const byAdapter = {};
+    for (const d of info.devices) byAdapter[d.adapter] = (byAdapter[d.adapter] ?? 0) + 1;
+    const summary = Object.entries(byAdapter).map(([a, n]) => `${a}×${n}`).join(' ');
+    // 凭证只看"配没配"，不打印值
+    const needEnv = {
+      tuya_ir: ['TUYA_CLIENT_ID', 'TUYA_ACCESS_KEY'],
+      tuya_cloud: ['TUYA_API_KEY'],
+      mqtt: ['MQTT_BROKER'],
+      esp32: [],
+    };
+    const missing = [];
+    for (const a of Object.keys(byAdapter)) {
+      for (const k of needEnv[a] ?? []) {
+        if (!(process.env[k] ?? '').trim()) missing.push(k);
+      }
+    }
+    add(
+      '家居设备清单',
+      missing.length === 0 ? 'ok' : 'fail',
+      `${info.devices.length} 台（${summary}）` +
+        (missing.length === 0 ? '' : `；缺 ${[...new Set(missing)].join(' / ')}`),
+      missing.length === 0
+        ? ''
+        : '把这些凭证写进 ~/.dotd/tokens.env；DP 码与 topic 见 docs/home-control.md',
     );
   }
 }

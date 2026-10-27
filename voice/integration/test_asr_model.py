@@ -104,10 +104,30 @@ class AsrModelTest(unittest.TestCase):
         self.assertEqual(list(self.dir.glob("*.part")), [], "落盘后不应残留 .part")
 
 
+def _isolated_candidates(home: Path) -> list[Path]:
+    """只留临时 home 那一处，去掉「仓库自带的模型目录」这个候选。
+
+    为什么必须这么做：`candidates()` 的第二个候选是
+    `voice/charlie/models/sense-voice`。开发机（Windows）那份是空的，所以
+    "没有模型"类断言一直绿；而 Docker/WSL 的开发副本里那份是**真的 237MB 权重**，
+    于是 `resolve()` 永远返回它，`test_resolve_none_when_missing` 之类的用例
+    只能失败 —— 报出来的却是"代码坏了"，而代码只是如实地在这台机器上看见了模型。
+
+    这些用例要钉的是**判定逻辑**（有/无/云端兜底），不是"本机有没有装权重"，
+    所以把候选钉死在临时目录：机器状态不该改变断言结果。
+    """
+    return [Path(home) / "voice" / "models" / "sense-voice"]
+
+
 class AsrWatchTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp(prefix="asr-watch-"))
         asr_watch._reset_for_tests()
+        patcher = mock.patch.object(
+            asr_watch, "candidates", side_effect=_isolated_candidates
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         asr_watch._reset_for_tests()

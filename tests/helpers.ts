@@ -31,6 +31,23 @@ import type {
   Track,
 } from '../src/shared/contracts.ts';
 
+// ── 0. 审批总开关的测试口径 ────────────────────────────────────────
+
+/**
+ * 产品默认 `DOTD_APPROVALS=off`（2026-10-26 主人要求去掉审批）。
+ * 但**测试必须显式选边**：绝大多数治理/Runner 用例断言的正是"要不要开单"
+ * （suspended / pending / approve_once …）。这里的默认值给 `on`，
+ * 让这些用例继续验它本来要验的东西；验 off 的用例在文件里自己设 off。
+ *
+ * 为什么放在 helpers 而不是每个文件：`node --test` 每个文件一个进程，
+ * 而所有会走到 `evaluate()` 的测试文件都直接或间接 import 本文件
+ * （governance-* 经 governance-support，runner-* 直接用）。
+ * 一处默认，等价于"除显式声明外，测试跑旧口径"。
+ */
+if (process.env['DOTD_APPROVALS'] === undefined) {
+  process.env['DOTD_APPROVALS'] = 'on';
+}
+
 // ── 1. 临时数据目录 ────────────────────────────────────────────────
 
 /**

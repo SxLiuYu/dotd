@@ -221,7 +221,39 @@ test('落定后遍历更新全部卡片（漏一条就是挂着按钮的旧卡�
   };
   const out = await resolveApprovalCards(deps, r.getMany(42), 42, '飞书');
   assert.deepEqual(sender.updated, ['om_1', 'om_2'], '两张都要改');
-  assert.deepEqual(out, { updated: 2, failed: 0 });
+  assert.equal(out.updated, 2);
+  assert.equal(out.failed, 0);
+});
+
+test('返回值带上结果卡（回调响应要用它钉住落定状态，2026-10-27）', async () => {
+  // 现场：PATCH 全部成功（日志「已改 2/2 张卡片」），但被点击那张卡的
+  // 最终状态由**回调响应**决定 —— 回包里没有卡，飞书就把卡片按点击时
+  // 的版本落定，按钮又回来了。所以 resolveApprovalCards 必须把结果卡
+  // 交出来，让 feishu-ws 放进响应体。
+  const sender = fakeSender();
+  const out = await resolveApprovalCards(
+    { sender, chatIds: [CHAT_A], getApprovalView: () => view({ status: 'approved' }) },
+    ['om_1'],
+    42,
+    '飞书',
+  );
+  assert.ok(out.card !== undefined, '结果卡必须随返回值出来');
+  const title = (out.card as { header?: { title?: { content?: string } } }).header?.title?.content ?? '';
+  assert.ok(title.includes('已同意'), `标题应是已同意：${title}`);
+  const cardJson = JSON.stringify(out.card);
+  assert.ok(!cardJson.includes('"action"'), '结果卡不能再有按钮块');
+});
+
+test('拒绝落定时返回的是灰色的已拒绝卡', async () => {
+  const sender = fakeSender();
+  const out = await resolveApprovalCards(
+    { sender, chatIds: [CHAT_A], getApprovalView: () => view({ status: 'rejected' }) },
+    ['om_1'],
+    42,
+    '飞书',
+  );
+  assert.ok(out.card !== undefined);
+  assert.equal((out.card as { header?: { template?: string } }).header?.template, 'grey');
 });
 
 test('某条卡片更新失败/抛异常不连累其它条（逐条 catch，不是第一条挂了就整批不更新）', async () => {
@@ -253,13 +285,17 @@ test('拿不到审批最新状态时一张都不改，但如实报失败数', as
   const sender = fakeSender();
   const out = await resolveApprovalCards({ sender, chatIds: [CHAT_A], getApprovalView: () => null }, ['om_1', 'om_2'], 99, '飞书');
   assert.deepEqual(sender.updated, []);
-  assert.deepEqual(out, { updated: 0, failed: 2 });
+  assert.equal(out.updated, 0);
+  assert.equal(out.failed, 2);
+  assert.equal(out.card, undefined, '状态都拿不到，没有结果卡可回');
 });
 
 test('发送器没有 updateCard 能力时直接返回（旧行为，不抛）', async () => {
   const sender: CardSender = { sendCard: async () => ({ ok: true, messageId: 'om_1' }) };
   const out = await resolveApprovalCards({ sender, chatIds: [CHAT_A] }, ['om_1'], 42, '飞书');
-  assert.deepEqual(out, { updated: 0, failed: 0 });
+  assert.equal(out.updated, 0);
+  assert.equal(out.failed, 0);
+  assert.equal(out.card, undefined);
 });
 // ── 4. 出站回路：claimAndSend 的投递目标（真调 startFeishuOutbound）──
 //
@@ -289,7 +325,7 @@ function seedThread(
 
 const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
-test('审批事件 + 卡片能力：每个主人会话各收到一张，审计里每个会话各一行', async () => {
+test('审批卡片只投来源会话（2026-10-27：主人报「不要在私聊和群聊都问我」）', async () => {
   const dir = makeTempDataDir();
   const logs: string[] = [];
   const cardCalls: string[] = [];
@@ -309,15 +345,18 @@ test('审批事件 + 卡片能力：每个主人会话各收到一张，审计�
     try {
       dir.bus.publish('approval:created', view({ taskRef: { taskId: 'tk_b1', journalStepId: 'st_1' } }), { dotId: 'dot1' });
       await settle();
-      assert.deepEqual(cardCalls, ['card:' + CHAT_A, 'card:' + CHAT_B], '两个主人会话都要收到卡片');
+      // 任务从 CHAT_A 来 → 只问 CHAT_A。同一个人的第二个窗口不该收到同一条问题：
+      // 两边各弹一张，答了这边那边还挂着，两边都点又成了迟到裁决。
+      assert.deepEqual(cardCalls, ['card:' + CHAT_A], '来源会话存在时只投它，不广播');
       const rows = dir.db
         .prepare("SELECT chat_id, ok FROM surf_outbound_log WHERE kind = 'approval_card' ORDER BY id")
         .all() as Array<{ chat_id: string; ok: number }>;
-      assert.equal(rows.length, 2, '广播的审计必须逐会话留痕（否则第二个会话收没收到查不到）');
-      assert.deepEqual(rows.map((r) => r.chat_id), [CHAT_A, CHAT_B]);
-      assert.ok(rows.every((r) => r.ok === 1));
+      assert.equal(rows.length, 1, '审计按实际投递留痕，不能还按广播记两行');
+      assert.deepEqual(rows.map((r) => r.chat_id), [CHAT_A]);
+      assert.equal(rows[0] === undefined ? null : rows[0].ok, 1);
       // 文本兜底不该再发一次（卡片已送达 = 这条事件已认领）
       assert.equal(cardCalls.filter((c) => c.startsWith('text:')).length, 0, '卡片成功后不能再发文本');
+      assert.ok(logs.some((l) => l.includes('来源会话')), '日志要说清这是来源会话投递');
     } finally {
       stop();
     }
@@ -326,12 +365,13 @@ test('审批事件 + 卡片能力：每个主人会话各收到一张，审计�
   }
 });
 
-test('广播中途某个会话失败：送达的那个算成功，且失败的落审计（不是静默丢）', async () => {
+test('审批卡片投递失败：落审计、如实报错，且退回纯文本（不是静默丢）', async () => {
   const dir = makeTempDataDir();
   const logs: string[] = [];
+  const texts: string[] = [];
   try {
     seedThread(dir, 'thr_b1', 'feishu', 'feishu:' + CHAT_A, 'tk_b1');
-    const gw = { sendText: async () => ({ ok: true }) };
+    const gw = { sendText: async (chatId: string) => (texts.push(chatId), { ok: true }) };
     const stop = startFeishuOutbound({
       db: dir.db,
       bus: dir.bus,
@@ -339,7 +379,7 @@ test('广播中途某个会话失败：送达的那个算成功，且失败的�
       log: (m) => logs.push(m),
       approvalCards: {
         chatIds: [CHAT_A, CHAT_B],
-        send: async (_v, chatId) => (chatId === CHAT_A ? { ok: false, error: '限流' } : { ok: true, messageId: 'om_b' }),
+        send: async () => ({ ok: false, error: '限流' }),
       },
     });
     try {
@@ -348,10 +388,80 @@ test('广播中途某个会话失败：送达的那个算成功，且失败的�
       const rows = dir.db
         .prepare("SELECT chat_id, ok, error FROM surf_outbound_log WHERE kind = 'approval_card' ORDER BY id")
         .all() as Array<{ chat_id: string; ok: number; error: string | null }>;
-      assert.equal(rows.length, 2, '失败的那个会话也要有一行，否则事后无从回答「第二个群收到没有」');
-      assert.equal(rows[0] === undefined ? null : rows[0].ok, 0);
-      assert.equal(rows[1] === undefined ? null : rows[1].ok, 1);
-      assert.match(logs.join(String.fromCharCode(10)), /1\/2 个主人会话/, '日志要说清投了几个');
+      assert.equal(rows.length, 2, '每次尝试都要留一行（来源会话失败后会再试下一个主人会话）');
+      assert.ok(rows.every((r) => r.ok === 0));
+      assert.match(logs.join(String.fromCharCode(10)), /卡片失败（限流）/);
+      assert.deepEqual(texts, [CHAT_A], '卡片挂了要退回纯文本，否则主人根本不知道有事要他决定');
+    } finally {
+      stop();
+    }
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('审批卡片：无来源会话时只问第一个主人会话（问题只该问一遍）', async () => {
+  const dir = makeTempDataDir();
+  const cardCalls: string[] = [];
+  const logs: string[] = [];
+  try {
+    seedThread(dir, 'thr_ev', 'event', null, 'tk_ev');
+    const stop = startFeishuOutbound({
+      db: dir.db,
+      bus: dir.bus,
+      gateway: { sendText: async () => ({ ok: true }) },
+      log: (m) => logs.push(m),
+      approvalCards: {
+        chatIds: [CHAT_A, CHAT_B],
+        send: async (_v, chatId) => (cardCalls.push(chatId), { ok: true, messageId: 'om_' + chatId.slice(3, 5) }),
+      },
+    });
+    try {
+      dir.bus.publish('approval:created', view({ taskRef: { taskId: 'tk_ev', journalStepId: 'st_1' } }), { dotId: 'dot1' });
+      await settle();
+      // 定时任务没有来源会话，但「提问」只该出现一次：广播等于同一件事问两遍，
+      // 一端答了另一端还挂着按钮（主人报的就是这个）。
+      assert.deepEqual(cardCalls, [CHAT_A], '无来源时只问第一个主人会话，不广播');
+      const rows = dir.db
+        .prepare("SELECT chat_id FROM surf_outbound_log WHERE kind = 'approval_card' ORDER BY id")
+        .all() as Array<{ chat_id: string }>;
+      assert.deepEqual(rows.map((r) => r.chat_id), [CHAT_A]);
+      assert.ok(logs.some((l) => l.includes('第一个主人会话')), '日志要说清无来源时取了第一个');
+    } finally {
+      stop();
+    }
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('审批卡片：第一个会话发不出去时换下一个（不能没有窗口问）', async () => {
+  const dir = makeTempDataDir();
+  const cardCalls: string[] = [];
+  try {
+    seedThread(dir, 'thr_ev', 'event', null, 'tk_ev');
+    const stop = startFeishuOutbound({
+      db: dir.db,
+      bus: dir.bus,
+      gateway: { sendText: async () => ({ ok: true }) },
+      log: () => {},
+      approvalCards: {
+        chatIds: [CHAT_A, CHAT_B],
+        send: async (_v, chatId) =>
+          chatId === CHAT_A
+            ? { ok: false, error: '限流' }
+            : (cardCalls.push(chatId), { ok: true, messageId: 'om_b' }),
+      },
+    });
+    try {
+      dir.bus.publish('approval:created', view({ taskRef: { taskId: 'tk_ev', journalStepId: 'st_1' } }), { dotId: 'dot1' });
+      await settle();
+      assert.deepEqual(cardCalls, [CHAT_B], '第一个挂了要换下一个，成功了就停，不再往后发');
+      const rows = dir.db
+        .prepare("SELECT chat_id, ok FROM surf_outbound_log WHERE kind = 'approval_card' ORDER BY id")
+        .all() as Array<{ chat_id: string; ok: number }>;
+      assert.deepEqual(rows.map((r) => r.chat_id), [CHAT_A, CHAT_B], '两次尝试都要留痕');
+      assert.deepEqual(rows.map((r) => r.ok), [0, 1]);
     } finally {
       stop();
     }

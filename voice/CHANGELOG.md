@@ -6,6 +6,43 @@
 ## [未发布]
 
 ### 变更
+- **家居控制重新接上：统一设备层 + 语音反射 + magic-home 工具（2026-10-26）**。
+
+  合并后家居控制是**三层同时断**的：① `agent/device_control.py:direct_ac_control()`
+  没有任何调用点（只有测试在 patch 它），空调快路径是死代码；② `agent/llm.py:160`
+  把「空调/灯/风扇」路由到 `ac-control`，但 `app/mcp_registry` 与
+  `agent/inproc_tools._SERVER_FILE_MAP` 里都没有这个名字 —— 说「开灯」工具域必然
+  加载失败；③ `agent/mqtt_device_control.py` 写好了函数却没写 `__mcp_meta__`、
+  不在映射表里，等于没挂上去。加上设备清单与涂鸦/MQTT 凭证双空，四条一起导致
+  "说了也不动"。
+
+  新增 `voice/integration/home_devices.py` 作为**唯一有意入口**：一张设备清单
+  （`<数据目录>/home-devices.yml`，模板 `config/home-devices.yml`）+ 四种适配器
+  （涂鸦 2B 红外 / 涂鸦 2C 云 / MQTT / ESP32）。两条路共用同一份代码，不会漂移：
+  `cortex_router.reflex()` 的家居反射（毫秒级、不过模型，插在 `smart_command`
+  之后、`decision_feedback` 之前），和 `voice/charlie/magic-home.py` 暴露的
+  `home_list` / `home_control` / `home_status` / `home_reload` 四个 MCP 工具。
+
+  `ac-control` 保留为别名（两个名字在 `_SERVER_FILE_MAP` 里指向 `magic-home.py`），
+  但**不进 core/optional 分层** —— 否则 `MCP_PROFILE=all` 会把同一批工具挂两遍。
+
+  守住的三条边界：① 否定句/疑问句一律不碰实物（历史事故：ASR 把「你是不是把客厅
+  空调关了」当关机指令，空调真的被关了），守卫写在 `parse_action()` 里而不只是
+  `handle()`；② 认不出设备/动作返回 `None` 交给模型，绝不猜一台设备去开关；
+  ③ 适配器失败就如实说"指令没发出去"，不播"已打开"。清单文件按 mtime 自动重载
+  （上一版用"建过一次就不再建"的布尔标记，启动时没清单的机器补上文件也永久失效）。
+  门锁/摄像头/报警器**写了也拒绝登记**（`_BLOCKED_KINDS`）。
+
+  同批：`voice/requirements-integration.txt` 补 `PyYAML`（清单读不了时只剩一台兜底
+  空调，而 `one_system` 读 config.yml 的窄正则回退把缺依赖掩盖了）；
+  `default_manifest_path()` 认 `ASSISTANT_KID_DATA_DIR`（`one_system.apply_env`
+  实际设的是它）；`scripts/voice-check.mjs` 新增「家居设备清单」一项，
+  报告登记台数、适配器构成、缺哪个凭证（以前没有一项问过"灯到底能不能开"）；
+  `config/mcp-servers.voice.yml` 新增 `charlie-home` 声明。
+  测试：`voice/integration/test_home_devices.py`（36 例）、`tests/home-devices.test.ts`
+  （门禁）、`test_cortex_router.py` 加 5 例家居反射（含记账、降级、顺序、mtime 重载）、
+  `tests/voice-mcp-seam.test.ts` 加 `magic-home` 端到端（真 stdio + 空调干跑）。
+
 - **新增用户画像统一门面 agent/user_profile.py（2026-09-21）**。
 
   用户状态早已存在但散在 6 个模块、6 种 schema（preferences / memory_store / evolution_data / persona / context / history），没有一个统一的"画像"对象可读可注入。新增 `get_user_profile(session_id)` 把各源聚合成一个规范画像对象（identity/location/preferences/interests/reply_style/persona_state/conversation_background/meta），**只读不改行为、不迁移数据**；同时给原先无主的"用户显式回复风格"（reply_style）一个持久新家 `user_profile_{uid}.json`。写路径双通道：`record_explicit`（"我喜欢X/我住在X/说简短点/记住X"确定性路由）+ `apply_extracted`（复用记忆抽取 + 敏感信息过滤：身份证/银行卡/手机号/病历/薪资一律不自动入库）。全程按 uid 分片（FR-14），跨用户零泄漏。

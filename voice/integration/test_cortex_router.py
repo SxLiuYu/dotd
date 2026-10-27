@@ -42,13 +42,16 @@ class FakeVoiceAgent(SimpleNamespace):
     pass
 
 
-def make_modules(fast_paths=None, scene=None):
+def make_modules(fast_paths=None, scene=None, home=None):
     va = FakeVoiceAgent(
         FAST_PATHS=fast_paths or [],
         is_garbled_asr=lambda text: False,
         LOW_INTENT_ASR_REPLY="没听清",
     )
-    return {"voice_agent": va, "llm": SimpleNamespace(), "scene": scene}
+    mods = {"voice_agent": va, "llm": SimpleNamespace(), "scene": scene}
+    if home is not None:
+        mods["home"] = home
+    return mods
 
 
 class FakeBridge:
@@ -118,6 +121,109 @@ class ReflexTests(unittest.TestCase):
             self.assertEqual(out.detail, "scene")
             self.assertEqual(bridge.calls, 0)
             self.assertEqual(bridge.events, [("scene", "晚安")])
+
+    def test_home_hit_is_reflex_and_accounted(self):
+        """家居反射：开关灯秒执行、不问 dotd，但要记账。
+
+        记账不是可选项 —— 家居是**真的动了实物**，不记账事后就查不出
+        「三点钟谁把空调关了」。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            bridge = FakeBridge()
+            mods = make_modules(home=lambda text: "客厅灯已打开。" if "开客厅灯" in text else None)
+            r = make_router(Path(td), bridge, mods)
+
+            out = r.reply("开客厅灯")
+
+            self.assertEqual(out.text, "客厅灯已打开。")
+            self.assertEqual(out.source, "reflex")
+            self.assertEqual(out.detail, "home")
+            self.assertEqual(bridge.calls, 0, "家居命中不能问 dotd")
+            self.assertEqual(bridge.events, [("home", "开客厅灯")])
+
+    def test_home_declining_falls_through_to_cortex(self):
+        """家居层没把握（返回 None）→ 必须交给 dotd 的模型，不能就地编一句。"""
+        with tempfile.TemporaryDirectory() as td:
+            bridge = FakeBridge()
+            mods = make_modules(home=lambda text: None)
+            r = make_router(Path(td), bridge, mods)
+
+            out = r.reply("把客厅弄舒服一点")
+
+            self.assertEqual(out.source, "cortex")
+            self.assertEqual(bridge.calls, 1)
+            self.assertEqual(bridge.events, [])
+
+    def test_home_runs_before_decision_feedback(self):
+        """顺序：smart_command → home → decision_feedback → FAST_PATHS。
+
+        家居必须早于 FAST_PATHS —— 否则「打开空调」会先被别的快路径吃掉。
+        """
+        calls = []
+
+        def home(text):
+            calls.append("home")
+            return "客厅灯已打开。"
+
+        with tempfile.TemporaryDirectory() as td:
+            bridge = FakeBridge()
+            mods = make_modules(
+                home=home,
+                fast_paths=[FakePath("never", reply="不该到这")],
+            )
+            r = make_router(Path(td), bridge, mods)
+
+            out = r.reply("开客厅灯")
+
+            self.assertEqual(out.detail, "home")
+            self.assertEqual(calls, ["home"])
+
+    def test_home_exception_falls_through(self):
+        """家居模块抛异常 → 记日志、落回皮层，不能让一句话把语音链路打断。"""
+
+        def boom(text):
+            raise RuntimeError("设备层炸了")
+
+        with tempfile.TemporaryDirectory() as td:
+            bridge = FakeBridge()
+            r = make_router(Path(td), bridge, make_modules(home=boom))
+
+            out = r.reply("开客厅灯")
+
+            self.assertEqual(out.source, "cortex")
+            self.assertEqual(bridge.calls, 1)
+
+    def test_home_controller_picks_up_manifest_created_later(self):
+        """启动时清单不存在 → 之后补上文件，应自动生效（不要求重启语音进程）。
+
+        上一版用「建过一次就再也不建」的布尔标记：启动时没有清单的机器，
+        补上 `home-devices.yml` 之后家居反射**永久**关闭，只能说「我明明配了」。
+        """
+        import os
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "home-devices.yml"
+            old = os.environ.get("HOME_DEVICES_FILE")
+            # 先让清单文件不存在
+            os.environ["HOME_DEVICES_FILE"] = str(path)
+            try:
+                r = make_router(Path(td), FakeBridge(), make_modules())
+                self.assertIsNone(r._home_controller(), "没有清单时不该有控制器")
+
+                # 补上文件（mtime 变了，缓存失效）
+                path.write_text(
+                    "devices:\n  - id: l1\n    name: 客厅灯\n    kind: light\n    adapter: mqtt\n"
+                    "    topic_cmnd: cmnd/l1/POWER\n",
+                    encoding="utf-8",
+                )
+                ctrl = r._home_controller()
+                self.assertIsNotNone(ctrl, "补上清单后必须能建出控制器")
+                self.assertEqual([d.id for d in ctrl.devices], ["l1"])
+            finally:
+                if old is None:
+                    os.environ.pop("HOME_DEVICES_FILE", None)
+                else:
+                    os.environ["HOME_DEVICES_FILE"] = old
 
 
 class CortexTests(unittest.TestCase):

@@ -22,6 +22,7 @@ import { DEFAULT_DOT_ID } from '../shared/ids.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { ControlPlane, MemoryPort } from '../shared/contracts.ts';
 import { handleFeishuCallback } from './feishu-inbound.ts';
+import { toCardCallbackResponse } from './feishu-card.ts';
 import type { FeishuConfig } from './types.ts';
 
 export interface FeishuWsDeps {
@@ -45,7 +46,11 @@ export interface FeishuWsDeps {
       verdict: 'approve' | 'reject',
       operatorId: string,
     ): Promise<{ ok: boolean; status?: string; reason?: string }>;
-    resolveCard?(cardMessageId: string, approvalId: number): Promise<void>;
+    /** 落定后改卡片（去掉按钮）。失败不影响裁决本身。
+     *  2026-10-27：返回值带结果卡 —— feishu-ws 要把它放进回调响应（见 route()）。 */
+    resolveCard?(cardMessageId: string, approvalId: number): Promise<{ card?: unknown } | void>;
+    /** 查审批当前状态对应的卡片（重复/迟到点击的回包用，见 feishu-inbound.ts）。 */
+    cardFor?(approvalId: number): unknown | null;
   };
   /** 图片下载器（2026-10-18 多模态）；不注入 = 图片按纯文本处理。 */
   media?: {
@@ -86,7 +91,10 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
   const dotId = deps.dotId ?? DEFAULT_DOT_ID;
   const dispatcher = new Lark.EventDispatcher({});
 
-  const route = (eventType: string) => async (frame: Record<string, unknown>): Promise<void> => {
+  // 返回值 = 卡片回调的落定状态（2026-10-27）：card.action.trigger 必须把结果卡
+  // 原样返回，SDK 才会把它写进回包（handleEventData：result 非空才带 data）。
+  // 其余事件返回 undefined，与旧行为一致。
+  const route = (eventType: string) => async (frame: Record<string, unknown>): Promise<unknown> => {
     // 无条件先记一行"事件到了"。
     //
     // 为什么必须有这条：改之前只有两种结果会落日志（被拒 / 建了任务）。于是
@@ -107,18 +115,6 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
       deps.log(`飞书长连接收到事件 ${eventType}（载荷结构异常，无法摘要）`);
     }
 
-    // 卡片回调单独转储原始载荷（2026-10-21）。
-    // 现场：主人报「点了没反应」，日志只有 `chat=- sender=-:- type=- len=0`，
-    // 因为那行摘要读的是 message/sender 字段，而卡片回调用的是
-    // context.open_chat_id / operator.open_id —— 打在错的地方，看不出失败在哪步。
-    // 只转储这一类事件，且截断，避免刷日志。
-    if (eventType === 'card.action.trigger') {
-      try {
-        deps.log(`飞书卡片回调原始载荷：${JSON.stringify(frame).slice(0, 1500)}`);
-      } catch {
-        deps.log('飞书卡片回调原始载荷：无法序列化');
-      }
-    }
     // 卡片回调单独转储原始载荷（2026-10-21）。
     // 为什么需要：主人报「点了没反应」，日志只有 `chat=- sender=-:- type=- len=0`，
     // 消息事件的摘要字段在卡片回调里全是空的 —— 看不出到底解析到哪一步失败。
@@ -158,6 +154,24 @@ export function startFeishuWs(deps: FeishuWsDeps): () => void {
       } else if ('taskId' in out.body) {
         deps.log(`飞书长连接：消息已建任务 ${out.body.taskId}`);
       }
+      // 2026-10-27：卡片按钮回调的**响应体必须带结果卡**。
+      //
+      // 现场与实测：主人点「同意」，daemon 照常 decide + PATCH 改卡（日志
+      // 「已改 2/2 张卡片」），客户端先显示出「已同意」；但 SDK 的回包协议是
+      // 「handler 的返回值 = 这张卡的落定状态」（lib/index.js handleEventData：
+      // result 非空才写进 respPayload.data）。此前 route() 返回 void，
+      // 回包里没有卡 —— 飞书便把卡片按**点击时**的版本落定，把 PATCH 冲掉。
+      //
+      // 2026-10-27 二次修（主人复现「还是刷新回去了」）：光带卡还不够，
+      // 形状要对。飞书 **v2** 回调要求的响应体是
+      //   { card: { type: 'raw', data: <卡片JSON> } }
+      // 上一版把卡片 JSON 裸着放顶层，飞书解析不到卡片，同样回退成点击时的版本。
+      // 这里统一过 toCardCallbackResponse()，别在调用点各自拼。
+      const card = (out.body as { card?: unknown } | undefined)?.card;
+      if (eventType === 'card.action.trigger' && card !== undefined && card !== null) {
+        return toCardCallbackResponse(card as Record<string, unknown>);
+      }
+      return undefined;
     } catch (cause) {
       // 处理器抛错会被 SDK 记为失败；吞掉并落日志，避免连接级惩罚。
       deps.log(`飞书长连接事件处理异常：${String(cause)}`);

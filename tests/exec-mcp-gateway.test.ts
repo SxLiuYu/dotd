@@ -303,18 +303,23 @@ test('配置：仓库自带的 config/mcp-servers.voice.yml 必须能解析（�
   // 就会让 daemon 拒启动 —— 那是最坏的一类缺陷，必须有门禁钉住。
   const raw = readFileSync(join(REPO_ROOT, 'config', 'mcp-servers.voice.yml'), 'utf8');
   const specs = parseMcpServersYaml(raw);
-  assert.equal(specs.length, 2, `示例里有 2 个 server，实际：${specs.map((s) => s.name).join(',')}`);
+  assert.equal(specs.length, 3, `示例里有 3 个 server，实际：${specs.map((s) => s.name).join(',')}`);
   const scenes = specs.find((s) => s.name === 'charlie-scenes');
   const reminders = specs.find((s) => s.name === 'charlie-reminders');
-  assert.ok(scenes !== undefined && reminders !== undefined);
+  const home = specs.find((s) => s.name === 'charlie-home');
+  assert.ok(scenes !== undefined && reminders !== undefined && home !== undefined);
   assert.equal(scenes.allowTools?.length, 6);
   assert.equal(reminders.allowTools?.length, 7);
+  // 家居控制（2026-10-26）：工具本体与语音反射层是同一份
+  // （voice/integration/home_devices.py），白名单只放四个显式动作工具。
+  assert.deepEqual(home.allowTools, ['home_list', 'home_control', 'home_status', 'home_reload']);
   // command 必须是这台机器上真的存在的东西：`python` 在 Debian/Ubuntu/WSL 上不存在，
   // 而且系统 python3 通常没有 `mcp` 包（依赖只装在 .venv）。所以示例用 py.mjs 解析器。
   assert.equal(scenes.command, 'node');
   assert.equal(scenes.args[0], 'scripts/py.mjs');
   assert.equal(reminders.args[0], 'scripts/py.mjs');
-  for (const a of [...scenes.args, ...reminders.args]) {
+  assert.equal(home.args[0], 'scripts/py.mjs');
+  for (const a of [...scenes.args, ...reminders.args, ...home.args]) {
     if (/\.(py|mjs)$/i.test(a)) {
       assert.ok(existsSync(join(REPO_ROOT, a)), `示例引用的文件必须存在：${a}`);
     }

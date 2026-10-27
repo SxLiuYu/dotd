@@ -15,19 +15,15 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePython } from '../scripts/lib/python.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
 
-function pythonBin(): string | null {
-  for (const bin of process.env.DOTD_PYTHON ? [process.env.DOTD_PYTHON] : ['python', 'python3']) {
-    const r = spawnSync(bin, ['--version'], { encoding: 'utf8' });
-    if (r.status === 0) return bin;
-  }
-  return null;
-}
-
-const PY = pythonBin();
+const PY = resolvePython({
+  repoRoot: REPO,
+  run: (bin, argv) => spawnSync(bin, argv, { encoding: 'utf8' }),
+})?.bin ?? null;
 const skip = PY === null ? '本机没有 Python' : false;
 
 test('8443 HTTPS 副本（真起 TLS + 证书落数据目录）', { skip, timeout: 90_000 }, () => {

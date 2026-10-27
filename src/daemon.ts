@@ -53,7 +53,7 @@ import {
   renderList,
   type LocalEventInput,
 } from './calendar/CalendarService.ts';
-import { buildApprovalCard, toDecideCall } from './surfaces/feishu-card.ts';
+import { buildApprovalCard, buildResolvedCard, toDecideCall } from './surfaces/feishu-card.ts';
 import { migrate } from '../db/migrate.ts';
 
 import { EventBus } from './shared/bus.ts';
@@ -2114,6 +2114,41 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   });
   log(`HTTP 监听 ${surfCfg.http.host}:${surfCfg.http.port}（契约 H2 默认 127.0.0.1:7788）`);
 
+  // 审批卡片用的「最新状态」取数闭包（2026-10-27 从 resolveCard 闭包里提出来）：
+  // resolveApprovalCards 与 cardFor 共用。
+  //
+  // 取这些列而不是只取 id/seq/status：结果卡上要写"是哪件事"。
+  // 之前只投影三列，`summary` 是 undefined，extractToolName 把 undefined
+  // 转成字符串 "undefined" 再被正则命中，卡片正文就成了 `**undefined**`
+  // （主人实际收到的那张结果卡）。kind/reason 用于 question 单
+  // （`ask` 没有工具名，用问题本身当主语）。
+  const approvalRowForCard = (id: number): ApprovalView | null => {
+    const row = db
+      .prepare('SELECT id, seq, status, kind, tool, summary, reason FROM approvals WHERE id = ?')
+      .get(id) as
+      | {
+          id: number;
+          seq: number;
+          status: string;
+          kind: string;
+          tool: string | null;
+          summary: string;
+          reason: string;
+        }
+      | undefined;
+    if (row === undefined) return null;
+    return {
+      id: row.id,
+      seq: row.seq,
+      status: row.status,
+      kind: row.kind,
+      summary: row.summary,
+      reason: row.reason,
+      // 只为了让 extractToolName 拿到工具名；结果卡不用其它参数。
+      fullParams: row.tool === null ? null : { tool: row.tool },
+    } as unknown as ApprovalView;
+  };
+
   // ⑧b 飞书长连接入站（主人 2026-10-16 拍板：无公网回调，事件订阅走出站 WS）。
   // App 凭据齐了就拨出去；owner_chat_id 为空时连接照建、消息全 403（fail-closed）。
   const stopFeishuWs =
@@ -2176,6 +2211,11 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
               // 「迟到裁决」噪音，而且主人会怀疑「我到底批了没有」。
               // 并入 cardMessageId：registry 是内存态，daemon 重启后为空，
               // 这时入站带来的那一张仍要改。
+              //
+              // 2026-10-27：返回构建出的结果卡 —— 被点击的那张卡，飞书以
+              // 「回调响应体」为准落定状态，PATCH 会被无卡回包冲掉
+              // （主人报「显示审批通过后又会刷新后选择卡片」，实测 GET 复现）。
+              // 结果卡随 handleFeishuCallback 的 body 回给 feishu-ws，由它放进回包。
               const mids = Array.from(
                 new Set([
                   ...(cardMessageId.length > 0 ? [cardMessageId] : []),
@@ -2183,25 +2223,32 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
                 ]),
               );
               if (mids.length === 0) return;
-              await resolveApprovalCards(
+              const r = await resolveApprovalCards(
                 {
                   sender: feishuGw,
                   chatIds: ownerChats,
                   log,
                   // 同步查最新状态：resolveApprovalCards 的 getApprovalView 是同步签名，
                   // 而 govGetApproval 返回 Promise。这里只要 status/verdict 用于改卡片文案。
-                  getApprovalView: (id) => {
-                    const row = db
-                      .prepare('SELECT id, seq, status FROM approvals WHERE id = ?')
-                      .get(id) as { id: number; seq: number; status: string } | undefined;
-                    if (row === undefined) return null;
-                    return { id: row.id, seq: row.seq, status: row.status } as unknown as ApprovalView;
-                  },
+                  getApprovalView: approvalRowForCard,
                 },
                 mids,
                 approvalId,
                 '飞书',
               );
+              return r.card !== undefined ? { card: r.card } : undefined;
+            },
+            // 2026-10-27：重复点击 / 迟到点击的回包也要带卡，否则飞书按点击时
+            // 版本落定，按钮又回来。已落定 → 结果卡；还在 pending → null
+            //（此时第一次点击的 decide 还在跑，它的响应稍后会把结果卡带上；
+            // 这里硬造一张 pending 卡反而会用残缺视图覆盖原本发出去的那张）。
+            cardFor: (approvalId: number) => {
+              const row = approvalRowForCard(approvalId);
+              if (row === null) return null;
+              if (row.status !== 'approved' && row.status !== 'rejected' && row.status !== 'expired') {
+                return null;
+              }
+              return buildResolvedCard(row, '飞书');
             },
           },
         })

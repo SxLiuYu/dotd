@@ -18,6 +18,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from voice.integration.one_system import (
     KernelSupervisor,
@@ -205,6 +206,17 @@ class CheckSeesTokensEnvTest(unittest.TestCase):
             "surfaces:\n  http:\n    port: 7790\n", encoding="utf-8"
         )
         self.paths = resolve_paths({"CHARLIE_HOME": str(self.root)})
+        # 断掉「仓库自带模型目录」这个候选：本机装了 237MB 权重时 asr 会报 local，
+        # 这几条要验的是 tokens.env 里的云端 key 看不看得见，不能被机器状态左右。
+        from voice.integration import asr_watch
+
+        patcher = mock.patch.object(
+            asr_watch,
+            "candidates",
+            side_effect=lambda home: [Path(home) / "voice" / "models" / "sense-voice"],
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

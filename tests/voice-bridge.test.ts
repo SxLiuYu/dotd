@@ -16,21 +16,16 @@ import { spawnSync, execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePython } from '../scripts/lib/python.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
 const BRIDGE = join(REPO, 'voice', 'integration', 'dotd_bridge.py');
 
-function pythonBin(): string | null {
-  if (process.env.DOTD_PYTHON) return process.env.DOTD_PYTHON;
-  for (const bin of ['python', 'python3', 'py']) {
-    const r = spawnSync(bin, ['--version'], { encoding: 'utf8' });
-    if (r.status === 0) return bin;
-  }
-  return null;
-}
-
-const PY = pythonBin();
+const PY = resolvePython({
+  repoRoot: REPO,
+  run: (bin, argv) => spawnSync(bin, argv, { encoding: 'utf8' }),
+})?.bin ?? null;
 const skip = PY === null || !existsSync(BRIDGE) ? '本机没有 Python 或缺少 voice/integration/dotd_bridge.py' : false;
 
 interface Harness {

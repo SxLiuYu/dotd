@@ -522,6 +522,17 @@ dotd 的立身之本是**完全自托管，唯一允许的外部依赖是可换 
   识别原文一致（[`docs/acceptance/voice-real-audio/REPORT.md`](docs/acceptance/voice-real-audio/REPORT.md)）。
   ESP32 硬件、真人/远场语音仍未验。
 - 一个安装入口：`npm run setup:all`（Node + Python + 体检）、`npm run up`（再加启动）。
+- **家居控制（2026-10-26）**：说「开客厅灯」「空调制冷 26 度」不经过模型 ——
+  `cortex_router` 的家居反射解析后直接下发（毫秒级），认不出就交给 dotd 的模型。
+  两条路共用 `voice/integration/home_devices.py` 与同一份设备清单
+  （`<数据目录>/home-devices.yml`，模板 `config/home-devices.yml`），适配器有
+  涂鸦 2B 红外 / 涂鸦 2C 云 / MQTT / ESP32 四种。模型侧的 MCP 工具是
+  `magic-home`（`config/mcp-servers.voice.yml` 的 `charlie-home`）。
+  配置、DP 码、MQTT topic、验收方法见 [`docs/home-control.md`](docs/home-control.md)。
+- **审批总开关**：`DOTD_APPROVALS` 默认 `off`（2026-10-26 主人要求去掉审批），
+  五档直通；`on` 恢复 `browser→review`、`spend`/`dangerous`→人工审批。
+  关的只是"等人"，账照记 —— decisions + audit 都写，reason 带 `approvals=off`。
+  未登记工具、金额算不清、EMERGENCY、缺登录身份四条**不受开关影响**。
 
 ### 那套 11 工具契约为什么存在
 
@@ -635,5 +646,6 @@ tier1 → tier2 → tier3 → tier4 **单向**，失败永远向前降级，绝�
 - `CONVENTIONS.md` —— 全仓库约定唯一权威（模块边界、stub 变量、数据库约定）。
 - `IMPLEMENTATION.md` —— 实现报告。**已部分过期**，2026-10-17 做过一轮逐条修订（文首有修订表），但未标注的段落仍是阶段一原文，数字可能已变。
 - `docs/tier1-endpoint.md` —— tier1 主轨端点（`:7863` workbuddy2api）的搭建、`WB2API_KEY` 拿法、以及没有这个容器时怎么换端点。
+- `docs/home-control.md` —— 家居控制：设备清单怎么写、四种通道各要什么凭证、DP 码与 MQTT topic 怎么填、语音反射与 MCP 工具两条路的关系、怎么干跑验收。
 - `docs/duet-parity.md` —— **对标 Claude Duet 的逐条能力对齐表**（2026-10-22）。文章里 11 条能力逐条给出 `file:line` 与实跑输出：哪条已对齐、哪条只是形式对齐、哪条明确不做（原生 App / 支付 / 内置财务预测）。想看「每日简报 / 仪表盘 / 已连接应用总览」这三个新功能凭什么算做到，从这里读。
 - **设计文档已并入本仓库**（`docs/design/`，2026-10-17 从仓库上一级移入）：`CONTEXT.md`、`自主Dot系统设计方案.md`、`modules/` 下六个模块加接缝契约，共 9 个 markdown、约 541K。**「为什么这样设计」的答案现在 clone 就能看到**，本文里所有 `docs/design/...` 引用都不再悬空。原先这是最大的一条分发缺口——只拿到 `dotd/` 的人解析不了任何设计引用；现在仍是同一批文件，只是位置变了。

@@ -153,6 +153,29 @@ npm run voice:device -- --create # 假设备跑一轮
 单设备规则（阶段 3）：同一设备同时只允许 1 个语音任务（`409 device_busy`），
 每日 200 次 / 200000 字符（`429 device_quota`，0 = 不限）。额度按本地日期切。
 
+## 5.1 家居控制（空调 / 灯 / 插座）
+
+说一句「开客厅灯」「空调制冷 26 度」就该动，不能等模型。这条链路是
+`cortex_router` 的家居反射，毫秒级，不经过 dotd：
+
+1. 写设备清单到 `<数据目录>/home-devices.yml`（模板 `config/home-devices.yml`）；
+2. 填凭证进 `~/.dotd/tokens.env`：红外空调要 `TUYA_CLIENT_ID` + `TUYA_ACCESS_KEY`，
+   涂鸦灯/插座要 `TUYA_API_KEY`，MQTT 设备要 `MQTT_BROKER`；
+3. `npm run voice:check` 会多出一行「家居设备清单」，告诉你登记了几台、缺哪个凭证。
+
+没写清单也能用：设了 `TUYA_IR_DEVICE_ID` + `TUYA_AC_DEVICE_ID` 会自动注册一台「空调」。
+门锁/摄像头这类安全设备写了也拒绝登记。
+
+先干跑（不碰真设备）：
+
+```bash
+HOME_DEVICES_FILE=config/home-devices.yml HOME_AC_DRY_RUN=1 \
+  npm run voice:test
+```
+
+字段、DP 码、MQTT topic、以及模型侧 `magic-home` 工具的关系见
+[`docs/home-control.md`](home-control.md)。
+
 ## 6. 排障
 
 | 现象 | 先看什么 |

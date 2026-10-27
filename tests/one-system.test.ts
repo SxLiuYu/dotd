@@ -21,19 +21,15 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolvePython } from '../scripts/lib/python.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
 
-function pythonBin(): string | null {
-  for (const bin of process.env.DOTD_PYTHON ? [process.env.DOTD_PYTHON] : ['python', 'python3']) {
-    const r = spawnSync(bin, ['--version'], { encoding: 'utf8' });
-    if (r.status === 0) return bin;
-  }
-  return null;
-}
-
-const PY = pythonBin();
+const PY = resolvePython({
+  repoRoot: REPO,
+  run: (bin, argv) => spawnSync(bin, argv, { encoding: 'utf8' }),
+})?.bin ?? null;
 const depsOk =
   PY !== null &&
   spawnSync(PY, ['-c', 'import fastapi, uvicorn, httpx'], { encoding: 'utf8' }).status === 0;

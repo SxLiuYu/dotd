@@ -241,6 +241,13 @@ class CortexRouter:
             if reply:
                 return CortexReply(reply, "reflex", detail="smart_command")
 
+        # 家居控制（2026-10-26 新增）：开关灯/空调这种必须毫秒级，不能等模型。
+        # 放在 smart_command 之后、decision_feedback 之前：音量/静音这类本机操作
+        # 先走，然后才是"动家里的东西"。返回 None 表示没把握，继续往下交给 dotd。
+        home = self._home(text)
+        if home is not None:
+            return CortexReply(home, "reflex", detail="home")
+
         feedback = getattr(va, "_decision_feedback_handler", None)
         if callable(feedback):
             reply = feedback(text, session_id)
@@ -278,6 +285,68 @@ class CortexRouter:
             return CortexReply(low, "reflex", detail="garbled")
 
         return None
+
+    def _home(self, text: str) -> Optional[str]:
+        """家居反射。两种注入方式（都只给单测/别的宿主用）：
+
+            modules['home']             一个 callable(text) -> str|None
+            modules['home_controller']  一个 HomeController 实例
+
+        都没注入时懒建一次（带清单 mtime 缓存）。
+        """
+        injected = (self._modules or {}).get("home")
+        if callable(injected):
+            try:
+                reply = injected(text)
+            except Exception as exc:
+                self._log(f"[cortex] 家居反射失败：{exc}")
+                return None
+            return reply if isinstance(reply, str) and reply.strip() else None
+
+        controller = (self._modules or {}).get("home_controller")
+        if controller is None:
+            try:
+                controller = self._home_controller()
+            except Exception as exc:
+                self._log(f"[cortex] 家居控制器不可用：{exc}")
+                return None
+        if controller is None:
+            return None
+        try:
+            reply = controller.handle(text)
+        except Exception as exc:
+            self._log(f"[cortex] 家居执行失败：{exc}")
+            return None
+        return reply if isinstance(reply, str) and reply.strip() else None
+
+    def _home_controller(self) -> Any:
+        """懒建一次并缓存。设备清单为空时返回 None（不占反射位置）。
+
+        缓存键带清单 mtime：主人改完 `home-devices.yml` 不该还要重启语音进程。
+        上一版用「建过一次就不再建」的布尔标记，于是**启动时清单还没写**的机器
+        会永久关闭家居反射 —— 补上文件也不生效，只能说"我明明配了"。
+        """
+        try:
+            from voice.integration.home_devices import HomeController, default_manifest_path
+
+            path = default_manifest_path()
+            try:
+                sig: tuple[str, float] = (path, os.path.getmtime(path))
+            except OSError:
+                sig = (path, 0.0)  # 文件不存在也记一个签名，之后创建了能感知到
+            if getattr(self, "_home_sig", None) == sig:
+                return getattr(self, "_home_ctrl", None)
+            ctrl = HomeController(logger=self._log)
+        except Exception as exc:
+            self._log(f"[cortex] 家居模块加载失败：{exc}")
+            return None
+        self._home_sig = sig
+        if not ctrl.devices:
+            self._log(f"[cortex] 没有家居设备清单（{path}），家居反射关闭")
+            self._home_ctrl = None
+            return None
+        self._home_ctrl = ctrl
+        return ctrl
 
     def _camera(self, text: str, session_id: str) -> Optional[str]:
         injected = (self._modules or {}).get("camera")
@@ -416,8 +485,8 @@ class CortexRouter:
         """反射 → 皮层。Charlie 的所有入口最终都收敛到这一步。"""
         reflex = self.reflex(text, session_id)
         if reflex is not None:
-            # 反射不经过 dotd，但也不能是"没发生过"：场景/工具类反射要留痕。
-            if reflex.detail in ("scene", "camera") or (
+            # 反射不经过 dotd，但也不能是"没发生过"：场景/家居/工具类反射要留痕。
+            if reflex.detail in ("scene", "camera", "home") or (
                 reflex.detail or ""
             ).startswith("fast_path."):
                 self.account(reflex.detail or "reflex", text)

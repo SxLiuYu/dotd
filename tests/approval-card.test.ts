@@ -12,7 +12,13 @@
  *   snapshot 会在我改文案时假红，而文案改成什么样都行。
  *   这里断言的是**语义**：有没有这个信息、解析对不对。
  */
-import { buildApprovalCard, parseCardAction, buildResolvedCard, toDecideCall } from '../src/surfaces/feishu-card.ts';
+import {
+  buildApprovalCard,
+  parseCardAction,
+  buildResolvedCard,
+  toCardCallbackResponse,
+  toDecideCall,
+} from '../src/surfaces/feishu-card.ts';
 import { classifyFeishuInbound } from '../src/surfaces/feishu-inbound.ts';
 import type { ApprovalView } from '../src/shared/contracts.ts';
 
@@ -132,6 +138,49 @@ const cardText = (c: Record<string, unknown>): string => JSON.stringify(c);
   ok('同意卡片写明正在执行', cardText(approved).includes('正在执行'));
   ok('拒绝卡片写明不会执行', cardText(rejected).includes('不会执行'));
   ok('改后没有按钮了', !cardText(approved).includes('"tag":"action"'));
+}
+
+// 6.5 结果卡不能出现 undefined（2026-10-27 现场：主人收到正文写着 **undefined** 的卡）
+{
+  // 装配层为了省一次全表投影，只 SELECT 了 id/seq/status；extractToolName 里
+  // `/^([a-z]…)/.exec(undefined)` 不会报错 —— JS 把 undefined 转成字符串
+  // "undefined"，正则命中首字母 u，于是卡片正文印出 `**undefined**`。
+  const sparse = {
+    id: 9,
+    seq: 3,
+    status: 'approved',
+    kind: 'tool_call',
+  } as unknown as ApprovalView;
+  const card = buildResolvedCard(sparse, '飞书');
+  ok('缺 summary 时不印 undefined', !cardText(card).includes('undefined'), cardText(card));
+  ok('缺 summary 时退回"未知操作"', cardText(card).includes('未知操作'), cardText(card));
+  // summary 正常时仍取工具名，不因这次收窄退化成"未知操作"。
+  const named = buildResolvedCard(makeView({ status: 'approved' }), '飞书');
+  ok('有 summary 时仍取工具名', cardText(named).includes('mail.send'), cardText(named));
+}
+
+// 6.6 卡片回调的响应体结构（2026-10-27 二次修）
+{
+  const card = buildResolvedCard(makeView({ status: 'approved' }), '飞书');
+  const resp = toCardCallbackResponse(card);
+  const c = resp['card'] as Record<string, unknown>;
+  ok('响应体顶层是 card 对象', typeof c === 'object' && c !== null);
+  ok('card.type 是 raw', c['type'] === 'raw', String(c['type']));
+  ok('card.data 就是卡片 JSON', c['data'] === card);
+  // 不能把卡片字段漏在顶层 —— 飞书只认 card.data 里的内容。
+  const top = resp as unknown as Record<string, unknown>;
+  ok('顶层不残留 config', top['config'] === undefined);
+  ok('顶层不残留 header', top['header'] === undefined);
+}
+
+// 6.7 question 单的结果卡用问题当主语（`ask` 没有工具名）
+{
+  const q = buildResolvedCard(
+    makeView({ kind: 'question', tier: null, status: 'approved', reason: '晚上回家先做哪件事？' }),
+    '飞书',
+  );
+  ok('question 结果卡写问题本身', cardText(q).includes('晚上回家先做哪件事'), cardText(q));
+  ok('question 结果卡不写未知操作', !cardText(q).includes('未知操作'), cardText(q));
 }
 
 // 7. 入站解析：card.action.trigger 事件

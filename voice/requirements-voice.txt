@@ -24,3 +24,10 @@ edge-tts>=6.1
 # 飞书长连接 SDK。Charlie 侧默认关（事件订阅归 dotd），但模块能被 import
 # 才谈得上"打开就能用"；dotd 侧用的是它自己的实现，不依赖这个包。
 lark-oapi>=1.4,<2
+
+# MQTT 客户端：家居控制里「灯/插座」这类本地设备走它（voice/integration/home_devices.py
+# 的 MqttAdapter），Charlie 自己的 mqtt_server 也 import 它收 ESP32 上行。
+# 一直没被任何 requirements 文件声明过，所以 `pip install -r requirements-voice.txt`
+# 装完仍是 `No module named 'paho'`，MQTT 设备一个都控不了，报错还写成
+# "MQTT 未连接（paho 未安装…）"—— 看起来像环境没配好，其实是装漏了。
+paho-mqtt>=2.0

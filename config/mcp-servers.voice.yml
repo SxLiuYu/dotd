@@ -21,7 +21,9 @@
 #     所以 `voice/charlie/...` 与 daemon 的 cwd 无关。
 #
 # 安全语义（不要放宽）：
-#   - mcp.call 在 dotd 里是 dangerous 档，每次调用都要主人审批；
+#   - mcp.call 在 dotd 里是 dangerous 档；`DOTD_APPROVALS=on` 时每次都要主人审批。
+#     产品默认 `DOTD_APPROVALS=off`（2026-10-26 主人要求去掉审批），这一档直通，
+#     但仍写 decisions + audit（reason 带 `approvals=off`），事后能筛出来；
 #   - allow_tools 是白名单：server 后来多出工具，模型也调不到；
 #   - 这些 server 跑在**宿主**（不是容器），因为它们要碰红外/涂鸦/ESP32。
 
@@ -50,3 +52,18 @@ servers:
       - get_calendar_today
       - schedule_task
       - list_alarms
+
+  # 家居控制（2026-10-26）：空调/灯/插座。工具本体是
+  # voice/integration/home_devices.py 的 HomeController —— 与语音反射层
+  # （cortex_router 的 home 反射）**同一份**代码、同一份设备清单。
+  # 清单路径：HOME_DEVICES_FILE → $CHARLIE_DATA_DIR/home-devices.yml → ~/.charlie/home-devices.yml
+  # 白名单只放四个显式动作工具，没有"随便发一条指令"的口子。
+  - name: charlie-home
+    command: node
+    args: ["scripts/py.mjs", "voice/charlie/magic-home.py"]
+    timeout_ms: 30000
+    allow_tools:
+      - home_list
+      - home_control
+      - home_status
+      - home_reload

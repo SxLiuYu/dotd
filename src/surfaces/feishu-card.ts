@@ -46,6 +46,38 @@ export interface CardAction {
 }
 
 /**
+ * 把卡片 JSON 包成**卡片回调的响应体**。
+ *
+ * 为什么必须包：飞书 v2 回调（我们的载荷里 `schema: "2.0"`）的响应体格式是
+ *   `{ "toast"?: {...}, "card": { "type": "raw" | "template", "data": <卡片JSON> } }`
+ * 顶层直接放卡片 JSON 是**无效结构**：飞书解析不到卡片，就按「用户点击那一刻」
+ * 的版本落定这张卡 —— 服务端 PATCH 改好的结果卡被冲掉，客户端闪一下"已同意"
+ * 又变回按钮（主人报的正是这个）。
+ *
+ * 2026-10-27 的实测链：日志「审批 #167 落定，已改 2/2 张卡片」，回包里也确实带了
+ * 结果卡，客户端先显示"已同意"，随后刷新回选项卡 —— 因为回包的 `card` 不是
+ * `{type,data}` 而是裸卡片，飞书不认。旧版回调（v1）才允许 `card` 直接放卡片 JSON，
+ * 我们收的是 v2 事件。
+ *
+ * 我们发出去的是 1.0 结构卡片（顶层 config/header/elements），所以 `data` 里
+ * 原样放 1.0 JSON，不塞 `schema: "2.0"` —— 飞书要求 data 的版本与发卡时一致。
+ */
+export function toCardCallbackResponse(
+  card: Record<string, unknown>,
+  toast?: { type: 'info' | 'success' | 'error' | 'warning'; content: string },
+): {
+  toast?: { type: string; content: string; i18n: { zh_cn: string; en_us: string } };
+  card: { type: 'raw'; data: Record<string, unknown> };
+} {
+  return {
+    ...(toast === undefined
+      ? {}
+      : { toast: { type: toast.type, content: toast.content, i18n: { zh_cn: toast.content, en_us: toast.content } } }),
+    card: { type: 'raw', data: card },
+  };
+}
+
+/**
  * 把一张审批单渲染成飞书卡片。
  *
  * 设计原则：**主人要在不看任务详情的情况下就能判断**。
@@ -247,7 +279,13 @@ function extractToolName(v: ApprovalView): string {
     if (typeof o['toolName'] === 'string' && (o['toolName'] as string) !== '') return o['toolName'] as string;
   }
   // summary 形如「mail.send（危险档）：给 a@b.com 发信」，取到第一个分隔符前
-  const m = /^([a-z][a-zA-Z0-9_.]*)/.exec(v.summary);
+  //
+  // 2026-10-27：必须先判类型。装配层为了省一次全表投影，只 SELECT 了
+  // id/seq/status 三列喂给结果卡，`summary` 于是是 undefined；旧实现直接
+  // `/^([a-z][a-zA-Z0-9_.]*)/.exec(undefined)`，JS 把它转成字符串 "undefined"，
+  // 正则命中 → 卡片上就印着 `**undefined**`（主人实际看到的那张）。
+  const summary = typeof v.summary === 'string' ? v.summary : '';
+  const m = /^([a-z][a-zA-Z0-9_.]*)/.exec(summary);
   if (m !== null && m[1] !== undefined) return m[1];
   return '未知操作';
 }
@@ -408,6 +446,12 @@ export function buildResolvedCard(
   by: string,
 ): Record<string, unknown> {
   const approved = v.status === 'approved';
+  // 这张卡是"结论回执"，主语要能让人认出是哪件事。
+  // question 单（`ask`）没有工具名，用问题本身当主语；tool_call 单用工具名。
+  const subject =
+    v.kind === 'question' && typeof v.reason === 'string' && v.reason.trim() !== ''
+      ? v.reason.trim().slice(0, 200)
+      : extractToolName(v);
   return {
     config: { wide_screen_mode: true, update_multi: true },
     header: {
@@ -423,7 +467,7 @@ export function buildResolvedCard(
         text: {
           tag: 'lark_md',
           content:
-            '**' + extractToolName(v) + '**\n' +
+            '**' + subject + '**\n' +
             (approved ? '已同意，正在执行。' : '已拒绝，不会执行。') +
             '\n处理人：' + by,
         },

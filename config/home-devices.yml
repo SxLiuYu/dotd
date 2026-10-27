@@ -1,0 +1,76 @@
+# home-devices.yml —— 家居设备清单（家居控制的事实源，2026-10-26）
+#
+# ⚠ 这是**模板**。真正生效的那份在 `<数据目录>/home-devices.yml`，查找顺序：
+#   1. `HOME_DEVICES_FILE`（显式路径，最省事）
+#   2. `<CHARLIE_DATA_DIR>/home-devices.yml`
+#   3. `<ASSISTANT_KID_DATA_DIR>/home-devices.yml`（`one_system` 实际设的是这个）
+#   4. `~/.charlie/home-devices.yml`
+#   路径只有一处实现：`voice/integration/home_devices.default_manifest_path()`。
+#   没有这份文件时也能用：只要设了 `TUYA_IR_DEVICE_ID` + `TUYA_AC_DEVICE_ID`，
+#   就会自动注册一台名叫「空调」的红外空调；MQTT 设备则按 topic 直接控制。
+#
+# 为什么要有这份清单：
+#   语音说「开客厅灯」，系统得知道「客厅灯」是哪个厂商的哪个设备、用哪个通道下发。
+#   纯靠自动发现做不到——发现得到设备 ID，发现不到「主人怎么称呼它」。
+#
+# 字段
+#   id      稳定标识（日志 / 审计里出现，改了等于换设备）
+#   name    主名称，语音里说的那个词
+#   aliases 别名列表（「卧室灯」「主卧灯」可以指同一台）
+#   room    房间；语音里带房间时优先按房间匹配
+#   kind    ac | light | switch | tv | esp32 | generic（决定默认动作与话术）
+#   adapter tuya_ir | tuya_cloud | mqtt | esp32
+#
+#   adapter=tuya_ir    需要 device_id(红外网关 infrared_id) + remote_id(遥控器)
+#   adapter=tuya_cloud 需要 device_id(涂鸦设备 ID)；dp 段给 DP 码，不写用默认灯控码
+#   adapter=mqtt       需要 topic_cmnd（控制 topic 前缀），可选 topic_stat（状态）
+#   adapter=esp32      需要 device_id（ESP32 在 Charlie 里的设备 ID）
+#
+# 环境变量（凭证，不写在本文件里）
+#   TUYA_API_KEY      涂鸦 2C 终端用户 key（sk- 开头），控制灯/插座必须在
+#   TUYA_CLIENT_ID    涂鸦 2B 云应用 Access ID，红外空调必须在
+#   TUYA_ACCESS_KEY   涂鸦 2B 云应用 Access Key
+#   TUYA_BASE_URL     可选，默认按 key 前缀自动识别数据中心
+#   MQTT_BROKER / MQTT_PORT / MQTT_USER / MQTT_PASSWORD
+#
+# 示例（把下面整段取消注释，改成你自己的设备）：
+#
+# devices:
+#   - id: ac-living
+#     name: 空调
+#     aliases: [客厅空调, 冷气]
+#     room: 客厅
+#     kind: ac
+#     adapter: tuya_ir
+#     infrared_id: "your-infrared-gateway-id"
+#     remote_id: "your-ac-remote-id"
+#
+#   - id: light-living
+#     name: 客厅灯
+#     aliases: [大灯, 顶灯]
+#     room: 客厅
+#     kind: light
+#     adapter: tuya_cloud
+#     device_id: "your-tuya-device-id"
+#     dp:
+#       switch: switch_led        # 开关 DP
+#       brightness: bright_value  # 亮度 DP（0–1000）
+#
+#   - id: plug-study
+#     name: 书房插座
+#     aliases: [插座]
+#     room: 书房
+#     kind: switch
+#     adapter: mqtt
+#     topic_cmnd: tasmota/cmnd/plug-study
+#     topic_stat: stat/plug-study/RESULT
+#
+#   - id: tv-living
+#     name: 电视
+#     room: 客厅
+#     kind: tv
+#     adapter: esp32
+#     device_id: esp32-abc123
+#     esp32_ip: 192.168.1.50
+
+devices: []

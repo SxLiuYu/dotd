@@ -249,6 +249,10 @@ ENTRIES: list[EnvEntry] = [
     EnvEntry("TUYA_BASE_URL", default="https://openapi.tuyacn.com",
              group="tuya", tunable=True,
              description="涂鸦 2B API 基址"),
+    EnvEntry("HOME_DEVICES_FILE", group="tuya", tunable=True,
+             description="家居设备清单路径（默认 <数据目录>/home-devices.yml），模板见 config/home-devices.yml"),
+    EnvEntry("HOME_AC_DRY_RUN", default="0", group="tuya", tunable=True,
+             description="1=空调只解析不发红外码（联调/验收用，不碰真设备）"),
 
     # --- esp32（开发板终端） ---
     EnvEntry("ESP32_IP", group="esp32",

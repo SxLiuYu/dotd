@@ -235,5 +235,89 @@ console.log('  F. question 单选：选项必须随回调变成 note（2026-10-2
   ok('普通审批卡片不带 note（保持旧行为）', got === undefined, String(got));
 }
 
+console.log('');
+console.log('  G. 回包必须带结果卡（2026-10-27，主人报「显示通过后又刷回选择卡片」）');
+// 现场实测：PATCH 全部成功（日志「已改 2/2 张卡片」），半小时后 GET 服务端
+// 仍是按钮卡片。根因：飞书长连接把 handler 的**返回值**当作这张卡片的落定
+// 状态；回包里没有卡，就把卡片按点击时的版本落定，PATCH 被冲掉。
+// 所以 decided 路径的 body 必须带 resolveCard 构建的结果卡。
+
+{
+  const db = mkDb();
+  const resolvedCard = { header: { template: 'green', title: { content: '已同意 · 审批 #133' } } };
+  let resolveCalled = 0;
+  const r = await handleFeishuCallback(cardFrame({ approvalId: 133, verdict: 'approve', eventId: 'ev_g' }), {
+    db,
+    cfg: CFG as never,
+    trustedTransport: true,
+    approval: {
+      decide: async () => ({ ok: true, status: 'approved' }),
+      resolveCard: async () => {
+        resolveCalled++;
+        return { card: resolvedCard };
+      },
+    },
+  } as never);
+  const body = r.body as { decided?: boolean; card?: unknown };
+  ok('resolveCard 被调用', resolveCalled === 1, String(resolveCalled));
+  ok('body 带结果卡（回包要用它钉住状态）', body.card !== undefined, JSON.stringify(body).slice(0, 120));
+  ok('结果卡就是 resolveCard 给的那张', (body.card as { header?: { title?: { content?: string } } }).header?.title?.content === '已同意 · 审批 #133');
+  ok('decided 仍为 true', body.decided === true);
+}
+
+{
+  // resolveCard 没接 / 返回 void：body 不带 card（回包退回旧行为，不抛）。
+  const db = mkDb();
+  const r = await handleFeishuCallback(cardFrame({ approvalId: 5, verdict: 'approve', eventId: 'ev_g2' }), {
+    db,
+    cfg: CFG as never,
+    trustedTransport: true,
+    approval: {
+      decide: async () => ({ ok: true, status: 'approved' }),
+    },
+  } as never);
+  ok('没接 resolveCard 时 body 无 card 字段', (r.body as { card?: unknown }).card === undefined, JSON.stringify(r.body));
+}
+
+{
+  // 重复点击（飞书重投）：cardFor 能给出当前状态卡时，dup 回包也要带卡 ——
+  // 否则重投的回包又把卡片按点击时版本落定一次。
+  const db = mkDb();
+  const resolvedCard = { header: { title: { content: '已同意 · 审批 #7' } } };
+  const frame = cardFrame({ approvalId: 7, verdict: 'approve', eventId: 'ev_g3' });
+  const deps = {
+    db,
+    cfg: CFG as never,
+    trustedTransport: true,
+    approval: {
+      decide: async () => ({ ok: true, status: 'approved' }),
+      cardFor: (id: number) => (id === 7 ? resolvedCard : null),
+    },
+  } as never;
+  await handleFeishuCallback(frame, deps);
+  const r2 = await handleFeishuCallback(frame, deps);
+  const body = r2.body as { reason?: string; card?: unknown };
+  ok('重复点击仍报 dup', body.reason === 'dup', JSON.stringify(body));
+  ok('dup 回包也带当前状态卡', body.card === resolvedCard);
+}
+
+{
+  // 迟到点击（另一端已裁决，decide 返回失败）：回包带落定卡，按钮别挂着。
+  const db = mkDb();
+  const resolvedCard = { header: { title: { content: '已同意 · 审批 #9' } } };
+  const r = await handleFeishuCallback(cardFrame({ approvalId: 9, verdict: 'approve', eventId: 'ev_g4' }), {
+    db,
+    cfg: CFG as never,
+    trustedTransport: true,
+    approval: {
+      decide: async () => ({ ok: false, reason: 'already_decided' }),
+      cardFor: () => resolvedCard,
+    },
+  } as never);
+  const body = r.body as { reason?: string; card?: unknown };
+  ok('迟到点击如实报原因', body.reason === 'already_decided', JSON.stringify(body));
+  ok('迟到点击回包带落定卡', body.card === resolvedCard);
+}
+
 console.log('  合计 ' + pass + ' 通过 / ' + fail + ' 失败');
 process.exit(fail === 0 ? 0 : 1);

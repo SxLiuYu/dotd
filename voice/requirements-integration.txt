@@ -7,3 +7,8 @@ httpx>=0.27
 mcp>=1.0,<2
 # xiaozhi_ws 每 100 帧会 import app.schedulers 做设备活跃标记，schedulers 依赖 psutil。
 psutil>=5.9
+# 家居设备清单 <数据目录>/home-devices.yml（voice/integration/home_devices.py 读）。
+# 2026-10-26 现场：开发机 .venv 里没有 PyYAML，清单直接读不了 → 只剩一台兜底空调，
+# `home_list` 答"还没有登记设备"。one_system 读 config.yml 时也有同一个隐含依赖，
+# 只是它有一条窄正则回退把问题掩盖了。补上声明。
+PyYAML>=6

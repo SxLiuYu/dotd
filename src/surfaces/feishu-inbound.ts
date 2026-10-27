@@ -450,8 +450,16 @@ export interface FeishuInboundDeps {
       /** 主人给的答案／补充说明（GOV §3.4：随审批单回到执行方）。 */
       note?: string,
     ): Promise<{ ok: boolean; status?: string; reason?: string }>;
-    /** 落定后改卡片（去掉按钮）。失败不影响裁决本身。 */
-    resolveCard?(cardMessageId: string, approvalId: number): Promise<void>;
+    /** 落定后改卡片（去掉按钮）。失败不影响裁决本身。
+     *  2026-10-27：返回值带上结果卡 —— 回调响应必须用它（见本文件 card_action 分支）。 */
+    resolveCard?(cardMessageId: string, approvalId: number): Promise<{ card?: unknown } | void>;
+    /**
+     * 查一张审批**当前状态**对应的卡片（2026-10-27）。
+     * 用在两类回包上：飞书重投的重复点击（dedup 拦下）、迟到点击（审批已落定）。
+     * 这两类如果回空包，飞书会把卡片按「点击时版本」落定 —— 按钮又回来了。
+     * 返回 null = 状态未知（比如还是 pending），回空包让第一次处理的响应兜底。
+     */
+    cardFor?(approvalId: number): unknown | null;
   };
   media?: {
     downloadImage(
@@ -489,8 +497,8 @@ export type FeishuInboundResult =
   | { httpStatus: 200; body: { ignored: true; eventId: string } }
   | { httpStatus: 202; body: { taskId: string; threadId: string } }
   | { httpStatus: 202; body: { eventId: number; dup: false; ack: true } }
-  | { httpStatus: 200; body: { decided: true; approvalId: number; status: string } }
-  | { httpStatus: 200; body: { ignored: true; reason: string } }
+  | { httpStatus: 200; body: { decided: true; approvalId: number; status: string; card?: unknown } }
+  | { httpStatus: 200; body: { ignored: true; reason: string; card?: unknown } }
   | { httpStatus: 400 | 401 | 403; body: { error: 'parse' | 'auth' | 'allowlist'; message: string } };
 
 /**
@@ -518,8 +526,19 @@ export async function handleFeishuCallback(
       };
     case 'card_action': {
       // 去重：飞书会重投按钮点击（尤其网络慢时）。同一 event_id 只处理一次。
+      //
+      // 2026-10-27：重复点击的回包也带上当前状态的卡片。
+      // 飞书长连接的卡片回包语义是「响应体里的卡片 = 这张卡的落定状态」；
+      // 回空包（无 card）会把卡片按**点击时**的版本落定 —— 于是已经改过的
+      // 结果卡被冲掉，按钮又回来了（主人报「显示审批通过后又会刷新后选择卡片」）。
       if (!claimFeishuMessage(deps.db, decision.dedupKey, 'feishu:card', Date.now())) {
-        return { httpStatus: 200, body: { ignored: true, reason: 'dup' } };
+        const card = deps.approval?.cardFor?.(decision.approvalId) ?? undefined;
+        return {
+          httpStatus: 200,
+          body: card === undefined
+            ? { ignored: true, reason: 'dup' }
+            : { ignored: true, reason: 'dup', card },
+        };
       }
       if (deps.approval === undefined) {
         // 装配层没接审批能力 —— 如实忽略，不假装点了。
@@ -527,19 +546,34 @@ export async function handleFeishuCallback(
       }
       const r = await deps.approval.decide(decision.approvalId, decision.verdict, decision.operatorId, decision.answer);
       if (!r.ok) {
-        return { httpStatus: 200, body: { ignored: true, reason: r.reason ?? 'decide_failed' } };
+        // 迟到点击（审批已落定）：把落定后的卡片回给飞书，别让按钮挂着。
+        const card = deps.approval.cardFor?.(decision.approvalId) ?? undefined;
+        return {
+          httpStatus: 200,
+          body: card === undefined
+            ? { ignored: true, reason: r.reason ?? 'decide_failed' }
+            : { ignored: true, reason: r.reason ?? 'decide_failed', card },
+        };
       }
       // 改卡片：把按钮换成结果。失败也不回滚裁决（裁决已经落库了）。
+      let appliedCard: unknown;
       if (deps.approval.resolveCard !== undefined && decision.cardMessageId !== '') {
         try {
-          await deps.approval.resolveCard(decision.cardMessageId, decision.approvalId);
+          const applied = await deps.approval.resolveCard(decision.cardMessageId, decision.approvalId);
+          appliedCard = applied?.card;
         } catch {
           /* 卡片改不动不影响结论 */
         }
       }
       return {
         httpStatus: 200,
-        body: { decided: true, approvalId: decision.approvalId, status: r.status ?? 'unknown' },
+        body: {
+          decided: true,
+          approvalId: decision.approvalId,
+          status: r.status ?? 'unknown',
+          // 结果卡必须随回包走：PATCH 会被本次点击的回包落定状态冲掉（2026-10-27 实测）。
+          ...(appliedCard !== undefined ? { card: appliedCard } : {}),
+        },
       };
     }
     case 'message': {
