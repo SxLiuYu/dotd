@@ -100,6 +100,7 @@ import type { GovDeps } from './governance/types.ts';
 import { ExecServiceImpl } from './exec/ExecService.ts';
 import { McpClient } from './exec/mcp-client.ts';
 import { loadMcpServers } from './exec/mcp-config.ts';
+import { PhoneApprovalBridge } from './exec/phone-approval.ts';
 import { execConfigFromEnv } from './exec/types.ts';
 import { toHomeAbs } from './exec/protocol.ts';
 import { makeExecFsOpsBridge } from './memory/exec-fsops-bridge.ts';
@@ -127,6 +128,8 @@ import { startConnectionWatch } from './surfaces/connection-watch-push.ts';
 import { buildBrief, buildConnectionsView, type InsightDeps } from './surfaces/insight.ts';
 import { collectFeed } from './surfaces/feed.ts';
 import { collectProof } from './surfaces/proof.ts';
+import { buildAnchorMail, listAnchors, recordAnchor } from './surfaces/anchor.ts';
+import { readPhoneTrace, resolvePhoneHome } from './exec/phone-trace-file.ts';
 import { metricsView } from './metrics/view.ts';
 import { vaultDelete, vaultGet, vaultList, vaultPut } from './vault/vault.ts';
 
@@ -864,10 +867,10 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   // ① openDb + migrate（CP §7.1 步骤 1；失败 → 拒启动 + 追加 OUTBOX.md）
   const db = openDb(cfg.dbPath);
   try {
-    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 214）。
+    // expectedVersion 必须等于 db/migrations/ 里最大的 NNN（当前 221）。
     // 少写一位 → 新库首次启动就 MigrationError 拒启动（实测：加 100 包忘了改这里，
     // 六个装配测试全挂在这一句）。新增迁移包时同步改这里与 tests/helpers.ts 的注释。
-    const res = migrate(db, { expectedVersion: 214 });
+    const res = migrate(db, { expectedVersion: 221 });
     if (res.from !== res.to) log(`迁移 ${res.from}→${res.to}（应用 ${res.applied.length} 包）`);
     else log(`库已是最新（user_version=${res.to}）`);
   } catch (cause) {
@@ -1158,6 +1161,73 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     );
   }
 
+  // MCP 客户端单独持有：exec 与手机审批桥都要用它（桥要在主人裁决后
+  // 反向调 phone.resume，那是宿主侧调用，走 callHostSide 才能过 host_only_tools）。
+  const mcpConfigPath = process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml');
+  const mcpClient = new McpClient(loadMcpServers(mcpConfigPath), { source: mcpConfigPath });
+
+  // 手机挂起动作 → dotd 审批单（2026-10-27）。见 src/exec/phone-approval.ts。
+  //
+  // 这里**只签单**，回头路（resume）在 gov 就绪之后的 `watch()` 里接上。
+  // 顺序上不冲突：签单只走 GOV 的 forceApproval（已 init），bus 也是同一个实例。
+  /** 原任务属于哪个 dot；查不到返回 null（交给 CP 默认，不猜）。 */
+  const dotOfTask = (taskId: string): string | null => {
+    if (taskId === '') return null;
+    try {
+      const row = db.prepare('SELECT dot_id FROM tasks WHERE id = ?').get(taskId) as
+        | { dot_id?: string }
+        | undefined;
+      return typeof row?.dot_id === 'string' && row.dot_id !== '' ? row.dot_id : null;
+    } catch {
+      return null;
+    }
+  };
+  const phoneApproval = new PhoneApprovalBridge({
+    mcp: mcpClient,
+    bus,
+    db,
+    log,
+    requestApproval: async (input) => {
+      const r = await govForceApproval(input.taskId, {
+        kind: 'phone_action',
+        subject: { ...input.subject },
+        reason: input.reason,
+        dotId: input.dotId,
+      });
+      return r;
+    },
+    // 批准后手机继续跑，跑到头在这里汇报（2026-10-27）。
+    //
+    // 为什么不能只发 resume：批准那一刻原 dotd 任务已经收尾了（模型在
+    // needs_approval 上把结论交回主人），没人 await，手机跑完的结果就只剩
+    // 那份 JSONL。所以跟到收尾，再起一个**新任务**让模型把结果说给主人 ——
+    // 不为这条链另造一条汇报通道，走既有的任务/出站回路。
+    onTraceSettled: ({ traceId, taskId, status, answer, steps }) => {
+      const ok = status === 'done';
+      const head = ok ? '手机那边做完了' : `手机那边的任务没做成（${status}）`;
+      const detail = answer.trim() === '' ? '' : `\n\n${answer.trim()}`;
+      const goal =
+        `汇报一件事，不要调用任何手机工具。\n\n` +
+        `刚才你在手机上做的任务已经结束：${head}。共 ${steps} 步。${detail}\n\n` +
+        `请用一两句话把结论说给主人（traceId ${traceId}${taskId === '' ? '' : `，原任务 ${taskId}`}）。`;
+      try {
+        cp.submit({
+          title: `手机任务结果：${answer.trim().slice(0, 40) === '' ? traceId : answer.trim().slice(0, 40)}`,
+          goal,
+          // 优先级 3：这是"告诉主人一件事"，不该排在主人新提的需求前面
+          //（默认 5，数字越小越先）。
+          priority: 3,
+          // 挂回原任务的 dot：查不到就交给 CP 的默认（`cfg.dotIds[0]`）——
+          // 单 dot 部署里两者一定相同，多 dot 时这个查询才有意义。
+          ...(dotOfTask(taskId) !== null ? { dotId: dotOfTask(taskId)! } : {}),
+        });
+        log(`[phone] 已提交汇报任务（trace=${traceId} status=${status} steps=${steps}）`);
+      } catch (err) {
+        log(`[phone] 提交汇报任务失败 ${traceId}：${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+  });
+
   const exec = new ExecServiceImpl({
     db,
     bus,
@@ -1180,17 +1250,20 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
         cp.heartbeat(taskId, epoch, undefined, { live: { at: now } });
       },
     },
+    // 手机侧挂起等批准时，由这里签 dotd 审批单（模型不参与裁决）。
+    phoneApproval,
     // P2-1：MCP 外部工具通道。**默认关闭**——mcp-servers.yml 未声明 server 时
     // 这里是空列表，`mcp.call` 不会出现在模型工具面里（见 getCapabilities 的过滤）。
     // 配置解析失败会抛错 → 拒启动（静默忽略一份写错的安全配置最危险）。
     //
     // `source` 只用于报错文案：没启用时要能说出"查的是哪个文件"，否则只报一句
     // "未声明"，人还得猜 DOTD_MCP_CONFIG 到底有没有生效。
-    mcp: new McpClient(
-      loadMcpServers(process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml')),
-      { source: process.env.DOTD_MCP_CONFIG ?? join(cfg.configDir, 'mcp-servers.yml') },
-    ),
+    mcp: mcpClient,
   });
+
+  // 主人裁决完，把决定送回手机（2026-10-27）。订阅必须挂在**签单之后、
+  // 第一次 needs_approval 之前**——签单只在运行期发生，所以这里的位置够早。
+  const unwatchPhoneApproval = phoneApproval.watch();
 
   // 宿主侧工具（2026-10-18）：定时任务的操作对象是控制面的 crontabs 表，
   // 容器只是沙箱，不能也不该让容器去改它。注册到执行面后对模型与普通工具无差别。
@@ -1860,6 +1933,12 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   if (!bootReport.dockerAvailable) {
     log('[exec] docker 不可用 —— degraded 启动（真实 fleet 下容器动作将被拒）');
   }
+  // ⑥a' 后台预热 MCP 工具清单（2026-10-27）：`mcp.call` 的说明书要列工具名，
+  // 而那只在 server 启动后才知道。不 await —— 起子进程要 1~3 秒，不该拖慢启动；
+  // 没赶上就退回配置里的白名单（名字齐，只是少一句描述）。
+  void exec.warmMcpTools().then((n) => {
+    if (n > 0) log(`[exec] MCP 工具清单已预热：${n} 个工具（mcp.call 说明书可见）`);
+  });
 
   // ⑥b 把 EX/GOV 补注进 CP 的惰性 holder（建 CP 时它们还不存在；CP 内部只在
   //     运行期经 execPortsOf / governance.requestApproval 读它们）
@@ -2067,6 +2146,105 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
   const proofOf = (taskId: string, opts: { includeArgs?: boolean } = {}) =>
     collectProof(db, cp, taskId, Date.now(), opts.includeArgs === true);
 
+  /**
+   * 凭证锚定（2026-10-27）：把 bundleHash 发到本机之外。
+   *
+   * 为什么必须走邮件而不是写个文件：文件仍在这台机器上，能改 journal 的人
+   * 也能改那个文件。锚定的价值全在"发到本机管不着的地方"。
+   *
+   * 收件人：body.to > DOTD_PROOF_ANCHOR_TO > 发信账号自己的地址（自寄）。
+   * 账号：DOTD_PROOF_ANCHOR_ACCOUNT（label 或地址）> 第一个 active 账号。
+   * 两者任一缺失就如实拒绝 —— 不猜一个地址把 hash 发出去。
+   */
+  const publishProof = async (
+    taskId: string,
+    opts: { to?: string; note?: string } = {},
+  ): Promise<{
+    ok: boolean;
+    bundleHash?: string;
+    to?: string;
+    messageId?: string;
+    anchorId?: number;
+    error?: string;
+    message?: string;
+  }> => {
+    if (mail === null) {
+      return {
+        ok: false,
+        error: 'mail_not_configured',
+        message: '没配 DOTD_MAIL_KEY：邮件工具未启用，无法锚定',
+      };
+    }
+    const bundle = proofOf(taskId);
+    if (bundle === null) return { ok: false, error: 'task_not_found', message: `任务 ${taskId} 不存在` };
+    const dot = cfg.dotIds[0] ?? 'dot1';
+    const accounts = mail.listAccounts(dot);
+    if (accounts.length === 0) {
+      return {
+        ok: false,
+        error: 'no_target',
+        message: '没有已接入的邮箱账号（先用 mail.account.add 接一个）',
+      };
+    }
+    const wantAccount = (process.env.DOTD_PROOF_ANCHOR_ACCOUNT ?? '').trim();
+    const acc =
+      wantAccount === ''
+        ? accounts[0]!
+        : accounts.find((a) => a.id === wantAccount || a.label === wantAccount || a.email === wantAccount);
+    if (acc === undefined) {
+      return {
+        ok: false,
+        error: 'no_target',
+        message: `DOTD_PROOF_ANCHOR_ACCOUNT 指向的账号不存在：${wantAccount}`,
+      };
+    }
+    const to = (opts.to ?? process.env.DOTD_PROOF_ANCHOR_TO ?? acc.email).trim();
+    if (to === '' || !to.includes('@')) {
+      return { ok: false, error: 'no_target', message: `收件地址为空或不合法：${to === '' ? '（空）' : to}` };
+    }
+
+    const { subject, body } = buildAnchorMail(bundle, opts.note ?? '');
+    let draftId: string;
+    try {
+      draftId = mail.createDraft(dot, acc.id, { to: [to], subject, body, taskId });
+    } catch (e) {
+      return { ok: false, error: 'publish_failed', message: `建草稿失败：${(e as Error).message}` };
+    }
+    const sent = await mail.sendDraft(dot, draftId);
+    if (!sent.ok) {
+      return { ok: false, error: 'publish_failed', message: sent.error ?? '发送失败' };
+    }
+    let anchorId: number | undefined;
+    try {
+      anchorId = recordAnchor(db, {
+        taskId,
+        bundleHash: bundle.bundleHash,
+        channel: 'email',
+        toAddr: to,
+        messageId: sent.messageId ?? null,
+        note: opts.note ?? null,
+        sentAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      // 邮件已经发出去了 —— 记账失败不能反过来报"锚定失败"。
+      log(`[proof] 锚定邮件已发但记账失败（${taskId}）：${(e as Error).message}`);
+    }
+    log(`[proof] 已锚定 ${taskId}：${bundle.bundleHash.slice(0, 16)}… → ${to}`);
+    return {
+      ok: true,
+      bundleHash: bundle.bundleHash,
+      to,
+      ...(sent.messageId !== undefined ? { messageId: sent.messageId } : {}),
+      ...(anchorId !== undefined ? { anchorId } : {}),
+    };
+  };
+  const proofAnchorsOf = (taskId: string, limit = 20) => listAnchors(db, taskId, limit);
+
+  // 手机 trace 目录（2026-10-27）：先看进程环境，再看 MCP 声明里的 env。
+  // 后者才是常态 —— DBPHONE_HOME 通常写在 mcp-servers.yml 的 phone server 里。
+  const phoneHome = resolvePhoneHome(process.env, mcpClient.configOf('phone')?.env);
+  const phoneTraceOf = (traceId: string) => readPhoneTrace(phoneHome, traceId);
+
   // 指标（2026-10-27）：反应速度 / 执行质量 / 自我进化。
   //
   // 口径全在 src/metrics/ —— CLI（`dotd metrics`）、HTTP（`/api/metrics`）、
@@ -2112,6 +2290,9 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
     // M1：动态页（只读投影；Web / `dotd feed` 共用一个入口）。
     feed: feedOf,
     proof: proofOf,
+    publishProof,
+    proofAnchors: proofAnchorsOf,
+    phoneTrace: phoneTraceOf,
     // 指标（2026-10-27）：只读；`?sample=1` 才落库并设为新基线。
     metrics: metricsOf,
     webRoot: cfg.webRoot,
@@ -2200,7 +2381,12 @@ export async function assembleDaemon(opts: { cfg?: DaemonConfig } = {}): Promise
             //
             // answer 只在 question 卡片上出现；tool_call 卡片没有这个字段，
             // 传下去就是 undefined，与旧行为逐字相同。
-            decide: async (approvalId: number, verdict: 'approve' | 'reject', operatorId: string, note?: string) => {
+            decide: async (
+              approvalId: number,
+              verdict: 'approve' | 'approve_remember' | 'reject',
+              operatorId: string,
+              note?: string,
+            ) => {
               // 映射收在 feishu-card.toDecideCall()（可单测）：answer → note。
               // 映射收在 feishu-card.toDecideCall()（可单测）：answer → note。
               const call = toDecideCall({
@@ -2621,6 +2807,45 @@ log(
     },
   });
 
+  // **记忆文件索引对账**（2026-10-27 补）。
+  //
+  // `MemoryService.syncFilesIndex()` 一直在（§6.2 明写"心跳经 /fs/ops list 增量对账"），
+  // 但全仓库**没有任何生产调用方**，只有测试在调。后果实测：
+  //   · mem_files_index 全库只有 1 行（停在 10-25 09:00），而容器里 /dot/home/notes/
+  //     昨晚 00:30 还在写文件 —— 索引比磁盘落后两天多；
+  //   · 索引是笔记检索与 `fs.read /dot/home/MEMORY.md` 的事实源。索引空着，
+  //     模型就会去读不存在的路径，本周 21 次 `not_found` 全是 /dot/home/MEMORY.md；
+  //   · 指标里"记忆文件"这一维永远是 1，看不出系统有没有在积累知识。
+  //
+  // 周期取 30 分钟而不是跟着 retention 一天一次：笔记是随时写的，索引落后一天
+  // 就意味着当天写的笔记搜不到。kind:'light' —— 水位紧张时跳轮，
+  // 索引晚半小时对账不影响正确性。
+  let lastIndexSyncAt = 0;
+  const syncMemoryIndex = async (): Promise<void> => {
+    const nowMs = Date.now();
+    // 首次立刻跑（把存量补上），之后 30 分钟一次。
+    if (lastIndexSyncAt !== 0 && nowMs - lastIndexSyncAt < 30 * 60_000) return;
+    lastIndexSyncAt = nowMs;
+    try {
+      const r = await memory.syncFilesIndex('dot1');
+      // 只在真有变化时说话，免得每半小时刷一行"0 增 0 删"。
+      if (r.added > 0 || r.removed > 0 || r.errors.length > 0) {
+        log(
+          `[memory] 索引对账：扫描 ${r.scanned}、新增 ${r.added}、更新 ${r.updated}、移除 ${r.removed}` +
+            (r.errors.length > 0 ? `（异常：${r.errors.join(',')}）` : ''),
+        );
+      }
+    } catch (err) {
+      log(`[memory] 索引对账失败（不影响主循环）：${String(err)}`);
+    }
+  };
+  cp.scheduler.registerInternalJob({
+    name: 'memory.index-sync',
+    kind: 'light',
+    everyMs: 10 * 60_000,
+    run: syncMemoryIndex,
+  });
+
   // **指标定时采样**（2026-10-27）。
   //
   // 只在有人跑 `dotd metrics --sample` 时落库，趋势就断在"想起来看一眼"的那一刻，
@@ -2666,8 +2891,13 @@ log(
   // 启动就采一次（有 1 小时护栏，部署重启不会堆重复行）。
   // 这样"刚部署完长什么样"直接进曲线，不用等 6 小时后的第一跳。
   sampleMetrics();
+  // **索引对账也要启动就跑一次**（2026-10-27 实测踩到）：
+  // `registerInternalJob` 的首次到期是 `now + everyMs`（10 分钟），不是立刻。
+  // 只注册的话，部署完这十分钟里索引仍是旧的一行，看日志也看不出"没跑"。
+  // 这里显式调一次，失败自己吞（syncMemoryIndex 内已 catch），不影响启动。
+  void syncMemoryIndex();
   log(
-    'scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention / exec.healthcheck / metrics.sample）',
+    'scheduler 已启动（heartbeat.tick / queue.gc / watchdog / guard / memory-retention / memory.index-sync / exec.healthcheck / metrics.sample）',
   );
 
   // **FTS 全量对账放在启动期**（2026-10-19 实测改）。
@@ -2715,6 +2945,9 @@ log(
     // ⓪ 先断外来源：飞书长连接停止投递新事件（否则关停中还在建任务）
     stopFeishuWs?.();
     emergencyWatch.stop();
+    // 手机审批桥的解订（2026-10-27）：关停中不要再往手机送 resume。
+    // 已签的单留在库里，重启后仍是 pending —— 与审批的既有恢复语义一致。
+    unwatchPhoneApproval();
     // ① 停 pop 与心跳投递（scheduler.stop 内部停全部 registerInternalJob）
     cp.shutdown();
     // ①b 停配置监听（2026-10-25）：否则关停过程中一次保存还会触发 reload

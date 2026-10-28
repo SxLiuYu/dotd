@@ -183,6 +183,59 @@ const cardText = (c: Record<string, unknown>): string => JSON.stringify(c);
   ok('question 结果卡不写未知操作', !cardText(q).includes('未知操作'), cardText(q));
 }
 
+// 6.8 「以后都这样」按钮（2026-10-27）
+//
+// 为什么需要：approval_rules 全库 0 行，30 天里 158 次同意全是 approve_once。
+// 不是派生链路没做（deriveRule → persistMemory 一直都在），是卡片上**根本没有入口**
+// 让主人表达"记住"。这个按钮就是那个入口。
+{
+  const tierOf = (t: ApprovalView['tier']): string => {
+    const c = buildApprovalCard(makeView({ tier: t }));
+    return cardText(c);
+  };
+
+  // 记忆档位（read/write_file/browser）→ 有按钮
+  for (const tier of ['read', 'write_file', 'browser'] as const) {
+    const text = tierOf(tier);
+    ok(`${tier} 档该有「以后都这样」`, text.includes('以后都这样'), text.slice(0, 200));
+    ok(`${tier} 档按钮带 approve_remember`, text.includes('approve_remember'));
+  }
+  // 非记忆档位（spend/dangerous）→ 没有按钮（GOV §4.1：永不入记忆）
+  for (const tier of ['spend', 'dangerous'] as const) {
+    const text = tierOf(tier);
+    ok(`${tier} 档不该有「以后都这样」`, !text.includes('以后都这样'));
+    ok(`${tier} 档不该出现 approve_remember`, !text.includes('approve_remember'));
+  }
+  // question / phone_action 不是许可题，没有"记住"的语义
+  const q = cardText(buildApprovalCard(makeView({ kind: 'question', tier: null })));
+  ok('question 卡不该有「以后都这样」', !q.includes('以后都这样'));
+  // tier 为 null（治理侧没定档）→ 派生必然失败，不给按钮
+  const noTier = cardText(buildApprovalCard(makeView({ tier: null })));
+  ok('tier 为 null 时不给按钮', !noTier.includes('以后都这样'));
+}
+
+// 6.9 点「以后都这样」一路能走到 approve_remember
+{
+  // 解析：卡片 value → CardAction
+  const parsed = parseCardAction(
+    JSON.stringify({ kind: 'approval', approvalId: 42, verdict: 'approve_remember' }),
+  );
+  ok('能解析 approve_remember', parsed?.verdict === 'approve_remember', JSON.stringify(parsed));
+  // 映射：CardAction → decide() 的 verdict（这里以前只会产出 approve_once|reject）
+  const call = toDecideCall(parsed!);
+  ok('映射成 approve_remember，不是 approve_once', call.verdict === 'approve_remember', call.verdict);
+  // 旧的两种语义不能被这次改动带偏
+  const once = toDecideCall({ kind: 'approval', approvalId: 42, verdict: 'approve' });
+  ok('「同意」仍是 approve_once', once.verdict === 'approve_once', once.verdict);
+  const rej = toDecideCall({ kind: 'approval', approvalId: 42, verdict: 'reject' });
+  ok('「拒绝」仍是 reject', rej.verdict === 'reject', rej.verdict);
+  // 乱填的 verdict 必须解析不出来（不能默默当成同意）
+  ok(
+    '未知 verdict 解析成 null',
+    parseCardAction(JSON.stringify({ kind: 'approval', approvalId: 42, verdict: 'whatever' })) === null,
+  );
+}
+
 // 7. 入站解析：card.action.trigger 事件
 {
   const cfg = { verificationToken: 'tok', ownerChatId: 'oc_owner' };

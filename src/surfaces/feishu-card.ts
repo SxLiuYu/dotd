@@ -21,6 +21,7 @@
 import type { ApprovalView } from '../shared/contracts.ts';
 import { LARGE_SPEND_WARN_CENTS, formatMoney, isLargeSpend } from '../shared/money.ts';
 import { describeOperation, redact } from '../shared/operation.ts';
+import { memoryEligible } from '../governance/policy.ts';
 
 // 金额格式化/大额判定已上移到 shared/money.ts（审批摘要与卡片共用同一实现）。
 // 这里保留再导出：既有调用方与测试从本模块导入，行为不变。
@@ -31,7 +32,7 @@ export { LARGE_SPEND_WARN_CENTS, formatMoney, isLargeSpend };
 export interface CardAction {
   kind: 'approval';
   approvalId: number;
-  verdict: 'approve' | 'reject';
+  verdict: 'approve' | 'reject' | 'approve_remember';
   /**
    * 主人选的答案（只有 question 类审批才有）。
    *
@@ -152,9 +153,89 @@ function buildQuestionCard(v: ApprovalView): Record<string, unknown> {
   };
 }
 
+/**
+ * 手机挂起的敏感动作（2026-10-27）：继续做 / 交还用户。
+ *
+ * 与 tool_call 的区别不是样式，是**答案的去向**：这里点了之后由 daemon 调
+ * `phone.resume` 把布尔送回手机，模型不参与。所以卡片必须写清三件事：
+ * 手机上在干什么、卡在哪一步、不点会怎样。
+ */
+function buildPhoneActionCard(v: ApprovalView): Record<string, unknown> {
+  const subj = v.subject;
+  const prompt = subj !== undefined && subj.kind === 'phone_action' ? subj.prompt : v.reason;
+  const goal = subj !== undefined && subj.kind === 'phone_action' ? (subj.goal ?? '') : '';
+  const desc = subj !== undefined && subj.kind === 'phone_action' ? (subj.desc ?? '') : '';
+  const traceId = subj !== undefined && subj.kind === 'phone_action' ? subj.traceId : '';
+
+  const fields: unknown[] = [];
+  if (goal !== '') {
+    fields.push({ is_short: false, text: { tag: 'lark_md', content: '**你让它做的事**\n' + goal.slice(0, 300) } });
+  }
+  fields.push({ is_short: false, text: { tag: 'lark_md', content: '**手机上卡在这一步**\n' + prompt.slice(0, 600) } });
+  if (desc !== '') {
+    fields.push({ is_short: false, text: { tag: 'lark_md', content: '**补充**\n' + desc.slice(0, 400) } });
+  }
+
+  const elements: unknown[] = [{ tag: 'div', fields }];
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content:
+        '点「继续」= 让手机接着做这一步；点「交还给我」= 手机停下，你自己动手。\n' +
+        (traceId === '' ? '' : '<font color=\'grey\'>trace ' + traceId + '</font>'),
+    },
+  });
+  elements.push({ tag: 'hr' });
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: '⏱ 若 ' + formatDeadline(v.expiresAt) + ' 内没有回应，**按交还处理**（手机停下，不会自己继续）',
+    },
+  });
+  elements.push({
+    tag: 'action',
+    actions: [
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '继续' },
+        type: 'primary',
+        value: JSON.stringify({
+          kind: 'approval',
+          approvalId: v.id,
+          verdict: 'approve',
+        } satisfies CardAction),
+      },
+      {
+        tag: 'button',
+        text: { tag: 'plain_text', content: '交还给我' },
+        type: 'danger',
+        value: JSON.stringify({
+          kind: 'approval',
+          approvalId: v.id,
+          verdict: 'reject',
+        } satisfies CardAction),
+      },
+    ],
+  });
+
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
+    header: {
+      template: 'orange',
+      title: { tag: 'plain_text', content: '手机上等你点头 · 审批 #' + v.id },
+    },
+    elements,
+  };
+}
+
 export function buildApprovalCard(v: ApprovalView): Record<string, unknown> {
   // question 是**问答题**，不是许可题：单独渲染，否则选项无处可点。
   if (v.kind === 'question') return buildQuestionCard(v);
+  // phone_action 是"继续/交还"二选一，答案要送回手机，不能用通用许可卡。
+  if (v.kind === 'phone_action') return buildPhoneActionCard(v);
 
   const rawRisk = extractRisk(v);
   const keyParams = extractKeyParams(v);
@@ -244,6 +325,25 @@ export function buildApprovalCard(v: ApprovalView): Record<string, unknown> {
           verdict: 'approve',
         } satisfies CardAction),
       },
+      // 「以后都这样」——只有记忆档位才给（GOV §4.1：spend/dangerous 永不入记忆）。
+      // 为什么需要这个按钮：「同意」按设计只批这一次；没有第三条路的话，
+      // 主人点一百次同意也沉淀不下任何规则，同类操作照样每次都问。
+      // 实测（2026-10-27）：approval_rules 全库 0 行，30 天里 158 次同意
+      // 全是 approve_once —— 不是功能没做，是根本没有入口让人表达"记住"。
+      ...(canRemember(v)
+        ? [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '以后都这样' },
+              type: 'default',
+              value: JSON.stringify({
+                kind: 'approval',
+                approvalId: v.id,
+                verdict: 'approve_remember',
+              } satisfies CardAction),
+            },
+          ]
+        : []),
       {
         tag: 'button',
         text: { tag: 'plain_text', content: '拒绝' },
@@ -265,6 +365,23 @@ export function buildApprovalCard(v: ApprovalView): Record<string, unknown> {
     },
     elements,
   };
+}
+
+/**
+ * 这张审批卡该不该显示「以后都这样」。
+ *
+ * 判据直接复用治理侧的 `memoryEligible`（GOV §4.1：只有 read/write_file/browser
+ * 能入记忆，spend/dangerous 永不）。**不在这里另写一份白名单** —— 两份白名单
+ * 迟早会分叉，那时卡片会给出一个点了必然失败的按钮。
+ *
+ * 另外两条排除：
+ *   · question / phone_action 不是许可题，没有"记住"的语义；
+ *   · tier 为 null 说明治理侧没定档，派生规则必然失败，不给按钮。
+ */
+function canRemember(v: ApprovalView): boolean {
+  if (v.kind !== 'tool_call') return false;
+  if (v.tier === null) return false;
+  return memoryEligible(v.tier);
 }
 
 /**
@@ -390,10 +507,18 @@ function formatDeadline(iso: string | null | undefined): string {
  *    `ask` 只能报「主人没有回答」。
  */
 export function toDecideCall(action: CardAction): {
-  verdict: 'approve_once' | 'reject';
+  verdict: 'approve_once' | 'approve_remember' | 'reject';
   note: string | undefined;
 } {
-  const verdict = action.verdict === 'approve' ? 'approve_once' : 'reject';
+  // 「以后都这样」直接对应 approve_remember —— 这是主人显式选择的"记住"，
+  // 不是我们替主人决定的。gate 的 §4 派生链路（deriveRule → persistMemory）
+  // 本来就是通的，只差这个入口。
+  const verdict =
+    action.verdict === 'approve_remember'
+      ? 'approve_remember'
+      : action.verdict === 'approve'
+        ? 'approve_once'
+        : 'reject';
   // 空串按「没答」处理：绝不能把空话当成主人的话塞进 ownerNote。
   const note = action.answer !== undefined && action.answer.trim() !== '' ? action.answer.trim() : undefined;
   return { verdict, note };
@@ -425,7 +550,14 @@ export function parseCardAction(raw: unknown): CardAction | null {
   if (o.kind !== 'approval') return null;
   const id = typeof o.approvalId === 'number' ? o.approvalId : Number(o.approvalId);
   if (!Number.isInteger(id) || id <= 0) return null;
-  const verdict = o.verdict === 'approve' ? 'approve' : o.verdict === 'reject' ? 'reject' : null;
+  const verdict =
+    o.verdict === 'approve'
+      ? 'approve'
+      : o.verdict === 'approve_remember'
+        ? 'approve_remember'
+        : o.verdict === 'reject'
+          ? 'reject'
+          : null;
   if (verdict === null) return null;
   // question 单的答案是随按钮回来的额外字段。空串按「没答」处理，不塞空话。
   const answerRaw = typeof o.answer === 'string' ? o.answer.trim() : '';
@@ -449,7 +581,9 @@ export function buildResolvedCard(
   // 这张卡是"结论回执"，主语要能让人认出是哪件事。
   // question 单（`ask`）没有工具名，用问题本身当主语；tool_call 单用工具名。
   const subject =
-    v.kind === 'question' && typeof v.reason === 'string' && v.reason.trim() !== ''
+    (v.kind === 'question' || v.kind === 'phone_action') &&
+    typeof v.reason === 'string' &&
+    v.reason.trim() !== ''
       ? v.reason.trim().slice(0, 200)
       : extractToolName(v);
   return {

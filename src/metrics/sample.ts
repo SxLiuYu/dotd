@@ -32,6 +32,17 @@ import type { DatabaseSync } from 'node:sqlite';
 /** 单任务步数超过它就算空转（见文件头注释：本库 1457 个任务里只有 4 个到过）。 */
 export const RUNAWAY_STEP_THRESHOLD = 200;
 
+/**
+ * 审批卡片上「以后都这样」按钮的上线时刻（2026-10-27，本机时区 UTC+8 的 09:50 前后）。
+ *
+ * 为什么要这个东西：8 张可记忆档的审批单全是 10-22 发的，那时卡片上只有
+ * 「同意 / 拒绝」两个按钮 —— 主人想记也点不到。把它们算进"该记没记"，
+ * 等于拿新规矩判旧账，还会催人去修一个刚修好的东西。
+ *
+ * 取一个宽松的整数时刻（部署完成之后的分钟），早于它的一律按"当时没有这个选项"算。
+ */
+export const REMEMBER_BUTTON_SINCE_MS = Date.UTC(2026, 9, 27, 1, 50, 0);
+
 export interface MetricWindow {
   /** 窗口起点（epoch ms，含）。 */
   from: number;
@@ -50,7 +61,10 @@ export interface MetricSample {
     /** 模型单次调用耗时（outcome=ok）。 */
     modelP50Ms: number | null;
     modelP95Ms: number | null;
-    /** 语音反射耗时。**当前恒为 null**：voice_events 没有耗时列（见文件头）。 */
+    /**
+     * 语音反射耗时（唤醒词结束 → 动作执行完），设备上报。
+     * 没有上报就是 null —— 不是 0（0ms 会被读成"极快"）。见 migrations/219。
+     */
     reflexP50Ms: number | null;
     reflexP95Ms: number | null;
   };
@@ -67,6 +81,32 @@ export interface MetricSample {
     modelBad: number;
     modelErrRate: number | null;
     approvalTotal: number;
+    /**
+     * 其中**工具类**审批单数（kind='tool_call'）。
+     *
+     * 为什么要单独一个数（2026-10-27）：判断「授权规则 0 条」是短板还是正常，
+     * 要看有没有工具审批单。审批总开关关着时全是 question 单，本来就不问，
+     * 自然沉淀不下规则 —— 那不是失败。混在一起就会让人去修没坏的东西。
+     */
+    approvalTool: number;
+    /**
+     * 其中**可记忆档位**的审批单数（tier ∈ read/write_file/browser）。
+     *
+     * 为什么还要再分一层（2026-10-27）：窗口里 19 条工具审批单全是 `dangerous`
+     * 档的 shell.run —— 那个档按 GOV §4.1 永不入记忆。只看 approvalTool 会说
+     * 「有单子但没人点记住」，暗示主人漏点了；实际是这批单子**根本没有可记的选项**。
+     * 要分清"该记没记"和"压根不可记"，否则又会催人去修没坏的东西。
+     *
+     * 只数**「以后都这样」按钮上线之后**的单子（见 REMEMBER_BUTTON_SINCE_MS）。
+     * 按钮上线前发出去的卡上没有这个选项，那批单子没记是必然的，
+     * 算进"该记没记"等于拿新规矩判旧账。
+     */
+    approvalRememberable: number;
+    /**
+     * 按钮上线前、本可记忆但注定记不下的单子数（单独列，避免被误读成"没记"）。
+     * 一并说明：这些不是短板，只是时间早于按钮。
+     */
+    approvalRememberableBefore: number;
     approvalLate: number;
     /** 步数超阈值的任务数（烧钱且多半没产出）。 */
     runawayTasks: number;
@@ -147,6 +187,12 @@ export function collectSample(deps: SampleDeps, win: MetricWindow, nowMs: number
   const modelDurSql = `SELECT latency_ms AS v FROM model_call_log
                         WHERE outcome='ok' AND latency_ms IS NOT NULL
                           AND ts >= ? AND ts < ?`;
+  // 语音反射耗时（2026-10-27 起有观测点，见 migrations/219）。
+  // 只取设备真的报了 latency_ms 的行：不是每次事件都是一次反射
+  // （离线告警、状态上报没有"响应"这个动作），把 NULL 当 0 会被读成"极快"。
+  const reflexDurSql = `SELECT latency_ms AS v FROM voice_events
+                        WHERE latency_ms IS NOT NULL
+                          AND at >= ? AND at < ?`;
 
   // ── 执行质量 ──
   const done = num(
@@ -198,6 +244,28 @@ export function collectSample(deps: SampleDeps, win: MetricWindow, nowMs: number
     db, new Date(from).toISOString().slice(0, 19).replace('T', ' '),
     new Date(to).toISOString().slice(0, 19).replace('T', ' '),
   ) ?? 0;
+  const approvalTool = num(
+    `SELECT COUNT(*) AS v FROM approvals
+      WHERE kind='tool_call' AND created_at >= ? AND created_at < ?`,
+    db, new Date(from).toISOString().slice(0, 19).replace('T', ' '),
+    new Date(to).toISOString().slice(0, 19).replace('T', ' '),
+  ) ?? 0;
+  const approvalRememberable = num(
+    `SELECT COUNT(*) AS v FROM approvals
+      WHERE kind='tool_call' AND tier IN ('read','write_file','browser')
+        AND created_at >= ? AND created_at < ?`,
+    db, new Date(Math.max(from, REMEMBER_BUTTON_SINCE_MS)).toISOString().slice(0, 19).replace('T', ' '),
+    new Date(to).toISOString().slice(0, 19).replace('T', ' '),
+  ) ?? 0;
+  // 按钮上线之前发的卡上没有这个选项，那批单子记不下来是必然的。
+  // 单独数出来，说明"不是漏点"，而不是把它们混进上面那个数里让人误判。
+  const approvalRememberableBefore = num(
+    `SELECT COUNT(*) AS v FROM approvals
+      WHERE kind='tool_call' AND tier IN ('read','write_file','browser')
+        AND created_at >= ? AND created_at < ?`,
+    db, new Date(from).toISOString().slice(0, 19).replace('T', ' '),
+    new Date(Math.min(to, REMEMBER_BUTTON_SINCE_MS)).toISOString().slice(0, 19).replace('T', ' '),
+  ) ?? 0;
   const approvalLate = num(
     `SELECT COUNT(*) AS v FROM audit_log
       WHERE action='late_decision' AND ts >= ? AND ts < ?`,
@@ -242,9 +310,9 @@ export function collectSample(deps: SampleDeps, win: MetricWindow, nowMs: number
       taskP95Ms: percentile(db, taskDurSql, 95, [from, to]),
       modelP50Ms: percentile(db, modelDurSql, 50, [from, to]),
       modelP95Ms: percentile(db, modelDurSql, 95, [from, to]),
-      // 见文件头第 2 条：voice_events 没有耗时列，这里如实留空。
-      reflexP50Ms: null,
-      reflexP95Ms: null,
+      // 见文件头 + migrations/219：设备上报才作数，没报就是 null（不是 0）。
+      reflexP50Ms: percentile(db, reflexDurSql, 50, [from, to]),
+      reflexP95Ms: percentile(db, reflexDurSql, 95, [from, to]),
     },
     quality: {
       done,
@@ -258,6 +326,9 @@ export function collectSample(deps: SampleDeps, win: MetricWindow, nowMs: number
       modelBad,
       modelErrRate: rate(modelBad, modelCalls),
       approvalTotal,
+      approvalTool,
+      approvalRememberable,
+      approvalRememberableBefore,
       approvalLate,
       runawayTasks,
     },
@@ -395,9 +466,10 @@ export function persistSample(
          tasks_done, tasks_failed, tasks_cancel, first_try_rate,
          tool_calls, tool_errors, tool_err_rate,
          model_calls, model_bad, model_err_rate,
-         approval_total, approval_late, runaway_tasks,
+         approval_total, approvals_tool, approvals_rememberable, approvals_rememberable_before,
+         approval_late, runaway_tasks,
          mem_threads, mem_messages, mem_files, mem_files_new, rules_active, rules_hits
-       ) VALUES (?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?,?,?,?)`,
+       ) VALUES (?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?,?,?,?,?)`,
     )
     .run(
       sample.at, sample.windowFrom, sample.windowTo,
@@ -408,7 +480,9 @@ export function persistSample(
       sample.quality.firstTryRate,
       sample.quality.toolCalls, sample.quality.toolErrors, sample.quality.toolErrRate,
       sample.quality.modelCalls, sample.quality.modelBad, sample.quality.modelErrRate,
-      sample.quality.approvalTotal, sample.quality.approvalLate, sample.quality.runawayTasks,
+      sample.quality.approvalTotal, sample.quality.approvalTool,
+      sample.quality.approvalRememberable, sample.quality.approvalRememberableBefore,
+      sample.quality.approvalLate, sample.quality.runawayTasks,
       sample.evolution.memThreads, sample.evolution.memMessages, sample.evolution.memFiles,
       sample.evolution.memFilesNew, sample.evolution.rulesActive, sample.evolution.rulesHits,
     ) as unknown as { lastInsertRowid: number | bigint };

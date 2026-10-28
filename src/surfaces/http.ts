@@ -74,6 +74,7 @@ import { serveStatic } from './web.ts';
 import type { DailyBrief } from './daily-brief.ts';
 import type { FeedSnapshot } from './feed.ts';
 import type { ProofBundle } from './proof.ts';
+import type { PhoneTraceRead } from '../exec/phone-trace-file.ts';
 import type { ConnectionRow } from './connections.ts';
 import type { MetricsView } from '../metrics/view.ts';
 import { connectionSummary, renderConnections } from './connections.ts';
@@ -122,6 +123,9 @@ export type Route =
   | 'hook_ingest'
   | 'task_by_id'
   | 'task_proof'
+  | 'task_proof_publish'
+  | 'task_proof_anchors'
+  | 'phone_trace'
   | 'devices'
   | 'device_by_id'
   | 'device_rotate'
@@ -296,6 +300,25 @@ export function matchRoute(method: string, pathname: string): MatchResult | null
   mm = /^\/api\/tasks\/([^/]+)\/proof$/.exec(p);
   if (m === 'GET' && mm !== null) {
     return { route: 'task_proof', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+  // 凭证锚定（2026-10-27）：把 bundleHash 发到本机之外（`dotd prove --publish`）。
+  // **必须是 POST**：这是有副作用的动作（真发一封邮件），不能被 GET 触发。
+  // 必须在 `/api/tasks/([^/]+)$` 之前匹配，否则会被当成任务 id 里带斜杠。
+  mm = /^\/api\/tasks\/([^/]+)\/proof\/publish$/.exec(p);
+  if (m === 'POST' && mm !== null) {
+    return { route: 'task_proof_publish', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+  mm = /^\/api\/tasks\/([^/]+)\/proof\/anchors$/.exec(p);
+  if (m === 'GET' && mm !== null) {
+    return { route: 'task_proof_anchors', params: { id: decodeURIComponent(mm[1]!) } };
+  }
+
+  // 手机侧那份 JSONL 的只读投影（2026-10-27）。traceId 的形状校验在
+  // `phoneTracePath` 里做（只认 ph_[0-9a-f]{8,}）—— 这里先路由过去，
+  // 让它给出"形状不对"的具体原因，而不是在这里静默 404。
+  mm = /^\/api\/phone\/traces\/([^/]+)$/.exec(p);
+  if (m === 'GET' && mm !== null) {
+    return { route: 'phone_trace', params: { traceId: decodeURIComponent(mm[1]!) } };
   }
 
   // P1-6 可观测性：任务明细（CP getTask + getJournal 的投影，供 `dotd task <id>` 用）。
@@ -672,6 +695,33 @@ export interface HttpDeps {
    * 缺省 = 503；任务不存在 = 404。默认不含明文参数。
    */
   proof?: (taskId: string, opts?: { includeArgs?: boolean }) => ProofBundle | null;
+  /**
+   * 凭证锚定（2026-10-27）：把 `bundleHash` 发到本机之外（邮件）。
+   *
+   * 缺省 = `POST /api/tasks/:id/proof/publish` 回 501 —— 没装邮件腿时明说，
+   * 而不是回一个"已发布"骗人。锚定失败要如实带原因（SMTP 不通 / 没配账号）。
+   */
+  publishProof?: (
+    taskId: string,
+    opts: { to?: string; note?: string },
+  ) => Promise<{
+    ok: boolean;
+    bundleHash?: string;
+    to?: string;
+    messageId?: string;
+    anchorId?: number;
+    /** 机读码：task_not_found / no_target / mail_not_configured / publish_failed。 */
+    error?: string;
+    /** 给人看的一句话（CLI 原样打到 stderr）。 */
+    message?: string;
+  }>;
+  /** 已锚定记录（`dotd prove --anchors` 用；只读）。缺省 = 501。 */
+  proofAnchors?: (taskId: string, limit?: number) => unknown[];
+  /**
+   * 手机 trace 的只读投影（`dotd phone trace <traceId>`，2026-10-27）。
+   * 缺省 = 501。实现必须自己保证 traceId 不能被用来穿越目录。
+   */
+  phoneTrace?: (traceId: string) => PhoneTraceRead;
   /** 已连接应用总览（D3）：同上，`insight.ts` 的 `buildConnectionsView`。 */
   connections?: () => ConnectionRow[];
   /**
@@ -1831,7 +1881,7 @@ export function createHttpServer(deps: HttpDeps): Server {
         const d = device!;
         const body = await readJson(req, res);
         if (body === null) return;
-        const b = body as { kind?: unknown; detail?: unknown };
+        const b = body as { kind?: unknown; detail?: unknown; latencyMs?: unknown };
         const kind = typeof b.kind === 'string' ? b.kind.trim() : '';
         if (!/^[a-z][a-z0-9._-]{0,40}$/.test(kind)) {
           json(res, 400, { error: 'schema', message: 'kind 必须是 [a-z][a-z0-9._-]{0,40}' });
@@ -1839,10 +1889,26 @@ export function createHttpServer(deps: HttpDeps): Server {
         }
         const detail =
           typeof b.detail === 'string' ? b.detail.replace(/\s+/g, ' ').trim().slice(0, 500) : null;
+        // 语音反射耗时（2026-10-27）：设备上报【唤醒词结束 → 动作执行完】的毫秒数。
+        //
+        // 为什么不信服务端掐表：服务端只看到请求到达，看不到"主人什么时候说完"、
+        // "灯什么时候真的亮"，掐出来的数会把网络抖动算成设备慢。
+        //
+        // 三条收口：非数字/负数 → 当没报（null）；超过 60 秒 → 当没报
+        // （那已经不是反射，多半是设备挂起后补报，进分位数会把 p95 拉到没意义）。
+        // 不是所有事件都是一次反射（离线告警、状态上报），它们留 NULL，
+        // 指标只对非 NULL 求分位数 —— 绝不把 0 当成"极快"混进去。
+        const rawLatency = typeof b.latencyMs === 'number' ? b.latencyMs : Number(b.latencyMs);
+        const latencyMs =
+          Number.isFinite(rawLatency) && rawLatency >= 0 && rawLatency <= 60_000
+            ? Math.round(rawLatency)
+            : null;
         const at = now().getTime();
         const r = deps.db
-          .prepare('INSERT INTO voice_events (dot_id, device_id, kind, detail, at) VALUES (?,?,?,?,?)')
-          .run(d.dotId, d.id, kind, detail, at);
+          .prepare(
+            'INSERT INTO voice_events (dot_id, device_id, kind, detail, at, latency_ms) VALUES (?,?,?,?,?,?)',
+          )
+          .run(d.dotId, d.id, kind, detail, at, latencyMs);
         try {
           deps.db
             .prepare(
@@ -2062,6 +2128,112 @@ export function createHttpServer(deps: HttpDeps): Server {
           json(res, 200, bundle);
         } catch (cause) {
           json(res, 500, { error: 'proof', message: `生成执行凭证失败：${String(cause)}` });
+        }
+        return;
+      }
+
+      /**
+       * POST /api/tasks/:id/proof/publish —— 把 bundleHash 锚定到本机之外（2026-10-27）。
+       *
+       * 为什么要一个独立端点而不是 GET 的查询参数：这会**真发一封邮件**。
+       * 用 GET + `?publish=1` 的话，浏览器预取、Web UI 刷新、日志里的 URL 都会
+       * 触发一次发信 —— 副作用藏在只读动词后面是最容易出事的一类设计。
+       *
+       * body：`{to?: string, note?: string}`。to 缺省用配置里的锚定邮箱；
+       * 两边都没有就 400（不猜一个地址把你的 hash 发出去）。
+       */
+      case 'task_proof_publish': {
+        const publisher = deps.publishProof;
+        if (publisher === undefined) {
+          json(res, 501, {
+            error: 'publish',
+            message:
+              'daemon 没装配凭证锚定（publishProof 未传）。需要 DOTD_MAIL_KEY 与一个已接入的邮箱账号',
+          });
+          return;
+        }
+        const body = await readJson(req, res);
+        if (body === null) return;
+        const b = body as { to?: unknown; note?: unknown };
+        const to = typeof b.to === 'string' ? b.to.trim() : undefined;
+        const note = typeof b.note === 'string' ? b.note.slice(0, 500) : undefined;
+        const id = match.params.id!;
+        try {
+          const r = await publisher(id, {
+            ...(to !== undefined && to !== '' ? { to } : {}),
+            ...(note !== undefined && note !== '' ? { note } : {}),
+          });
+          if (!r.ok) {
+            // 404 = 任务不存在；400 = 请求能懂但前置条件不满足（没配账号/地址不合法）；
+            // 412 = 邮件腿根本没装；其余按 502（上游 SMTP 的问题，不是请求写错了）。
+            const status =
+              r.error === 'task_not_found'
+                ? 404
+                : r.error === 'no_target'
+                  ? 400
+                  : r.error === 'mail_not_configured'
+                    ? 412
+                    : 502;
+            json(res, status, {
+              ok: false,
+              error: r.error ?? 'publish_failed',
+              message: r.message ?? r.error ?? '锚定失败',
+            });
+            return;
+          }
+          json(res, 200, r);
+        } catch (cause) {
+          json(res, 500, { error: 'publish', message: `锚定失败：${String(cause)}` });
+        }
+        return;
+      }
+
+      /** GET /api/tasks/:id/proof/anchors —— 这个任务的锚定记录（只读）。 */
+      case 'task_proof_anchors': {
+        const lister = deps.proofAnchors;
+        if (lister === undefined) {
+          json(res, 501, { error: 'publish', message: 'daemon 没装配凭证锚定查询（proofAnchors 未传）' });
+          return;
+        }
+        const raw = Number(url.searchParams.get('limit') ?? '20');
+        const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 100) : 20;
+        try {
+          json(res, 200, { taskId: match.params.id!, anchors: lister(match.params.id!, limit) });
+        } catch (cause) {
+          json(res, 500, { error: 'publish', message: `读锚定记录失败：${String(cause)}` });
+        }
+        return;
+      }
+
+      /**
+       * GET /api/phone/traces/:traceId —— 手机侧那份 JSONL 的只读投影（2026-10-27）。
+       *
+       * 为什么不从库里读：`phone_steps` 只有动作。手机上真正发生的还有
+       * start / approval_request / approval_decision / log / end —— 把这些复制
+       * 进库会让表膨胀，而且没人真的用 SQL 查它。留在 `DBPHONE_HOME/traces/`
+       * 里按需读更合适。
+       *
+       * 路径只由 traceId 拼出来（`phoneTracePath` 双重校验），不接受调用方给路径。
+       */
+      case 'phone_trace': {
+        const reader = deps.phoneTrace;
+        if (reader === undefined) {
+          json(res, 501, {
+            error: 'phone_trace',
+            message: 'daemon 没装配手机 trace 读取（phoneTrace 未传；需要设 DBPHONE_HOME）',
+          });
+          return;
+        }
+        try {
+          const r = reader(match.params.traceId!);
+          if (!r.ok) {
+            const status = r.reason === 'bad_id' ? 400 : r.reason === 'not_found' ? 404 : 501;
+            json(res, status, { ok: false, error: r.reason, message: r.message });
+            return;
+          }
+          json(res, 200, r.trace);
+        } catch (cause) {
+          json(res, 500, { error: 'phone_trace', message: `读手机 trace 失败：${String(cause)}` });
         }
         return;
       }

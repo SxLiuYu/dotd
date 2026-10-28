@@ -90,9 +90,16 @@ export function renderReport(
       trend(sample.speed.modelP50Ms, b?.speed.modelP50Ms),
   );
   if (sample.speed.reflexP50Ms === null) {
-    lines.push('  语音反射     — 缺观测点（voice_events 没有耗时列，measured=none）');
+    // 两种"没有"要分开说（2026-10-27）：
+    //   · 表里一列都没有 → 老库还没迁到 216，得先升级；
+    //   · 有列但没数据 → 语音设备还没上报 latencyMs，得让设备端补这个字段。
+    // 混成一句"缺观测点"，人不知道该改代码还是改设备。
+    lines.push('  语音反射     — 缺观测点（voice_events.latency_ms 本窗口无数据：等设备上报）');
   } else {
-    lines.push(`  语音反射     p50 ${fmtMs(sample.speed.reflexP50Ms)}  p95 ${fmtMs(sample.speed.reflexP95Ms)}`);
+    lines.push(
+      `  语音反射     p50 ${fmtMs(sample.speed.reflexP50Ms)}  p95 ${fmtMs(sample.speed.reflexP95Ms)}` +
+        trend(sample.speed.reflexP50Ms, b?.speed.reflexP50Ms),
+    );
   }
   lines.push('');
 
@@ -162,7 +169,31 @@ export function renderReport(
   if (sample.evolution.rulesActive === 0) {
     // 这条必须说出来：0 条授权规则意味着「每次同类操作都还会问一遍」，
     // 是自我进化维度最直接的短板，不能只在数字里躺着。
-    lines.push('  授权规则     0 条 —— 没有任何「一次点头、以后不再问」的沉淀');
+    //
+    // 但三种 0 条完全不同（2026-10-27 核账，逐个查过本库）：
+    //   ① 没有工具审批单 —— 审批总开关 DOTD_APPROVALS 默认 off，所有档位直通，
+    //      本来就不问，0 条是正常的，不是短板；
+    //   ② 有单子但全在不可记忆档（spend/dangerous，GOV §4.1 永不入记忆）——
+    //      卡片上本来就不该有「以后都这样」，也是正常的；
+    //   ③ 有可记忆档的单子却一条没记 —— **这才是真短板**，该去改入口或引导。
+    // 三种混成一句"没有任何沉淀"，就会催着人去修一个没坏的东西。
+    const q = sample.quality;
+    if (q.approvalTool === 0) {
+      lines.push('  授权规则     0 条（本窗口没有工具审批单：审批总开关关着，本来就不问，不是沉淀失败）');
+    } else if (q.approvalRememberable === 0) {
+      // 「以后都这样」按钮上线前发的卡上没有这个选项，那批单子记不下来是必然的。
+      // 说清"那是时间早于按钮"，而不是让读者以为主人漏点了。
+      const before = q.approvalRememberableBefore;
+      lines.push(
+        before > 0
+          ? `  授权规则     0 条（本窗口 ${q.approvalTool} 张工具审批单，其中 ${before} 张可记忆的早于「以后都这样」按钮上线，当时没有这个选项；按钮上线后还没有可记忆的单子）`
+          : `  授权规则     0 条（本窗口 ${q.approvalTool} 张工具审批单全在 spend/dangerous 档，按规则永不入记忆，正常）`,
+      );
+    } else {
+      lines.push(
+        `  授权规则     0 条 —— 该记的没记：${q.approvalRememberable} 张可记忆档的审批单，没有一张被点「以后都这样」`,
+      );
+    }
   } else {
     lines.push(
       `  授权规则     ${sample.evolution.rulesActive} 条，累计省下 ${sample.evolution.rulesHits} 次提问`,

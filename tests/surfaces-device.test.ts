@@ -531,10 +531,45 @@ test('/api/device/events：记 voice_events + audit_log；坏 kind 400', async (
   }
 });
 
+test('/api/device/events：latencyMs 收口（语音反射延迟的唯一观测点，2026-10-27）', async () => {
+  // 为什么这条重要：指标里"语音反射 p50/p95"完全依赖这一列。收口写错两种方向都糟：
+  //   · 把非反射事件的 null 记成 0 → 分位数被拉成"极快"，报喜不报忧；
+  //   · 把设备挂起后补报的 5 分钟当成反射 → p95 变成毫无意义的量级。
+  const h = await startServer();
+  try {
+    const dev = await createDevice(h);
+    const post = async (body: Record<string, unknown>): Promise<number> => {
+      const r = await fetch(`${h.base}/api/device/events`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${dev.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      assert.equal(r.status, 201);
+      const j = (await r.json()) as { id: number };
+      const row = h.dir.db
+        .prepare('SELECT latency_ms AS l FROM voice_events WHERE id = ?')
+        .get(j.id) as { l: number | null };
+      return row.l as number;
+    };
+
+    assert.equal(await post({ kind: 'scene', detail: '开灯', latencyMs: 320 }), 320);
+    assert.equal(await post({ kind: 'scene', detail: '开灯', latencyMs: 0 }), 0, '0 毫秒是合法读数，不是"没报"');
+    assert.equal(await post({ kind: 'offline', detail: '断网' }), null as unknown as number, '没报就是 null，不能当 0');
+    assert.equal(await post({ kind: 'scene', detail: 'x', latencyMs: 'abc' }), null as unknown as number, '非数字当没报');
+    assert.equal(await post({ kind: 'scene', detail: 'x', latencyMs: -5 }), null as unknown as number, '负数当没报');
+    assert.equal(
+      await post({ kind: 'scene', detail: 'x', latencyMs: 300_000 }),
+      null as unknown as number,
+      '超过 60 秒已经不是反射（多半是挂起后补报），不能进分位数',
+    );
+  } finally {
+    await close(h);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════
 // 四、凭证里的设备维度（阶段 2 第 6 条）
 // ═══════════════════════════════════════════════════════════════════
-
 test('collectProof：语音任务带 device（id/name/status/channel），普通任务不带这个键', async () => {
   const h = await startServer();
   try {

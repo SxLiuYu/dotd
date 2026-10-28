@@ -43,7 +43,7 @@ export interface FeishuWsDeps {
   approval?: {
     decide(
       approvalId: number,
-      verdict: 'approve' | 'reject',
+      verdict: 'approve' | 'approve_remember' | 'reject',
       operatorId: string,
     ): Promise<{ ok: boolean; status?: string; reason?: string }>;
     /** 落定后改卡片（去掉按钮）。失败不影响裁决本身。

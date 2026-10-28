@@ -78,7 +78,11 @@ export type FeishuInboundDecision =
       dedupKey: string;
       eventId: string;
       approvalId: number;
-      verdict: 'approve' | 'reject';
+      /**
+       * 主人点的按钮语义。`approve_remember` = 卡片上的「以后都这样」，
+       * 由治理侧 deriveRule → persistMemory 沉淀成长期规则（GOV §4）。
+       */
+      verdict: 'approve' | 'approve_remember' | 'reject';
       /** question 单的答案（主人点的那个选项）。tool_call 单没有这个字段。 */
       answer?: string;
       /** 卡片的 message_id，落定后要拿它改卡片 */
@@ -445,7 +449,7 @@ export interface FeishuInboundDeps {
   approval?: {
     decide(
       approvalId: number,
-      verdict: 'approve' | 'reject',
+      verdict: 'approve' | 'approve_remember' | 'reject',
       operatorId: string,
       /** 主人给的答案／补充说明（GOV §3.4：随审批单回到执行方）。 */
       note?: string,

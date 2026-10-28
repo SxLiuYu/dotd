@@ -16,6 +16,7 @@ import { test } from 'node:test';
 
 import { makeTempDataDir } from './helpers.ts';
 import {
+  REMEMBER_BUTTON_SINCE_MS,
   RUNAWAY_STEP_THRESHOLD,
   collectSample,
   collectSeries,
@@ -147,6 +148,33 @@ test('反应速度：语音反射没有观测点时如实留 null（不拿别的
     assert.equal(s.speed.reflexP95Ms, null);
     const text = renderReport(s);
     assert.ok(text.includes('缺观测点'), '报告必须写明缺观测点，不能默默空着');
+    assert.ok(text.includes('等设备上报'), '要说清查代码还是等设备：这里该等设备');
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('反应速度：语音反射有上报就算真值，null 行不能混进来当 0', () => {
+  const dir = makeTempDataDir();
+  try {
+    const ins = dir.db.prepare(
+      'INSERT INTO voice_events (dot_id, device_id, kind, detail, at, latency_ms) VALUES (?,?,?,?,?,?)',
+    );
+    // 三次真反射：200ms / 400ms / 600ms
+    ins.run('dot1', 'dev1', 'scene', '开客厅灯', NOW - HOUR, 200);
+    ins.run('dot1', 'dev1', 'scene', '开卧室灯', NOW - HOUR, 400);
+    ins.run('dot1', 'dev1', 'device.ac', '空调 26 度', NOW - HOUR, 600);
+    // 两次非反射事件（离线告警、状态上报）：没有"响应"这个动作，latency 留 null。
+    // 如果把它们当 0 参与计算，p50 会从 400 掉到 200 —— 指标就撒谎了。
+    ins.run('dot1', 'dev1', 'offline', '断网重连', NOW - HOUR, null);
+    ins.run('dot1', 'dev1', 'status', '电量 80%', NOW - HOUR, null);
+
+    const s = collectSample({ db: dir.db }, windowDays(7, NOW), NOW);
+    assert.equal(s.speed.reflexP50Ms, 400, 'null 行不能参与分位数');
+    assert.equal(s.speed.reflexP95Ms, 600);
+    const text = renderReport(s);
+    assert.ok(text.includes('语音反射     p50 400ms'), text.slice(0, 400));
+    assert.ok(!text.includes('缺观测点'), '有数据就不该再说缺观测点');
   } finally {
     dir.cleanup();
   }
@@ -252,14 +280,110 @@ test('自我进化：记忆存量是当前时点，增量按窗口切', () => {
   }
 });
 
-test('自我进化：0 条授权规则必须说出来（那是"每次同类操作还会问一遍"）', () => {
+test('自我进化：0 条授权规则必须说出来，且要分清是"没入口"还是"根本就在问"', () => {
   const dir = makeTempDataDir();
   try {
-    const s = collectSample({ db: dir.db }, windowDays(7, NOW), NOW);
-    assert.equal(s.evolution.rulesActive, 0);
+    // 情形一：没有任何审批单（审批总开关关着，本来就不问）
+    const quiet = collectSample({ db: dir.db }, windowDays(7, NOW), NOW);
+    assert.equal(quiet.evolution.rulesActive, 0);
+    assert.equal(quiet.quality.approvalTool, 0);
+    const quietText = renderReport(quiet);
+    assert.ok(quietText.includes('0 条'), '不能只在数字里躺着，要明说后果');
+    assert.ok(
+      quietText.includes('本来就不问'),
+      `开关关着时不能催人去修入口：${quietText.slice(-200)}`,
+    );
+
+    // 情形二：有工具审批单，但没人点「以后都这样」—— 这才是真的沉淀失败
+    // 时间点要在「以后都这样」按钮上线之后（REMEMBER_BUTTON_SINCE_MS），
+  // 否则会被正确地归到"当时没这个选项"，测不到"该记没记"这条分支。
+  const afterButton = REMEMBER_BUTTON_SINCE_MS + HOUR;
+  dir.db
+      .prepare(`INSERT INTO approvals (seq, kind, dot_id, task_id, tool, tier, journal_step,
+                                       params_json, summary, reason, status, created_at, pending_until)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        1, 'tool_call', 'dot1', 'tk_x', 'fs.read', 'read', 'st_x',
+        '{}', 's', 'r', 'pending',
+        new Date(afterButton).toISOString().slice(0, 19).replace('T', ' '),
+        new Date(afterButton + HOUR).toISOString().slice(0, 19).replace('T', ' '),
+      );
+    const loud = collectSample({ db: dir.db }, windowDays(7, NOW), NOW);
+    assert.equal(loud.quality.approvalTool, 1, '工具审批单要单独数，不能混进 question 单');
+    assert.equal(loud.quality.approvalRememberable, 1, 'read 档是可记忆档');
+    const loudText = renderReport(loud);
+    assert.ok(loudText.includes('该记的没记'), `可记忆的单却 0 条时要说这是真短板：${loudText.slice(-220)}`);
+    assert.ok(loudText.includes('没有一张被点'), `要指向真正的短板（主人没点那个按钮）：${loudText.slice(-200)}`);
+
+    // 情形三：工具审批单全是 dangerous 档 —— 按 GOV §4.1 永不入记忆，
+    // 卡片上本来就没有「以后都这样」。这是正常的，不能催人去修入口。
+    // 本库实测就是这样：7 天内 19 张单子全是 dangerous 的 shell.run。
+    dir.db
+      .prepare(`INSERT INTO approvals (seq, kind, dot_id, task_id, tool, tier, journal_step,
+                                       params_json, summary, reason, status, created_at, pending_until)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        2, 'tool_call', 'dot1', 'tk_y', 'shell.run', 'dangerous', 'st_y',
+        '{}', 's', 'r', 'pending',
+        new Date(NOW - HOUR).toISOString().slice(0, 19).replace('T', ' '),
+        new Date(NOW + HOUR).toISOString().slice(0, 19).replace('T', ' '),
+      );
+    const onlyDangerous = collectSample({ db: dir.db }, windowDays(7, NOW), NOW);
+    assert.equal(onlyDangerous.quality.approvalTool, 2);
+    assert.equal(onlyDangerous.quality.approvalRememberable, 1, '只有 read 那张可记忆');
+    const mixedText = renderReport(onlyDangerous);
+    assert.ok(mixedText.includes('没有一张被点'), '有可记忆的单时仍指向短板');
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('自我进化：按钮上线前的单子不算"该记没记"（拿新规矩判旧账会催人修没坏的）', () => {
+  const dir = makeTempDataDir();
+  try {
+    // 本库实测就是这种：8 张 browser 审批单全是 10-22 发的，
+    // 而「以后都这样」按钮 10-27 才上线。那批卡上没有这个选项，记不下来是必然的。
+    dir.db
+      .prepare(`INSERT INTO approvals (seq, kind, dot_id, task_id, tool, tier, journal_step,
+                                       params_json, summary, reason, status, created_at, pending_until)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        1, 'tool_call', 'dot1', 'tk_old', 'browser.act', 'browser', 'st_old',
+        '{}', 's', 'r', 'executed',
+        new Date(REMEMBER_BUTTON_SINCE_MS - 5 * 86_400_000).toISOString().slice(0, 19).replace('T', ' '),
+        new Date(REMEMBER_BUTTON_SINCE_MS - 4 * 86_400_000).toISOString().slice(0, 19).replace('T', ' '),
+      );
+    const s = collectSample({ db: dir.db }, windowDays(30, NOW), NOW);
+    assert.equal(s.quality.approvalTool, 1);
+    assert.equal(s.quality.approvalRememberable, 0, '按钮上线前的单子不算"该记没记"');
+    assert.equal(s.quality.approvalRememberableBefore, 1, '但要单独数出来，别让人以为没人发过单');
     const text = renderReport(s);
-    assert.ok(text.includes('0 条'), '不能只在数字里躺着，要明说后果');
-    assert.ok(text.includes('一次点头'), '要说清 0 条意味着什么');
+    assert.ok(text.includes('没有这个选项'), `要说清那是时间早于按钮：${text.slice(-240)}`);
+    assert.ok(!text.includes('该记的没记'), '不能拿新规矩判旧账');
+  } finally {
+    dir.cleanup();
+  }
+});
+
+test('自我进化：工具审批单全在 spend/dangerous 档时说"正常"，不催人去修', () => {
+  const dir = makeTempDataDir();
+  try {
+    dir.db
+      .prepare(`INSERT INTO approvals (seq, kind, dot_id, task_id, tool, tier, journal_step,
+                                       params_json, summary, reason, status, created_at, pending_until)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        1, 'tool_call', 'dot1', 'tk_x', 'shell.run', 'dangerous', 'st_x',
+        '{}', 's', 'r', 'pending',
+        new Date(NOW - HOUR).toISOString().slice(0, 19).replace('T', ' '),
+        new Date(NOW + HOUR).toISOString().slice(0, 19).replace('T', ' '),
+      );
+    const s = collectSample({ db: dir.db }, windowDays(7, NOW), NOW);
+    assert.equal(s.quality.approvalTool, 1);
+    assert.equal(s.quality.approvalRememberable, 0);
+    const text = renderReport(s);
+    assert.ok(text.includes('永不入记忆'), `要说清这张单子本来就不能记：${text.slice(-220)}`);
+    assert.ok(!text.includes('没有一张被点'), '不可记忆的单不能说成主人漏点');
   } finally {
     dir.cleanup();
   }
