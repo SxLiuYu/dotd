@@ -111,10 +111,14 @@ class ReflexSpool:
         self.path = path
         self._lock = threading.Lock()
 
-    def add(self, kind: str, detail: Optional[str]) -> bool:
+    def add(self, kind: str, detail: Optional[str], latency_ms: Optional[int] = None) -> bool:
         if self.path is None:
             return False
         rec = {"kind": kind, "detail": detail, "at": int(time.time())}
+        # 延迟一起存：断网时反射照样执行，补传后这条读数不能凭空消失
+        # （否则线上会看起来"断网那几天没有语音"，而实际是数据被丢了）。
+        if latency_ms is not None:
+            rec["latency_ms"] = int(latency_ms)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock, self.path.open("a", encoding="utf-8") as fh:
@@ -155,7 +159,7 @@ class ReflexSpool:
         for rec in recs:
             ok = False
             try:
-                ok = bool(bridge.record_event(str(rec["kind"]), rec.get("detail")))
+                ok = bool(bridge.record_event(str(rec["kind"]), rec.get("detail"), rec.get("latency_ms")))
             except Exception:
                 ok = False
             if ok:
@@ -458,38 +462,62 @@ class CortexRouter:
         return CortexReply(BUSY_REPLY, "busy", detail=reason)
 
     def _offline(self, text: str, reason: str) -> CortexReply:
-        """dotd 不在线：只做本地场景，并且**必须说出来**。"""
+        """dotd 不在线：只做本地场景，并且**必须说出来**。
+
+        这里也计时（2026-10-27）：断网时的「开灯」照样是主人在等的那一下，
+        而且**更快**（不碰网络）。只统计联网成功的那部分，会让指标看起来
+        比实际慢 —— 慢的那半被丢掉了。
+        """
+        started = time.monotonic()
         scene = self._scene(text)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
         if scene is not None:
-            self.account("scene.offline", text)
+            self.account("scene.offline", text, elapsed_ms)
             return CortexReply(scene + OFFLINE_SCENE_SUFFIX, "offline-scene", detail=reason)
-        self.account("offline", text)
+        self.account("offline", text, elapsed_ms)
         return CortexReply(OFFLINE_REPLY, "offline", detail=reason)
 
     # -- 记账 --------------------------------------------------------
 
-    def account(self, kind: str, detail: Optional[str] = None) -> bool:
+    def account(
+        self, kind: str, detail: Optional[str] = None, latency_ms: Optional[int] = None
+    ) -> bool:
+        """留痕。`latency_ms` 只在**反射**路径上传（见 reply()）。"""
         clipped = (detail or "")[:200] or None
         rec = self.bridge if getattr(self.bridge, "record_event", None) is not None else None
         if rec is not None:
             try:
-                if rec.record_event(kind, clipped):
+                if rec.record_event(kind, clipped, latency_ms):
                     return True
             except Exception:
                 pass
-        return self.spool.add(kind, clipped)
+        # spool 也要带上延迟：断网时"开灯"照样执行，补传后这条读数不能丢，
+        # 否则断网期间的延迟会永久缺失，指标看起来像"那几天没语音"。
+        return self.spool.add(kind, clipped, latency_ms)
 
     # -- 单入口 ------------------------------------------------------
 
     def reply(self, text: str, session_id: str = "default") -> CortexReply:
-        """反射 → 皮层。Charlie 的所有入口最终都收敛到这一步。"""
+        """反射 → 皮层。Charlie 的所有入口最终都收敛到这一步。
+
+        **计时起点在这里**（2026-10-27）：`reply()` 是 ASR 之后的唯一入口，
+        进来就到了"主人说完了"这一刻。终点在反射真的返回之后 —— 也就是动作
+        已经执行完（`_home()` 里发出去的那一帧已经交给设备）。
+        这段就是主人感受到的"说完到灯亮"。
+
+        为什么不把 ASR 也算进去：ASR 的尾静音等待（本机 1.2s）由设备侧的
+        VAD 决定，混进来会让"系统慢"和"麦克风等静音"分不清。
+        要调的是 dotd + 反射，不是麦克风的耐心。
+        """
+        started = time.monotonic()
         reflex = self.reflex(text, session_id)
         if reflex is not None:
             # 反射不经过 dotd，但也不能是"没发生过"：场景/家居/工具类反射要留痕。
             if reflex.detail in ("scene", "camera", "home") or (
                 reflex.detail or ""
             ).startswith("fast_path."):
-                self.account(reflex.detail or "reflex", text)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                self.account(reflex.detail or "reflex", text, elapsed_ms)
             return reflex
         return self.ask(text, session_id)
 

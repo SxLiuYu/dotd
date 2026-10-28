@@ -69,10 +69,10 @@ class FakeBridge:
             return TurnResult(ok=False, status="unreachable", reason="connection refused")
         return self.result
 
-    def record_event(self, kind, detail=None):
+    def record_event(self, kind, detail=None, latency_ms=None):
         if not self.online:
             return False
-        self.events.append((kind, detail))
+        self.events.append((kind, detail, latency_ms))
         return True
 
 
@@ -96,7 +96,13 @@ class ReflexTests(unittest.TestCase):
             self.assertEqual(out.text, "已切换到贾维斯")
             self.assertEqual(out.source, "reflex")
             self.assertEqual(bridge.calls, 0, "反射命中不能问 dotd")
-            self.assertEqual(bridge.events, [("fast_path.role_switch", "切换到贾维斯")])
+            # 第三个元素是延迟（2026-10-27 加）：必须是真实测到的毫秒数，
+            # 不是固定的 0 或 None —— 那是"没测"而不是"很快"。
+            self.assertEqual(len(bridge.events), 1)
+            kind, detail, latency = bridge.events[0]
+            self.assertEqual((kind, detail), ("fast_path.role_switch", "切换到贾维斯"))
+            self.assertIsInstance(latency, int)
+            self.assertGreaterEqual(latency, 0)
 
     def test_fast_path_exception_falls_through_to_cortex(self):
         with tempfile.TemporaryDirectory() as td:
@@ -120,7 +126,11 @@ class ReflexTests(unittest.TestCase):
             self.assertEqual(out.text, "晚安，灯已关")
             self.assertEqual(out.detail, "scene")
             self.assertEqual(bridge.calls, 0)
-            self.assertEqual(bridge.events, [("scene", "晚安")])
+            self.assertEqual(len(bridge.events), 1)
+            kind, detail, latency = bridge.events[0]
+            self.assertEqual((kind, detail), ("scene", "晚安"))
+            self.assertIsInstance(latency, int)
+            self.assertGreaterEqual(latency, 0)
 
     def test_home_hit_is_reflex_and_accounted(self):
         """家居反射：开关灯秒执行、不问 dotd，但要记账。
@@ -139,7 +149,11 @@ class ReflexTests(unittest.TestCase):
             self.assertEqual(out.source, "reflex")
             self.assertEqual(out.detail, "home")
             self.assertEqual(bridge.calls, 0, "家居命中不能问 dotd")
-            self.assertEqual(bridge.events, [("home", "开客厅灯")])
+            self.assertEqual(len(bridge.events), 1)
+            kind, detail, latency = bridge.events[0]
+            self.assertEqual((kind, detail), ("home", "开客厅灯"))
+            self.assertIsInstance(latency, int)
+            self.assertGreaterEqual(latency, 0)
 
     def test_home_declining_falls_through_to_cortex(self):
         """家居层没把握（返回 None）→ 必须交给 dotd 的模型，不能就地编一句。"""
@@ -253,6 +267,78 @@ class CortexTests(unittest.TestCase):
             self.assertIn("确认", out.text)
 
 
+class ReflexLatencyTests(unittest.TestCase):
+    """语音反射延迟（2026-10-27）。
+
+    为什么单独一组：指标里"语音反射 p50/p95"完全取决于设备有没有真报这个数。
+    没有它，报告只能写「缺观测点」，而"说一句 → 灯亮"恰恰是家居场景最该看的读数。
+    这里钉两件事：① 报上去的是真的测到的耗时；② 断网补传不能把它丢掉。
+    """
+
+    def test_reflex_reports_measured_latency(self):
+        with tempfile.TemporaryDirectory() as td:
+            bridge = FakeBridge()
+            mods = make_modules(fast_paths=[FakePath("role_switch", reply="已切换")])
+            r = make_router(Path(td), bridge, mods)
+
+            r.reply("切换到贾维斯")
+
+            self.assertEqual(len(bridge.events), 1)
+            _, _, latency = bridge.events[0]
+            # 必须是整数毫秒且 >= 0。0 是合法值（本机指令可能 <1ms），
+            # 但 None 不行 —— 那是"没报"，指标会当缺观测点。
+            self.assertIsInstance(latency, int)
+            self.assertGreaterEqual(latency, 0)
+
+    def test_latency_covers_the_whole_reflex_not_just_one_step(self):
+        """计时必须包住反射执行本身，不能只测记账那段。
+
+        反证法：让路径自己睡 50ms，若计时的起止点落在路径外面，读数会接近 0。
+        """
+        import time as _t
+
+        class SlowPath:
+            name = "slow"
+
+            def run(self, text, session_id="default"):
+                _t.sleep(0.05)
+                return "做完了"
+
+        with tempfile.TemporaryDirectory() as td:
+            bridge = FakeBridge()
+            r = make_router(Path(td), bridge, make_modules(fast_paths=[SlowPath()]))
+
+            r.reply("慢一点")
+
+            _, _, latency = bridge.events[0]
+            self.assertGreaterEqual(latency, 40, f"反射本身耗时没算进去：{latency}ms")
+
+    def test_offline_spool_keeps_latency(self):
+        """断网时反射照样执行，补传后这条读数不能丢。
+
+        丢掉的话，线上会看起来"断网那几天没有语音"，而实际是数据被扔了。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bridge = FakeBridge(online=False)
+            mods = make_modules(scene=lambda text: "已关灯" if "晚安" in text else None)
+            r = make_router(root, bridge, mods)
+
+            r.reply("晚安")  # 离线：写 spool
+            spool = ReflexSpool(root / "spool.jsonl")
+            recs = spool._read()
+            self.assertEqual(len(recs), 1)
+            self.assertIn("latency_ms", recs[0], f"补传记录里必须有延迟：{recs[0]}")
+            self.assertIsInstance(recs[0]["latency_ms"], int)
+
+            # 网络恢复 → 补传，延迟要原样带过去。
+            online = FakeBridge()
+            sent = spool.flush(online)
+            self.assertEqual(sent, 1)
+            self.assertEqual(len(online.events), 1)
+            self.assertIsInstance(online.events[0][2], int)
+
+
 class OfflineTests(unittest.TestCase):
     def test_offline_without_scene_says_so(self):
         with tempfile.TemporaryDirectory() as td:
@@ -305,7 +391,10 @@ class OfflineTests(unittest.TestCase):
             bridge.online = True
             r.reply("今天几号")
             self.assertEqual(spool.pending(), 0, "恢复后应补传并清空")
-            self.assertIn(("offline", "帮我订明天去上海的票"), bridge.events)
+            self.assertTrue(
+                any(k == "offline" and d == "帮我订明天去上海的票" for k, d, _ in bridge.events),
+                bridge.events,
+            )
 
     def test_spool_keeps_failed_records(self):
         with tempfile.TemporaryDirectory() as td:

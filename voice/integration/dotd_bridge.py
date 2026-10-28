@@ -342,11 +342,25 @@ class DeviceBridge:
                 return "timeout", last
             time.sleep(POLL_INTERVAL_S)
 
-    def record_event(self, kind: str, detail: Optional[str] = None) -> bool:
-        """反射层记账。返回 False = 没记上（离线/鉴权失败），调用方负责补传。"""
+    def record_event(
+        self, kind: str, detail: Optional[str] = None, latency_ms: Optional[int] = None
+    ) -> bool:
+        """反射层记账。返回 False = 没记上（离线/鉴权失败），调用方负责补传。
+
+        `latency_ms` 是**这一句反射从听到说完到动作做完**的毫秒数（2026-10-27 加）。
+        为什么由这里报而不是服务端掐表：服务端只看到请求到达，看不到主人什么时候
+        说完、灯什么时候真的亮，掐出来会把网络抖动算成设备慢。语音延迟是家居场景
+        最该看的数（"说一句 → 灯亮"），没它就只剩模型 p50 一个读数。
+
+        只在**真的执行了反射**时传：皮层（走 dotd）那条路径有任务耗时，
+        混进反射分位数会把两个量级的数放在一起比，没有意义。
+        """
         body: dict[str, Any] = {"kind": kind}
         if detail:
             body["detail"] = detail
+        # 0 是合法读数（本机指令可以 <1ms），所以判 `is not None` 而不是真值判断。
+        if latency_ms is not None:
+            body["latencyMs"] = int(latency_ms)
         try:
             self._request("POST", "/api/device/events", body)
             return True
